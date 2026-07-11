@@ -78,7 +78,7 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token type")
-        member = await db.members.find_one({"id": payload["sub"]}, {"_id": 0, "passcode_hash": 0})
+        member = await db.members.find_one({"id": payload["sub"]}, {"_id": 0, "passcode_hash": 0, "passcode_plain": 0})
         if not member:
             raise HTTPException(status_code=401, detail="Member not found")
         return member
@@ -124,6 +124,8 @@ class AppConfigInput(BaseModel):
     app_name: Optional[str] = None
     default_theme: Optional[Literal["clean", "candy", "mermaid", "cyber", "galaxy"]] = None
     slideshow_background_url: Optional[str] = None
+    rupiah_per_point: Optional[int] = Field(default=None, ge=1, le=1000000)
+    skip_cost_points: Optional[int] = Field(default=None, ge=0, le=100000)
 
 
 class ReminderInput(BaseModel):
@@ -168,6 +170,7 @@ class TaskInput(BaseModel):
     due_date: Optional[str] = None  # ISO date string
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
+    order: Optional[int] = Field(default=None, ge=1)
 
 
 class TaskUpdate(BaseModel):
@@ -179,6 +182,23 @@ class TaskUpdate(BaseModel):
     due_date: Optional[str] = None
     recurrence: Optional[Literal["none", "daily", "weekly"]] = None
     icon: Optional[str] = None
+    order: Optional[int] = Field(default=None, ge=1)
+
+
+class RedeemMoneyInput(BaseModel):
+    child_id: str
+    points: int = Field(ge=1, le=1000000)
+
+
+class SelfPasscodeInput(BaseModel):
+    old_passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    new_passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class SelfProfileInput(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    avatar_emoji: Optional[str] = Field(default=None, max_length=10)
+    avatar_color: Optional[str] = Field(default=None, max_length=20)
 
 
 class RewardInput(BaseModel):
@@ -210,7 +230,7 @@ api = APIRouter(prefix="/api")
 @api.get("/auth/members")
 async def list_members():
     """Public: list family members to show on the login picker (no passcodes)."""
-    members = await db.members.find({}, {"_id": 0, "passcode_hash": 0}).to_list(20)
+    members = await db.members.find({}, {"_id": 0, "passcode_hash": 0, "passcode_plain": 0}).to_list(20)
     order = {"parent": 0, "child": 1}
     members.sort(key=lambda m: (order.get(m.get("role"), 2), m.get("created_at", "")))
     return members
@@ -258,12 +278,29 @@ async def me(user: dict = Depends(get_current_user)):
 
 
 # --------------- Member Passcode Management (parents only) ---------------
+def _passcode_set_fields(role: str, passcode: str, is_default: bool) -> dict:
+    """Children's passcodes stay parent-viewable (family app, kids forget codes).
+    Parents' passcodes are hash-only for their own privacy."""
+    fields = {
+        "passcode_hash": hash_password(passcode),
+        "passcode_is_default": is_default,
+    }
+    if role == "child":
+        fields["passcode_plain"] = passcode
+    else:
+        fields["passcode_plain"] = None
+    return fields
+
+
 @api.post("/members/{member_id}/passcode")
 async def set_member_passcode(member_id: str, payload: MemberPasscodeInput, user: dict = Depends(require_parent)):
     member = await db.members.find_one({"id": member_id})
     if not member:
         raise HTTPException(status_code=404, detail="Member not found")
-    await db.members.update_one({"id": member_id}, {"$set": {"passcode_hash": hash_password(payload.passcode), "passcode_is_default": False}})
+    await db.members.update_one(
+        {"id": member_id},
+        {"$set": _passcode_set_fields(member["role"], payload.passcode, False)},
+    )
     await log_activity(FAMILY_ID, member_id if member["role"] == "child" else None, "passcode_updated", {"member_name": member["name"]})
     return {"success": True}
 
@@ -275,7 +312,7 @@ async def reset_member_passcode(member_id: str, user: dict = Depends(require_par
         raise HTTPException(status_code=404, detail="Member not found")
     await db.members.update_one(
         {"id": member_id},
-        {"$set": {"passcode_hash": hash_password(DEFAULT_PASSCODE), "passcode_is_default": True}}
+        {"$set": _passcode_set_fields(member["role"], DEFAULT_PASSCODE, True)},
     )
     await log_activity(FAMILY_ID, member_id if member["role"] == "child" else None, "passcode_reset", {"member_name": member["name"]})
     return {"success": True, "default_passcode": DEFAULT_PASSCODE}
@@ -284,6 +321,8 @@ async def reset_member_passcode(member_id: str, user: dict = Depends(require_par
 @api.get("/admin/members-passcodes")
 async def get_members_passcode_status(user: dict = Depends(require_parent)):
     members = await db.members.find({}, {"_id": 0}).to_list(20)
+    order = {"parent": 0, "child": 1}
+    members.sort(key=lambda m: (order.get(m.get("role"), 2), m.get("created_at", "")))
     return [
         {
             "member_id": m["id"],
@@ -291,9 +330,111 @@ async def get_members_passcode_status(user: dict = Depends(require_parent)):
             "role": m["role"],
             "has_passcode": bool(m.get("passcode_hash")),
             "is_default": m.get("passcode_is_default", False),
+            # Only children's codes are exposed to parents.
+            "passcode_plain": m.get("passcode_plain") if m.get("role") == "child" else None,
         }
         for m in members
     ]
+
+
+# --------------- Self-Service Profile (any logged-in member) ---------------
+@api.post("/me/passcode")
+async def change_own_passcode(payload: SelfPasscodeInput, user: dict = Depends(get_current_user)):
+    member = await db.members.find_one({"id": user["id"]})
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if not verify_password(payload.old_passcode, member["passcode_hash"]):
+        raise HTTPException(status_code=401, detail="Passcode lama salah")
+    await db.members.update_one(
+        {"id": user["id"]},
+        {"$set": _passcode_set_fields(member["role"], payload.new_passcode, False)},
+    )
+    await log_activity(FAMILY_ID, user["id"] if member["role"] == "child" else None, "passcode_updated", {"member_name": member["name"], "by": "self"})
+    return {"success": True}
+
+
+@api.patch("/me/profile")
+async def update_own_profile(payload: SelfProfileInput, user: dict = Depends(get_current_user)):
+    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if updates:
+        await db.members.update_one({"id": user["id"]}, {"$set": updates})
+        # Children have a mirrored row used by tasks/points logic.
+        await db.children.update_one({"id": user["id"]}, {"$set": updates})
+    member = await db.members.find_one({"id": user["id"]}, {"_id": 0, "passcode_hash": 0, "passcode_plain": 0})
+    return member
+
+
+# --------------- Points → Money (Tukar Poin) ---------------
+@api.post("/points/redeem-money")
+async def redeem_points_for_money(payload: RedeemMoneyInput, user: dict = Depends(get_current_user)):
+    """Child (or parent on their behalf) converts points into a cash payout request."""
+    if user["role"] == "child" and user["id"] != payload.child_id:
+        raise HTTPException(status_code=403, detail="Kids can only redeem their own points")
+
+    child = await db.children.find_one({"id": payload.child_id})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+    if child.get("points", 0) < payload.points:
+        raise HTTPException(status_code=400, detail="Poin tidak cukup")
+
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    rate = int(config.get("rupiah_per_point", 100))
+    rupiah = payload.points * rate
+
+    await db.children.update_one({"id": payload.child_id}, {"$inc": {"points": -payload.points}})
+    doc = {
+        "id": new_id(),
+        "parent_id": FAMILY_ID,
+        "child_id": payload.child_id,
+        "child_name": child["name"],
+        "points": payload.points,
+        "rupiah": rupiah,
+        "rate": rate,
+        "status": "pending",  # pending -> paid / cancelled
+        "created_at": now_iso(),
+        "paid_at": None,
+    }
+    await db.money_redemptions.insert_one(doc)
+    doc.pop("_id", None)
+    await log_activity(FAMILY_ID, payload.child_id, "money_redeemed", {"points": payload.points, "rupiah": rupiah})
+    return doc
+
+
+@api.get("/money-redemptions")
+async def list_money_redemptions(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]
+    elif child_id:
+        query["child_id"] = child_id
+    items = await db.money_redemptions.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api.post("/money-redemptions/{redemption_id}/pay")
+async def pay_money_redemption(redemption_id: str, user: dict = Depends(require_parent)):
+    r = await db.money_redemptions.find_one({"id": redemption_id, "parent_id": FAMILY_ID})
+    if not r:
+        raise HTTPException(status_code=404, detail="Redemption not found")
+    if r["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Already processed")
+    await db.money_redemptions.update_one({"id": redemption_id}, {"$set": {"status": "paid", "paid_at": now_iso()}})
+    await log_activity(FAMILY_ID, r["child_id"], "money_paid", {"rupiah": r["rupiah"], "points": r["points"]})
+    return {"success": True}
+
+
+@api.post("/money-redemptions/{redemption_id}/cancel")
+async def cancel_money_redemption(redemption_id: str, user: dict = Depends(require_parent)):
+    """Cancel a pending payout and refund the points."""
+    r = await db.money_redemptions.find_one({"id": redemption_id, "parent_id": FAMILY_ID})
+    if not r:
+        raise HTTPException(status_code=404, detail="Redemption not found")
+    if r["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Already processed")
+    await db.children.update_one({"id": r["child_id"]}, {"$inc": {"points": r["points"]}})
+    await db.money_redemptions.update_one({"id": redemption_id}, {"$set": {"status": "cancelled"}})
+    await log_activity(FAMILY_ID, r["child_id"], "money_redemption_cancelled", {"points": r["points"]})
+    return {"success": True}
 
 
 # --------------- Helpers ---------------
@@ -390,6 +531,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "avatar_emoji": payload.avatar_emoji,
         "passcode_hash": hash_password(DEFAULT_PASSCODE),
         "passcode_is_default": True,
+        "passcode_plain": DEFAULT_PASSCODE,
         "theme_preference": "clean",
         "created_at": now_iso(),
     })
@@ -437,6 +579,13 @@ async def list_tasks(child_id: Optional[str] = None, status_filter: Optional[str
 @api.post("/tasks")
 async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
     await get_child_or_404(FAMILY_ID, payload.child_id)
+
+    # Treasure-hunt ordering: default to the end of this child's quest line.
+    order = payload.order
+    if order is None:
+        last = await db.tasks.find({"child_id": payload.child_id}).sort("order", -1).to_list(1)
+        order = (last[0].get("order", 0) + 1) if last else 1
+
     doc = {
         "id": new_id(),
         "parent_id": FAMILY_ID,
@@ -448,7 +597,8 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
         "due_date": payload.due_date,
         "recurrence": payload.recurrence,
         "icon": payload.icon,
-        "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed
+        "order": order,
+        "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
         "completed_at": None,
         "approved_at": None,
         "created_at": now_iso(),
@@ -478,17 +628,63 @@ async def delete_task(task_id: str, user: dict = Depends(require_parent)):
     return {"success": True}
 
 
+async def get_next_actionable_task(child_id: str) -> Optional[dict]:
+    """The lowest-order task still blocking the quest line (pending or rejected)."""
+    open_tasks = await db.tasks.find(
+        {"child_id": child_id, "status": {"$in": ["pending", "rejected"]}}
+    ).sort("order", 1).to_list(1)
+    return open_tasks[0] if open_tasks else None
+
+
 @api.post("/tasks/{task_id}/complete")
 async def complete_task(task_id: str, user: dict = Depends(get_current_user)):
-    """Kid marks a task complete → awaits parent approval."""
+    """Kid marks a task complete → awaits parent approval. Treasure-hunt rule:
+    only the next task in the sequence can be completed."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Task cannot be completed in current state")
+
+    nxt = await get_next_actionable_task(task["child_id"])
+    if nxt and nxt["id"] != task_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\" (atau lewati dengan poin)",
+        )
+
     await db.tasks.update_one({"id": task_id}, {"$set": {"status": "completed", "completed_at": now_iso()}})
     await log_activity(FAMILY_ID, task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+@api.post("/tasks/{task_id}/skip")
+async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
+    """Pay points to skip a blocking task and unlock the next one."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail="Only open tasks can be skipped")
+
+    nxt = await get_next_actionable_task(task["child_id"])
+    if nxt and nxt["id"] != task_id:
+        raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dilewati")
+
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    cost = int(config.get("skip_cost_points", 20))
+
+    child = await db.children.find_one({"id": task["child_id"]})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+    if child.get("points", 0) < cost:
+        raise HTTPException(status_code=400, detail=f"Poin tidak cukup. Butuh {cost} poin untuk melewati misi ini.")
+
+    await db.children.update_one({"id": child["id"]}, {"$inc": {"points": -cost}})
+    await db.tasks.update_one({"id": task_id}, {"$set": {"status": "skipped", "completed_at": now_iso()}})
+    await log_activity(FAMILY_ID, child["id"], "task_skipped", {"task_id": task_id, "title": task["title"], "cost": cost})
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"task": updated, "points_spent": cost}
 
 
 @api.post("/tasks/{task_id}/approve")
@@ -612,7 +808,8 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
     config_doc = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if config_doc:
         update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
-        await db.app_config.update_one({"parent_id": FAMILY_ID}, {"$set": update_data})
+        if update_data:
+            await db.app_config.update_one({"parent_id": FAMILY_ID}, {"$set": update_data})
     else:
         config = {
             "id": new_id(),
@@ -620,6 +817,8 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "app_name": payload.app_name or "My Lil Famz",
             "default_theme": payload.default_theme or "clean",
             "slideshow_background_url": payload.slideshow_background_url or "",
+            "rupiah_per_point": payload.rupiah_per_point if payload.rupiah_per_point is not None else 100,
+            "skip_cost_points": payload.skip_cost_points if payload.skip_cost_points is not None else 20,
             "created_at": now_iso(),
         }
         await db.app_config.insert_one(config)
@@ -635,11 +834,15 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "app_name": "My Lil Famz",
             "default_theme": "clean",
             "slideshow_background_url": "",
+            "rupiah_per_point": 100,
+            "skip_cost_points": 20,
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
         "default_theme": config.get("default_theme", "clean"),
         "slideshow_background_url": config.get("slideshow_background_url", ""),
+        "rupiah_per_point": int(config.get("rupiah_per_point", 100)),
+        "skip_cost_points": int(config.get("skip_cost_points", 20)),
     }
 
 
@@ -1090,7 +1293,7 @@ async def seed_default_family():
     for coll in (
         "users", "children", "tasks", "rewards", "consequences", "redemptions",
         "applied_consequences", "badges", "activity", "reminders",
-        "push_subscriptions", "achievements", "app_config",
+        "push_subscriptions", "achievements", "app_config", "money_redemptions",
     ):
         await db[coll].delete_many({})
 
@@ -1119,6 +1322,7 @@ async def seed_default_family():
             **c,
             "passcode_hash": default_hash,
             "passcode_is_default": True,
+            "passcode_plain": DEFAULT_PASSCODE,
             "theme_preference": "clean",
             "created_at": ts,
         })

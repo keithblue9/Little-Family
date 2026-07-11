@@ -2,9 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import "@/App.css";
 import { Toaster } from "@/components/ui/sonner";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
-import { LanguageProvider } from "@/contexts/LanguageContext";
 import ErrorBoundary from "@/components/ErrorBoundary";
-import LandingPage from "@/pages/LandingPage";
 import LoginPage from "@/pages/LoginPage";
 import ParentApp from "@/pages/ParentApp";
 import KidHome from "@/pages/KidHome";
@@ -15,8 +13,8 @@ function Protected({ children, role }) {
   const { user } = useAuth();
   if (user === null) {
     return (
-      <div className="min-h-screen flex items-center justify-center font-parent text-slate-500">
-        Loading…
+      <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">
+        Memuat…
       </div>
     );
   }
@@ -27,14 +25,26 @@ function Protected({ children, role }) {
   return children;
 }
 
+function HomeRedirect() {
+  const { user } = useAuth();
+  if (user === null) {
+    return (
+      <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">
+        Memuat…
+      </div>
+    );
+  }
+  if (user === false) return <Navigate to="/login" replace />;
+  return <Navigate to={user.role === "parent" ? "/parent" : `/kid/${user.id}`} replace />;
+}
+
 function App() {
   return (
     <ErrorBoundary>
-      <LanguageProvider>
-        <AuthProvider>
+      <AuthProvider>
         <BrowserRouter>
           <Routes>
-            <Route path="/" element={<LandingPage />} />
+            <Route path="/" element={<HomeRedirect />} />
             <Route path="/login" element={<LoginPage />} />
             <Route
               path="/parent/*"
@@ -66,7 +76,6 @@ function App() {
         <Toaster position="top-center" richColors />
         <InstallPrompt />
       </AuthProvider>
-      </LanguageProvider>
     </ErrorBoundary>
   );
 }

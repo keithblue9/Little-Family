@@ -6,12 +6,9 @@ import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import PinInputModal from "@/components/PinInputModal";
-import { useLanguage } from "@/contexts/LanguageContext";
-import LanguageToggle from "@/components/LanguageToggle";
 
 export default function ChildPicker() {
   const nav = useNavigate();
-  const { t } = useLanguage();
   const [children, setChildren] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedChild, setSelectedChild] = useState(null);
@@ -41,7 +38,7 @@ export default function ChildPicker() {
           </div>
           <span className="font-fun font-bold text-2xl text-slate-800">My Lil Famz</span>
         </div>
-        <LanguageToggle />
+        <div className="w-24" />
       </nav>
 
       <div className="max-w-4xl mx-auto px-6 md:px-12 pt-8">
@@ -50,9 +47,9 @@ export default function ChildPicker() {
           animate={{ opacity: 1, y: 0 }}
           className="font-fun font-bold text-4xl md:text-6xl text-slate-900 text-center mb-2"
         >
-          {t("whosPlaying")}
+          Siapa yang main?
         </motion.h1>
-        <p className="text-center text-slate-600 mb-12">{t("tapYourName")}</p>
+        <p className="text-center text-slate-600 mb-12">Ketuk namamu untuk lihat misi!</p>
 
         {loading ? (
           <div className="text-center text-slate-400">Loading…</div>

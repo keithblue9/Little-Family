@@ -9,8 +9,8 @@ import {
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
-import { useLanguage } from "@/contexts/LanguageContext";
-import LanguageToggle from "@/components/LanguageToggle";
+import MoneyApprovals from "@/components/MoneyApprovals";
+import ProfileEditor from "@/components/ProfileEditor";
 import ConfigMenu from "@/components/ConfigMenu";
 import MemberPasscodeManager from "@/components/ChildPasscodeManager";
 import ThemeSwitcher from "@/components/ThemeSwitcher";
@@ -29,6 +29,7 @@ const NAV = [
   { key: "overview", label: "Overview", icon: Home },
   { key: "tasks", label: "Tasks", icon: ListChecks, testId: TEST_IDS.parent.tabTasks },
   { key: "rewards", label: "Rewards", icon: Gift, testId: TEST_IDS.parent.tabRewards },
+  { key: "money", label: "Uang & Poin", icon: Gift, testId: "tab-money" },
   { key: "consequences", label: "Consequences", icon: ShieldAlert, testId: TEST_IDS.parent.tabConsequences },
   { key: "activity", label: "Activity", icon: Activity, testId: TEST_IDS.parent.tabActivity },
   { key: "leaderboard", label: "Leaderboard", icon: Users, testId: "tab-leaderboard" },
@@ -147,7 +148,6 @@ export default function ParentApp() {
           <span className="text-sm text-slate-500">
             Hi, <span className="font-semibold text-slate-700">{user?.name}</span>
           </span>
-          <LanguageToggle />
         </div>
         <nav className="flex-1 p-3 space-y-1">
           {NAV.map((n) => (
@@ -239,6 +239,11 @@ export default function ParentApp() {
               onAdd={() => setRewardModal(true)}
               onRefresh={load}
             />
+          )}
+          {view === "money" && (
+            <div className="bg-white rounded-2xl border border-slate-200 p-6">
+              <MoneyApprovals />
+            </div>
           )}
           {view === "consequences" && (
             <ConsequencesView
@@ -392,9 +397,10 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
 // ─────────────────────────────────────────────────────────
 function TasksView({ kids, tasks, selectedChildId, onAddTask, onRefresh, onApplyConsequence, onAddChild }) {
   const grouped = useMemo(() => {
-    const pending = tasks.filter((t) => t.status === "pending" || t.status === "rejected");
-    const awaiting = tasks.filter((t) => t.status === "completed");
-    const done = tasks.filter((t) => t.status === "approved");
+    const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
+    const pending = tasks.filter((t) => t.status === "pending" || t.status === "rejected").sort(byOrder);
+    const awaiting = tasks.filter((t) => t.status === "completed").sort(byOrder);
+    const done = tasks.filter((t) => t.status === "approved" || t.status === "skipped").sort(byOrder);
     const missed = tasks.filter((t) => t.status === "missed");
     return { pending, awaiting, done, missed };
   }, [tasks]);
@@ -511,6 +517,11 @@ function Section({ title, count, children }) {
 function TaskRow({ task, childName, children, dim = false }) {
   return (
     <div className={`p-4 flex flex-wrap items-center gap-3 ${dim ? "opacity-60" : ""}`} data-testid={`${TEST_IDS.parent.taskItem}-${task.id}`}>
+      {task.order != null && (
+        <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 font-bold text-sm flex items-center justify-center shrink-0" title="Urutan misi">
+          {task.order}
+        </div>
+      )}
       <div className="flex-1 min-w-0">
         <div className="font-parent font-semibold text-slate-900 truncate">{task.title}</div>
         <div className="text-xs text-slate-500 flex gap-2 flex-wrap">
@@ -520,6 +531,7 @@ function TaskRow({ task, childName, children, dim = false }) {
           {task.penalty_points > 0 && <><span>·</span><span>penalty −{task.penalty_points}</span></>}
           {task.due_date && <><span>·</span><span>due {new Date(task.due_date).toLocaleDateString()}</span></>}
           {task.recurrence !== "none" && <><span>·</span><span>{task.recurrence}</span></>}
+          {task.status === "skipped" && <><span>·</span><span className="text-slate-400">dilewati</span></>}
         </div>
       </div>
       <div className="flex items-center gap-2 flex-wrap">{children}</div>
@@ -764,6 +776,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
         )}
       </div>
 
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <ProfileEditor />
+      </div>
+
       {/* Stage 2 & 3: New Features */}
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <ConfigMenu />
@@ -870,13 +886,14 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
   const [penalty, setPenalty] = useState(0);
   const [dueDate, setDueDate] = useState("");
   const [recurrence, setRecurrence] = useState("none");
+  const [order, setOrder] = useState("");
   const [childId, setChildId] = useState(defaultChildId || (kids[0] && kids[0].id) || "");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (open) {
       setChildId(defaultChildId || (kids[0] && kids[0].id) || "");
-      setTitle(""); setDesc(""); setPoints(10); setPenalty(0); setDueDate(""); setRecurrence("none");
+      setTitle(""); setDesc(""); setPoints(10); setPenalty(0); setDueDate(""); setRecurrence("none"); setOrder("");
     }
   }, [open, defaultChildId, kids]);
 
@@ -893,6 +910,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
         penalty_points: Number(penalty) || 0,
         due_date: dueDate ? new Date(dueDate).toISOString() : null,
         recurrence,
+        order: order ? Number(order) : null,
       });
       toast.success("Task created");
       onSaved();
@@ -941,6 +959,18 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
             <label className={labelClass}>Due date</label>
             <input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className={inputClass} />
           </div>
+        </div>
+        <div>
+          <label className={labelClass}>Urutan misi (opsional)</label>
+          <input
+            type="number" min="1" value={order}
+            onChange={(e) => setOrder(e.target.value)}
+            className={inputClass}
+            placeholder="Kosongkan = otomatis di akhir urutan"
+          />
+          <p className="text-xs text-slate-400 mt-1">
+            Anak harus menyelesaikan misi sesuai urutan (konsep treasure hunt). Misi berikutnya terkunci sampai yang sebelumnya selesai/dilewati.
+          </p>
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={onClose} className={btnGhost}>Cancel</button>

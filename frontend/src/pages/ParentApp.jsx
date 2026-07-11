@@ -15,6 +15,10 @@ import ChildPasscodeManager from "@/components/ChildPasscodeManager";
 import ThemeSwitcher from "@/components/ThemeSwitcher";
 import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
 import ReminderCreator from "@/components/ReminderCreator";
+import Leaderboard from "@/components/Leaderboard";
+import Achievements from "@/components/Achievements";
+import AnalyticsDashboard from "@/components/AnalyticsDashboard";
+import PushNotificationManager from "@/components/PushNotificationManager";
 import { TEST_IDS } from "@/constants/testIds/app";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
@@ -26,6 +30,8 @@ const NAV = [
   { key: "rewards", label: "Rewards", icon: Gift, testId: TEST_IDS.parent.tabRewards },
   { key: "consequences", label: "Consequences", icon: ShieldAlert, testId: TEST_IDS.parent.tabConsequences },
   { key: "activity", label: "Activity", icon: Activity, testId: TEST_IDS.parent.tabActivity },
+  { key: "leaderboard", label: "Leaderboard", icon: Users, testId: "tab-leaderboard" },
+  { key: "analytics", label: "Analytics", icon: Activity, testId: "tab-analytics" },
   { key: "settings", label: "Settings", icon: Settings, testId: TEST_IDS.parent.tabSettings },
 ];
 
@@ -254,6 +260,21 @@ export default function ParentApp() {
             />
           )}
           {view === "activity" && <ActivityView activity={activity} kids={children} />}
+          
+          {/* Stage 4: Leaderboard */}
+          {view === "leaderboard" && (
+            <div className="space-y-6">
+              <Leaderboard />
+            </div>
+          )}
+
+          {/* Stage 4: Analytics */}
+          {view === "analytics" && (
+            <div className="space-y-6">
+              <AnalyticsDashboard />
+            </div>
+          )}
+
           {view === "settings" && (
             <SettingsView
               kids={children}
@@ -794,6 +815,15 @@ function SettingsView({ kids, onAdd, onRefresh }) {
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <ChildPasscodeManager />
+      </div>
+
+      {/* Stage 4: Achievements & Push Notifications */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <Achievements />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <PushNotificationManager />
       </div>
     </div>
   );

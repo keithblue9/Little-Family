@@ -76,3 +76,44 @@ self.addEventListener('notificationclick', (event) => {
     })
   );
 });
+
+// Stage 4: Push notifications from server
+self.addEventListener('push', (event) => {
+  if (!event.data) return;
+
+  const data = event.data.json();
+  const options = {
+    body: data.body || 'Reminder from My Lil Famz',
+    tag: data.tag || 'reminder',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    vibrate: [120, 60, 120],
+    renotify: true,
+    data: data.data || {}
+  };
+
+  event.waitUntil(self.registration.showNotification(data.title || 'My Lil Famz', options));
+});
+
+// Stage 4: Background sync untuk offline actions
+self.addEventListener('sync', (event) => {
+  if (event.tag === 'sync-tasks') {
+    event.waitUntil(
+      // This will be triggered when device comes online
+      // Frontend can queue actions and sync when ready
+      Promise.resolve()
+    );
+  }
+});
+
+// Periodic background sync untuk check reminders (jika di-enable)
+self.addEventListener('periodicsync', (event) => {
+  if (event.tag === 'check-reminders') {
+    event.waitUntil(
+      // Check for pending reminders setiap X menit
+      fetch('/api/reminders')
+        .then(() => console.log('Reminders checked'))
+        .catch(() => console.log('Reminders check failed - offline'))
+    );
+  }
+});

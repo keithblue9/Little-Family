@@ -120,6 +120,17 @@ class ReminderInput(BaseModel):
     message: Optional[str] = None
 
 
+class PushSubscriptionInput(BaseModel):
+    subscription: dict  # Web Push API subscription object
+
+
+class AchievementInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = ""
+    icon: str = "⭐"
+    threshold_points: int = Field(ge=0)
+
+
 class ChildInput(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     age: Optional[int] = Field(default=None, ge=1, le=25)
@@ -865,6 +876,191 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
     }
 
 
+# --------------- Push Notifications (Stage 4) ---------------
+@api.post("/push/subscribe")
+async def subscribe_to_push(payload: PushSubscriptionInput, user: dict = Depends(get_current_user)):
+    """Subscribe to push notifications"""
+    sub_doc = {
+        "id": new_id(),
+        "parent_id": user["id"],
+        "subscription": payload.subscription,
+        "created_at": now_iso(),
+    }
+    await db.push_subscriptions.insert_one(sub_doc)
+    return {"success": True, "message": "Subscribed to notifications"}
+
+
+@api.post("/push/unsubscribe")
+async def unsubscribe_from_push(payload: PushSubscriptionInput, user: dict = Depends(get_current_user)):
+    """Unsubscribe from push notifications"""
+    await db.push_subscriptions.delete_one({
+        "parent_id": user["id"],
+        "subscription.endpoint": payload.subscription.get("endpoint")
+    })
+    return {"success": True, "message": "Unsubscribed from notifications"}
+
+
+@api.get("/push/subscriptions")
+async def get_push_subscriptions(user: dict = Depends(get_current_user)):
+    """Get all push subscriptions for user"""
+    subs = await db.push_subscriptions.find(
+        {"parent_id": user["id"]}, 
+        {"_id": 0}
+    ).to_list(100)
+    return subs
+
+
+# --------------- Leaderboard & Gamification (Stage 4) ---------------
+@api.get("/leaderboard")
+async def get_leaderboard(user: dict = Depends(get_current_user)):
+    """Get leaderboard of all children by points"""
+    children = await db.children.find(
+        {"parent_id": user["id"]}, 
+        {"_id": 0}
+    ).sort("points", -1).to_list(100)
+    
+    leaderboard = []
+    for idx, child in enumerate(children, 1):
+        leaderboard.append({
+            "rank": idx,
+            "id": child["id"],
+            "name": child["name"],
+            "points": child.get("points", 0),
+            "lifetime_points": child.get("lifetime_points", 0),
+            "avatar_emoji": child.get("avatar_emoji", "🦁"),
+            "avatar_color": child.get("avatar_color", "#FF9D23"),
+        })
+    return leaderboard
+
+
+@api.post("/achievements")
+async def create_achievement(payload: AchievementInput, user: dict = Depends(get_current_user)):
+    """Create new achievement milestone"""
+    achievement = {
+        "id": new_id(),
+        "parent_id": user["id"],
+        "name": payload.name,
+        "description": payload.description,
+        "icon": payload.icon,
+        "threshold_points": payload.threshold_points,
+        "created_at": now_iso(),
+    }
+    await db.achievements.insert_one(achievement)
+    achievement.pop("_id", None)
+    return achievement
+
+
+@api.get("/achievements")
+async def list_achievements(user: dict = Depends(get_current_user)):
+    """List all achievement milestones"""
+    achievements = await db.achievements.find(
+        {"parent_id": user["id"]}, 
+        {"_id": 0}
+    ).to_list(100)
+    return achievements
+
+
+@api.get("/achievements/earned")
+async def get_earned_achievements(child_id: str, user: dict = Depends(get_current_user)):
+    """Get achievements earned by a child"""
+    child = await get_child_or_404(user["id"], child_id)
+    child_points = child.get("points", 0)
+    
+    achievements = await db.achievements.find(
+        {"parent_id": user["id"]}, 
+        {"_id": 0}
+    ).to_list(100)
+    
+    earned = []
+    for ach in achievements:
+        if child_points >= ach["threshold_points"]:
+            earned.append({**ach, "earned": True, "earned_at": now_iso()})
+    
+    return earned
+
+
+@api.delete("/achievements/{achievement_id}")
+async def delete_achievement(achievement_id: str, user: dict = Depends(get_current_user)):
+    """Delete an achievement"""
+    result = await db.achievements.delete_one({
+        "id": achievement_id, 
+        "parent_id": user["id"]
+    })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Achievement not found")
+    return {"success": True}
+
+
+# --------------- Analytics (Stage 4) ---------------
+@api.get("/analytics/child/{child_id}")
+async def get_child_analytics(child_id: str, user: dict = Depends(get_current_user)):
+    """Get detailed analytics for a child"""
+    child = await get_child_or_404(user["id"], child_id)
+    
+    # Get task statistics
+    total_tasks = await db.tasks.count_documents({"child_id": child_id})
+    completed_tasks = await db.tasks.count_documents({"child_id": child_id, "status": "approved"})
+    pending_tasks = await db.tasks.count_documents({"child_id": child_id, "status": "pending"})
+    missed_tasks = await db.tasks.count_documents({"child_id": child_id, "status": "missed"})
+    
+    # Calculate completion rate
+    completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+    
+    # Get recent activity
+    recent_activity = await db.activity.find(
+        {"child_id": child_id, "parent_id": user["id"]},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(10)
+    
+    # Get rewards redeemed
+    redeemed = await db.redemptions.count_documents({
+        "child_id": child_id,
+        "parent_id": user["id"],
+        "status": "fulfilled"
+    })
+    
+    return {
+        "child_id": child_id,
+        "child_name": child["name"],
+        "current_points": child.get("points", 0),
+        "lifetime_points": child.get("lifetime_points", 0),
+        "stats": {
+            "total_tasks": total_tasks,
+            "completed_tasks": completed_tasks,
+            "pending_tasks": pending_tasks,
+            "missed_tasks": missed_tasks,
+            "completion_rate": round(completion_rate, 2),
+            "rewards_redeemed": redeemed,
+        },
+        "recent_activity": recent_activity,
+    }
+
+
+@api.get("/analytics/family")
+async def get_family_analytics(user: dict = Depends(get_current_user)):
+    """Get family-wide analytics"""
+    children = await db.children.find(
+        {"parent_id": user["id"]}, 
+        {"_id": 0}
+    ).to_list(100)
+    
+    total_family_points = sum(c.get("points", 0) for c in children)
+    total_family_tasks = await db.tasks.count_documents({"parent_id": user["id"]})
+    total_approved = await db.tasks.count_documents({
+        "parent_id": user["id"],
+        "status": "approved"
+    })
+    
+    return {
+        "children_count": len(children),
+        "total_family_points": total_family_points,
+        "total_tasks_created": total_family_tasks,
+        "total_tasks_approved": total_approved,
+        "average_points_per_child": round(total_family_points / len(children), 2) if children else 0,
+        "family_completion_rate": round(total_approved / total_family_tasks * 100, 2) if total_family_tasks > 0 else 0,
+    }
+
+
 # --------------- Health ---------------
 @api.get("/")
 async def root():
@@ -882,6 +1078,8 @@ async def startup():
     await db.activity.create_index([("parent_id", 1), ("created_at", -1)])
     await db.app_config.create_index("parent_id", unique=True)
     await db.reminders.create_index([("parent_id", 1), ("child_id", 1)])
+    await db.push_subscriptions.create_index("parent_id")
+    await db.achievements.create_index("parent_id")
 
 
 @app.on_event("shutdown")

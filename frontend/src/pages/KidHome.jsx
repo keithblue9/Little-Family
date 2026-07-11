@@ -14,11 +14,17 @@ import { useAuth } from "@/contexts/AuthContext";
 import ThemeSwitcher from "@/components/ThemeSwitcher";
 import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
 import ReminderCreator from "@/components/ReminderCreator";
+import Leaderboard from "@/components/Leaderboard";
+import Achievements from "@/components/Achievements";
+import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 
 const TABS = [
   { key: "tasks", label: "Quests", icon: HomeIcon, testId: TEST_IDS.kid.tabTasks },
   { key: "rewards", label: "Rewards", icon: Gift, testId: TEST_IDS.kid.tabRewards },
   { key: "badges", label: "Badges", icon: Award, testId: TEST_IDS.kid.tabBadges },
+  { key: "leaderboard", label: "Leaderboard", icon: Trophy, testId: "tab-leaderboard" },
+  { key: "achievements", label: "Achievements", icon: Star, testId: "tab-achievements" },
+  { key: "analytics", label: "Stats", icon: Sparkles, testId: "tab-analytics" },
   { key: "theme", label: "Theme", icon: Sparkles, testId: "tab-theme" },
   { key: "reminders", label: "Reminders", icon: Flame, testId: "tab-reminders" },
   { key: "settings", label: "Settings", icon: HomeIcon, testId: "tab-settings" },
@@ -322,6 +328,42 @@ export default function KidHome() {
                   ))}
                 </div>
               )}
+            </motion.div>
+          )}
+
+          {/* Stage 4: Leaderboard Tab */}
+          {tab === "leaderboard" && (
+            <motion.div
+              key="leaderboard"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+            >
+              <Leaderboard />
+            </motion.div>
+          )}
+
+          {/* Stage 4: Achievements Tab */}
+          {tab === "achievements" && (
+            <motion.div
+              key="achievements"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+            >
+              <Achievements childId={childId} />
+            </motion.div>
+          )}
+
+          {/* Stage 4: Analytics Tab */}
+          {tab === "analytics" && (
+            <motion.div
+              key="analytics"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+            >
+              <AnalyticsDashboard childId={childId} />
             </motion.div>
           )}
 

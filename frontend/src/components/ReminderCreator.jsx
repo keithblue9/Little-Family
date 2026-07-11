@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { motion } from "framer-motion";
 import { Clock, Plus, Trash2, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
@@ -20,9 +20,9 @@ export default function ReminderCreator({ childId, childName }) {
       fetchReminders();
       fetchTasks();
     }
-  }, [childId]);
+  }, [childId, fetchReminders, fetchTasks]);
 
-  const fetchReminders = async () => {
+  const fetchReminders = useCallback(async () => {
     try {
       const response = await api.get("/reminders", {
         params: { child_id: childId },
@@ -31,9 +31,9 @@ export default function ReminderCreator({ childId, childName }) {
     } catch (err) {
       console.error("Failed to fetch reminders:", err);
     }
-  };
+  }, [childId]);
 
-  const fetchTasks = async () => {
+  const fetchTasks = useCallback(async () => {
     try {
       const response = await api.get("/tasks", {
         params: { child_id: childId },
@@ -44,7 +44,7 @@ export default function ReminderCreator({ childId, childName }) {
       toast.error(formatApiError(err));
       setLoading(false);
     }
-  };
+  }, [childId]);
 
   const handleAddReminder = async () => {
     if (!formData.task_id || !formData.time) {

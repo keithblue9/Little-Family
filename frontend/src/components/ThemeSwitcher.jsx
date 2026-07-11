@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { motion } from "framer-motion";
 import { Palette } from "lucide-react";
 import { toast } from "sonner";
@@ -46,9 +46,9 @@ export default function ThemeSwitcher({ childId, onThemeChange }) {
     if (childId) {
       fetchTheme();
     }
-  }, [childId]);
+  }, [childId, fetchTheme]);
 
-  const fetchTheme = async () => {
+  const fetchTheme = useCallback(async () => {
     try {
       const response = await api.get(`/children/${childId}/theme`);
       setCurrentTheme(response.data.theme);
@@ -57,7 +57,7 @@ export default function ThemeSwitcher({ childId, onThemeChange }) {
       console.error("Failed to fetch theme:", err);
       setLoading(false);
     }
-  };
+  }, [childId]);
 
   const handleThemeChange = async (theme) => {
     if (theme === currentTheme) return;

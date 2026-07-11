@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { motion } from "framer-motion";
 import { BarChart3, TrendingUp, Users, ListChecks } from "lucide-react";
 import { toast } from "sonner";
@@ -10,9 +10,9 @@ export default function AnalyticsDashboard({ childId }) {
 
   useEffect(() => {
     fetchAnalytics();
-  }, [childId]);
+  }, [fetchAnalytics]);
 
-  const fetchAnalytics = async () => {
+  const fetchAnalytics = useCallback(async () => {
     try {
       const response = childId
         ? await api.get(`/analytics/child/${childId}`)
@@ -24,7 +24,7 @@ export default function AnalyticsDashboard({ childId }) {
       toast.error(formatApiError(err));
       setLoading(false);
     }
-  };
+  }, [childId]);
 
   if (loading) {
     return <div className="text-center text-slate-400 py-8">Loading analytics...</div>;

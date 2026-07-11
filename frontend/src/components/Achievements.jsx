@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { motion } from "framer-motion";
 import { Star, Plus, Trash2, Lock } from "lucide-react";
 import { toast } from "sonner";
@@ -20,9 +20,9 @@ export default function Achievements({ childId }) {
 
   useEffect(() => {
     fetchAchievements();
-  }, []);
+  }, [fetchAchievements]);
 
-  const fetchAchievements = async () => {
+  const fetchAchievements = useCallback(async () => {
     try {
       const [achRes, earnedRes] = await Promise.all([
         api.get("/achievements"),
@@ -35,7 +35,7 @@ export default function Achievements({ childId }) {
       toast.error(formatApiError(err));
       setLoading(false);
     }
-  };
+  }, [childId]);
 
   const handleAddAchievement = async () => {
     if (!formData.name.trim()) {

@@ -1,0 +1,120 @@
+{
+  "typography": {
+    "kid_mode": {
+      "headings": "Fredoka, sans-serif (Bold, playful, rounded edges)",
+      "body": "Nunito, sans-serif (Highly readable, friendly)",
+      "scale": "text-4xl for main goals, text-2xl for task titles"
+    },
+    "parent_mode": {
+      "headings": "Manrope, sans-serif (Clean, approachable, structural)",
+      "body": "Nunito, sans-serif (To maintain family brand consistency)",
+      "scale": "text-3xl for dashboard headers, text-sm for labels"
+    }
+  },
+  "colors": {
+    "archetype": "Vibrant Play (Archetype 6) & Pastel Soft (Archetype 3)",
+    "kid_mode": {
+      "background": "#FFF9E6",
+      "primary": "#FF9D23",
+      "secondary": "#4DB8FF",
+      "accent": "#FF5C5C",
+      "success": "#34D399"
+    },
+    "parent_mode": {
+      "background": "#F8FAFC",
+      "primary": "#6366F1",
+      "card": "#FFFFFF",
+      "muted": "#94A3B8"
+    }
+  },
+  "visual enhancers": {
+    "kid_mode": "Neumorphism & 'Bouncy' solid colors. Heavy use of rounded corners (rounded-3xl). No sharp edges. Colorful icons.",
+    "parent_mode": "Glassmorphism for sticky navs, subtle 1px borders (border-slate-200), soft shadows for dashboard cards. Clean bento-box style grids."
+  },
+  "component name": [
+    "TaskCard (Kid & Parent variants)",
+    "RewardChest",
+    "AvatarSelector",
+    "PinGateModal",
+    "ProgressRing",
+    "StreakTracker",
+    "ParentStatsDashboard",
+    "ConfettiAnimation"
+  ],
+  "grids": {
+    "kid_mode": "Chunky list view with gap-6. Avoid dense grids. Use large touch-friendly targets.",
+    "parent_mode": "Bento Grid Mode B (High Density Grid for Dashboards). grid-cols-1 md:grid-cols-3 lg:grid-cols-4 with gap-6."
+  },
+  "layouts": {
+    "overall": "Mobile-first approach. Parent dashboard optimized for desktop and mobile, Kid view heavily optimized for tablets and mobile.",
+    "kid_view": "Bottom navigation for kids (Tasks, Rewards, Profile). Large hero section showing current points and avatar.",
+    "parent_view": "Sidebar navigation on desktop, hamburger on mobile. Overview at the top, followed by individual child breakdowns."
+  },
+  "motion": {
+    "kid_mode": "Bouncy entrance animations (spring physics), confetti on task completion, coin drop animations for rewards.",
+    "parent_mode": "Subtle fades, slide-in panels for task creation, smooth accordion down for chore details."
+  },
+  "accessibility": {
+    "contrast": "Ensure text over vibrant backgrounds meets APCA standards. Use dark text (e.g., #1E293B) on yellow/blue backgrounds.",
+    "touch_targets": "Minimum 48x48px touch targets for kid mode.",
+    "motion": "Respect prefers-reduced-motion, disable confetti if enabled."
+  },
+  "media": {
+    "icons": "lucide-react (Use high stroke-width, e.g., 2.5 for kid mode to make them look friendlier)",
+    "illustrations": "Use 3D style elements and large colorful emojis for rewards/tasks if images aren't available."
+  },
+  "3d libraries": {
+    "confetti": "react-confetti (for task completion celebrations)",
+    "animations": "framer-motion (for spring animations, layout transitions between parent/kid mode)"
+  },
+  "image_urls": [
+    {
+      "url": "https://images.unsplash.com/photo-1740252117027-4275d3f84385?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2OTV8MHwxfHNlYXJjaHwxfHxjdXRlJTIwM2QlMjBjaGlsZCUyMGF2YXRhciUyMGZhY2V8ZW58MHx8fHwxNzgyOTk4MzYxfDA&ixlib=rb-4.1.0&q=85",
+      "category": "Child Avatar 1",
+      "description": "Used in the kid profile selection and header"
+    },
+    {
+      "url": "https://images.unsplash.com/photo-1740252117012-bb53ad05e370?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2OTV8MHwxfHNlYXJjaHwyfHxjdXRlJTIwM2QlMjBjaGlsZCUyMGF2YXRhciUyMGZhY2V8ZW58MHx8fHwxNzgyOTk4MzYxfDA&ixlib=rb-4.1.0&q=85",
+      "category": "Child Avatar 2",
+      "description": "Used in the kid profile selection and header"
+    },
+    {
+      "url": "https://images.unsplash.com/photo-1642211841112-2beeda7bfc07?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHw0fHx0cmVhc3VyZSUyMGNoZXN0JTIwZ29sZCUyMGNvaW5zJTIwM2R8ZW58MHx8fHwxNzgzNzgwMjMzfDA&ixlib=rb-4.1.0&q=85",
+      "category": "Reward Store Cover",
+      "description": "Used as a visual for the rewards section or points bank"
+    },
+    {
+      "url": "https://images.unsplash.com/photo-1752652012592-8f618322a63c?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDJ8MHwxfHNlYXJjaHw0fHxwYXJlbnQlMjBjaGVja2luZyUyMHBob25lJTIwc21pbGluZ3xlbnwwfHx8fDE3ODM3ODAyMzN8MA&ixlib=rb-4.1.0&q=85",
+      "category": "Parent Onboarding",
+      "description": "Used in the parent login/registration screen to convey trust and family connection"
+    }
+  ],
+  "component_path": {
+    "ui_components": "/app/frontend/src/components/ui",
+    "pages": "/app/frontend/src/pages",
+    "kid_views": "/app/frontend/src/components/kid",
+    "parent_views": "/app/frontend/src/components/parent"
+  },
+  "instructions_to_main_agent": [
+    "You are building a hybrid full-stack application with TWO distinct visual modes: a playful Kid View and an approachable Parent Dashboard.",
+    "Do NOT build a generic SaaS dashboard for the Kid View. It must feel like a game. Use big rounded corners (rounded-3xl), bright colors, large touch targets, and bouncy animations.",
+    "Parent View should use a clean Bento Box grid style, soft pastels, and clear data visualization to avoid overwhelming the parent.",
+    "Implement a 'PIN Gate' modal to switch from Kid Mode to Parent Mode.",
+    "Use framer-motion for smooth transitions and 'react-confetti' for celebrating completed tasks.",
+    "Ensure 'emergent watermark' is completely removed if it exists in any boilerplate.",
+    "Include data-testid attributes on all interactive elements (buttons, inputs, task items) for testing.",
+    "Use lucide-react for icons, scaling them up (w-8 h-8 or w-10 h-10) for the kid interface.",
+    "CRITICAL: You have .js files not .tsx file, so build all components as .jsx or .js, do not use typescript.",
+    "Install and add lucide-react, framer-motion, and react-confetti via npm/yarn."
+  ],
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "Avoid the 'AI slop' aesthetic. Do not use generic centered layouts or simplistic gradients.",
+    "Create depth through layered design elements with z-index hierarchy and soft shadows.",
+    "Never apply universal transitions (transition: all). Target specific properties like transform and opacity.",
+    "DO NOT use transparent backgrounds for headers or dropdowns where content can scroll underneath.",
+    "Always use modern pill-shaped or fully rounded buttons for kids' apps, with active/press states (e.g., scale-95).",
+    "Do NOT use emojis as UI icons. Use a professional icon set like lucide-react.",
+    "Use 2-3x more spacing than typical apps. The Parent dashboard needs breathing room, and Kid mode needs massive touch targets.",
+    "Use sonner for all toast notifications."
+  ]
+}

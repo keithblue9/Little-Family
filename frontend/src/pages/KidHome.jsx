@@ -11,11 +11,17 @@ import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import PinGate from "@/components/PinGate";
 import { useAuth } from "@/contexts/AuthContext";
+import ThemeSwitcher from "@/components/ThemeSwitcher";
+import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
+import ReminderCreator from "@/components/ReminderCreator";
 
 const TABS = [
   { key: "tasks", label: "Quests", icon: HomeIcon, testId: TEST_IDS.kid.tabTasks },
   { key: "rewards", label: "Rewards", icon: Gift, testId: TEST_IDS.kid.tabRewards },
   { key: "badges", label: "Badges", icon: Award, testId: TEST_IDS.kid.tabBadges },
+  { key: "theme", label: "Theme", icon: Sparkles, testId: "tab-theme" },
+  { key: "reminders", label: "Reminders", icon: Flame, testId: "tab-reminders" },
+  { key: "settings", label: "Settings", icon: HomeIcon, testId: "tab-settings" },
 ];
 
 export default function KidHome() {
@@ -316,6 +322,52 @@ export default function KidHome() {
                   ))}
                 </div>
               )}
+            </motion.div>
+          )}
+
+          {/* Stage 2 & 3: Theme Tab */}
+          {tab === "theme" && (
+            <motion.div
+              key="theme"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+            >
+              <ThemeSwitcher
+                childId={childId}
+                onThemeChange={(theme) => {
+                  setChild((prev) => ({ ...prev, theme_preference: theme }));
+                }}
+              />
+            </motion.div>
+          )}
+
+          {/* Stage 3: Reminders Tab */}
+          {tab === "reminders" && (
+            <motion.div
+              key="reminders"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+            >
+              <ReminderCreator childId={childId} childName={child?.name} />
+            </motion.div>
+          )}
+
+          {/* Stage 3: Settings Tab (Profile Photo) */}
+          {tab === "settings" && child && (
+            <motion.div
+              key="settings"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              className="space-y-6"
+            >
+              <ProfilePhotoUpload
+                childId={childId}
+                childName={child.name}
+                currentPhoto={child.profile_photo_url}
+              />
             </motion.div>
           )}
         </AnimatePresence>

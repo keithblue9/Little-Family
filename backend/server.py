@@ -99,6 +99,27 @@ class PinInput(BaseModel):
     pin: str = Field(min_length=4, max_length=4, pattern=r"^\d{4}$")
 
 
+class ChildPasscodeInput(BaseModel):
+    passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class ChildThemeInput(BaseModel):
+    theme: Literal["clean", "candy", "mermaid", "cyber", "galaxy"]
+
+
+class AppConfigInput(BaseModel):
+    app_name: Optional[str] = None
+    default_theme: Optional[Literal["clean", "candy", "mermaid", "cyber", "galaxy"]] = None
+    slideshow_background_url: Optional[str] = None
+
+
+class ReminderInput(BaseModel):
+    child_id: str
+    task_id: str
+    time: str  # HH:MM format
+    message: Optional[str] = None
+
+
 class ChildInput(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     age: Optional[int] = Field(default=None, ge=1, le=25)
@@ -502,6 +523,164 @@ async def mark_task_missed(task_id: str, user: dict = Depends(get_current_user))
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
+# --------------- Child Passcode (Stage 2) ---------------
+@api.post("/children/{child_id}/passcode")
+async def set_child_passcode(child_id: str, payload: ChildPasscodeInput, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(user["id"], child_id)
+    await db.children.update_one(
+        {"id": child_id},
+        {"$set": {"passcode_hash": hash_password(payload.passcode)}}
+    )
+    await log_activity(user["id"], child_id, "passcode_updated", {"child_name": child["name"]})
+    return {"success": True, "message": "Passcode set successfully"}
+
+
+@api.post("/children/{child_id}/validate-passcode")
+async def validate_child_passcode(child_id: str, payload: ChildPasscodeInput):
+    child = await db.children.find_one({"id": child_id})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+    if not child.get("passcode_hash"):
+        raise HTTPException(status_code=400, detail="Passcode not set for this child")
+    if not verify_password(payload.passcode, child["passcode_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect passcode")
+    return {"success": True, "child_id": child_id, "name": child["name"]}
+
+
+@api.get("/admin/children-passcodes")
+async def get_children_passcodes(user: dict = Depends(get_current_user)):
+    children = await db.children.find({"parent_id": user["id"]}, {"_id": 0}).to_list(100)
+    result = []
+    for child in children:
+        result.append({
+            "child_id": child["id"],
+            "name": child["name"],
+            "has_passcode": bool(child.get("passcode_hash")),
+            "passcode_hint": child.get("passcode_hash", "Not set")[:20] + "..." if child.get("passcode_hash") else None,
+        })
+    return result
+
+
+@api.post("/children/{child_id}/reset-passcode")
+async def reset_child_passcode(child_id: str, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(user["id"], child_id)
+    await db.children.update_one({"id": child_id}, {"$set": {"passcode_hash": None}})
+    await log_activity(user["id"], child_id, "passcode_reset", {"child_name": child["name"]})
+    return {"success": True, "message": "Passcode reset successfully"}
+
+
+# --------------- Child Theme (Stage 2) ---------------
+@api.post("/children/{child_id}/theme")
+async def set_child_theme(child_id: str, payload: ChildThemeInput, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(user["id"], child_id)
+    await db.children.update_one({"id": child_id}, {"$set": {"theme_preference": payload.theme}})
+    await log_activity(user["id"], child_id, "theme_changed", {"theme": payload.theme, "child_name": child["name"]})
+    return {"success": True, "theme": payload.theme}
+
+
+@api.get("/children/{child_id}/theme")
+async def get_child_theme(child_id: str, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(user["id"], child_id)
+    return {"theme": child.get("theme_preference", "clean")}
+
+
+# --------------- App Config (Stage 2) ---------------
+@api.post("/config")
+async def set_app_config(payload: AppConfigInput, user: dict = Depends(get_current_user)):
+    config_doc = await db.app_config.find_one({"parent_id": user["id"]})
+    if config_doc:
+        update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        await db.app_config.update_one({"parent_id": user["id"]}, {"$set": update_data})
+    else:
+        config = {
+            "id": new_id(),
+            "parent_id": user["id"],
+            "app_name": payload.app_name or "My Lil Famz",
+            "default_theme": payload.default_theme or "clean",
+            "slideshow_background_url": payload.slideshow_background_url or "",
+            "created_at": now_iso(),
+        }
+        await db.app_config.insert_one(config)
+    await log_activity(user["id"], None, "config_updated", {"changes": payload.model_dump()})
+    return {"success": True}
+
+
+@api.get("/config")
+async def get_app_config(user: dict = Depends(get_current_user)):
+    config = await db.app_config.find_one({"parent_id": user["id"]})
+    if not config:
+        return {
+            "app_name": "My Lil Famz",
+            "default_theme": "clean",
+            "slideshow_background_url": "",
+        }
+    return {
+        "app_name": config.get("app_name", "My Lil Famz"),
+        "default_theme": config.get("default_theme", "clean"),
+        "slideshow_background_url": config.get("slideshow_background_url", ""),
+    }
+
+
+# --------------- Child Profile Photo (Stage 3) ---------------
+@api.post("/children/{child_id}/profile-photo")
+async def set_child_profile_photo(child_id: str, photo_url: str, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(user["id"], child_id)
+    await db.children.update_one({"id": child_id}, {"$set": {"profile_photo_url": photo_url}})
+    await log_activity(user["id"], child_id, "profile_photo_updated", {"child_name": child["name"]})
+    return {"success": True, "photo_url": photo_url}
+
+
+# --------------- Reminders (Stage 3) ---------------
+@api.post("/reminders")
+async def create_reminder(payload: ReminderInput, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(user["id"], payload.child_id)
+    task = await db.tasks.find_one({"id": payload.task_id, "child_id": payload.child_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    reminder = {
+        "id": new_id(),
+        "parent_id": user["id"],
+        "child_id": payload.child_id,
+        "task_id": payload.task_id,
+        "time": payload.time,
+        "message": payload.message or f"Reminder: {task['title']}",
+        "enabled": True,
+        "created_at": now_iso(),
+    }
+    await db.reminders.insert_one(reminder)
+    reminder.pop("_id", None)
+    await log_activity(user["id"], payload.child_id, "reminder_created", {"task_id": payload.task_id, "time": payload.time})
+    return reminder
+
+
+@api.get("/reminders")
+async def list_reminders(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = {"parent_id": user["id"]}
+    if child_id:
+        query["child_id"] = child_id
+    reminders = await db.reminders.find(query, {"_id": 0}).to_list(200)
+    return reminders
+
+
+@api.delete("/reminders/{reminder_id}")
+async def delete_reminder(reminder_id: str, user: dict = Depends(get_current_user)):
+    reminder = await db.reminders.find_one({"id": reminder_id, "parent_id": user["id"]})
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    await db.reminders.delete_one({"id": reminder_id})
+    return {"success": True}
+
+
+@api.post("/reminders/{reminder_id}/toggle")
+async def toggle_reminder(reminder_id: str, user: dict = Depends(get_current_user)):
+    reminder = await db.reminders.find_one({"id": reminder_id, "parent_id": user["id"]})
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Reminder not found")
+    new_state = not reminder.get("enabled", True)
+    await db.reminders.update_one({"id": reminder_id}, {"$set": {"enabled": new_state}})
+    return {"success": True, "enabled": new_state}
+
+
 # --------------- Rewards ---------------
 @api.get("/rewards")
 async def list_rewards(user: dict = Depends(get_current_user)):
@@ -701,6 +880,8 @@ async def startup():
     await db.rewards.create_index("parent_id")
     await db.consequences.create_index("parent_id")
     await db.activity.create_index([("parent_id", 1), ("created_at", -1)])
+    await db.app_config.create_index("parent_id", unique=True)
+    await db.reminders.create_index([("parent_id", 1), ("child_id", 1)])
 
 
 @app.on_event("shutdown")

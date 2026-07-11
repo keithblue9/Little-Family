@@ -10,6 +10,11 @@ import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 import PinGate from "@/components/PinGate";
+import ConfigMenu from "@/components/ConfigMenu";
+import ChildPasscodeManager from "@/components/ChildPasscodeManager";
+import ThemeSwitcher from "@/components/ThemeSwitcher";
+import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
+import ReminderCreator from "@/components/ReminderCreator";
 import { TEST_IDS } from "@/constants/testIds/app";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
@@ -780,6 +785,15 @@ function SettingsView({ kids, onAdd, onRefresh }) {
             ))}
           </div>
         )}
+      </div>
+
+      {/* Stage 2 & 3: New Features */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <ConfigMenu />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <ChildPasscodeManager />
       </div>
     </div>
   );

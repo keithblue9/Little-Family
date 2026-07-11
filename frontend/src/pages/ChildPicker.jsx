@@ -6,12 +6,15 @@ import { useAuth } from "@/contexts/AuthContext";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
+import PinInputModal from "@/components/PinInputModal";
 
 export default function ChildPicker() {
   const nav = useNavigate();
   const { setParentUnlocked } = useAuth();
   const [children, setChildren] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [selectedChild, setSelectedChild] = useState(null);
+  const [showPinModal, setShowPinModal] = useState(false);
 
   useEffect(() => {
     // Entering kid mode locks the parent controls
@@ -74,7 +77,14 @@ export default function ChildPicker() {
                 transition={{ delay: i * 0.08, type: "spring" }}
                 whileHover={{ y: -4 }}
                 whileTap={{ scale: 0.96 }}
-                onClick={() => nav(`/kid/${c.id}`)}
+                onClick={() => {
+                  if (c.passcode_hash) {
+                    setSelectedChild(c);
+                    setShowPinModal(true);
+                  } else {
+                    nav(`/kid/${c.id}`);
+                  }
+                }}
                 data-testid={`${TEST_IDS.kid.childOption}-${c.name}`}
                 className="press-btn chunky-shadow-lg bg-white rounded-3xl p-6 border-2 border-slate-100 flex flex-col items-center gap-3"
               >
@@ -91,6 +101,21 @@ export default function ChildPicker() {
           </div>
         )}
       </div>
+
+      {showPinModal && selectedChild && (
+        <PinInputModal
+          childId={selectedChild.id}
+          childName={selectedChild.name}
+          onSuccess={() => {
+            setShowPinModal(false);
+            nav(`/kid/${selectedChild.id}`);
+          }}
+          onClose={() => {
+            setShowPinModal(false);
+            setSelectedChild(null);
+          }}
+        />
+      )}
     </div>
   );
 }

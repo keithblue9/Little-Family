@@ -1,11 +1,10 @@
 import axios from "axios";
 
-// Prefer REACT_APP_BACKEND_URL; fall back to same-origin so a missing env var
-// degrades to failed API calls (visible errors) instead of a blank screen.
-const BACKEND_URL =
-  process.env.REACT_APP_BACKEND_URL ||
-  process.env.REACT_APP_API_URL ||
-  "";
+// Frontend and API now live on the same Vercel deployment (no separate
+// Render backend), so the default is a relative path — same-origin, no CORS,
+// no cross-site cookie issues. REACT_APP_BACKEND_URL can still override this
+// for local dev against a different host if ever needed.
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "";
 
 export const API_BASE = `${BACKEND_URL}/api`;
 

@@ -245,7 +245,7 @@ async def login(payload: MemberLoginInput, response: Response):
         raise HTTPException(status_code=401, detail="Incorrect passcode")
     token = create_access_token(member["id"], member["role"])
     response.set_cookie(
-        key="access_token", value=token, httponly=True, secure=False,
+        key="access_token", value=token, httponly=True, secure=True,
         samesite="lax", max_age=JWT_ACCESS_MINUTES * 60, path="/",
     )
     return {

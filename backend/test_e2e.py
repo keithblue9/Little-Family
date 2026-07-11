@@ -19,7 +19,7 @@ def check(name, cond, extra=""):
     (passed if cond else failed).append(name + (f"  [{extra}]" if extra and not cond else ""))
     print(("PASS" if cond else "FAIL"), name, extra if not cond else "")
 
-with TestClient(server.app) as c:  # context manager triggers startup → seeding
+with TestClient(server.app, base_url="https://testserver") as c:  # context manager triggers startup → seeding
     # ---- 1. Member list (public) ----
     r = c.get("/api/auth/members")
     members = r.json()

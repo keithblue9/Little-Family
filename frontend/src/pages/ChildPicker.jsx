@@ -2,29 +2,28 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Rocket, ArrowLeft } from "lucide-react";
-import { useAuth } from "@/contexts/AuthContext";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import PinInputModal from "@/components/PinInputModal";
+import { useLanguage } from "@/contexts/LanguageContext";
+import LanguageToggle from "@/components/LanguageToggle";
 
 export default function ChildPicker() {
   const nav = useNavigate();
-  const { setParentUnlocked } = useAuth();
+  const { t } = useLanguage();
   const [children, setChildren] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedChild, setSelectedChild] = useState(null);
   const [showPinModal, setShowPinModal] = useState(false);
 
   useEffect(() => {
-    // Entering kid mode locks the parent controls
-    setParentUnlocked(false);
     api
       .get("/children")
       .then((r) => setChildren(r.data))
       .catch((e) => toast.error(formatApiError(e)))
       .finally(() => setLoading(false));
-  }, [setParentUnlocked]);
+  }, []);
 
   return (
     <div className="min-h-screen kid-shell grain relative font-body pb-16" data-testid={TEST_IDS.kid.picker}>
@@ -42,7 +41,7 @@ export default function ChildPicker() {
           </div>
           <span className="font-fun font-bold text-2xl text-slate-800">My Lil Famz</span>
         </div>
-        <div className="w-24" />
+        <LanguageToggle />
       </nav>
 
       <div className="max-w-4xl mx-auto px-6 md:px-12 pt-8">
@@ -51,9 +50,9 @@ export default function ChildPicker() {
           animate={{ opacity: 1, y: 0 }}
           className="font-fun font-bold text-4xl md:text-6xl text-slate-900 text-center mb-2"
         >
-          Who&apos;s playing?
+          {t("whosPlaying")}
         </motion.h1>
-        <p className="text-center text-slate-600 mb-12">Tap your name to see your quests!</p>
+        <p className="text-center text-slate-600 mb-12">{t("tapYourName")}</p>
 
         {loading ? (
           <div className="text-center text-slate-400">Loading…</div>
@@ -78,12 +77,8 @@ export default function ChildPicker() {
                 whileHover={{ y: -4 }}
                 whileTap={{ scale: 0.96 }}
                 onClick={() => {
-                  if (c.passcode_hash) {
-                    setSelectedChild(c);
-                    setShowPinModal(true);
-                  } else {
-                    nav(`/kid/${c.id}`);
-                  }
+                  setSelectedChild(c);
+                  setShowPinModal(true);
                 }}
                 data-testid={`${TEST_IDS.kid.childOption}-${c.name}`}
                 className="press-btn chunky-shadow-lg bg-white rounded-3xl p-6 border-2 border-slate-100 flex flex-col items-center gap-3"

@@ -15,7 +15,7 @@ from typing import List, Optional, Literal
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # --------------- Setup ---------------
@@ -24,7 +24,12 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 
 JWT_ALGORITHM = "HS256"
-JWT_ACCESS_MINUTES = 60 * 24 * 7  # 7 days, family app
+JWT_ACCESS_MINUTES = 60 * 24 * 30  # 30 days, shared family device
+
+# Single-family app: all data is scoped under one constant family id.
+FAMILY_ID = "family-default"
+
+DEFAULT_PASSCODE = "123456"  # seeded members start with this; must be changed
 
 
 def get_jwt_secret() -> str:
@@ -42,10 +47,10 @@ def verify_password(plain: str, hashed: str) -> bool:
         return False
 
 
-def create_access_token(user_id: str, email: str) -> str:
+def create_access_token(member_id: str, role: str) -> str:
     payload = {
-        "sub": user_id,
-        "email": email,
+        "sub": member_id,
+        "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_ACCESS_MINUTES),
         "type": "access",
     }
@@ -73,30 +78,38 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token type")
-        user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0, "pin_hash": 0})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        return user
+        member = await db.members.find_one({"id": payload["sub"]}, {"_id": 0, "passcode_hash": 0})
+        if not member:
+            raise HTTPException(status_code=401, detail="Member not found")
+        return member
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+async def require_parent(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "parent":
+        raise HTTPException(status_code=403, detail="Only parents can do this")
+    return user
+
+
 # --------------- Models ---------------
-class RegisterInput(BaseModel):
-    name: str = Field(min_length=1, max_length=80)
-    email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
+class MemberLoginInput(BaseModel):
+    member_id: str
+    passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
-class LoginInput(BaseModel):
-    email: EmailStr
-    password: str
+class MemberPasscodeInput(BaseModel):
+    passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
 
-class PinInput(BaseModel):
-    pin: str = Field(min_length=4, max_length=4, pattern=r"^\d{4}$")
+class MemberProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: Optional[str] = None
+    age: Optional[int] = None
+    avatar_color: Optional[str] = None
+    avatar_emoji: Optional[str] = None
 
 
 class ChildPasscodeInput(BaseModel):
@@ -194,46 +207,34 @@ api = APIRouter(prefix="/api")
 
 
 # --------------- Auth Endpoints ---------------
-@api.post("/auth/register")
-async def register(payload: RegisterInput, response: Response):
-    email = payload.email.lower()
-    existing = await db.users.find_one({"email": email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    user_id = new_id()
-    doc = {
-        "id": user_id,
-        "email": email,
-        "name": payload.name,
-        "password_hash": hash_password(payload.password),
-        "pin_hash": None,
-        "created_at": now_iso(),
-    }
-    await db.users.insert_one(doc)
-    token = create_access_token(user_id, email)
-    response.set_cookie(
-        key="access_token", value=token, httponly=True, secure=False,
-        samesite="lax", max_age=JWT_ACCESS_MINUTES * 60, path="/",
-    )
-    return {"id": user_id, "email": email, "name": payload.name, "has_pin": False, "token": token}
+@api.get("/auth/members")
+async def list_members():
+    """Public: list family members to show on the login picker (no passcodes)."""
+    members = await db.members.find({}, {"_id": 0, "passcode_hash": 0}).to_list(20)
+    order = {"parent": 0, "child": 1}
+    members.sort(key=lambda m: (order.get(m.get("role"), 2), m.get("created_at", "")))
+    return members
 
 
 @api.post("/auth/login")
-async def login(payload: LoginInput, response: Response):
-    email = payload.email.lower()
-    user = await db.users.find_one({"email": email})
-    if not user or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_access_token(user["id"], email)
+async def login(payload: MemberLoginInput, response: Response):
+    member = await db.members.find_one({"id": payload.member_id})
+    if not member or not member.get("passcode_hash"):
+        raise HTTPException(status_code=401, detail="Member not found")
+    if not verify_password(payload.passcode, member["passcode_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect passcode")
+    token = create_access_token(member["id"], member["role"])
     response.set_cookie(
         key="access_token", value=token, httponly=True, secure=False,
         samesite="lax", max_age=JWT_ACCESS_MINUTES * 60, path="/",
     )
     return {
-        "id": user["id"],
-        "email": user["email"],
-        "name": user["name"],
-        "has_pin": bool(user.get("pin_hash")),
+        "id": member["id"],
+        "name": member["name"],
+        "role": member["role"],
+        "avatar_emoji": member.get("avatar_emoji", "🦁"),
+        "avatar_color": member.get("avatar_color", "#FF9D23"),
+        "is_default_passcode": member.get("passcode_is_default", False),
         "token": token,
     }
 
@@ -246,30 +247,53 @@ async def logout(response: Response, user: dict = Depends(get_current_user)):
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
-    full = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password_hash": 0})
     return {
-        "id": full["id"],
-        "email": full["email"],
-        "name": full["name"],
-        "has_pin": bool(full.get("pin_hash")),
+        "id": user["id"],
+        "name": user["name"],
+        "role": user["role"],
+        "age": user.get("age"),
+        "avatar_emoji": user.get("avatar_emoji", "🦁"),
+        "avatar_color": user.get("avatar_color", "#FF9D23"),
     }
 
 
-# --------------- Parent PIN ---------------
-@api.post("/parent/pin")
-async def set_pin(payload: PinInput, user: dict = Depends(get_current_user)):
-    await db.users.update_one({"id": user["id"]}, {"$set": {"pin_hash": hash_password(payload.pin)}})
-    return {"success": True, "has_pin": True}
-
-
-@api.post("/parent/pin/verify")
-async def verify_pin(payload: PinInput, user: dict = Depends(get_current_user)):
-    full = await db.users.find_one({"id": user["id"]})
-    if not full.get("pin_hash"):
-        raise HTTPException(status_code=400, detail="PIN not set")
-    if not verify_password(payload.pin, full["pin_hash"]):
-        raise HTTPException(status_code=401, detail="Incorrect PIN")
+# --------------- Member Passcode Management (parents only) ---------------
+@api.post("/members/{member_id}/passcode")
+async def set_member_passcode(member_id: str, payload: MemberPasscodeInput, user: dict = Depends(require_parent)):
+    member = await db.members.find_one({"id": member_id})
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    await db.members.update_one({"id": member_id}, {"$set": {"passcode_hash": hash_password(payload.passcode), "passcode_is_default": False}})
+    await log_activity(FAMILY_ID, member_id if member["role"] == "child" else None, "passcode_updated", {"member_name": member["name"]})
     return {"success": True}
+
+
+@api.post("/members/{member_id}/reset-passcode")
+async def reset_member_passcode(member_id: str, user: dict = Depends(require_parent)):
+    member = await db.members.find_one({"id": member_id})
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    await db.members.update_one(
+        {"id": member_id},
+        {"$set": {"passcode_hash": hash_password(DEFAULT_PASSCODE), "passcode_is_default": True}}
+    )
+    await log_activity(FAMILY_ID, member_id if member["role"] == "child" else None, "passcode_reset", {"member_name": member["name"]})
+    return {"success": True, "default_passcode": DEFAULT_PASSCODE}
+
+
+@api.get("/admin/members-passcodes")
+async def get_members_passcode_status(user: dict = Depends(require_parent)):
+    members = await db.members.find({}, {"_id": 0}).to_list(20)
+    return [
+        {
+            "member_id": m["id"],
+            "name": m["name"],
+            "role": m["role"],
+            "has_passcode": bool(m.get("passcode_hash")),
+            "is_default": m.get("passcode_is_default", False),
+        }
+        for m in members
+    ]
 
 
 # --------------- Helpers ---------------
@@ -331,16 +355,17 @@ async def get_child_or_404(parent_id: str, child_id: str) -> dict:
 # --------------- Children ---------------
 @api.get("/children")
 async def list_children(user: dict = Depends(get_current_user)):
-    children = await db.children.find({"parent_id": user["id"]}, {"_id": 0}).to_list(100)
+    children = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(100)
     children.sort(key=lambda c: c.get("created_at", ""))
     return children
 
 
 @api.post("/children")
-async def create_child(payload: ChildInput, user: dict = Depends(get_current_user)):
+async def create_child(payload: ChildInput, user: dict = Depends(require_parent)):
+    child_id = new_id()
     doc = {
-        "id": new_id(),
-        "parent_id": user["id"],
+        "id": child_id,
+        "parent_id": FAMILY_ID,
         "name": payload.name,
         "age": payload.age,
         "avatar_color": payload.avatar_color,
@@ -354,24 +379,41 @@ async def create_child(payload: ChildInput, user: dict = Depends(get_current_use
     }
     await db.children.insert_one(doc)
     doc.pop("_id", None)
-    await log_activity(user["id"], doc["id"], "child_created", {"name": payload.name})
+
+    # Every child also gets a login-capable family member profile with a default passcode.
+    await db.members.insert_one({
+        "id": child_id,
+        "name": payload.name,
+        "role": "child",
+        "age": payload.age,
+        "avatar_color": payload.avatar_color,
+        "avatar_emoji": payload.avatar_emoji,
+        "passcode_hash": hash_password(DEFAULT_PASSCODE),
+        "passcode_is_default": True,
+        "theme_preference": "clean",
+        "created_at": now_iso(),
+    })
+
+    await log_activity(FAMILY_ID, doc["id"], "child_created", {"name": payload.name})
     return doc
 
 
 @api.patch("/children/{child_id}")
-async def update_child(child_id: str, payload: ChildUpdate, user: dict = Depends(get_current_user)):
-    await get_child_or_404(user["id"], child_id)
+async def update_child(child_id: str, payload: ChildUpdate, user: dict = Depends(require_parent)):
+    await get_child_or_404(FAMILY_ID, child_id)
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
     if updates:
         await db.children.update_one({"id": child_id}, {"$set": updates})
+        await db.members.update_one({"id": child_id}, {"$set": updates})
     updated = await db.children.find_one({"id": child_id}, {"_id": 0})
     return updated
 
 
 @api.delete("/children/{child_id}")
-async def delete_child(child_id: str, user: dict = Depends(get_current_user)):
-    await get_child_or_404(user["id"], child_id)
+async def delete_child(child_id: str, user: dict = Depends(require_parent)):
+    await get_child_or_404(FAMILY_ID, child_id)
     await db.children.delete_one({"id": child_id})
+    await db.members.delete_one({"id": child_id, "role": "child"})
     await db.tasks.delete_many({"child_id": child_id})
     await db.badges.delete_many({"child_id": child_id})
     await db.redemptions.delete_many({"child_id": child_id})
@@ -382,7 +424,7 @@ async def delete_child(child_id: str, user: dict = Depends(get_current_user)):
 # --------------- Tasks ---------------
 @api.get("/tasks")
 async def list_tasks(child_id: Optional[str] = None, status_filter: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = {"parent_id": user["id"]}
+    query = {"parent_id": FAMILY_ID}
     if child_id:
         query["child_id"] = child_id
     if status_filter:
@@ -393,11 +435,11 @@ async def list_tasks(child_id: Optional[str] = None, status_filter: Optional[str
 
 
 @api.post("/tasks")
-async def create_task(payload: TaskInput, user: dict = Depends(get_current_user)):
-    await get_child_or_404(user["id"], payload.child_id)
+async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
+    await get_child_or_404(FAMILY_ID, payload.child_id)
     doc = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "child_id": payload.child_id,
         "title": payload.title,
         "description": payload.description,
@@ -413,13 +455,13 @@ async def create_task(payload: TaskInput, user: dict = Depends(get_current_user)
     }
     await db.tasks.insert_one(doc)
     doc.pop("_id", None)
-    await log_activity(user["id"], payload.child_id, "task_created", {"title": payload.title, "points": payload.points})
+    await log_activity(FAMILY_ID, payload.child_id, "task_created", {"title": payload.title, "points": payload.points})
     return doc
 
 
 @api.patch("/tasks/{task_id}")
-async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(get_current_user)):
-    task = await db.tasks.find_one({"id": task_id, "parent_id": user["id"]})
+async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(require_parent)):
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
@@ -429,8 +471,8 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(ge
 
 
 @api.delete("/tasks/{task_id}")
-async def delete_task(task_id: str, user: dict = Depends(get_current_user)):
-    res = await db.tasks.delete_one({"id": task_id, "parent_id": user["id"]})
+async def delete_task(task_id: str, user: dict = Depends(require_parent)):
+    res = await db.tasks.delete_one({"id": task_id, "parent_id": FAMILY_ID})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"success": True}
@@ -439,19 +481,19 @@ async def delete_task(task_id: str, user: dict = Depends(get_current_user)):
 @api.post("/tasks/{task_id}/complete")
 async def complete_task(task_id: str, user: dict = Depends(get_current_user)):
     """Kid marks a task complete → awaits parent approval."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": user["id"]})
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Task cannot be completed in current state")
     await db.tasks.update_one({"id": task_id}, {"$set": {"status": "completed", "completed_at": now_iso()}})
-    await log_activity(user["id"], task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
+    await log_activity(FAMILY_ID, task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
 @api.post("/tasks/{task_id}/approve")
-async def approve_task(task_id: str, user: dict = Depends(get_current_user)):
-    task = await db.tasks.find_one({"id": task_id, "parent_id": user["id"]})
+async def approve_task(task_id: str, user: dict = Depends(require_parent)):
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if task["status"] != "completed":
@@ -505,120 +547,89 @@ async def approve_task(task_id: str, user: dict = Depends(get_current_user)):
         {"id": task_id},
         {"$set": {"status": "approved", "approved_at": now_iso()}},
     )
-    new_badges = await award_badges(user["id"], task["child_id"])
-    await log_activity(user["id"], task["child_id"], "task_approved", {"task_id": task_id, "points": points})
+    new_badges = await award_badges(FAMILY_ID, task["child_id"])
+    await log_activity(FAMILY_ID, task["child_id"], "task_approved", {"task_id": task_id, "points": points})
     return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges}
 
 
 @api.post("/tasks/{task_id}/reject")
-async def reject_task(task_id: str, user: dict = Depends(get_current_user)):
-    task = await db.tasks.find_one({"id": task_id, "parent_id": user["id"]})
+async def reject_task(task_id: str, user: dict = Depends(require_parent)):
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     await db.tasks.update_one({"id": task_id}, {"$set": {"status": "pending", "completed_at": None}})
-    await log_activity(user["id"], task["child_id"], "task_rejected", {"task_id": task_id})
+    await log_activity(FAMILY_ID, task["child_id"], "task_rejected", {"task_id": task_id})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
 @api.post("/tasks/{task_id}/miss")
-async def mark_task_missed(task_id: str, user: dict = Depends(get_current_user)):
+async def mark_task_missed(task_id: str, user: dict = Depends(require_parent)):
     """Parent marks task as missed → apply penalty."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": user["id"]})
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     penalty = task.get("penalty_points", 0)
     if penalty > 0:
         await db.children.update_one({"id": task["child_id"]}, {"$inc": {"points": -penalty}})
     await db.tasks.update_one({"id": task_id}, {"$set": {"status": "missed"}})
-    await log_activity(user["id"], task["child_id"], "task_missed", {"task_id": task_id, "penalty": penalty})
+    await log_activity(FAMILY_ID, task["child_id"], "task_missed", {"task_id": task_id, "penalty": penalty})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
-# --------------- Child Passcode (Stage 2) ---------------
-@api.post("/children/{child_id}/passcode")
-async def set_child_passcode(child_id: str, payload: ChildPasscodeInput, user: dict = Depends(get_current_user)):
-    child = await get_child_or_404(user["id"], child_id)
-    await db.children.update_one(
-        {"id": child_id},
-        {"$set": {"passcode_hash": hash_password(payload.passcode)}}
-    )
-    await log_activity(user["id"], child_id, "passcode_updated", {"child_name": child["name"]})
-    return {"success": True, "message": "Passcode set successfully"}
-
-
+# --------------- Child Quick-Switch Passcode (uses members collection) ---------------
 @api.post("/children/{child_id}/validate-passcode")
 async def validate_child_passcode(child_id: str, payload: ChildPasscodeInput):
-    child = await db.children.find_one({"id": child_id})
-    if not child:
+    """Used by the in-app child picker for a parent to quickly switch into a kid's view
+    without fully logging out. Validates against that child's own member passcode."""
+    member = await db.members.find_one({"id": child_id, "role": "child"})
+    if not member:
         raise HTTPException(status_code=404, detail="Child not found")
-    if not child.get("passcode_hash"):
+    if not member.get("passcode_hash"):
         raise HTTPException(status_code=400, detail="Passcode not set for this child")
-    if not verify_password(payload.passcode, child["passcode_hash"]):
+    if not verify_password(payload.passcode, member["passcode_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect passcode")
-    return {"success": True, "child_id": child_id, "name": child["name"]}
-
-
-@api.get("/admin/children-passcodes")
-async def get_children_passcodes(user: dict = Depends(get_current_user)):
-    children = await db.children.find({"parent_id": user["id"]}, {"_id": 0}).to_list(100)
-    result = []
-    for child in children:
-        result.append({
-            "child_id": child["id"],
-            "name": child["name"],
-            "has_passcode": bool(child.get("passcode_hash")),
-            "passcode_hint": child.get("passcode_hash", "Not set")[:20] + "..." if child.get("passcode_hash") else None,
-        })
-    return result
-
-
-@api.post("/children/{child_id}/reset-passcode")
-async def reset_child_passcode(child_id: str, user: dict = Depends(get_current_user)):
-    child = await get_child_or_404(user["id"], child_id)
-    await db.children.update_one({"id": child_id}, {"$set": {"passcode_hash": None}})
-    await log_activity(user["id"], child_id, "passcode_reset", {"child_name": child["name"]})
-    return {"success": True, "message": "Passcode reset successfully"}
+    return {"success": True, "child_id": child_id, "name": member["name"]}
 
 
 # --------------- Child Theme (Stage 2) ---------------
 @api.post("/children/{child_id}/theme")
 async def set_child_theme(child_id: str, payload: ChildThemeInput, user: dict = Depends(get_current_user)):
-    child = await get_child_or_404(user["id"], child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
     await db.children.update_one({"id": child_id}, {"$set": {"theme_preference": payload.theme}})
-    await log_activity(user["id"], child_id, "theme_changed", {"theme": payload.theme, "child_name": child["name"]})
+    await log_activity(FAMILY_ID, child_id, "theme_changed", {"theme": payload.theme, "child_name": child["name"]})
     return {"success": True, "theme": payload.theme}
 
 
 @api.get("/children/{child_id}/theme")
 async def get_child_theme(child_id: str, user: dict = Depends(get_current_user)):
-    child = await get_child_or_404(user["id"], child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
     return {"theme": child.get("theme_preference", "clean")}
 
 
 # --------------- App Config (Stage 2) ---------------
 @api.post("/config")
-async def set_app_config(payload: AppConfigInput, user: dict = Depends(get_current_user)):
-    config_doc = await db.app_config.find_one({"parent_id": user["id"]})
+async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_parent)):
+    config_doc = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if config_doc:
         update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
-        await db.app_config.update_one({"parent_id": user["id"]}, {"$set": update_data})
+        await db.app_config.update_one({"parent_id": FAMILY_ID}, {"$set": update_data})
     else:
         config = {
             "id": new_id(),
-            "parent_id": user["id"],
+            "parent_id": FAMILY_ID,
             "app_name": payload.app_name or "My Lil Famz",
             "default_theme": payload.default_theme or "clean",
             "slideshow_background_url": payload.slideshow_background_url or "",
             "created_at": now_iso(),
         }
         await db.app_config.insert_one(config)
-    await log_activity(user["id"], None, "config_updated", {"changes": payload.model_dump()})
+    await log_activity(FAMILY_ID, None, "config_updated", {"changes": payload.model_dump()})
     return {"success": True}
 
 
 @api.get("/config")
 async def get_app_config(user: dict = Depends(get_current_user)):
-    config = await db.app_config.find_one({"parent_id": user["id"]})
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if not config:
         return {
             "app_name": "My Lil Famz",
@@ -635,22 +646,22 @@ async def get_app_config(user: dict = Depends(get_current_user)):
 # --------------- Child Profile Photo (Stage 3) ---------------
 @api.post("/children/{child_id}/profile-photo")
 async def set_child_profile_photo(child_id: str, photo_url: str, user: dict = Depends(get_current_user)):
-    child = await get_child_or_404(user["id"], child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
     await db.children.update_one({"id": child_id}, {"$set": {"profile_photo_url": photo_url}})
-    await log_activity(user["id"], child_id, "profile_photo_updated", {"child_name": child["name"]})
+    await log_activity(FAMILY_ID, child_id, "profile_photo_updated", {"child_name": child["name"]})
     return {"success": True, "photo_url": photo_url}
 
 
 # --------------- Reminders (Stage 3) ---------------
 @api.post("/reminders")
-async def create_reminder(payload: ReminderInput, user: dict = Depends(get_current_user)):
-    child = await get_child_or_404(user["id"], payload.child_id)
+async def create_reminder(payload: ReminderInput, user: dict = Depends(require_parent)):
+    child = await get_child_or_404(FAMILY_ID, payload.child_id)
     task = await db.tasks.find_one({"id": payload.task_id, "child_id": payload.child_id})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     reminder = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "child_id": payload.child_id,
         "task_id": payload.task_id,
         "time": payload.time,
@@ -660,13 +671,13 @@ async def create_reminder(payload: ReminderInput, user: dict = Depends(get_curre
     }
     await db.reminders.insert_one(reminder)
     reminder.pop("_id", None)
-    await log_activity(user["id"], payload.child_id, "reminder_created", {"task_id": payload.task_id, "time": payload.time})
+    await log_activity(FAMILY_ID, payload.child_id, "reminder_created", {"task_id": payload.task_id, "time": payload.time})
     return reminder
 
 
 @api.get("/reminders")
 async def list_reminders(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = {"parent_id": user["id"]}
+    query = {"parent_id": FAMILY_ID}
     if child_id:
         query["child_id"] = child_id
     reminders = await db.reminders.find(query, {"_id": 0}).to_list(200)
@@ -674,8 +685,8 @@ async def list_reminders(child_id: Optional[str] = None, user: dict = Depends(ge
 
 
 @api.delete("/reminders/{reminder_id}")
-async def delete_reminder(reminder_id: str, user: dict = Depends(get_current_user)):
-    reminder = await db.reminders.find_one({"id": reminder_id, "parent_id": user["id"]})
+async def delete_reminder(reminder_id: str, user: dict = Depends(require_parent)):
+    reminder = await db.reminders.find_one({"id": reminder_id, "parent_id": FAMILY_ID})
     if not reminder:
         raise HTTPException(status_code=404, detail="Reminder not found")
     await db.reminders.delete_one({"id": reminder_id})
@@ -683,8 +694,8 @@ async def delete_reminder(reminder_id: str, user: dict = Depends(get_current_use
 
 
 @api.post("/reminders/{reminder_id}/toggle")
-async def toggle_reminder(reminder_id: str, user: dict = Depends(get_current_user)):
-    reminder = await db.reminders.find_one({"id": reminder_id, "parent_id": user["id"]})
+async def toggle_reminder(reminder_id: str, user: dict = Depends(require_parent)):
+    reminder = await db.reminders.find_one({"id": reminder_id, "parent_id": FAMILY_ID})
     if not reminder:
         raise HTTPException(status_code=404, detail="Reminder not found")
     new_state = not reminder.get("enabled", True)
@@ -695,16 +706,16 @@ async def toggle_reminder(reminder_id: str, user: dict = Depends(get_current_use
 # --------------- Rewards ---------------
 @api.get("/rewards")
 async def list_rewards(user: dict = Depends(get_current_user)):
-    rewards = await db.rewards.find({"parent_id": user["id"]}, {"_id": 0}).to_list(200)
+    rewards = await db.rewards.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(200)
     rewards.sort(key=lambda r: r.get("cost_points", 0))
     return rewards
 
 
 @api.post("/rewards")
-async def create_reward(payload: RewardInput, user: dict = Depends(get_current_user)):
+async def create_reward(payload: RewardInput, user: dict = Depends(require_parent)):
     doc = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "name": payload.name,
         "description": payload.description,
         "cost_points": payload.cost_points,
@@ -717,8 +728,8 @@ async def create_reward(payload: RewardInput, user: dict = Depends(get_current_u
 
 
 @api.delete("/rewards/{reward_id}")
-async def delete_reward(reward_id: str, user: dict = Depends(get_current_user)):
-    res = await db.rewards.delete_one({"id": reward_id, "parent_id": user["id"]})
+async def delete_reward(reward_id: str, user: dict = Depends(require_parent)):
+    res = await db.rewards.delete_one({"id": reward_id, "parent_id": FAMILY_ID})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Reward not found")
     return {"success": True}
@@ -726,16 +737,16 @@ async def delete_reward(reward_id: str, user: dict = Depends(get_current_user)):
 
 @api.post("/rewards/{reward_id}/redeem")
 async def redeem_reward(reward_id: str, child_id: str, user: dict = Depends(get_current_user)):
-    reward = await db.rewards.find_one({"id": reward_id, "parent_id": user["id"]})
+    reward = await db.rewards.find_one({"id": reward_id, "parent_id": FAMILY_ID})
     if not reward:
         raise HTTPException(status_code=404, detail="Reward not found")
-    child = await get_child_or_404(user["id"], child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
     if child["points"] < reward["cost_points"]:
         raise HTTPException(status_code=400, detail="Not enough points")
     await db.children.update_one({"id": child_id}, {"$inc": {"points": -reward["cost_points"]}})
     redemption = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "child_id": child_id,
         "reward_id": reward_id,
         "reward_name": reward["name"],
@@ -746,13 +757,13 @@ async def redeem_reward(reward_id: str, child_id: str, user: dict = Depends(get_
     }
     await db.redemptions.insert_one(redemption)
     redemption.pop("_id", None)
-    await log_activity(user["id"], child_id, "reward_redeemed", {"reward": reward["name"], "cost": reward["cost_points"]})
+    await log_activity(FAMILY_ID, child_id, "reward_redeemed", {"reward": reward["name"], "cost": reward["cost_points"]})
     return redemption
 
 
 @api.get("/redemptions")
 async def list_redemptions(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = {"parent_id": user["id"]}
+    query = {"parent_id": FAMILY_ID}
     if child_id:
         query["child_id"] = child_id
     items = await db.redemptions.find(query, {"_id": 0}).to_list(500)
@@ -761,8 +772,8 @@ async def list_redemptions(child_id: Optional[str] = None, user: dict = Depends(
 
 
 @api.post("/redemptions/{redemption_id}/fulfill")
-async def fulfill_redemption(redemption_id: str, user: dict = Depends(get_current_user)):
-    red = await db.redemptions.find_one({"id": redemption_id, "parent_id": user["id"]})
+async def fulfill_redemption(redemption_id: str, user: dict = Depends(require_parent)):
+    red = await db.redemptions.find_one({"id": redemption_id, "parent_id": FAMILY_ID})
     if not red:
         raise HTTPException(status_code=404, detail="Redemption not found")
     await db.redemptions.update_one({"id": redemption_id}, {"$set": {"status": "fulfilled", "fulfilled_at": now_iso()}})
@@ -772,15 +783,15 @@ async def fulfill_redemption(redemption_id: str, user: dict = Depends(get_curren
 # --------------- Consequences ---------------
 @api.get("/consequences")
 async def list_consequences(user: dict = Depends(get_current_user)):
-    items = await db.consequences.find({"parent_id": user["id"]}, {"_id": 0}).to_list(200)
+    items = await db.consequences.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(200)
     return items
 
 
 @api.post("/consequences")
-async def create_consequence(payload: ConsequenceInput, user: dict = Depends(get_current_user)):
+async def create_consequence(payload: ConsequenceInput, user: dict = Depends(require_parent)):
     doc = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "name": payload.name,
         "description": payload.description,
         "points_deducted": payload.points_deducted,
@@ -792,24 +803,24 @@ async def create_consequence(payload: ConsequenceInput, user: dict = Depends(get
 
 
 @api.delete("/consequences/{consequence_id}")
-async def delete_consequence(consequence_id: str, user: dict = Depends(get_current_user)):
-    res = await db.consequences.delete_one({"id": consequence_id, "parent_id": user["id"]})
+async def delete_consequence(consequence_id: str, user: dict = Depends(require_parent)):
+    res = await db.consequences.delete_one({"id": consequence_id, "parent_id": FAMILY_ID})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Consequence not found")
     return {"success": True}
 
 
 @api.post("/consequences/apply")
-async def apply_consequence(payload: ApplyConsequenceInput, user: dict = Depends(get_current_user)):
-    cons = await db.consequences.find_one({"id": payload.consequence_id, "parent_id": user["id"]})
+async def apply_consequence(payload: ApplyConsequenceInput, user: dict = Depends(require_parent)):
+    cons = await db.consequences.find_one({"id": payload.consequence_id, "parent_id": FAMILY_ID})
     if not cons:
         raise HTTPException(status_code=404, detail="Consequence not found")
-    await get_child_or_404(user["id"], payload.child_id)
+    await get_child_or_404(FAMILY_ID, payload.child_id)
     if cons["points_deducted"] > 0:
         await db.children.update_one({"id": payload.child_id}, {"$inc": {"points": -cons["points_deducted"]}})
     applied = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "child_id": payload.child_id,
         "consequence_id": payload.consequence_id,
         "consequence_name": cons["name"],
@@ -820,13 +831,13 @@ async def apply_consequence(payload: ApplyConsequenceInput, user: dict = Depends
     }
     await db.applied_consequences.insert_one(applied)
     applied.pop("_id", None)
-    await log_activity(user["id"], payload.child_id, "consequence_applied", {"name": cons["name"], "deducted": cons["points_deducted"]})
+    await log_activity(FAMILY_ID, payload.child_id, "consequence_applied", {"name": cons["name"], "deducted": cons["points_deducted"]})
     return applied
 
 
 @api.get("/applied-consequences")
 async def list_applied_consequences(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = {"parent_id": user["id"]}
+    query = {"parent_id": FAMILY_ID}
     if child_id:
         query["child_id"] = child_id
     items = await db.applied_consequences.find(query, {"_id": 0}).to_list(500)
@@ -837,7 +848,7 @@ async def list_applied_consequences(child_id: Optional[str] = None, user: dict =
 # --------------- Badges ---------------
 @api.get("/badges")
 async def list_badges(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = {"parent_id": user["id"]}
+    query = {"parent_id": FAMILY_ID}
     if child_id:
         query["child_id"] = child_id
     items = await db.badges.find(query, {"_id": 0}).to_list(500)
@@ -848,7 +859,7 @@ async def list_badges(child_id: Optional[str] = None, user: dict = Depends(get_c
 # --------------- Activity / Stats ---------------
 @api.get("/activity")
 async def list_activity(child_id: Optional[str] = None, limit: int = 50, user: dict = Depends(get_current_user)):
-    query = {"parent_id": user["id"]}
+    query = {"parent_id": FAMILY_ID}
     if child_id:
         query["child_id"] = child_id
     items = await db.activity.find(query, {"_id": 0}).sort("created_at", -1).to_list(limit)
@@ -857,12 +868,12 @@ async def list_activity(child_id: Optional[str] = None, limit: int = 50, user: d
 
 @api.get("/stats/dashboard")
 async def dashboard_stats(user: dict = Depends(get_current_user)):
-    children = await db.children.find({"parent_id": user["id"]}, {"_id": 0}).to_list(100)
-    total_tasks = await db.tasks.count_documents({"parent_id": user["id"]})
-    pending_approval = await db.tasks.count_documents({"parent_id": user["id"], "status": "completed"})
+    children = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(100)
+    total_tasks = await db.tasks.count_documents({"parent_id": FAMILY_ID})
+    pending_approval = await db.tasks.count_documents({"parent_id": FAMILY_ID, "status": "completed"})
     approved_today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     approved_today = await db.tasks.count_documents({
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "status": "approved",
         "approved_at": {"$gte": approved_today_start},
     })
@@ -882,7 +893,7 @@ async def subscribe_to_push(payload: PushSubscriptionInput, user: dict = Depends
     """Subscribe to push notifications"""
     sub_doc = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "subscription": payload.subscription,
         "created_at": now_iso(),
     }
@@ -894,7 +905,7 @@ async def subscribe_to_push(payload: PushSubscriptionInput, user: dict = Depends
 async def unsubscribe_from_push(payload: PushSubscriptionInput, user: dict = Depends(get_current_user)):
     """Unsubscribe from push notifications"""
     await db.push_subscriptions.delete_one({
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "subscription.endpoint": payload.subscription.get("endpoint")
     })
     return {"success": True, "message": "Unsubscribed from notifications"}
@@ -904,7 +915,7 @@ async def unsubscribe_from_push(payload: PushSubscriptionInput, user: dict = Dep
 async def get_push_subscriptions(user: dict = Depends(get_current_user)):
     """Get all push subscriptions for user"""
     subs = await db.push_subscriptions.find(
-        {"parent_id": user["id"]}, 
+        {"parent_id": FAMILY_ID}, 
         {"_id": 0}
     ).to_list(100)
     return subs
@@ -915,7 +926,7 @@ async def get_push_subscriptions(user: dict = Depends(get_current_user)):
 async def get_leaderboard(user: dict = Depends(get_current_user)):
     """Get leaderboard of all children by points"""
     children = await db.children.find(
-        {"parent_id": user["id"]}, 
+        {"parent_id": FAMILY_ID}, 
         {"_id": 0}
     ).sort("points", -1).to_list(100)
     
@@ -934,11 +945,11 @@ async def get_leaderboard(user: dict = Depends(get_current_user)):
 
 
 @api.post("/achievements")
-async def create_achievement(payload: AchievementInput, user: dict = Depends(get_current_user)):
+async def create_achievement(payload: AchievementInput, user: dict = Depends(require_parent)):
     """Create new achievement milestone"""
     achievement = {
         "id": new_id(),
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "name": payload.name,
         "description": payload.description,
         "icon": payload.icon,
@@ -954,7 +965,7 @@ async def create_achievement(payload: AchievementInput, user: dict = Depends(get
 async def list_achievements(user: dict = Depends(get_current_user)):
     """List all achievement milestones"""
     achievements = await db.achievements.find(
-        {"parent_id": user["id"]}, 
+        {"parent_id": FAMILY_ID}, 
         {"_id": 0}
     ).to_list(100)
     return achievements
@@ -963,11 +974,11 @@ async def list_achievements(user: dict = Depends(get_current_user)):
 @api.get("/achievements/earned")
 async def get_earned_achievements(child_id: str, user: dict = Depends(get_current_user)):
     """Get achievements earned by a child"""
-    child = await get_child_or_404(user["id"], child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
     child_points = child.get("points", 0)
     
     achievements = await db.achievements.find(
-        {"parent_id": user["id"]}, 
+        {"parent_id": FAMILY_ID}, 
         {"_id": 0}
     ).to_list(100)
     
@@ -980,11 +991,11 @@ async def get_earned_achievements(child_id: str, user: dict = Depends(get_curren
 
 
 @api.delete("/achievements/{achievement_id}")
-async def delete_achievement(achievement_id: str, user: dict = Depends(get_current_user)):
+async def delete_achievement(achievement_id: str, user: dict = Depends(require_parent)):
     """Delete an achievement"""
     result = await db.achievements.delete_one({
         "id": achievement_id, 
-        "parent_id": user["id"]
+        "parent_id": FAMILY_ID
     })
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Achievement not found")
@@ -995,7 +1006,7 @@ async def delete_achievement(achievement_id: str, user: dict = Depends(get_curre
 @api.get("/analytics/child/{child_id}")
 async def get_child_analytics(child_id: str, user: dict = Depends(get_current_user)):
     """Get detailed analytics for a child"""
-    child = await get_child_or_404(user["id"], child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
     
     # Get task statistics
     total_tasks = await db.tasks.count_documents({"child_id": child_id})
@@ -1008,14 +1019,14 @@ async def get_child_analytics(child_id: str, user: dict = Depends(get_current_us
     
     # Get recent activity
     recent_activity = await db.activity.find(
-        {"child_id": child_id, "parent_id": user["id"]},
+        {"child_id": child_id, "parent_id": FAMILY_ID},
         {"_id": 0}
     ).sort("created_at", -1).to_list(10)
     
     # Get rewards redeemed
     redeemed = await db.redemptions.count_documents({
         "child_id": child_id,
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "status": "fulfilled"
     })
     
@@ -1040,14 +1051,14 @@ async def get_child_analytics(child_id: str, user: dict = Depends(get_current_us
 async def get_family_analytics(user: dict = Depends(get_current_user)):
     """Get family-wide analytics"""
     children = await db.children.find(
-        {"parent_id": user["id"]}, 
+        {"parent_id": FAMILY_ID}, 
         {"_id": 0}
     ).to_list(100)
     
     total_family_points = sum(c.get("points", 0) for c in children)
-    total_family_tasks = await db.tasks.count_documents({"parent_id": user["id"]})
+    total_family_tasks = await db.tasks.count_documents({"parent_id": FAMILY_ID})
     total_approved = await db.tasks.count_documents({
-        "parent_id": user["id"],
+        "parent_id": FAMILY_ID,
         "status": "approved"
     })
     
@@ -1067,10 +1078,61 @@ async def root():
     return {"message": "My Lil Famz API", "status": "ok"}
 
 
+async def seed_default_family():
+    """First-run only: create the 4 fixed family members if none exist yet."""
+    existing_count = await db.members.count_documents({})
+    if existing_count > 0:
+        return
+
+    default_hash = hash_password(DEFAULT_PASSCODE)
+    ts = now_iso()
+
+    parents = [
+        {"id": new_id(), "name": "Abi", "role": "parent", "avatar_emoji": "👨", "avatar_color": "#4DB8FF"},
+        {"id": new_id(), "name": "Ummi", "role": "parent", "avatar_emoji": "👩", "avatar_color": "#F472B6"},
+    ]
+    children = [
+        {"id": new_id(), "name": "Adskhan", "role": "child", "age": 11, "avatar_emoji": "🦸‍♂️", "avatar_color": "#4DB8FF"},
+        {"id": new_id(), "name": "Syila", "role": "child", "age": 8, "avatar_emoji": "🦋", "avatar_color": "#F472B6"},
+    ]
+
+    for p in parents:
+        await db.members.insert_one({
+            **p,
+            "passcode_hash": default_hash,
+            "passcode_is_default": True,
+            "created_at": ts,
+        })
+
+    for c in children:
+        await db.members.insert_one({
+            **c,
+            "passcode_hash": default_hash,
+            "passcode_is_default": True,
+            "theme_preference": "clean",
+            "created_at": ts,
+        })
+        # Mirror into children collection so existing task/reward/points logic works unchanged.
+        await db.children.insert_one({
+            "id": c["id"],
+            "parent_id": FAMILY_ID,
+            "name": c["name"],
+            "age": c["age"],
+            "avatar_color": c["avatar_color"],
+            "avatar_emoji": c["avatar_emoji"],
+            "points": 0,
+            "lifetime_points": 0,
+            "streak_days": 0,
+            "last_completion_date": None,
+            "tasks_completed": 0,
+            "created_at": ts,
+        })
+
+
 # --------------- Startup ---------------
 @app.on_event("startup")
 async def startup():
-    await db.users.create_index("email", unique=True)
+    await db.members.create_index("id", unique=True)
     await db.children.create_index("parent_id")
     await db.tasks.create_index([("parent_id", 1), ("child_id", 1)])
     await db.rewards.create_index("parent_id")
@@ -1080,6 +1142,7 @@ async def startup():
     await db.reminders.create_index([("parent_id", 1), ("child_id", 1)])
     await db.push_subscriptions.create_index("parent_id")
     await db.achievements.create_index("parent_id")
+    await seed_default_family()
 
 
 @app.on_event("shutdown")

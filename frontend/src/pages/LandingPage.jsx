@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Sparkles, Trophy, ShieldCheck, Star, Heart, Rocket } from "lucide-react";
 import { TEST_IDS } from "@/constants/testIds/app";
+import LanguageToggle from "@/components/LanguageToggle";
 
 export default function LandingPage() {
   return (
@@ -18,13 +19,16 @@ export default function LandingPage() {
           </div>
           <span className="font-fun font-bold text-2xl text-slate-800">My Lil Famz</span>
         </div>
-        <Link
-          to="/login"
-          data-testid={TEST_IDS.landing.login}
-          className="font-fun font-semibold text-slate-700 hover:text-[#FF9D23] transition-colors"
-        >
-          Log in →
-        </Link>
+        <div className="flex items-center gap-3">
+          <LanguageToggle />
+          <Link
+            to="/login"
+            data-testid={TEST_IDS.landing.login}
+            className="font-fun font-semibold text-slate-700 hover:text-[#FF9D23] transition-colors"
+          >
+            Log in →
+          </Link>
+        </div>
       </nav>
 
       <div className="relative z-10 max-w-6xl mx-auto px-6 md:px-16 pt-8 md:pt-16 pb-24">
@@ -50,11 +54,11 @@ export default function LandingPage() {
             </p>
             <div className="flex flex-wrap gap-4">
               <Link
-                to="/register"
+                to="/login"
                 data-testid={TEST_IDS.landing.getStarted}
                 className="press-btn chunky-shadow-lg inline-flex items-center gap-2 bg-[#FF9D23] hover:bg-[#f08e14] text-white font-fun font-semibold text-lg px-8 py-4 rounded-2xl transition-colors"
               >
-                Get started free
+                Get started
                 <Rocket className="w-5 h-5" strokeWidth={2.5} />
               </Link>
               <Link

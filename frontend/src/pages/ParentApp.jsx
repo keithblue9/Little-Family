@@ -9,9 +9,10 @@ import {
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
-import PinGate from "@/components/PinGate";
+import { useLanguage } from "@/contexts/LanguageContext";
+import LanguageToggle from "@/components/LanguageToggle";
 import ConfigMenu from "@/components/ConfigMenu";
-import ChildPasscodeManager from "@/components/ChildPasscodeManager";
+import MemberPasscodeManager from "@/components/ChildPasscodeManager";
 import ThemeSwitcher from "@/components/ThemeSwitcher";
 import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
 import ReminderCreator from "@/components/ReminderCreator";
@@ -67,7 +68,7 @@ const btnDanger = "inline-flex items-center gap-2 bg-white border border-red-200
 // ─────────────────────────────────────────────────────────
 export default function ParentApp() {
   const nav = useNavigate();
-  const { user, logout, parentUnlocked } = useAuth();
+  const { user, logout } = useAuth();
   const [view, setView] = useState("overview");
   const [children, setChildren] = useState([]);
   const [selectedChildId, setSelectedChildId] = useState(null);
@@ -78,7 +79,6 @@ export default function ParentApp() {
   const [activity, setActivity] = useState([]);
   const [stats, setStats] = useState(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [showPin, setShowPin] = useState(!parentUnlocked);
 
   // Modals
   const [childModal, setChildModal] = useState(false);
@@ -86,10 +86,6 @@ export default function ParentApp() {
   const [rewardModal, setRewardModal] = useState(false);
   const [consModal, setConsModal] = useState(false);
   const [applyConsModal, setApplyConsModal] = useState(null);
-
-  useEffect(() => {
-    setShowPin(!parentUnlocked);
-  }, [parentUnlocked]);
 
   const load = useCallback(async () => {
     try {
@@ -116,8 +112,8 @@ export default function ParentApp() {
   }, [selectedChildId]);
 
   useEffect(() => {
-    if (parentUnlocked) load();
-  }, [parentUnlocked, load]);
+    load();
+  }, [load]);
 
   const doLogout = async () => {
     await logout();
@@ -133,18 +129,6 @@ export default function ParentApp() {
     [redemptions]
   );
 
-  if (showPin) {
-    return (
-      <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center font-body">
-        <PinGate
-          open={true}
-          mode={user?.has_pin ? "verify" : "set"}
-          onSuccess={() => setShowPin(false)}
-        />
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen bg-[#F8FAFC] font-body flex" data-testid={TEST_IDS.parent.dashboard}>
       {/* Sidebar */}
@@ -158,6 +142,12 @@ export default function ParentApp() {
             <Rocket className="w-5 h-5 text-white" strokeWidth={2.5} />
           </div>
           <span className="font-fun font-bold text-xl text-slate-900">My Lil Famz</span>
+        </div>
+        <div className="px-6 py-3 flex items-center justify-between border-b border-slate-100">
+          <span className="text-sm text-slate-500">
+            Hi, <span className="font-semibold text-slate-700">{user?.name}</span>
+          </span>
+          <LanguageToggle />
         </div>
         <nav className="flex-1 p-3 space-y-1">
           {NAV.map((n) => (
@@ -728,23 +718,7 @@ function ActivityView({ activity, kids }) {
 
 // ─────────────────────────────────────────────────────────
 function SettingsView({ kids, onAdd, onRefresh }) {
-  const { user, setPin } = useAuth();
-  const [pin, setNewPin] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  const savePin = async () => {
-    if (!/^\d{4}$/.test(pin)) {
-      toast.error("PIN must be 4 digits");
-      return;
-    }
-    setSaving(true);
-    try {
-      await setPin(pin);
-      toast.success("PIN updated");
-      setNewPin("");
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setSaving(false); }
-  };
+  const { user } = useAuth();
 
   const delChild = async (c) => {
     if (!window.confirm(`Delete ${c.name}? This removes all their tasks and history.`)) return;
@@ -756,26 +730,8 @@ function SettingsView({ kids, onAdd, onRefresh }) {
     <div className="space-y-6">
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <h3 className="font-parent font-bold text-lg text-slate-900 mb-1">Account</h3>
-        <div className="text-sm text-slate-500 mb-4">{user?.name} · {user?.email}</div>
-
-        <div className="border-t border-slate-100 pt-4">
-          <label className={labelClass}>Parent PIN (4 digits)</label>
-          <div className="text-xs text-slate-500 mb-2">{user?.has_pin ? "Change your PIN" : "Set a PIN to protect parent controls"}</div>
-          <div className="flex gap-2">
-            <input
-              type="password"
-              inputMode="numeric"
-              maxLength={4}
-              value={pin}
-              onChange={(e) => setNewPin(e.target.value.replace(/\D/g, ""))}
-              className={inputClass + " max-w-[140px] tracking-widest text-center"}
-              placeholder="••••"
-              data-testid={TEST_IDS.parent.pinInput}
-            />
-            <button onClick={savePin} disabled={saving} data-testid={TEST_IDS.parent.setPinBtn} className={btnPrimary}>
-              {saving ? "Saving…" : "Save PIN"}
-            </button>
-          </div>
+        <div className="text-sm text-slate-500">
+          Signed in as <span className="font-semibold text-slate-700">{user?.name}</span> ({user?.role})
         </div>
       </div>
 
@@ -814,7 +770,7 @@ function SettingsView({ kids, onAdd, onRefresh }) {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <ChildPasscodeManager />
+        <MemberPasscodeManager />
       </div>
 
       {/* Stage 4: Achievements & Push Notifications */}

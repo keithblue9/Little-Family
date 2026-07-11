@@ -9,7 +9,6 @@ import {
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
-import PinGate from "@/components/PinGate";
 import { useAuth } from "@/contexts/AuthContext";
 import ThemeSwitcher from "@/components/ThemeSwitcher";
 import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
@@ -17,6 +16,7 @@ import ReminderCreator from "@/components/ReminderCreator";
 import Leaderboard from "@/components/Leaderboard";
 import Achievements from "@/components/Achievements";
 import AnalyticsDashboard from "@/components/AnalyticsDashboard";
+import LanguageToggle from "@/components/LanguageToggle";
 
 const TABS = [
   { key: "tasks", label: "Quests", icon: HomeIcon, testId: TEST_IDS.kid.tabTasks },
@@ -33,15 +33,13 @@ const TABS = [
 export default function KidHome() {
   const { childId } = useParams();
   const nav = useNavigate();
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
   const [child, setChild] = useState(null);
   const [tasks, setTasks] = useState([]);
   const [rewards, setRewards] = useState([]);
   const [badges, setBadges] = useState([]);
   const [tab, setTab] = useState("tasks");
   const [celebrate, setCelebrate] = useState(false);
-  const [showPin, setShowPin] = useState(false);
-  const [pinAction, setPinAction] = useState("exit"); // "exit" or "set"
   const [dims, setDims] = useState({ w: window.innerWidth, h: window.innerHeight });
 
   useEffect(() => {
@@ -106,13 +104,14 @@ export default function KidHome() {
     }
   };
 
-  const tryExit = () => {
-    if (!user?.has_pin) {
-      setPinAction("set");
+  const tryExit = async () => {
+    if (user?.role === "parent") {
+      // A parent was previewing this kid's dashboard via quick-switch; just go back.
+      nav("/parent");
     } else {
-      setPinAction("exit");
+      await logout();
+      nav("/login");
     }
-    setShowPin(true);
   };
 
   if (!child) {
@@ -150,14 +149,17 @@ export default function KidHome() {
             </div>
           </div>
         </div>
-        <button
-          onClick={tryExit}
-          data-testid={TEST_IDS.kid.exitKidBtn}
-          className="press-btn bg-white/80 backdrop-blur border-2 border-slate-200 p-3 rounded-2xl"
-          title="Parent access"
-        >
-          <Lock className="w-5 h-5 text-slate-700" strokeWidth={2.5} />
-        </button>
+        <div className="flex items-center gap-2">
+          <LanguageToggle />
+          <button
+            onClick={tryExit}
+            data-testid={TEST_IDS.kid.exitKidBtn}
+            className="press-btn bg-white/80 backdrop-blur border-2 border-slate-200 p-3 rounded-2xl"
+            title="Parent access"
+          >
+            <Lock className="w-5 h-5 text-slate-700" strokeWidth={2.5} />
+          </button>
+        </div>
       </div>
 
       {/* Points hero */}
@@ -436,16 +438,6 @@ export default function KidHome() {
           })}
         </div>
       </div>
-
-      <PinGate
-        open={showPin}
-        onClose={() => setShowPin(false)}
-        mode={pinAction === "set" ? "set" : "verify"}
-        onSuccess={() => {
-          setShowPin(false);
-          nav("/parent");
-        }}
-      />
     </div>
   );
 }

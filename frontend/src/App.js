@@ -8,6 +8,7 @@ import RegisterPage from "@/pages/RegisterPage";
 import ParentApp from "@/pages/ParentApp";
 import KidHome from "@/pages/KidHome";
 import ChildPicker from "@/pages/ChildPicker";
+import InstallPrompt from "@/components/InstallPrompt";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -58,6 +59,7 @@ function App() {
         </Routes>
       </BrowserRouter>
       <Toaster position="top-center" richColors />
+      <InstallPrompt />
     </AuthProvider>
   );
 }

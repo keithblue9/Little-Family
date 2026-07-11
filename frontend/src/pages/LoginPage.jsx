@@ -34,7 +34,7 @@ export default function LoginPage() {
           <div className="w-10 h-10 rounded-2xl bg-[#FF9D23] flex items-center justify-center chunky-shadow">
             <Rocket className="w-5 h-5 text-white" strokeWidth={2.5} />
           </div>
-          <span className="font-fun font-bold text-2xl text-slate-800">ChoreQuest</span>
+          <span className="font-fun font-bold text-2xl text-slate-800">My Lil Famz</span>
         </Link>
 
         <div className="bg-white rounded-3xl p-8 chunky-shadow-lg border-2 border-slate-100">

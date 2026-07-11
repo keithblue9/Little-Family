@@ -146,7 +146,7 @@ export default function ParentApp() {
           <div className="w-9 h-9 rounded-xl bg-[#FF9D23] flex items-center justify-center">
             <Rocket className="w-5 h-5 text-white" strokeWidth={2.5} />
           </div>
-          <span className="font-fun font-bold text-xl text-slate-900">ChoreQuest</span>
+          <span className="font-fun font-bold text-xl text-slate-900">My Lil Famz</span>
         </div>
         <nav className="flex-1 p-3 space-y-1">
           {NAV.map((n) => (

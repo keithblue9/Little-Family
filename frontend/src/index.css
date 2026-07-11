@@ -170,3 +170,106 @@ body {
 ::-webkit-scrollbar-thumb:hover {
     background: #94a3b8;
 }
+
+/* ============================================================
+   My Lil Famz — Theme system
+   Applied via <html data-theme="clean|candy|mermaid|cyber|galaxy">.
+   Themes override the --kid-* tokens that .kid-shell and kid UI use.
+   Helper: use class .font-kid-display for the theme's display font.
+   ============================================================ */
+.font-kid-display {
+    font-family: var(--kid-font, "Fredoka"), "Nunito", sans-serif;
+    letter-spacing: -0.01em;
+}
+
+/* Clean — calm parent/admin palette */
+[data-theme="clean"] {
+    --kid-bg: #f4f6fb;
+    --kid-bg-soft: #eaeefb;
+    --kid-primary: #6366f1;
+    --kid-secondary: #0ea5e9;
+    --kid-accent: #14b8a6;
+    --kid-success: #16a34a;
+    --kid-ink: #0f172a;
+    --kid-font: "Manrope";
+}
+[data-theme="clean"] .kid-shell {
+    background:
+        radial-gradient(circle at 12% 8%, rgba(99, 102, 241, 0.1), transparent 42%),
+        radial-gradient(circle at 88% 16%, rgba(14, 165, 233, 0.1), transparent 45%),
+        var(--kid-bg);
+}
+
+/* Candy Pop — girls 8-10 */
+[data-theme="candy"] {
+    --kid-bg: #fff0f8;
+    --kid-bg-soft: #ffe3f1;
+    --kid-primary: #ff5fa2;
+    --kid-secondary: #b07bff;
+    --kid-accent: #ffb347;
+    --kid-success: #37c98b;
+    --kid-ink: #5b2a55;
+    --kid-font: "Baloo 2";
+}
+[data-theme="candy"] .kid-shell {
+    background:
+        radial-gradient(circle at 10% 10%, rgba(255, 95, 162, 0.22), transparent 42%),
+        radial-gradient(circle at 90% 18%, rgba(176, 123, 255, 0.22), transparent 46%),
+        radial-gradient(circle at 50% 92%, rgba(255, 179, 71, 0.18), transparent 46%),
+        var(--kid-bg);
+}
+
+/* Mermaid Lagoon — girls 8-10 */
+[data-theme="mermaid"] {
+    --kid-bg: #eafaff;
+    --kid-bg-soft: #d8fff6;
+    --kid-primary: #12b5c9;
+    --kid-secondary: #7c6cff;
+    --kid-accent: #ff8fab;
+    --kid-success: #1fc7a0;
+    --kid-ink: #0d4b5a;
+    --kid-font: "Baloo 2";
+}
+[data-theme="mermaid"] .kid-shell {
+    background:
+        radial-gradient(circle at 12% 10%, rgba(18, 181, 201, 0.22), transparent 44%),
+        radial-gradient(circle at 88% 14%, rgba(124, 108, 255, 0.2), transparent 46%),
+        radial-gradient(circle at 50% 94%, rgba(255, 143, 171, 0.18), transparent 46%),
+        var(--kid-bg);
+}
+
+/* Cyber Neon — boys 11-14 (dark) */
+[data-theme="cyber"] {
+    --kid-bg: #0a0e1a;
+    --kid-bg-soft: #121a30;
+    --kid-primary: #00e5ff;
+    --kid-secondary: #b14bff;
+    --kid-accent: #39ff14;
+    --kid-success: #39ff14;
+    --kid-ink: #e8f0ff;
+    --kid-font: "Orbitron";
+}
+[data-theme="cyber"] .kid-shell {
+    background:
+        radial-gradient(circle at 18% 6%, rgba(0, 229, 255, 0.18), transparent 45%),
+        radial-gradient(circle at 84% 16%, rgba(177, 75, 255, 0.18), transparent 48%),
+        linear-gradient(160deg, #0b1226, #0a0e1a);
+}
+
+/* Galaxy Quest — boys 11-14 (dark) */
+[data-theme="galaxy"] {
+    --kid-bg: #120c33;
+    --kid-bg-soft: #1a1440;
+    --kid-primary: #7c5cff;
+    --kid-secondary: #3ad0ff;
+    --kid-accent: #ff9e57;
+    --kid-success: #4ee1a0;
+    --kid-ink: #efeaff;
+    --kid-font: "Baloo 2";
+}
+[data-theme="galaxy"] .kid-shell {
+    background:
+        radial-gradient(700px 420px at 80% 8%, rgba(124, 92, 255, 0.28), transparent 60%),
+        radial-gradient(620px 460px at 12% 92%, rgba(58, 208, 255, 0.18), transparent 60%),
+        linear-gradient(160deg, #17103f, #0e0926);
+}

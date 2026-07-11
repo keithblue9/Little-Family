@@ -101,7 +101,7 @@
     "Parent View should use a clean Bento Box grid style, soft pastels, and clear data visualization to avoid overwhelming the parent.",
     "Implement a 'PIN Gate' modal to switch from Kid Mode to Parent Mode.",
     "Use framer-motion for smooth transitions and 'react-confetti' for celebrating completed tasks.",
-    "Ensure 'emergent watermark' is completely removed if it exists in any boilerplate.",
+    "Ensure no third-party builder watermark or branding remains anywhere in the app.",
     "Include data-testid attributes on all interactive elements (buttons, inputs, task items) for testing.",
     "Use lucide-react for icons, scaling them up (w-8 h-8 or w-10 h-10) for the kid interface.",
     "CRITICAL: You have .js files not .tsx file, so build all components as .jsx or .js, do not use typescript.",

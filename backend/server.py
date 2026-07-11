@@ -157,7 +157,7 @@ class ApplyConsequenceInput(BaseModel):
 
 
 # --------------- App ---------------
-app = FastAPI(title="ChoreQuest API")
+app = FastAPI(title="My Lil Famz API")
 api = APIRouter(prefix="/api")
 
 
@@ -689,7 +689,7 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
 # --------------- Health ---------------
 @api.get("/")
 async def root():
-    return {"message": "ChoreQuest API", "status": "ok"}
+    return {"message": "My Lil Famz API", "status": "ok"}
 
 
 # --------------- Startup ---------------

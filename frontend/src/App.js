@@ -3,6 +3,7 @@ import "@/App.css";
 import { Toaster } from "@/components/ui/sonner";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import { LanguageProvider } from "@/contexts/LanguageContext";
+import ErrorBoundary from "@/components/ErrorBoundary";
 import LandingPage from "@/pages/LandingPage";
 import LoginPage from "@/pages/LoginPage";
 import ParentApp from "@/pages/ParentApp";
@@ -28,8 +29,9 @@ function Protected({ children, role }) {
 
 function App() {
   return (
-    <LanguageProvider>
-      <AuthProvider>
+    <ErrorBoundary>
+      <LanguageProvider>
+        <AuthProvider>
         <BrowserRouter>
           <Routes>
             <Route path="/" element={<LandingPage />} />
@@ -64,7 +66,8 @@ function App() {
         <Toaster position="top-center" richColors />
         <InstallPrompt />
       </AuthProvider>
-    </LanguageProvider>
+      </LanguageProvider>
+    </ErrorBoundary>
   );
 }
 

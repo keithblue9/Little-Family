@@ -1,6 +1,11 @@
 import axios from "axios";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+// Prefer REACT_APP_BACKEND_URL; fall back to same-origin so a missing env var
+// degrades to failed API calls (visible errors) instead of a blank screen.
+const BACKEND_URL =
+  process.env.REACT_APP_BACKEND_URL ||
+  process.env.REACT_APP_API_URL ||
+  "";
 
 export const API_BASE = `${BACKEND_URL}/api`;
 

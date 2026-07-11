@@ -1084,6 +1084,16 @@ async def seed_default_family():
     if existing_count > 0:
         return
 
+    # First run of the new member-based system. Clear any leftover data from the
+    # previous email/password prototype so the fixed family starts clean and the
+    # mirrored children collection matches the seeded members exactly.
+    for coll in (
+        "users", "children", "tasks", "rewards", "consequences", "redemptions",
+        "applied_consequences", "badges", "activity", "reminders",
+        "push_subscriptions", "achievements", "app_config",
+    ):
+        await db[coll].delete_many({})
+
     default_hash = hash_password(DEFAULT_PASSCODE)
     ts = now_iso()
 

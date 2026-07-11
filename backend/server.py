@@ -1343,6 +1343,25 @@ async def seed_default_family():
         })
 
 
+async def migrate_existing_data():
+    """Idempotent backfills for databases seeded by earlier versions."""
+    # 1. Children still on the default passcode get their plain code recorded
+    #    so parents can view it (new behavior).
+    await db.members.update_many(
+        {"role": "child", "passcode_is_default": True, "passcode_plain": {"$exists": False}},
+        {"$set": {"passcode_plain": DEFAULT_PASSCODE}},
+    )
+    # 2. Tasks created before the treasure-hunt update get sequential order
+    #    per child based on creation time.
+    async for child in db.children.find({}, {"id": 1}):
+        tasks = await db.tasks.find({"child_id": child["id"]}).sort("created_at", 1).to_list(1000)
+        max_order = max((t.get("order") or 0 for t in tasks), default=0)
+        for t in tasks:
+            if t.get("order") is None:
+                max_order += 1
+                await db.tasks.update_one({"id": t["id"]}, {"$set": {"order": max_order}})
+
+
 # --------------- Startup ---------------
 @app.on_event("startup")
 async def startup():
@@ -1357,6 +1376,7 @@ async def startup():
     await db.push_subscriptions.create_index("parent_id")
     await db.achievements.create_index("parent_id")
     await seed_default_family()
+    await migrate_existing_data()
 
 
 @app.on_event("shutdown")

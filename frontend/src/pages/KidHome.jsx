@@ -199,7 +199,7 @@ export default function KidHome() {
 
           {tab === "money" && (
             <motion.div key="money" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-              <MoneyExchange childId={childId} points={child.points || 0} onChanged={load} />
+              <MoneyExchange childId={childId} points={child.points || 0} child={child} onChanged={load} />
             </motion.div>
           )}
 

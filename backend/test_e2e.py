@@ -473,6 +473,23 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     next_day2 = [t for t in c.get(f"/api/tasks?date_key={tomorrow_local}&child_id={adskhan['id']}").json() if t["title"] == "HarianDedup"]
     check("recur: still exactly one tomorrow", len(next_day2) == 1, f"found {len(next_day2)}")
 
+    # ================= 25. SAVINGS GOAL (BusyKid-inspired) =================
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.patch("/api/me/profile", json={"savings_goal_name": "Sepeda baru", "savings_goal_amount": 500000})
+    check("goal: kid sets savings goal", r.status_code == 200 and r.json().get("savings_goal_name") == "Sepeda baru" and r.json().get("savings_goal_amount") == 500000, r.text[:150])
+    # persists in children list (used by kid UI)
+    kid_row = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("goal: visible in children list", kid_row.get("savings_goal_name") == "Sepeda baru", str(kid_row.get("savings_goal_name")))
+    # invalid values rejected
+    r = c.patch("/api/me/profile", json={"savings_goal_amount": -5})
+    check("goal: negative amount rejected", r.status_code == 422, str(r.status_code))
+    r = c.patch("/api/me/profile", json={"savings_goal_name": "x" * 100})
+    check("goal: over-long name rejected", r.status_code == 422, str(r.status_code))
+    # parent can also set it for a child
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.patch(f"/api/children/{syila['id']}", json={"savings_goal_name": "Boneka", "savings_goal_amount": 150000})
+    check("goal: parent sets for child", r.status_code == 200 and r.json().get("savings_goal_amount") == 150000, r.text[:150])
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

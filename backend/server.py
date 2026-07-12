@@ -219,6 +219,8 @@ class ChildUpdate(BaseModel):
     avatar_emoji: Optional[str] = None
     mbti: Optional[MBTI_TYPES] = None
     quest_theme: Optional[Literal["space", "garden", "ninja", "rainbow", "ocean"]] = None
+    savings_goal_name: Optional[str] = Field(default=None, max_length=60)
+    savings_goal_amount: Optional[int] = Field(default=None, ge=0, le=1000000000)
 
 
 class TaskInput(BaseModel):
@@ -273,6 +275,9 @@ class SelfProfileInput(BaseModel):
     avatar_emoji: Optional[str] = Field(default=None, max_length=10)
     avatar_color: Optional[str] = Field(default=None, max_length=20)
     quest_theme: Optional[Literal["space", "garden", "ninja", "rainbow", "ocean"]] = None
+    # BusyKid-inspired savings goal: what the child is saving toward.
+    savings_goal_name: Optional[str] = Field(default=None, max_length=60)
+    savings_goal_amount: Optional[int] = Field(default=None, ge=0, le=1000000000)
 
 
 class RewardInput(BaseModel):

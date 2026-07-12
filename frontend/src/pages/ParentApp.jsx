@@ -25,6 +25,7 @@ import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
 import { todayKey } from "@/lib/dates";
+import { ROUTINE_TEMPLATES } from "@/lib/routineTemplates";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -90,6 +91,7 @@ export default function ParentApp() {
   const [childModal, setChildModal] = useState(false);
   const [taskModal, setTaskModal] = useState(false);
   const [editingTask, setEditingTask] = useState(null);
+  const [templateModal, setTemplateModal] = useState(false);
   const [rewardModal, setRewardModal] = useState(false);
   const [consModal, setConsModal] = useState(false);
   const [applyConsModal, setApplyConsModal] = useState(null);
@@ -232,6 +234,7 @@ export default function ParentApp() {
               tasks={filteredTasks}
               selectedChildId={selectedChildId}
               onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
+              onOpenTemplates={() => setTemplateModal(true)}
               onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
               onRefresh={load}
               onApplyConsequence={(task) => setApplyConsModal({ task })}
@@ -298,6 +301,7 @@ export default function ParentApp() {
         onSaved={load}
         editTask={editingTask}
       />
+      <TemplateModal open={templateModal} onClose={() => setTemplateModal(false)} kids={children} onSaved={load} />
       <RewardFormModal open={rewardModal} onClose={() => setRewardModal(false)} onSaved={load} />
       <ConsequenceFormModal open={consModal} onClose={() => setConsModal(false)} onSaved={load} />
       <ApplyConsequenceModal
@@ -404,7 +408,7 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
 }
 
 // ─────────────────────────────────────────────────────────
-function TasksView({ kids, tasks, selectedChildId, onAddTask, onEditTask, onRefresh, onApplyConsequence, onAddChild }) {
+function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onRefresh, onApplyConsequence, onAddChild }) {
   const grouped = useMemo(() => {
     const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
     const pending = tasks.filter((t) => t.status === "pending" || t.status === "rejected").sort(byOrder);
@@ -461,7 +465,10 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onEditTask, onRefr
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2 flex-wrap">
+        <button onClick={onOpenTemplates} className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-indigo-200 text-indigo-600 hover:bg-indigo-50 font-semibold px-4 py-2 rounded-xl text-sm">
+          📋 Dari Template
+        </button>
         <button onClick={onAddTask} data-testid={TEST_IDS.parent.addTaskBtn} className={btnPrimary}>
           <Plus className="w-4 h-4" strokeWidth={2.5} /> Tugas baru
         </button>
@@ -1368,6 +1375,172 @@ function ApplyConsequenceModal({ open, onClose, consequences, kids, preselect, s
           <button onClick={onClose} className={btnGhost}>Cancel</button>
           <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="apply-cons-submit-btn">
             {saving ? "Saving…" : "Apply"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function TemplateModal({ open, onClose, kids, onSaved }) {
+  const [selectedTemplate, setSelectedTemplate] = useState(null);
+  const [selectedKidIds, setSelectedKidIds] = useState([]); // [] = semua anak
+  const [dateKey, setDateKey] = useState(todayKey());
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setSelectedTemplate(null);
+      setSelectedKidIds([]);
+      setDateKey(todayKey());
+    }
+  }, [open]);
+
+  const toggleKid = (id) => {
+    setSelectedKidIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
+
+  const isBroadcast = selectedKidIds.length === 0;
+
+  const apply = async () => {
+    if (!selectedTemplate) return toast.error("Pilih template dulu");
+    setSaving(true);
+    try {
+      // Create each template task in order via the existing endpoint. Sequential
+      // so per-child quest order stays deterministic.
+      for (const t of selectedTemplate.tasks) {
+        const body = {
+          title: t.title,
+          description: "",
+          points: t.points,
+          penalty_points: 0,
+          date_key: dateKey,
+          due_time: t.due_time || null,
+          duration_minutes: t.duration_minutes || null,
+          is_bonus: false,
+          recurrence: "none",
+          order: null,
+          task_style: t.task_style || null,
+        };
+        if (isBroadcast) {
+          await api.post("/tasks", { ...body, target_children: [] });
+        } else if (selectedKidIds.length === 1) {
+          await api.post("/tasks", { ...body, child_id: selectedKidIds[0] });
+        } else {
+          await api.post("/tasks", { ...body, target_children: selectedKidIds });
+        }
+      }
+      const target = isBroadcast ? `semua anak (${kids.length})` : `${selectedKidIds.length} anak`;
+      toast.success(`${selectedTemplate.label} dibuat untuk ${target} — ${selectedTemplate.tasks.length} misi 🎉`);
+      onSaved();
+      onClose();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="Buat dari Template Rutinitas">
+      <div className="space-y-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          {ROUTINE_TEMPLATES.map((tpl) => {
+            const active = selectedTemplate?.key === tpl.key;
+            return (
+              <button
+                key={tpl.key}
+                type="button"
+                onClick={() => setSelectedTemplate(tpl)}
+                className={`text-left rounded-2xl border-2 p-3 transition-colors ${
+                  active ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+                }`}
+              >
+                <div className="font-semibold text-slate-900 text-sm">
+                  {tpl.emoji} {tpl.label}
+                </div>
+                <div className="text-xs text-slate-500 mt-0.5">{tpl.desc}</div>
+                <div className="text-xs text-indigo-500 font-semibold mt-1">
+                  {tpl.tasks.length} misi · {tpl.tasks.reduce((s, t) => s + t.points, 0)} poin total
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {selectedTemplate && (
+          <div className="bg-slate-50 rounded-xl p-3 border border-slate-100">
+            <div className="text-xs font-bold text-slate-500 uppercase mb-2">Isi template</div>
+            <div className="space-y-1">
+              {selectedTemplate.tasks.map((t, i) => (
+                <div key={i} className="text-sm text-slate-700 flex items-center gap-2 flex-wrap">
+                  <span className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-600 text-xs font-bold flex items-center justify-center shrink-0">{i + 1}</span>
+                  <span className="flex-1 min-w-0 truncate">{t.title}</span>
+                  <span className="text-xs text-slate-400 shrink-0">
+                    +{t.points}{t.due_time ? ` · 🕒 ${t.due_time}` : ""}{t.duration_minutes ? ` · ⏱️ ${t.duration_minutes}m` : ""}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div>
+          <label className={labelClass}>Untuk anak</label>
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => setSelectedKidIds([])}
+              className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
+                isBroadcast ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+              }`}
+            >
+              <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+                isBroadcast ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
+              }`}>
+                {isBroadcast && <span className="text-white text-xs">✓</span>}
+              </div>
+              <span className="font-semibold text-slate-800 text-sm">🌟 Semua anak</span>
+            </button>
+            <div className="grid grid-cols-2 gap-2">
+              {kids.map((c) => {
+                const checked = selectedKidIds.includes(c.id);
+                return (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => toggleKid(c.id)}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
+                      checked ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+                      checked ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
+                    }`}>
+                      {checked && <span className="text-white text-xs">✓</span>}
+                    </div>
+                    <div className="w-6 h-6 rounded-lg flex items-center justify-center text-sm" style={{ background: c.avatar_color }}>
+                      {c.avatar_emoji}
+                    </div>
+                    <span className="font-semibold text-slate-800 text-sm truncate">{c.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <label className={labelClass}>📅 Tanggal misi</label>
+          <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
+        </div>
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button onClick={onClose} className={btnGhost}>Batal</button>
+          <button onClick={apply} disabled={saving || !selectedTemplate} className={btnPrimary}>
+            {saving ? "Membuat…" : "Buat Misi"}
           </button>
         </div>
       </div>

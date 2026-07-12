@@ -71,7 +71,6 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   };
 
   const skipTask = async (task) => {
-    const cost = progress?.tasks?.[0] && 20; // display only; server enforces
     if (!window.confirm(`Lewati misi "${task.title}" dengan bayar poin?`)) return;
     setBusyId(task.id);
     try {
@@ -81,7 +80,6 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     } catch (e) {
       toast.error(formatApiError(e));
     } finally { setBusyId(null); }
-    void cost;
   };
 
   const isToday = dateKey === todayKey();
@@ -479,8 +477,3 @@ function LiveTimer({ startedAt, durationMinutes }) {
     </div>
   );
 }
-
-function LiveTimerEnd() {
-  return null;
-}
-export { LiveTimerEnd };

@@ -432,10 +432,13 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onEditTask, onRefr
   });
   const reject = (t) => act(async () => { await api.post(`/tasks/${t.id}/reject`); toast.info("Dikembalikan ke anak"); });
   const miss = (t) => act(async () => { await api.post(`/tasks/${t.id}/miss`); toast(`Ditandai terlewat${t.penalty_points ? ` · -${t.penalty_points} poin` : ""}`); });
-  const del = (t) => act(async () => {
+  const del = (t) => {
     if (!window.confirm(`Hapus tugas "${t.title}"?`)) return;
-    await api.delete(`/tasks/${t.id}`); toast.success("Tugas dihapus");
-  });
+    act(async () => {
+      await api.delete(`/tasks/${t.id}`);
+      toast.success("Tugas dihapus");
+    });
+  };
 
   const editBtn = (t) => (
     <button onClick={() => onEditTask(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-sm" title="Edit tugas">

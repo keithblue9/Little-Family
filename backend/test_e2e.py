@@ -438,6 +438,41 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post(f"/api/tasks/{free_task['id']}/start")
     check("time-gate: no-due-time bonus startable now", r.status_code == 200, f"{r.status_code} {r.text[:100]}")
 
+    # ================= 24. IDEMPOTENT DELETES & RECURRENCE DEDUP =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "Del2x", "points": 5, "child_id": adskhan["id"], "date_key": today_local})
+    d_task = r.json()
+    r1 = c.delete(f"/api/tasks/{d_task['id']}")
+    r2 = c.delete(f"/api/tasks/{d_task['id']}")  # double-click / stale-list simulation
+    check("idem: task double-delete both 200", r1.status_code == 200 and r2.status_code == 200, f"{r1.status_code},{r2.status_code}")
+    r = c.delete("/api/tasks/garbage-id")
+    check("idem: delete unknown id is 200", r.status_code == 200, str(r.status_code))
+
+    rw = c.post("/api/rewards", json={"name": "IdemR", "description": "", "cost_points": 1}).json()
+    check("idem: reward double-delete", c.delete(f"/api/rewards/{rw['id']}").status_code == 200 and c.delete(f"/api/rewards/{rw['id']}").status_code == 200)
+    cq = c.post("/api/consequences", json={"name": "IdemC", "description": "", "penalty_points": 1}).json()
+    check("idem: consequence double-delete", c.delete(f"/api/consequences/{cq['id']}").status_code == 200 and c.delete(f"/api/consequences/{cq['id']}").status_code == 200)
+
+    # Recurrence: approving a daily task spawns tomorrow's copy, NOT a same-day duplicate
+    r = c.post("/api/tasks", json={"title": "HarianDedup", "points": 5, "target_children": [adskhan["id"]], "date_key": today_local, "recurrence": "daily", "is_bonus": True})
+    rec = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{rec['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{rec['id']}/approve")
+    check("recur: approve ok", r.status_code == 200, r.text[:100])
+    same_day_open = [t for t in c.get(f"/api/tasks?date_key={today_local}&child_id={adskhan['id']}").json()
+                     if t["title"] == "HarianDedup" and t["status"] in ("pending", "rejected")]
+    check("recur: no same-day duplicate", len(same_day_open) == 0, f"found {len(same_day_open)}")
+    tomorrow_local = (now_local + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    next_day = [t for t in c.get(f"/api/tasks?date_key={tomorrow_local}&child_id={adskhan['id']}").json() if t["title"] == "HarianDedup"]
+    check("recur: spawned on next day", len(next_day) == 1, f"found {len(next_day)}")
+    # double-approve doesn't double-spawn
+    r = c.post(f"/api/tasks/{rec['id']}/approve")
+    check("recur: double-approve blocked", r.status_code == 400, str(r.status_code))
+    next_day2 = [t for t in c.get(f"/api/tasks?date_key={tomorrow_local}&child_id={adskhan['id']}").json() if t["title"] == "HarianDedup"]
+    check("recur: still exactly one tomorrow", len(next_day2) == 1, f"found {len(next_day2)}")
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

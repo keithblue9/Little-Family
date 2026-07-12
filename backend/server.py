@@ -894,9 +894,9 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
 
 @api.delete("/tasks/{task_id}")
 async def delete_task(task_id: str, user: dict = Depends(require_parent)):
-    res = await db.tasks.delete_one({"id": task_id, "parent_id": FAMILY_ID})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Task not found")
+    # Idempotent: deleting a task that's already gone (double-click, stale list)
+    # is not an error — the desired end state ("task doesn't exist") is met.
+    await db.tasks.delete_one({"id": task_id, "parent_id": FAMILY_ID})
     return {"success": True}
 
 
@@ -1127,25 +1127,50 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
     )
 
     if task["recurrence"] in ("daily", "weekly"):
-        # Create next occurrence
+        delta_days = 1 if task["recurrence"] == "daily" else 7
+        # Next occurrence lives on the NEXT date_key, otherwise approving a
+        # daily task would duplicate it on the same day.
+        next_date_key = None
+        if task.get("date_key"):
+            try:
+                base_day = datetime.strptime(task["date_key"], "%Y-%m-%d")
+                next_date_key = (base_day + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+            except Exception:
+                next_date_key = None
+        if not next_date_key:
+            next_date_key = (_now_local() + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+
         next_due = None
         if task.get("due_date"):
             try:
                 base = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
-                delta = timedelta(days=1 if task["recurrence"] == "daily" else 7)
-                next_due = (base + delta).isoformat()
+                next_due = (base + timedelta(days=delta_days)).isoformat()
             except Exception:
                 next_due = None
-        new_task = {
-            **{k: v for k, v in task.items() if k != "_id"},
-            "id": new_id(),
-            "status": "pending",
-            "completed_at": None,
-            "approved_at": None,
-            "due_date": next_due,
-            "created_at": now_iso(),
-        }
-        await db.tasks.insert_one(new_task)
+
+        # Guard against double-approval races creating two copies for the same
+        # day: only spawn if an identical open occurrence doesn't already exist.
+        existing = await db.tasks.find_one({
+            "child_id": task["child_id"],
+            "title": task["title"],
+            "date_key": next_date_key,
+            "recurrence": task["recurrence"],
+            "status": {"$in": ["pending", "rejected"]},
+        })
+        if not existing:
+            new_task = {
+                **{k: v for k, v in task.items() if k != "_id"},
+                "id": new_id(),
+                "status": "pending",
+                "completed_at": None,
+                "approved_at": None,
+                "due_date": next_due,
+                "date_key": next_date_key,
+                "timer_started_at": None,
+                "timer_completed_at": None,
+                "created_at": now_iso(),
+            }
+            await db.tasks.insert_one(new_task)
 
     await db.tasks.update_one(
         {"id": task_id},
@@ -1304,10 +1329,8 @@ async def list_reminders(child_id: Optional[str] = None, user: dict = Depends(ge
 
 @api.delete("/reminders/{reminder_id}")
 async def delete_reminder(reminder_id: str, user: dict = Depends(require_parent)):
-    reminder = await db.reminders.find_one({"id": reminder_id, "parent_id": FAMILY_ID})
-    if not reminder:
-        raise HTTPException(status_code=404, detail="Reminder not found")
-    await db.reminders.delete_one({"id": reminder_id})
+    # Idempotent — see delete_task.
+    await db.reminders.delete_one({"id": reminder_id, "parent_id": FAMILY_ID})
     return {"success": True}
 
 
@@ -1347,9 +1370,8 @@ async def create_reward(payload: RewardInput, user: dict = Depends(require_paren
 
 @api.delete("/rewards/{reward_id}")
 async def delete_reward(reward_id: str, user: dict = Depends(require_parent)):
-    res = await db.rewards.delete_one({"id": reward_id, "parent_id": FAMILY_ID})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Reward not found")
+    # Idempotent — see delete_task.
+    await db.rewards.delete_one({"id": reward_id, "parent_id": FAMILY_ID})
     return {"success": True}
 
 
@@ -1422,9 +1444,8 @@ async def create_consequence(payload: ConsequenceInput, user: dict = Depends(req
 
 @api.delete("/consequences/{consequence_id}")
 async def delete_consequence(consequence_id: str, user: dict = Depends(require_parent)):
-    res = await db.consequences.delete_one({"id": consequence_id, "parent_id": FAMILY_ID})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Consequence not found")
+    # Idempotent — see delete_task.
+    await db.consequences.delete_one({"id": consequence_id, "parent_id": FAMILY_ID})
     return {"success": True}
 
 
@@ -1610,13 +1631,11 @@ async def get_earned_achievements(child_id: str, user: dict = Depends(get_curren
 
 @api.delete("/achievements/{achievement_id}")
 async def delete_achievement(achievement_id: str, user: dict = Depends(require_parent)):
-    """Delete an achievement"""
-    result = await db.achievements.delete_one({
-        "id": achievement_id, 
+    """Delete an achievement (idempotent — see delete_task)."""
+    await db.achievements.delete_one({
+        "id": achievement_id,
         "parent_id": FAMILY_ID
     })
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Achievement not found")
     return {"success": True}
 
 

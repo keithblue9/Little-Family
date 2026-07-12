@@ -20,6 +20,7 @@ import Leaderboard from "@/components/Leaderboard";
 import Achievements from "@/components/Achievements";
 import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import PushNotificationManager from "@/components/PushNotificationManager";
+import FamilyDayMonitor from "@/components/FamilyDayMonitor";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
@@ -29,14 +30,15 @@ const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "
 
 const NAV = [
   { key: "overview", label: "Overview", icon: Home },
-  { key: "tasks", label: "Tasks", icon: ListChecks, testId: TEST_IDS.parent.tabTasks },
-  { key: "rewards", label: "Rewards", icon: Gift, testId: TEST_IDS.parent.tabRewards },
+  { key: "monitor", label: "Monitor Harian", icon: Clock, testId: "tab-monitor" },
+  { key: "tasks", label: "Tugas", icon: ListChecks, testId: TEST_IDS.parent.tabTasks },
+  { key: "rewards", label: "Hadiah", icon: Gift, testId: TEST_IDS.parent.tabRewards },
   { key: "money", label: "Uang & Poin", icon: Gift, testId: "tab-money" },
-  { key: "consequences", label: "Consequences", icon: ShieldAlert, testId: TEST_IDS.parent.tabConsequences },
-  { key: "activity", label: "Activity", icon: Activity, testId: TEST_IDS.parent.tabActivity },
-  { key: "leaderboard", label: "Leaderboard", icon: Users, testId: "tab-leaderboard" },
-  { key: "analytics", label: "Analytics", icon: Activity, testId: "tab-analytics" },
-  { key: "settings", label: "Settings", icon: Settings, testId: TEST_IDS.parent.tabSettings },
+  { key: "consequences", label: "Konsekuensi", icon: ShieldAlert, testId: TEST_IDS.parent.tabConsequences },
+  { key: "activity", label: "Aktivitas", icon: Activity, testId: TEST_IDS.parent.tabActivity },
+  { key: "leaderboard", label: "Papan Juara", icon: Users, testId: "tab-leaderboard" },
+  { key: "analytics", label: "Analitik", icon: Activity, testId: "tab-analytics" },
+  { key: "settings", label: "Pengaturan", icon: Settings, testId: TEST_IDS.parent.tabSettings },
 ];
 
 // ─────────────────────────────────────────────────────────
@@ -222,6 +224,7 @@ export default function ParentApp() {
           {view === "overview" && (
             <Overview stats={stats} kids={children} tasks={tasks} pendingRedemptions={pendingRedemptions} onAddChild={() => setChildModal(true)} onNavigate={setView} />
           )}
+          {view === "monitor" && <FamilyDayMonitor />}
           {view === "tasks" && (
             <TasksView
               kids={children}

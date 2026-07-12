@@ -242,6 +242,92 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     ads_row = next(k for k in kids_list if k["id"] == adskhan["id"])
     check("quest_theme persists in children list", ads_row.get("quest_theme") == "space", str(ads_row.get("quest_theme")))
 
+    # ---- 18. Broadcast tasks & daily quest system ----
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # cleanup: give kids fresh state for this section
+    tomorrow = "2026-08-15"
+    # Broadcast (target_children empty) → both kids get a copy
+    r = c.post("/api/tasks", json={"title": "Sikat gigi", "points": 5, "date_key": tomorrow})
+    check("broadcast task creates for all kids", r.status_code == 200 and r.json().get("count") == 2, r.text[:200])
+    bcast_data = r.json()
+    bcast_id = bcast_data["broadcast_id"]
+    check("broadcast_id links siblings", all(t.get("broadcast_id") == bcast_id for t in bcast_data["tasks"]))
+
+    # Explicit target_children [1 kid] → single task
+    r = c.post("/api/tasks", json={"title": "Baca buku", "points": 10, "target_children": [adskhan["id"]], "date_key": tomorrow})
+    check("explicit single target", r.status_code == 200 and r.json().get("child_id") == adskhan["id"])
+
+    # Explicit target_children [both] → 2 tasks with broadcast_id
+    r = c.post("/api/tasks", json={"title": "Rapikan mainan", "points": 8, "target_children": [adskhan["id"], syila["id"]], "date_key": tomorrow})
+    check("explicit multi target", r.status_code == 200 and r.json().get("count") == 2)
+
+    # date_key filter
+    r = c.get(f"/api/tasks?date_key={tomorrow}&child_id={adskhan['id']}")
+    tasks_tomorrow = r.json()
+    check("date_key filter returns only that day", all(t["date_key"] == tomorrow for t in tasks_tomorrow) and len(tasks_tomorrow) >= 3, str(len(tasks_tomorrow)))
+
+    # invalid date rejected
+    r = c.post("/api/tasks", json={"title": "x", "points": 1, "date_key": "13-01-2026"})
+    check("invalid date_key rejected", r.status_code == 422, str(r.status_code))
+
+    # Bonus task doesn't block quest line
+    r = c.post("/api/tasks", json={"title": "Bonus: bantuin cuci piring", "points": 15, "is_bonus": True, "target_children": [adskhan["id"]], "date_key": tomorrow})
+    check("bonus task marked bonus", r.status_code == 200 and r.json().get("is_bonus") is True)
+
+    # ---- 19. Timer start/complete + sequence rule ----
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    ads_tasks = c.get(f"/api/tasks?date_key={tomorrow}&child_id={adskhan['id']}").json()
+    required = [t for t in ads_tasks if not t.get("is_bonus")]
+    required.sort(key=lambda t: t.get("order") or 0)
+    first, second = required[0], required[1]
+
+    # Can start bonus even if required not done
+    bonus_task = next(t for t in ads_tasks if t.get("is_bonus"))
+    r = c.post(f"/api/tasks/{bonus_task['id']}/start")
+    check("start bonus while required pending", r.status_code == 200 and r.json().get("timer_started_at"), r.text[:150])
+
+    # Can't start #2 before #1
+    r = c.post(f"/api/tasks/{second['id']}/start")
+    check("start blocked by sequence", r.status_code == 409, str(r.status_code))
+
+    # Start #1 → complete it
+    r = c.post(f"/api/tasks/{first['id']}/start")
+    check("start first task", r.status_code == 200 and r.json().get("timer_started_at"))
+    r = c.post(f"/api/tasks/{first['id']}/complete")
+    check("complete first task", r.status_code == 200)
+
+    # Now #2 unlocked
+    r = c.post(f"/api/tasks/{second['id']}/start")
+    check("start second task now unlocked", r.status_code == 200, r.text[:150])
+
+    # ---- 20. Day progress endpoint ----
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={tomorrow}")
+    prog = r.json()
+    check("day-progress structure", r.status_code == 200 and "daily_goal" in prog and "total_earned" in prog and "tasks" in prog, r.text[:200])
+    check("day-progress has required_count", prog["required_count"] >= 2, str(prog.get("required_count")))
+    check("day-progress bonus separated", prog["bonus_count"] >= 1, str(prog.get("bonus_count")))
+
+    # Parent family day-progress
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get(f"/api/family/day-progress?date_key={tomorrow}")
+    fam = r.json()
+    check("family day-progress lists all kids", r.status_code == 200 and len(fam["children"]) == 2, str(len(fam.get("children", []))))
+    check("family progress date matches", fam["date_key"] == tomorrow)
+
+    # daily_point_goal is persisted via config
+    r = c.post("/api/config", json={"daily_point_goal": 80})
+    check("set daily_point_goal", r.status_code == 200)
+    r = c.get("/api/config")
+    check("daily_point_goal persists", r.json().get("daily_point_goal") == 80, str(r.json().get("daily_point_goal")))
+
+    # ---- 21. Kids can't see admin routes ----
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.get(f"/api/family/day-progress?date_key={tomorrow}")
+    check("kid can't view family progress", r.status_code == 403, str(r.status_code))
+    # kid CAN see own day-progress
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={tomorrow}")
+    check("kid can see own progress", r.status_code == 200)
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

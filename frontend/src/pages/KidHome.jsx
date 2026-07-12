@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import Confetti from "react-confetti";
@@ -16,9 +16,9 @@ import Leaderboard from "@/components/Leaderboard";
 import Achievements from "@/components/Achievements";
 import MoneyExchange from "@/components/MoneyExchange";
 import ProfileEditor from "@/components/ProfileEditor";
-import TreasureMap from "@/components/TreasureMap";
-import { personalityMeta, styleMeta } from "@/lib/personality";
-import { QUEST_THEME_LIST, pickQuestTheme } from "@/lib/questThemes";
+import DailyQuestView from "@/components/DailyQuestView";
+import { personalityMeta } from "@/lib/personality";
+import { pickQuestTheme } from "@/lib/questThemes";
 
 const TABS = [
   { key: "tasks", label: "Misi", icon: Map, testId: TEST_IDS.kid.tabTasks },
@@ -33,9 +33,7 @@ export default function KidHome() {
   const nav = useNavigate();
   const { user, logout } = useAuth();
   const [child, setChild] = useState(null);
-  const [tasks, setTasks] = useState([]);
   const [rewards, setRewards] = useState([]);
-  const [config, setConfig] = useState({ skip_cost_points: 20, rupiah_per_point: 100 });
   const [tab, setTab] = useState("tasks");
   const [celebrate, setCelebrate] = useState(false);
   const [dims, setDims] = useState({ w: window.innerWidth, h: window.innerHeight });
@@ -48,11 +46,9 @@ export default function KidHome() {
 
   const load = useCallback(async () => {
     try {
-      const [cRes, tRes, rRes, cfgRes] = await Promise.all([
+      const [cRes, rRes] = await Promise.all([
         api.get("/children"),
-        api.get("/tasks", { params: { child_id: childId } }),
         api.get("/rewards"),
-        api.get("/config"),
       ]);
       const c = cRes.data.find((x) => x.id === childId);
       if (!c) {
@@ -61,58 +57,13 @@ export default function KidHome() {
         return;
       }
       setChild(c);
-      setTasks(tRes.data);
       setRewards(rRes.data);
-      setConfig(cfgRes.data);
     } catch (e) {
       toast.error(formatApiError(e));
     }
   }, [childId, nav]);
 
   useEffect(() => { load(); }, [load]);
-
-  // Treasure hunt: open tasks sorted by order; first one is the active quest.
-  const questLine = useMemo(() => {
-    const open = tasks
-      .filter((t) => t.status === "pending" || t.status === "rejected")
-      .sort((a, b) => (a.order || 0) - (b.order || 0));
-    return open;
-  }, [tasks]);
-
-  const pendingApproval = useMemo(
-    () => tasks.filter((t) => t.status === "completed"),
-    [tasks]
-  );
-  const doneTasks = useMemo(
-    () => tasks
-      .filter((t) => t.status === "approved" || t.status === "skipped")
-      .sort((a, b) => (a.order || 0) - (b.order || 0)),
-    [tasks]
-  );
-
-  const completeTask = async (task) => {
-    try {
-      await api.post(`/tasks/${task.id}/complete`);
-      setCelebrate(true);
-      setTimeout(() => setCelebrate(false), 3000);
-      toast.success("Misi selesai! Tunggu dicek Abi/Ummi ya ⭐");
-      load();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    }
-  };
-
-  const skipTask = async (task) => {
-    const cost = config.skip_cost_points ?? 20;
-    if (!window.confirm(`Lewati misi "${task.title}" dengan membayar ${cost} poin?`)) return;
-    try {
-      await api.post(`/tasks/${task.id}/skip`);
-      toast.success(`Misi dilewati! -${cost} poin ⏭️`);
-      load();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    }
-  };
 
   const redeem = async (reward) => {
     try {
@@ -140,13 +91,13 @@ export default function KidHome() {
   const skipCost = config.skip_cost_points ?? 20;
 
   return (
-    <div className="min-h-screen kid-shell grain relative font-body pb-28" data-testid={TEST_IDS.kid.home}>
+    <div className="min-h-screen kid-shell grain relative font-body pb-28 safe-x" data-testid={TEST_IDS.kid.home}>
       {celebrate && (
         <Confetti width={dims.w} height={dims.h} numberOfPieces={220} recycle={false} gravity={0.25} />
       )}
 
       {/* Header */}
-      <div className="relative z-10 flex items-center justify-between px-5 md:px-10 pt-6">
+      <div className="relative z-10 flex items-center justify-between px-5 md:px-10 safe-top">
         <div className="flex items-center gap-3">
           <motion.div
             initial={{ scale: 0 }}
@@ -214,7 +165,7 @@ export default function KidHome() {
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <h2 className="font-fun font-bold text-2xl text-slate-900 mb-1">Petualangan Misi 🗺️</h2>
               <p className="text-sm text-slate-500 mb-4">
-                Selesaikan misi secara berurutan. Misi berikutnya terbuka setelah yang sebelumnya selesai!
+                Selesaikan misi harianmu sesuai urutan. Selesaikan target poin harianmu untuk jadi juara!
               </p>
 
               {child.mbti && personalityMeta(child.mbti) && (
@@ -236,65 +187,15 @@ export default function KidHome() {
                 </motion.div>
               )}
 
-              {questLine.length === 0 && pendingApproval.length === 0 ? (
-                <div className="bg-white rounded-3xl p-8 text-center border-2 border-slate-100 chunky-shadow">
-                  <div className="text-5xl mb-3">🎉</div>
-                  <div className="font-fun font-bold text-xl text-slate-900">Semua misi beres!</div>
-                  <div className="text-slate-500 text-sm">Cek lagi nanti untuk petualangan baru.</div>
-                </div>
-              ) : (
-                <TreasureMap
-                  theme={pickQuestTheme(child)}
-                  quests={questLine}
-                  done={doneTasks}
-                  onComplete={completeTask}
-                  onSkip={skipTask}
-                  skipCost={skipCost}
-                />
-              )}
-
-              {pendingApproval.length > 0 && (
-                <div className="mt-6">
-                  <h3 className="font-fun font-semibold text-base text-slate-500 mb-2">Menunggu dicek Abi/Ummi</h3>
-                  <div className="space-y-2">
-                    {pendingApproval.map((t) => (
-                      <div key={t.id} className="bg-[#FFF4D1] rounded-3xl p-4 border-2 border-[#FFE4A0] flex items-center gap-4">
-                        <div className="w-12 h-12 rounded-full bg-[#FFE4A0] flex items-center justify-center flex-shrink-0">
-                          <Trophy className="w-5 h-5 text-[#FF9D23]" strokeWidth={2.5} />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="font-fun font-bold text-slate-900 truncate">{t.title}</div>
-                          <div className="text-xs text-slate-600">Kerja bagus! Menunggu persetujuan.</div>
-                        </div>
-                        <div className="text-sm font-bold text-[#FF9D23] flex-shrink-0">+{t.points} ⭐</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {doneTasks.length > 0 && (
-                <div className="mt-6">
-                  <h3 className="font-fun font-semibold text-base text-slate-500 mb-2">Sudah selesai ✅</h3>
-                  <div className="space-y-2">
-                    {doneTasks.slice(-5).map((t) => (
-                      <div key={t.id} className="bg-white/60 rounded-2xl px-4 py-2.5 border border-slate-100 flex items-center gap-3">
-                        <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${t.status === "approved" ? "bg-green-100" : "bg-slate-100"}`}>
-                          {t.status === "approved" ? (
-                            <CheckCircle2 className="w-4 h-4 text-green-500" />
-                          ) : (
-                            <FastForward className="w-4 h-4 text-slate-400" />
-                          )}
-                        </div>
-                        <div className="flex-1 text-sm text-slate-500 line-through truncate">{t.title}</div>
-                        <div className="text-xs font-bold text-slate-400">
-                          {t.status === "approved" ? `+${t.points}` : "dilewati"}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+              <DailyQuestView
+                child={child}
+                themeKey={pickQuestTheme(child)}
+                onCelebrate={() => {
+                  setCelebrate(true);
+                  setTimeout(() => setCelebrate(false), 3000);
+                  load();
+                }}
+              />
             </motion.div>
           )}
 
@@ -383,7 +284,7 @@ export default function KidHome() {
       </div>
 
       {/* Bottom nav */}
-      <div className="fixed bottom-4 left-4 right-4 z-30">
+      <div className="fixed safe-bottom-nav left-4 right-4 z-30">
         <div className="max-w-md mx-auto bg-white rounded-full p-2 chunky-shadow-lg border-2 border-slate-100 flex items-center justify-around">
           {TABS.map((t) => {
             const active = tab === t.key;

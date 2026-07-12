@@ -139,6 +139,7 @@ class AppConfigInput(BaseModel):
     slideshow_background_url: Optional[str] = None
     rupiah_per_point: Optional[int] = Field(default=None, ge=1, le=1000000)
     skip_cost_points: Optional[int] = Field(default=None, ge=0, le=100000)
+    daily_point_goal: Optional[int] = Field(default=None, ge=0, le=10000)
 
 
 class ReminderInput(BaseModel):
@@ -191,14 +192,19 @@ class ChildUpdate(BaseModel):
 
 
 class TaskInput(BaseModel):
-    child_id: str
+    # Assignment: pick 1 kid, several kids, or leave empty = broadcast to ALL kids.
+    # `child_id` is kept for backward compatibility (equivalent to target_children=[child_id]).
+    child_id: Optional[str] = None
+    target_children: Optional[List[str]] = None
     title: str = Field(min_length=1, max_length=120)
     description: str = ""
     points: int = Field(ge=0, le=1000, default=10)
     penalty_points: int = Field(ge=0, le=1000, default=0)
-    due_date: Optional[str] = None  # ISO date string
-    due_time: Optional[str] = None  # "HH:MM" 24h deadline within the day, optional
-    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)  # optional expected duration
+    is_bonus: bool = False  # true = counts as bonus above the daily goal, not required
+    due_date: Optional[str] = None       # ISO date string
+    due_time: Optional[str] = None       # "HH:MM" 24h deadline within the day
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    date_key: Optional[str] = None       # "YYYY-MM-DD" — which daily slot this belongs to
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
@@ -211,9 +217,11 @@ class TaskUpdate(BaseModel):
     description: Optional[str] = None
     points: Optional[int] = None
     penalty_points: Optional[int] = None
+    is_bonus: Optional[bool] = None
     due_date: Optional[str] = None
     due_time: Optional[str] = None
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    date_key: Optional[str] = None
     recurrence: Optional[Literal["none", "daily", "weekly"]] = None
     icon: Optional[str] = None
     order: Optional[int] = Field(default=None, ge=1)
@@ -702,57 +710,120 @@ async def delete_child(child_id: str, user: dict = Depends(require_parent)):
 
 # --------------- Tasks ---------------
 @api.get("/tasks")
-async def list_tasks(child_id: Optional[str] = None, status_filter: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def list_tasks(
+    child_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    date_key: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
     query = {"parent_id": FAMILY_ID}
     if child_id:
         query["child_id"] = child_id
     if status_filter:
         query["status"] = status_filter
-    tasks = await db.tasks.find(query, {"_id": 0}).to_list(1000)
-    tasks.sort(key=lambda t: (t.get("status") != "pending", t.get("due_date") or "9999"))
+    if date_key:
+        query["date_key"] = date_key
+    tasks = await db.tasks.find(query, {"_id": 0}).to_list(2000)
+    tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
     return tasks
 
 
-@api.post("/tasks")
-async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
-    await get_child_or_404(FAMILY_ID, payload.child_id)
+def validate_date_key(value):
+    if value in (None, ""):
+        return None
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        raise HTTPException(status_code=422, detail="Format tanggal harus YYYY-MM-DD")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    return value
 
-    # Treasure-hunt ordering: default to the end of this child's quest line.
-    order = payload.order
+
+def _today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+async def _build_task_doc(
+    child_id: str,
+    payload: TaskInput,
+    date_key: Optional[str],
+    order: Optional[int],
+    broadcast_id: Optional[str],
+) -> dict:
+    """Assemble a task document for one child. Order is per-child within its date_key."""
     if order is None:
-        last = await db.tasks.find({"child_id": payload.child_id}).sort("order", -1).to_list(1)
+        last = await db.tasks.find(
+            {"child_id": child_id, "date_key": date_key}
+        ).sort("order", -1).to_list(1)
         order = (last[0].get("order", 0) + 1) if last else 1
 
-    # Default the task style from the child's personality if the parent didn't pick one.
     task_style = payload.task_style
     if task_style is None:
-        child = await db.children.find_one({"id": payload.child_id})
+        child = await db.children.find_one({"id": child_id})
         task_style = suggested_style_for_mbti(child.get("mbti") if child else None)
 
-    doc = {
+    return {
         "id": new_id(),
         "parent_id": FAMILY_ID,
-        "child_id": payload.child_id,
+        "child_id": child_id,
+        "broadcast_id": broadcast_id,  # groups tasks created together for edit/delete
         "title": payload.title,
         "description": payload.description,
         "points": payload.points,
         "penalty_points": payload.penalty_points,
+        "is_bonus": payload.is_bonus,
         "due_date": payload.due_date,
         "due_time": validate_due_time(payload.due_time),
         "duration_minutes": payload.duration_minutes,
+        "date_key": date_key,
         "recurrence": payload.recurrence,
         "icon": payload.icon,
         "order": order,
         "task_style": task_style,
+        "timer_started_at": None,
+        "timer_completed_at": None,
         "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
         "completed_at": None,
         "approved_at": None,
         "created_at": now_iso(),
     }
-    await db.tasks.insert_one(doc)
-    doc.pop("_id", None)
-    await log_activity(FAMILY_ID, payload.child_id, "task_created", {"title": payload.title, "points": payload.points})
-    return doc
+
+
+@api.post("/tasks")
+async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
+    # Resolve target children set:
+    #   - `target_children` explicit list wins
+    #   - else `child_id` (backward-compat)
+    #   - else empty -> broadcast to ALL children (family-wide daily chore)
+    targets = payload.target_children
+    if not targets and payload.child_id:
+        targets = [payload.child_id]
+    if not targets:
+        all_kids = await db.children.find({"parent_id": FAMILY_ID}, {"id": 1}).to_list(100)
+        targets = [k["id"] for k in all_kids]
+    if not targets:
+        raise HTTPException(status_code=400, detail="Belum ada anak — tambahkan anak dulu")
+
+    # Validate all target children exist
+    for cid in targets:
+        await get_child_or_404(FAMILY_ID, cid)
+
+    date_key = validate_date_key(payload.date_key) or _today_key()
+
+    # A single broadcast_id groups sibling copies so parents can edit/delete them together
+    broadcast_id = new_id() if len(targets) > 1 else None
+
+    created = []
+    for cid in targets:
+        doc = await _build_task_doc(cid, payload, date_key, payload.order, broadcast_id)
+        await db.tasks.insert_one(doc)
+        doc.pop("_id", None)
+        created.append(doc)
+        await log_activity(FAMILY_ID, cid, "task_created", {"title": payload.title, "points": payload.points, "date_key": date_key})
+
+    # Backward-compatible response: single-target keeps object shape, multi-target returns list.
+    return created[0] if len(created) == 1 else {"broadcast_id": broadcast_id, "tasks": created, "count": len(created)}
 
 
 @api.patch("/tasks/{task_id}")
@@ -788,32 +859,134 @@ async def delete_task(task_id: str, user: dict = Depends(require_parent)):
     return {"success": True}
 
 
-async def get_next_actionable_task(child_id: str) -> Optional[dict]:
-    """The lowest-order task still blocking the quest line (pending or rejected)."""
-    open_tasks = await db.tasks.find(
-        {"child_id": child_id, "status": {"$in": ["pending", "rejected"]}}
-    ).sort("order", 1).to_list(1)
+@api.get("/children/{child_id}/day-progress")
+async def child_day_progress(
+    child_id: str,
+    date_key: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Snapshot of one child's daily quest progress for a specific date.
+    Used both by the kid (own progress) and the parent (monitoring)."""
+    await get_child_or_404(FAMILY_ID, child_id)
+    dk = validate_date_key(date_key) or _today_key()
+
+    tasks = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk},
+        {"_id": 0},
+    ).to_list(500)
+    tasks.sort(key=lambda t: (bool(t.get("is_bonus")), t.get("order") or 0))
+
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    daily_goal = int(config.get("daily_point_goal", 50))
+
+    required = [t for t in tasks if not t.get("is_bonus")]
+    bonus = [t for t in tasks if t.get("is_bonus")]
+
+    def earned(bucket):
+        return sum(t.get("points", 0) for t in bucket if t.get("status") in ("completed", "approved"))
+
+    required_earned = earned(required)
+    bonus_earned = earned(bonus)
+    total_earned = required_earned + bonus_earned
+
+    finished_required = sum(1 for t in required if t.get("status") in ("completed", "approved", "skipped"))
+
+    return {
+        "child_id": child_id,
+        "date_key": dk,
+        "daily_goal": daily_goal,
+        "required_total": sum(t.get("points", 0) for t in required),
+        "required_earned": required_earned,
+        "bonus_earned": bonus_earned,
+        "total_earned": total_earned,
+        "goal_met": total_earned >= daily_goal,
+        "goal_percent": min(100, int((total_earned / daily_goal) * 100)) if daily_goal else 100,
+        "required_count": len(required),
+        "required_done": finished_required,
+        "bonus_count": len(bonus),
+        "tasks": tasks,
+    }
+
+
+@api.get("/family/day-progress")
+async def family_day_progress(
+    date_key: Optional[str] = None,
+    user: dict = Depends(require_parent),
+):
+    """One-shot summary of every child's day, for the parent dashboard."""
+    dk = validate_date_key(date_key) or _today_key()
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(100)
+    out = []
+    for k in kids:
+        # Reuse the per-child computation
+        summary = await child_day_progress(k["id"], dk, user)  # type: ignore[arg-type]
+        out.append({"child": {
+            "id": k["id"],
+            "name": k["name"],
+            "avatar_emoji": k.get("avatar_emoji"),
+            "avatar_color": k.get("avatar_color"),
+            "mbti": k.get("mbti"),
+            "quest_theme": k.get("quest_theme"),
+            "points": k.get("points", 0),
+        }, **summary})
+    return {"date_key": dk, "children": out}
+
+
+async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None) -> Optional[dict]:
+    """The lowest-order task still blocking today's quest line for this child.
+    Bonus tasks (is_bonus=True) don't block."""
+    query = {"child_id": child_id, "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True}}
+    if date_key:
+        query["date_key"] = date_key
+    open_tasks = await db.tasks.find(query).sort("order", 1).to_list(1)
     return open_tasks[0] if open_tasks else None
+
+
+@api.post("/tasks/{task_id}/start")
+async def start_task_timer(task_id: str, user: dict = Depends(get_current_user)):
+    """Kid clicks Start → records timer_started_at. Only the next actionable
+    quest for that day can be started (except bonuses)."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail="Misi tidak bisa dimulai")
+
+    # Bonuses can be started any time. Required tasks must be the next in line.
+    if not task.get("is_bonus"):
+        nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
+        if nxt and nxt["id"] != task_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
+            )
+
+    await db.tasks.update_one({"id": task_id}, {"$set": {"timer_started_at": now_iso()}})
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
 @api.post("/tasks/{task_id}/complete")
 async def complete_task(task_id: str, user: dict = Depends(get_current_user)):
     """Kid marks a task complete → awaits parent approval. Treasure-hunt rule:
-    only the next task in the sequence can be completed."""
+    only the next non-bonus task in the day's sequence can be completed."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Task cannot be completed in current state")
 
-    nxt = await get_next_actionable_task(task["child_id"])
-    if nxt and nxt["id"] != task_id:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\" (atau lewati dengan poin)",
-        )
+    if not task.get("is_bonus"):
+        nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
+        if nxt and nxt["id"] != task_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\" (atau lewati dengan poin)",
+            )
 
-    await db.tasks.update_one({"id": task_id}, {"$set": {"status": "completed", "completed_at": now_iso()}})
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {"status": "completed", "completed_at": now_iso(), "timer_completed_at": now_iso()}},
+    )
     await log_activity(FAMILY_ID, task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
@@ -827,7 +1000,7 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Only open tasks can be skipped")
 
-    nxt = await get_next_actionable_task(task["child_id"])
+    nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
     if nxt and nxt["id"] != task_id:
         raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dilewati")
 
@@ -979,6 +1152,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "slideshow_background_url": payload.slideshow_background_url or "",
             "rupiah_per_point": payload.rupiah_per_point if payload.rupiah_per_point is not None else 100,
             "skip_cost_points": payload.skip_cost_points if payload.skip_cost_points is not None else 20,
+            "daily_point_goal": payload.daily_point_goal if payload.daily_point_goal is not None else 50,
             "created_at": now_iso(),
         }
         await db.app_config.insert_one(config)
@@ -996,6 +1170,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "slideshow_background_url": "",
             "rupiah_per_point": 100,
             "skip_cost_points": 20,
+            "daily_point_goal": 50,
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
@@ -1003,6 +1178,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "slideshow_background_url": config.get("slideshow_background_url", ""),
         "rupiah_per_point": int(config.get("rupiah_per_point", 100)),
         "skip_cost_points": int(config.get("skip_cost_points", 20)),
+        "daily_point_goal": int(config.get("daily_point_goal", 50)),
     }
 
 
@@ -1545,6 +1721,28 @@ async def migrate_existing_data():
     )
     await db.tasks.update_many(
         {"duration_minutes": {"$exists": False}}, {"$set": {"duration_minutes": None}}
+    )
+    await db.tasks.update_many(
+        {"is_bonus": {"$exists": False}}, {"$set": {"is_bonus": False}}
+    )
+    await db.tasks.update_many(
+        {"broadcast_id": {"$exists": False}}, {"$set": {"broadcast_id": None}}
+    )
+    await db.tasks.update_many(
+        {"timer_started_at": {"$exists": False}}, {"$set": {"timer_started_at": None, "timer_completed_at": None}}
+    )
+    # date_key backfill: derive from created_at, else from due_date, else today.
+    async for t in db.tasks.find({"date_key": {"$in": [None, ""]}}, {"id": 1, "created_at": 1, "due_date": 1}):
+        dk = None
+        for src in (t.get("due_date"), t.get("created_at")):
+            if src and isinstance(src, str) and len(src) >= 10:
+                dk = src[:10]
+                break
+        if not dk:
+            dk = _today_key()
+        await db.tasks.update_one({"id": t["id"]}, {"$set": {"date_key": dk}})
+    await db.tasks.update_many(
+        {"date_key": {"$exists": False}}, {"$set": {"date_key": _today_key()}}
     )
 
 

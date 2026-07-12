@@ -74,7 +74,7 @@ export default function ParentApp() {
   const { user, logout } = useAuth();
   const [view, setView] = useState("overview");
   const [children, setChildren] = useState([]);
-  const [selectedChildId, setSelectedChildId] = useState(null);
+  const [selectedChildId, setSelectedChildId] = useState(undefined); // undefined = not yet initialized, null = "All"
   const [tasks, setTasks] = useState([]);
   const [rewards, setRewards] = useState([]);
   const [consequences, setConsequences] = useState([]);
@@ -109,7 +109,7 @@ export default function ParentApp() {
       setRedemptions(rd.data);
       setActivity(a.data);
       setStats(s.data);
-      if (!selectedChildId && c.data[0]) setSelectedChildId(c.data[0].id);
+      if (selectedChildId === undefined && c.data[0]) setSelectedChildId(c.data[0].id);
     } catch (e) {
       toast.error(formatApiError(e));
     }
@@ -965,40 +965,54 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [desc, setDesc] = useState("");
   const [points, setPoints] = useState(10);
   const [penalty, setPenalty] = useState(0);
-  const [dueDate, setDueDate] = useState("");
+  const [dateKey, setDateKey] = useState(new Date().toISOString().slice(0, 10));
   const [dueTime, setDueTime] = useState("");
   const [duration, setDuration] = useState("");
+  const [isBonus, setIsBonus] = useState(false);
   const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
   const [taskStyle, setTaskStyle] = useState("");
-  const [childId, setChildId] = useState(defaultChildId || (kids[0] && kids[0].id) || "");
+  // Selected kid ids: [] means "everyone" (broadcast). Edit mode is always the task's own child.
+  const [selectedKidIds, setSelectedKidIds] = useState(
+    defaultChildId ? [defaultChildId] : []
+  );
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     if (editTask) {
-      setChildId(editTask.child_id);
+      setSelectedKidIds([editTask.child_id]);
       setTitle(editTask.title || "");
       setDesc(editTask.description || "");
       setPoints(editTask.points ?? 10);
       setPenalty(editTask.penalty_points ?? 0);
-      setDueDate(editTask.due_date ? new Date(editTask.due_date).toISOString().slice(0, 10) : "");
+      setDateKey(editTask.date_key || new Date().toISOString().slice(0, 10));
       setDueTime(editTask.due_time || "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
+      setIsBonus(!!editTask.is_bonus);
       setRecurrence(editTask.recurrence || "none");
       setOrder(editTask.order ? String(editTask.order) : "");
       setTaskStyle(editTask.task_style || "");
     } else {
-      setChildId(defaultChildId || (kids[0] && kids[0].id) || "");
+      setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
       setTitle(""); setDesc(""); setPoints(10); setPenalty(0);
-      setDueDate(""); setDueTime(""); setDuration("");
+      setDateKey(new Date().toISOString().slice(0, 10));
+      setDueTime(""); setDuration(""); setIsBonus(false);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
-  }, [open, defaultChildId, kids, editTask]);
+  }, [open, defaultChildId, editTask]);
+
+  const toggleKid = (id) => {
+    setSelectedKidIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  };
+
+  const isBroadcast = selectedKidIds.length === 0;
+  const isSingle = selectedKidIds.length === 1;
 
   const submit = async () => {
     if (!title.trim()) return toast.error("Judul tugas wajib diisi");
-    if (!childId) return toast.error("Pilih anak");
     if (dueTime && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(dueTime)) {
       return toast.error("Format jam harus HH:MM (contoh 18:00)");
     }
@@ -1009,9 +1023,10 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         description: desc,
         points: Number(points) || 0,
         penalty_points: Number(penalty) || 0,
-        due_date: dueDate ? new Date(dueDate).toISOString() : null,
+        date_key: dateKey || null,
         due_time: dueTime || null,
         duration_minutes: duration ? Number(duration) : null,
+        is_bonus: isBonus,
         recurrence,
         order: order ? Number(order) : null,
         task_style: taskStyle || null,
@@ -1020,8 +1035,17 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         await api.patch(`/tasks/${editTask.id}`, body);
         toast.success("Tugas diperbarui");
       } else {
-        await api.post("/tasks", { child_id: childId, ...body });
-        toast.success("Tugas dibuat");
+        // Broadcast: send empty target_children (or all kid ids). Backend treats empty as "all".
+        if (isBroadcast) {
+          await api.post("/tasks", { ...body, target_children: [] });
+          toast.success(`Tugas dibuat untuk semua anak (${kids.length})`);
+        } else if (isSingle) {
+          await api.post("/tasks", { ...body, child_id: selectedKidIds[0] });
+          toast.success("Tugas dibuat");
+        } else {
+          await api.post("/tasks", { ...body, target_children: selectedKidIds });
+          toast.success(`Tugas dibuat untuk ${selectedKidIds.length} anak`);
+        }
       }
       onSaved();
       onClose();
@@ -1040,12 +1064,72 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
           <label className={labelClass}>Deskripsi (opsional)</label>
           <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} />
         </div>
+        {/* Kid selection */}
+        <div>
+          <label className={labelClass}>Untuk anak</label>
+          {isEdit ? (
+            <div className="text-sm text-slate-500 bg-slate-50 rounded-xl px-3 py-2 border border-slate-200">
+              {kids.find((k) => k.id === selectedKidIds[0])?.name || "—"}
+              <span className="text-xs text-slate-400 ml-2">(tidak bisa diubah saat edit)</span>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <button
+                type="button"
+                onClick={() => setSelectedKidIds([])}
+                className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
+                  isBroadcast ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+                }`}
+              >
+                <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+                  isBroadcast ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
+                }`}>
+                  {isBroadcast && <span className="text-white text-xs">✓</span>}
+                </div>
+                <span className="font-semibold text-slate-800">🌟 Semua anak (broadcast)</span>
+                <span className="text-xs text-slate-500 ml-auto">1 tugas untuk tiap anak</span>
+              </button>
+              <div className="grid grid-cols-2 gap-2">
+                {kids.map((c) => {
+                  const checked = selectedKidIds.includes(c.id);
+                  return (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() => toggleKid(c.id)}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
+                        checked ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+                      }`}
+                    >
+                      <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+                        checked ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
+                      }`}>
+                        {checked && <span className="text-white text-xs">✓</span>}
+                      </div>
+                      <div className="w-6 h-6 rounded-lg flex items-center justify-center text-sm" style={{ background: c.avatar_color }}>
+                        {c.avatar_emoji}
+                      </div>
+                      <span className="font-semibold text-slate-800 text-sm truncate">{c.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-slate-400">
+                {isBroadcast
+                  ? `Akan dibuat 1 tugas untuk masing-masing dari ${kids.length} anak.`
+                  : selectedKidIds.length === 0
+                  ? "Pilih setidaknya satu anak, atau pilih 'Semua anak'."
+                  : `Akan dibuat untuk ${selectedKidIds.length} anak.`}
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Date + repeat */}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className={labelClass}>Untuk anak</label>
-            <select value={childId} onChange={(e) => setChildId(e.target.value)} className={inputClass} data-testid="task-child-select" disabled={isEdit}>
-              {kids.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
+            <label className={labelClass}>📅 Tanggal misi</label>
+            <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
           </div>
           <div>
             <label className={labelClass}>Ulangi</label>
@@ -1056,6 +1140,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
             </select>
           </div>
         </div>
+
         <div className="grid grid-cols-3 gap-3">
           <div>
             <label className={labelClass}>Poin</label>
@@ -1066,10 +1151,29 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
             <input type="number" min="0" value={penalty} onChange={(e) => setPenalty(e.target.value)} className={inputClass} />
           </div>
           <div>
-            <label className={labelClass}>Tanggal (opsional)</label>
-            <input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className={inputClass} />
+            <label className={labelClass}>Urutan (opsional)</label>
+            <input type="number" min="1" value={order} onChange={(e) => setOrder(e.target.value)} className={inputClass} placeholder="Auto" />
           </div>
         </div>
+
+        {/* Bonus toggle */}
+        <button
+          type="button"
+          onClick={() => setIsBonus(!isBonus)}
+          className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
+            isBonus ? "border-amber-400 bg-amber-50" : "border-slate-200 hover:bg-slate-50"
+          }`}
+        >
+          <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+            isBonus ? "bg-amber-500 border-amber-500" : "border-slate-300"
+          }`}>
+            {isBonus && <span className="text-white text-xs">✓</span>}
+          </div>
+          <div className="flex-1 text-left">
+            <div className="font-semibold text-slate-800 text-sm">✨ Tugas Bonus</div>
+            <div className="text-xs text-slate-500">Tidak wajib, tidak menghalangi urutan misi. Poinnya jadi ekstra.</div>
+          </div>
+        </button>
 
         {/* Duration & time — both optional, either or both */}
         <div className="grid grid-cols-2 gap-3 bg-slate-50 rounded-xl p-3 border border-slate-100">
@@ -1094,18 +1198,6 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
           </div>
         </div>
 
-        <div>
-          <label className={labelClass}>Urutan misi (opsional)</label>
-          <input
-            type="number" min="1" value={order}
-            onChange={(e) => setOrder(e.target.value)}
-            className={inputClass}
-            placeholder="Kosongkan = otomatis di akhir urutan"
-          />
-          <p className="text-xs text-slate-400 mt-1">
-            Anak harus menyelesaikan misi sesuai urutan (konsep treasure hunt). Misi berikutnya terkunci sampai yang sebelumnya selesai/dilewati.
-          </p>
-        </div>
         <div>
           <label className={labelClass}>Gaya tugas (opsional)</label>
           <select value={taskStyle} onChange={(e) => setTaskStyle(e.target.value)} className={inputClass}>

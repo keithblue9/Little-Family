@@ -1,4 +1,32 @@
 /* App-level styles kept minimal — most styling in index.css and Tailwind */
 .App {
     min-height: 100vh;
+    min-height: 100dvh;
+}
+
+/* Safe area utilities for iOS/Android PWA with notch/Dynamic Island. */
+.safe-top {
+    padding-top: max(env(safe-area-inset-top, 0px), 12px);
+}
+.safe-bottom {
+    padding-bottom: max(env(safe-area-inset-bottom, 0px), 12px);
+}
+.safe-x {
+    padding-left: max(env(safe-area-inset-left, 0px), 16px);
+    padding-right: max(env(safe-area-inset-right, 0px), 16px);
+}
+.safe-all {
+    padding-top: max(env(safe-area-inset-top, 0px), 12px);
+    padding-bottom: max(env(safe-area-inset-bottom, 0px), 12px);
+    padding-left: max(env(safe-area-inset-left, 0px), 16px);
+    padding-right: max(env(safe-area-inset-right, 0px), 16px);
+}
+
+/* Extra bottom margin for fixed bottom nav */
+.safe-bottom-nav {
+    bottom: max(env(safe-area-inset-bottom, 0px), 8px);
+}
+
+html, body {
+    overflow-x: hidden;
 }

@@ -170,6 +170,10 @@ class AppConfigInput(BaseModel):
     rupiah_per_point: Optional[int] = Field(default=None, ge=1, le=1000000)
     skip_cost_points: Optional[int] = Field(default=None, ge=0, le=100000)
     daily_point_goal: Optional[int] = Field(default=None, ge=0, le=10000)
+    # Three piggy banks (BusyKid): auto-split earned points by percentage
+    piggy_save_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    piggy_spend_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    piggy_share_pct: Optional[int] = Field(default=None, ge=0, le=100)
 
 
 class ReminderInput(BaseModel):
@@ -579,6 +583,61 @@ async def get_child_or_404(parent_id: str, child_id: str) -> dict:
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
     return child
+
+
+# --------------- Weekly Report ---------------
+@api.get("/family/weekly-report")
+async def family_weekly_report(user: dict = Depends(require_parent)):
+    """Summary of the last 7 days: per-child points, tasks, streaks, goal hits."""
+    now = _now_local()
+    today = now.strftime("%Y-%m-%d")
+    week_ago = (now - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(100)
+    report = []
+    for k in kids:
+        tasks = await db.tasks.find({
+            "child_id": k["id"],
+            "date_key": {"$gte": week_ago, "$lte": today},
+        }, {"_id": 0}).to_list(2000)
+
+        approved = [t for t in tasks if t.get("status") == "approved"]
+        completed = [t for t in tasks if t.get("status") in ("completed", "approved")]
+        total_points = sum(t.get("points", 0) for t in approved)
+
+        # Per-day breakdown
+        days = {}
+        for d_offset in range(7):
+            dk = (now - timedelta(days=6 - d_offset)).strftime("%Y-%m-%d")
+            day_tasks = [t for t in tasks if t.get("date_key") == dk]
+            day_earned = sum(t.get("points", 0) for t in day_tasks if t.get("status") in ("completed", "approved"))
+            days[dk] = {
+                "total": len(day_tasks),
+                "done": len([t for t in day_tasks if t.get("status") in ("completed", "approved", "skipped")]),
+                "earned": day_earned,
+            }
+
+        report.append({
+            "child": {
+                "id": k["id"], "name": k["name"],
+                "avatar_emoji": k.get("avatar_emoji"), "avatar_color": k.get("avatar_color"),
+                "mbti": k.get("mbti"), "points": k.get("points", 0),
+                "streak_days": k.get("streak_days", 0),
+                "piggy_save": k.get("piggy_save", 0),
+                "piggy_spend": k.get("piggy_spend", 0),
+                "piggy_share": k.get("piggy_share", 0),
+            },
+            "week_points": total_points,
+            "week_tasks_done": len(completed),
+            "week_tasks_total": len(tasks),
+            "days": days,
+        })
+
+    return {
+        "period_start": week_ago,
+        "period_end": today,
+        "children": report,
+    }
 
 
 # --------------- Personality (MBTI) ---------------
@@ -1123,10 +1182,28 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
         streak = 1
 
     points = task["points"]
+
+    # Three piggy banks: auto-split earned points into Save/Spend/Share
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    save_pct = int(config.get("piggy_save_pct", 40))
+    spend_pct = int(config.get("piggy_spend_pct", 40))
+    share_pct = int(config.get("piggy_share_pct", 20))
+    total_pct = save_pct + spend_pct + share_pct or 100
+    p_save = round(points * save_pct / total_pct)
+    p_spend = round(points * spend_pct / total_pct)
+    p_share = points - p_save - p_spend  # remainder goes to share to avoid rounding loss
+
     await db.children.update_one(
         {"id": task["child_id"]},
         {
-            "$inc": {"points": points, "lifetime_points": points, "tasks_completed": 1},
+            "$inc": {
+                "points": points,
+                "lifetime_points": points,
+                "tasks_completed": 1,
+                "piggy_save": p_save,
+                "piggy_spend": p_spend,
+                "piggy_share": p_share,
+            },
             "$set": {"last_completion_date": today, "streak_days": streak},
         },
     )
@@ -1276,6 +1353,9 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "rupiah_per_point": 100,
             "skip_cost_points": 20,
             "daily_point_goal": 50,
+            "piggy_save_pct": 40,
+            "piggy_spend_pct": 40,
+            "piggy_share_pct": 20,
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
@@ -1284,6 +1364,9 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "rupiah_per_point": int(config.get("rupiah_per_point", 100)),
         "skip_cost_points": int(config.get("skip_cost_points", 20)),
         "daily_point_goal": int(config.get("daily_point_goal", 50)),
+        "piggy_save_pct": int(config.get("piggy_save_pct", 40)),
+        "piggy_spend_pct": int(config.get("piggy_spend_pct", 40)),
+        "piggy_share_pct": int(config.get("piggy_share_pct", 20)),
     }
 
 

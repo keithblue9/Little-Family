@@ -490,6 +490,40 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.patch(f"/api/children/{syila['id']}", json={"savings_goal_name": "Boneka", "savings_goal_amount": 150000})
     check("goal: parent sets for child", r.status_code == 200 and r.json().get("savings_goal_amount") == 150000, r.text[:150])
 
+    # ================= 26. THREE PIGGY BANKS =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"piggy_save_pct": 50, "piggy_spend_pct": 30, "piggy_share_pct": 20})
+    r = c.get("/api/config")
+    check("piggy: config persists", r.json()["piggy_save_pct"] == 50 and r.json()["piggy_share_pct"] == 20)
+
+    # Create + complete + approve a bonus task and check piggy split
+    r = c.post("/api/tasks", json={"title": "PiggyTest", "points": 10, "target_children": [syila["id"]], "date_key": today_local, "is_bonus": True})
+    pt = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{pt['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    syi_before = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    save_before = syi_before.get("piggy_save", 0)
+    spend_before = syi_before.get("piggy_spend", 0)
+    share_before = syi_before.get("piggy_share", 0)
+    c.post(f"/api/tasks/{pt['id']}/approve")
+    syi_after = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("piggy: save increased", syi_after.get("piggy_save", 0) == save_before + 5, f"{save_before}->{syi_after.get('piggy_save')}")
+    check("piggy: spend increased", syi_after.get("piggy_spend", 0) == spend_before + 3, f"{spend_before}->{syi_after.get('piggy_spend')}")
+    check("piggy: share increased", syi_after.get("piggy_share", 0) == share_before + 2, f"{share_before}->{syi_after.get('piggy_share')}")
+
+    # ================= 27. WEEKLY REPORT =================
+    r = c.get("/api/family/weekly-report")
+    check("weekly: returns report", r.status_code == 200 and "children" in r.json() and len(r.json()["children"]) == 2, r.text[:200])
+    check("weekly: has period", "period_start" in r.json() and "period_end" in r.json())
+    report_child = r.json()["children"][0]
+    check("weekly: child has piggy info", "piggy_save" in report_child["child"], str(report_child["child"].keys()))
+    check("weekly: has days breakdown", len(report_child["days"]) == 7, str(len(report_child.get("days", {}))))
+    # kid can't see weekly report
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.get("/api/family/weekly-report")
+    check("weekly: kid blocked", r.status_code == 403)
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

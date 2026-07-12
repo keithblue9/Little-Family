@@ -21,6 +21,7 @@ import Achievements from "@/components/Achievements";
 import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import PushNotificationManager from "@/components/PushNotificationManager";
 import FamilyDayMonitor from "@/components/FamilyDayMonitor";
+import WeeklyReport from "@/components/WeeklyReport";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
@@ -40,6 +41,7 @@ const NAV = [
   { key: "activity", label: "Aktivitas", icon: Activity, testId: TEST_IDS.parent.tabActivity },
   { key: "leaderboard", label: "Papan Juara", icon: Users, testId: "tab-leaderboard" },
   { key: "analytics", label: "Analitik", icon: Activity, testId: "tab-analytics" },
+  { key: "weekly", label: "Laporan Mingguan", icon: Activity, testId: "tab-weekly" },
   { key: "settings", label: "Pengaturan", icon: Settings, testId: TEST_IDS.parent.tabSettings },
 ];
 
@@ -228,6 +230,7 @@ export default function ParentApp() {
             <Overview stats={stats} kids={children} tasks={tasks} pendingRedemptions={pendingRedemptions} onAddChild={() => setChildModal(true)} onNavigate={setView} />
           )}
           {view === "monitor" && <FamilyDayMonitor />}
+          {view === "weekly" && <WeeklyReport />}
           {view === "tasks" && (
             <TasksView
               kids={children}

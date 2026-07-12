@@ -1,7 +1,7 @@
 /* My Lil Famz — service worker
    Caches the app shell so it can be installed as a PWA and work offline.
    Bump CACHE_VERSION whenever you change index.html so users get the update. */
-const CACHE_VERSION = 'mylilfamz-v1';
+const CACHE_VERSION = 'mylilfamz-v4';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -29,7 +29,25 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
-  // Network-first for the HTML so updates show up; cache-first for everything else.
+
+  // API responses: stale-while-revalidate — return cached immediately,
+  // fetch fresh in background, update cache. If offline, cached version.
+  if (req.url.includes('/api/')) {
+    event.respondWith(
+      caches.open(CACHE_VERSION).then((cache) =>
+        cache.match(req).then((cached) => {
+          const fetchPromise = fetch(req).then((res) => {
+            if (res.ok) cache.put(req, res.clone());
+            return res;
+          }).catch(() => cached);
+          return cached || fetchPromise;
+        })
+      )
+    );
+    return;
+  }
+
+  // HTML: network-first so updates show up; fallback to cache.
   if (req.mode === 'navigate' || req.destination === 'document') {
     event.respondWith(
       fetch(req).then((res) => {

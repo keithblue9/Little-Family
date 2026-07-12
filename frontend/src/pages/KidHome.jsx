@@ -296,6 +296,16 @@ export default function KidHome() {
                                   {styleMeta(t.task_style).emoji} {styleMeta(t.task_style).label}
                                 </span>
                               )}
+                              {t.due_time && (
+                                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700">
+                                  🕒 sebelum {t.due_time}
+                                </span>
+                              )}
+                              {t.duration_minutes && (
+                                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">
+                                  ⏱️ {t.duration_minutes} menit
+                                </span>
+                              )}
                             </div>
                           </div>
 

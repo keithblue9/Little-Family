@@ -159,7 +159,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("Adskhan suggested challenge", "challenge" in r.json()["suggested_styles"], str(r.json().get("suggested_styles")))
 
     r = c.get(f"/api/children/{syila['id']}/personality")
-    check("Syila is ESFJ-T", r.json()["mbti"] == "ESFJ-T", str(r.json().get("mbti")))
+    check("Syila is ENFJ-T", r.json()["mbti"] == "ENFJ-T", str(r.json().get("mbti")))
     check("Syila suggested helper", "helper" in r.json()["suggested_styles"], str(r.json().get("suggested_styles")))
 
     # New task auto-inherits style from child MBTI when not specified
@@ -182,6 +182,49 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # invalid MBTI rejected by schema
     r = c.patch(f"/api/children/{syila['id']}", json={"mbti": "XXXX-Z"})
     check("invalid mbti rejected", r.status_code == 422, str(r.status_code))
+
+    # ---- 14. Task duration & due_time ----
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # both set
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Makan malam", "points": 5, "duration_minutes": 15, "due_time": "18:00"})
+    check("task with duration+time", r.status_code == 200 and r.json()["duration_minutes"] == 15 and r.json()["due_time"] == "18:00", r.text[:160])
+    dt_task = r.json()
+    # only duration
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Mandi", "points": 5, "duration_minutes": 10})
+    check("task duration only", r.json().get("duration_minutes") == 10 and r.json().get("due_time") is None, r.text[:160])
+    # only time
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Tidur", "points": 5, "due_time": "21:00"})
+    check("task time only", r.json().get("due_time") == "21:00" and r.json().get("duration_minutes") is None, r.text[:160])
+    # neither (both optional)
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Bebas", "points": 5})
+    check("task neither time nor duration", r.status_code == 200 and r.json().get("due_time") is None and r.json().get("duration_minutes") is None, r.text[:160])
+    # invalid time format rejected
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Salah", "points": 5, "due_time": "25:99"})
+    check("invalid time rejected", r.status_code == 422, str(r.status_code))
+    # duration out of range rejected
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Salah2", "points": 5, "duration_minutes": 99999})
+    check("duration out of range rejected", r.status_code == 422, str(r.status_code))
+
+    # ---- 15. Edit task (update duration/time) ----
+    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"duration_minutes": 20, "due_time": "17:30", "title": "Makan malam (edit)"})
+    check("edit task fields", r.status_code == 200 and r.json()["duration_minutes"] == 20 and r.json()["due_time"] == "17:30" and r.json()["title"] == "Makan malam (edit)", r.text[:180])
+    # clear the optional fields
+    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"duration_minutes": None, "due_time": None})
+    check("clear duration+time", r.status_code == 200 and r.json().get("duration_minutes") is None and r.json().get("due_time") is None, r.text[:180])
+    # edit invalid time rejected
+    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"due_time": "99:99"})
+    check("edit invalid time rejected", r.status_code == 422, str(r.status_code))
+
+    # ---- 16. Delete task ----
+    r = c.delete(f"/api/tasks/{dt_task['id']}")
+    check("delete task", r.status_code == 200, r.text[:120])
+    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"title": "x"})
+    check("deleted task gone", r.status_code == 404, str(r.status_code))
+
+    # kid cannot edit/delete tasks
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"child_id": syila["id"], "title": "x", "points": 1})
+    check("kid still can't create", r.status_code == 403, str(r.status_code))
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

@@ -5,6 +5,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 import os
+import re
 import uuid
 import logging
 import bcrypt
@@ -63,6 +64,18 @@ def now_iso() -> str:
 
 def new_id() -> str:
     return str(uuid.uuid4())
+
+
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def validate_due_time(value):
+    """Accept 'HH:MM' 24-hour strings, or None. Raises 422-style error otherwise."""
+    if value in (None, ""):
+        return None
+    if not _TIME_RE.match(value):
+        raise HTTPException(status_code=422, detail="Format jam harus HH:MM (contoh 18:00)")
+    return value
 
 
 # --------------- Auth Dependency ---------------
@@ -182,6 +195,8 @@ class TaskInput(BaseModel):
     points: int = Field(ge=0, le=1000, default=10)
     penalty_points: int = Field(ge=0, le=1000, default=0)
     due_date: Optional[str] = None  # ISO date string
+    due_time: Optional[str] = None  # "HH:MM" 24h deadline within the day, optional
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)  # optional expected duration
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
@@ -195,6 +210,8 @@ class TaskUpdate(BaseModel):
     points: Optional[int] = None
     penalty_points: Optional[int] = None
     due_date: Optional[str] = None
+    due_time: Optional[str] = None
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
     recurrence: Optional[Literal["none", "daily", "weekly"]] = None
     icon: Optional[str] = None
     order: Optional[int] = Field(default=None, ge=1)
@@ -533,6 +550,16 @@ PERSONALITY_PROFILES = {
         "motivation": "Keluarga senang dengan bantuanmu! Yuk selesaikan misi ini bersama. 🤗",
         "encourage_done": "Kamu luar biasa membantu! Semua bangga padamu. 🌟",
     },
+    "ENFJ-T": {
+        "nickname": "Sang Pemimpin Hangat",
+        "emoji": "🌟",
+        "color": "#F472B6",
+        "summary": "Karismatik, empatik, dan senang menginspirasi serta membantu orang lain.",
+        "likes": ["Membantu & menyemangati orang lain", "Tugas bersama keluarga", "Apresiasi & pengakuan tulus"],
+        "best_styles": ["helper", "social", "creative"],
+        "motivation": "Kamu pemimpin yang hangat! Semangatmu menular ke seluruh keluarga. 🌟",
+        "encourage_done": "Luar biasa! Kepemimpinan dan kebaikanmu membuat semua bangga. 💫",
+    },
 }
 
 STYLE_META = {
@@ -706,6 +733,8 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
         "points": payload.points,
         "penalty_points": payload.penalty_points,
         "due_date": payload.due_date,
+        "due_time": validate_due_time(payload.due_time),
+        "duration_minutes": payload.duration_minutes,
         "recurrence": payload.recurrence,
         "icon": payload.icon,
         "order": order,
@@ -726,7 +755,21 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+
+    # Fields the parent is allowed to explicitly clear (set back to empty).
+    clearable = {"due_date", "due_time", "duration_minutes", "task_style"}
+    raw = payload.model_dump(exclude_unset=True)
+
+    updates = {}
+    for k, v in raw.items():
+        if v is not None:
+            updates[k] = v
+        elif k in clearable:
+            updates[k] = None  # explicit clear
+
+    if "due_time" in updates and updates["due_time"] is not None:
+        updates["due_time"] = validate_due_time(updates["due_time"])
+
     if updates:
         await db.tasks.update_one({"id": task_id}, {"$set": updates})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
@@ -1418,7 +1461,7 @@ async def seed_default_family():
     ]
     children = [
         {"id": new_id(), "name": "Adskhan", "role": "child", "age": 11, "avatar_emoji": "🦸‍♂️", "avatar_color": "#4DB8FF", "mbti": "INTJ-T"},
-        {"id": new_id(), "name": "Syila", "role": "child", "age": 8, "avatar_emoji": "🦋", "avatar_color": "#F472B6", "mbti": "ESFJ-T"},
+        {"id": new_id(), "name": "Syila", "role": "child", "age": 8, "avatar_emoji": "🦋", "avatar_color": "#F472B6", "mbti": "ENFJ-T"},
     ]
 
     for p in parents:
@@ -1476,7 +1519,11 @@ async def migrate_existing_data():
 
 
     # 3. Assign personality types to the two known children if not yet set.
-    mbti_by_name = {"Adskhan": "INTJ-T", "Syila": "ESFJ-T"}
+    #    Syila was briefly seeded as ESFJ-T; correct her to ENFJ-T.
+    await db.children.update_many({"name": "Syila", "mbti": "ESFJ-T"}, {"$set": {"mbti": "ENFJ-T"}})
+    await db.members.update_many({"name": "Syila", "role": "child", "mbti": "ESFJ-T"}, {"$set": {"mbti": "ENFJ-T"}})
+
+    mbti_by_name = {"Adskhan": "INTJ-T", "Syila": "ENFJ-T"}
     for name, mbti in mbti_by_name.items():
         await db.children.update_many(
             {"name": name, "$or": [{"mbti": {"$exists": False}}, {"mbti": None}]},
@@ -1486,6 +1533,14 @@ async def migrate_existing_data():
             {"name": name, "role": "child", "$or": [{"mbti": {"$exists": False}}, {"mbti": None}]},
             {"$set": {"mbti": mbti}},
         )
+
+    # 4. Ensure new task fields exist on older tasks.
+    await db.tasks.update_many(
+        {"due_time": {"$exists": False}}, {"$set": {"due_time": None}}
+    )
+    await db.tasks.update_many(
+        {"duration_minutes": {"$exists": False}}, {"$set": {"duration_minutes": None}}
+    )
 
 
 # --------------- Startup ---------------

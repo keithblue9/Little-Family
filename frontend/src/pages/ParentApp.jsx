@@ -85,6 +85,7 @@ export default function ParentApp() {
   // Modals
   const [childModal, setChildModal] = useState(false);
   const [taskModal, setTaskModal] = useState(false);
+  const [editingTask, setEditingTask] = useState(null);
   const [rewardModal, setRewardModal] = useState(false);
   const [consModal, setConsModal] = useState(false);
   const [applyConsModal, setApplyConsModal] = useState(null);
@@ -225,7 +226,8 @@ export default function ParentApp() {
               kids={children}
               tasks={filteredTasks}
               selectedChildId={selectedChildId}
-              onAddTask={() => setTaskModal(true)}
+              onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
+              onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
               onRefresh={load}
               onApplyConsequence={(task) => setApplyConsModal({ task })}
               onAddChild={() => setChildModal(true)}
@@ -285,10 +287,11 @@ export default function ParentApp() {
       <ChildFormModal open={childModal} onClose={() => setChildModal(false)} onSaved={load} />
       <TaskFormModal
         open={taskModal}
-        onClose={() => setTaskModal(false)}
+        onClose={() => { setTaskModal(false); setEditingTask(null); }}
         kids={children}
         defaultChildId={selectedChildId}
         onSaved={load}
+        editTask={editingTask}
       />
       <RewardFormModal open={rewardModal} onClose={() => setRewardModal(false)} onSaved={load} />
       <ConsequenceFormModal open={consModal} onClose={() => setConsModal(false)} onSaved={load} />
@@ -396,7 +399,7 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
 }
 
 // ─────────────────────────────────────────────────────────
-function TasksView({ kids, tasks, selectedChildId, onAddTask, onRefresh, onApplyConsequence, onAddChild }) {
+function TasksView({ kids, tasks, selectedChildId, onAddTask, onEditTask, onRefresh, onApplyConsequence, onAddChild }) {
   const grouped = useMemo(() => {
     const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
     const pending = tasks.filter((t) => t.status === "pending" || t.status === "rejected").sort(byOrder);
@@ -417,23 +420,32 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onRefresh, onApply
 
   const approve = (t) => act(async () => {
     const { data } = await api.post(`/tasks/${t.id}/approve`);
-    toast.success(`Approved! +${t.points} points`);
+    toast.success(`Disetujui! +${t.points} poin`);
     if (data.new_badges?.length) {
-      data.new_badges.forEach((b) => toast.success(`New badge unlocked: ${b.name} 🏆`));
+      data.new_badges.forEach((b) => toast.success(`Badge baru terbuka: ${b.name} 🏆`));
     }
   });
-  const reject = (t) => act(async () => { await api.post(`/tasks/${t.id}/reject`); toast.info("Sent back to your kid"); });
-  const miss = (t) => act(async () => { await api.post(`/tasks/${t.id}/miss`); toast(`Marked missed${t.penalty_points ? ` · -${t.penalty_points} pts` : ""}`); });
-  const del = (t) => act(async () => { await api.delete(`/tasks/${t.id}`); toast.success("Task deleted"); });
+  const reject = (t) => act(async () => { await api.post(`/tasks/${t.id}/reject`); toast.info("Dikembalikan ke anak"); });
+  const miss = (t) => act(async () => { await api.post(`/tasks/${t.id}/miss`); toast(`Ditandai terlewat${t.penalty_points ? ` · -${t.penalty_points} poin` : ""}`); });
+  const del = (t) => act(async () => {
+    if (!window.confirm(`Hapus tugas "${t.title}"?`)) return;
+    await api.delete(`/tasks/${t.id}`); toast.success("Tugas dihapus");
+  });
+
+  const editBtn = (t) => (
+    <button onClick={() => onEditTask(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-sm" title="Edit tugas">
+      <Settings className="w-4 h-4" strokeWidth={2.5} /> Edit
+    </button>
+  );
 
   if (kids.length === 0) {
     return (
       <div className="bg-white rounded-2xl p-10 text-center border border-slate-200">
         <Users className="w-10 h-10 text-slate-300 mx-auto mb-3" strokeWidth={2.5} />
-        <div className="font-parent font-bold text-lg text-slate-900">Add a child first</div>
-        <div className="text-sm text-slate-500 mb-4">Tasks need to be assigned to a child.</div>
+        <div className="font-parent font-bold text-lg text-slate-900">Tambah anak dulu</div>
+        <div className="text-sm text-slate-500 mb-4">Tugas harus diberikan ke seorang anak.</div>
         <button onClick={onAddChild} className={btnPrimary} data-testid={TEST_IDS.parent.addChildBtn}>
-          <Plus className="w-4 h-4" strokeWidth={2.5} /> Add child
+          <Plus className="w-4 h-4" strokeWidth={2.5} /> Tambah anak
         </button>
       </div>
     );
@@ -443,35 +455,36 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onRefresh, onApply
     <div className="space-y-6">
       <div className="flex justify-end">
         <button onClick={onAddTask} data-testid={TEST_IDS.parent.addTaskBtn} className={btnPrimary}>
-          <Plus className="w-4 h-4" strokeWidth={2.5} /> New task
+          <Plus className="w-4 h-4" strokeWidth={2.5} /> Tugas baru
         </button>
       </div>
 
       {grouped.awaiting.length > 0 && (
-        <Section title="⏳ Awaiting approval" count={grouped.awaiting.length}>
+        <Section title="⏳ Menunggu persetujuan" count={grouped.awaiting.length}>
           {grouped.awaiting.map((t) => (
             <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name}>
               <button onClick={() => approve(t)} data-testid={`${TEST_IDS.parent.approveTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
-                <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Approve
+                <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Setujui
               </button>
               <button onClick={() => reject(t)} data-testid={`${TEST_IDS.parent.rejectTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-600 font-semibold px-3 py-1.5 rounded-lg text-sm">
-                <XCircle className="w-4 h-4" strokeWidth={2.5} /> Reject
+                <XCircle className="w-4 h-4" strokeWidth={2.5} /> Tolak
               </button>
             </TaskRow>
           ))}
         </Section>
       )}
 
-      <Section title="📋 Pending" count={grouped.pending.length}>
+      <Section title="📋 Aktif" count={grouped.pending.length}>
         {grouped.pending.length === 0 ? (
-          <div className="text-sm text-slate-400 py-3">No pending tasks.</div>
+          <div className="text-sm text-slate-400 py-3">Tidak ada tugas aktif.</div>
         ) : grouped.pending.map((t) => (
           <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name}>
+            {editBtn(t)}
             <button onClick={() => miss(t)} data-testid={`${TEST_IDS.parent.missTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-white border border-red-200 text-red-600 font-semibold px-3 py-1.5 rounded-lg text-sm">
-              <AlertTriangle className="w-4 h-4" strokeWidth={2.5} /> Missed
+              <AlertTriangle className="w-4 h-4" strokeWidth={2.5} /> Terlewat
             </button>
             <button onClick={() => onApplyConsequence(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-sm">
-              <ShieldAlert className="w-4 h-4" strokeWidth={2.5} /> Consequence
+              <ShieldAlert className="w-4 h-4" strokeWidth={2.5} /> Konsekuensi
             </button>
             <button onClick={() => del(t)} data-testid={`${TEST_IDS.parent.deleteTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-red-50 text-red-500">
               <Trash2 className="w-4 h-4" strokeWidth={2.5} />
@@ -481,20 +494,21 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onRefresh, onApply
       </Section>
 
       {grouped.done.length > 0 && (
-        <Section title="✅ Completed" count={grouped.done.length}>
+        <Section title="✅ Selesai" count={grouped.done.length}>
           {grouped.done.slice(0, 10).map((t) => (
-            <TaskRow key={t.id} task={t} childName={children.find((c) => c.id === t.child_id)?.name} dim>
-              <span className="text-sm text-slate-400">+{t.points} pts</span>
+            <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name} dim>
+              <span className="text-sm text-slate-400">+{t.points} poin</span>
             </TaskRow>
           ))}
         </Section>
       )}
 
       {grouped.missed.length > 0 && (
-        <Section title="❌ Missed" count={grouped.missed.length}>
+        <Section title="❌ Terlewat" count={grouped.missed.length}>
           {grouped.missed.slice(0, 10).map((t) => (
-            <TaskRow key={t.id} task={t} childName={children.find((c) => c.id === t.child_id)?.name} dim>
-              <span className="text-sm text-red-500">−{t.penalty_points || 0} pts</span>
+            <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name} dim>
+              {editBtn(t)}
+              <span className="text-sm text-red-500">−{t.penalty_points || 0} poin</span>
             </TaskRow>
           ))}
         </Section>
@@ -530,8 +544,10 @@ function TaskRow({ task, childName, children, dim = false }) {
           <span>·</span>
           <span>+{task.points} pts</span>
           {task.penalty_points > 0 && <><span>·</span><span>penalty −{task.penalty_points}</span></>}
-          {task.due_date && <><span>·</span><span>due {new Date(task.due_date).toLocaleDateString()}</span></>}
-          {task.recurrence !== "none" && <><span>·</span><span>{task.recurrence}</span></>}
+          {task.due_date && <><span>·</span><span>tgl {new Date(task.due_date).toLocaleDateString("id-ID")}</span></>}
+          {task.due_time && <><span>·</span><span className="text-indigo-600 font-semibold">🕒 sblm {task.due_time}</span></>}
+          {task.duration_minutes && <><span>·</span><span className="text-indigo-600 font-semibold">⏱️ {task.duration_minutes} mnt</span></>}
+          {task.recurrence !== "none" && <><span>·</span><span>{task.recurrence === "daily" ? "harian" : "mingguan"}</span></>}
           {task.status === "skipped" && <><span>·</span><span className="text-slate-400">dilewati</span></>}
         </div>
       </div>
@@ -925,12 +941,15 @@ function ChildFormModal({ open, onClose, onSaved }) {
   );
 }
 
-function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
+function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask }) {
+  const isEdit = !!editTask;
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
   const [points, setPoints] = useState(10);
   const [penalty, setPenalty] = useState(0);
   const [dueDate, setDueDate] = useState("");
+  const [dueTime, setDueTime] = useState("");
+  const [duration, setDuration] = useState("");
   const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
   const [taskStyle, setTaskStyle] = useState("");
@@ -938,29 +957,54 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (open) {
+    if (!open) return;
+    if (editTask) {
+      setChildId(editTask.child_id);
+      setTitle(editTask.title || "");
+      setDesc(editTask.description || "");
+      setPoints(editTask.points ?? 10);
+      setPenalty(editTask.penalty_points ?? 0);
+      setDueDate(editTask.due_date ? new Date(editTask.due_date).toISOString().slice(0, 10) : "");
+      setDueTime(editTask.due_time || "");
+      setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
+      setRecurrence(editTask.recurrence || "none");
+      setOrder(editTask.order ? String(editTask.order) : "");
+      setTaskStyle(editTask.task_style || "");
+    } else {
       setChildId(defaultChildId || (kids[0] && kids[0].id) || "");
-      setTitle(""); setDesc(""); setPoints(10); setPenalty(0); setDueDate(""); setRecurrence("none"); setOrder(""); setTaskStyle("");
+      setTitle(""); setDesc(""); setPoints(10); setPenalty(0);
+      setDueDate(""); setDueTime(""); setDuration("");
+      setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
-  }, [open, defaultChildId, kids]);
+  }, [open, defaultChildId, kids, editTask]);
 
   const submit = async () => {
-    if (!title.trim()) return toast.error("Title required");
-    if (!childId) return toast.error("Pick a child");
+    if (!title.trim()) return toast.error("Judul tugas wajib diisi");
+    if (!childId) return toast.error("Pilih anak");
+    if (dueTime && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(dueTime)) {
+      return toast.error("Format jam harus HH:MM (contoh 18:00)");
+    }
     setSaving(true);
     try {
-      await api.post("/tasks", {
-        child_id: childId,
+      const body = {
         title: title.trim(),
         description: desc,
         points: Number(points) || 0,
         penalty_points: Number(penalty) || 0,
         due_date: dueDate ? new Date(dueDate).toISOString() : null,
+        due_time: dueTime || null,
+        duration_minutes: duration ? Number(duration) : null,
         recurrence,
         order: order ? Number(order) : null,
         task_style: taskStyle || null,
-      });
-      toast.success("Task created");
+      };
+      if (isEdit) {
+        await api.patch(`/tasks/${editTask.id}`, body);
+        toast.success("Tugas diperbarui");
+      } else {
+        await api.post("/tasks", { child_id: childId, ...body });
+        toast.success("Tugas dibuat");
+      }
       onSaved();
       onClose();
     } catch (e) { toast.error(formatApiError(e)); }
@@ -968,46 +1012,70 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="New task">
+    <Modal open={open} onClose={onClose} title={isEdit ? "Edit tugas" : "Tugas baru"}>
       <div className="space-y-4">
         <div>
-          <label className={labelClass}>Task</label>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputClass} placeholder="Make the bed" data-testid="task-title-input" />
+          <label className={labelClass}>Tugas</label>
+          <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputClass} placeholder="Rapikan tempat tidur" data-testid="task-title-input" />
         </div>
         <div>
-          <label className={labelClass}>Description (optional)</label>
+          <label className={labelClass}>Deskripsi (opsional)</label>
           <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} />
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className={labelClass}>Assign to</label>
-            <select value={childId} onChange={(e) => setChildId(e.target.value)} className={inputClass} data-testid="task-child-select">
+            <label className={labelClass}>Untuk anak</label>
+            <select value={childId} onChange={(e) => setChildId(e.target.value)} className={inputClass} data-testid="task-child-select" disabled={isEdit}>
               {kids.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
           </div>
           <div>
-            <label className={labelClass}>Repeat</label>
+            <label className={labelClass}>Ulangi</label>
             <select value={recurrence} onChange={(e) => setRecurrence(e.target.value)} className={inputClass}>
-              <option value="none">Once</option>
-              <option value="daily">Daily</option>
-              <option value="weekly">Weekly</option>
+              <option value="none">Sekali</option>
+              <option value="daily">Harian</option>
+              <option value="weekly">Mingguan</option>
             </select>
           </div>
         </div>
         <div className="grid grid-cols-3 gap-3">
           <div>
-            <label className={labelClass}>Points</label>
+            <label className={labelClass}>Poin</label>
             <input type="number" min="0" value={points} onChange={(e) => setPoints(e.target.value)} className={inputClass} data-testid="task-points-input" />
           </div>
           <div>
-            <label className={labelClass}>Penalty</label>
+            <label className={labelClass}>Penalti</label>
             <input type="number" min="0" value={penalty} onChange={(e) => setPenalty(e.target.value)} className={inputClass} />
           </div>
           <div>
-            <label className={labelClass}>Due date</label>
+            <label className={labelClass}>Tanggal (opsional)</label>
             <input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className={inputClass} />
           </div>
         </div>
+
+        {/* Duration & time — both optional, either or both */}
+        <div className="grid grid-cols-2 gap-3 bg-slate-50 rounded-xl p-3 border border-slate-100">
+          <div>
+            <label className={labelClass}>⏱️ Durasi (menit, opsional)</label>
+            <input
+              type="number" min="1" max="1440" value={duration}
+              onChange={(e) => setDuration(e.target.value.replace(/\D/g, ""))}
+              className={inputClass}
+              placeholder="mis. 15"
+            />
+            <p className="text-xs text-slate-400 mt-1">Berapa lama tugas dikerjakan.</p>
+          </div>
+          <div>
+            <label className={labelClass}>🕒 Harus sebelum jam (opsional)</label>
+            <input
+              type="time" value={dueTime}
+              onChange={(e) => setDueTime(e.target.value)}
+              className={inputClass}
+            />
+            <p className="text-xs text-slate-400 mt-1">Batas waktu dalam sehari, mis. 18:00.</p>
+          </div>
+        </div>
+
         <div>
           <label className={labelClass}>Urutan misi (opsional)</label>
           <input
@@ -1029,13 +1097,13 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
             ))}
           </select>
           <p className="text-xs text-slate-400 mt-1">
-            Kalau dikosongkan, gaya dipilih otomatis dari tipe kepribadian anak (mis. INTJ-T → Tantangan, ESFJ-T → Membantu).
+            Kalau dikosongkan, gaya dipilih otomatis dari tipe kepribadian anak (mis. INTJ-T → Tantangan, ENFJ-T → Membantu).
           </p>
         </div>
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Cancel</button>
+          <button onClick={onClose} className={btnGhost}>Batal</button>
           <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="task-submit-btn">
-            {saving ? "Saving…" : "Create task"}
+            {saving ? "Menyimpan…" : isEdit ? "Simpan perubahan" : "Buat tugas"}
           </button>
         </div>
       </div>

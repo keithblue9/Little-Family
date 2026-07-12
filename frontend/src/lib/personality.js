@@ -29,6 +29,15 @@ export const PERSONALITY_PROFILES = {
     best_styles: ["helper", "social", "routine"],
     motivation: "Keluarga senang dengan bantuanmu! Yuk selesaikan misi ini bersama. 🤗",
   },
+  "ENFJ-T": {
+    nickname: "Sang Pemimpin Hangat",
+    emoji: "🌟",
+    color: "#F472B6",
+    summary: "Karismatik, empatik, dan senang menginspirasi serta membantu orang lain.",
+    likes: ["Membantu & menyemangati orang lain", "Tugas bersama keluarga", "Apresiasi & pengakuan tulus"],
+    best_styles: ["helper", "social", "creative"],
+    motivation: "Kamu pemimpin yang hangat! Semangatmu menular ke seluruh keluarga. 🌟",
+  },
 };
 
 // All 32 MBTI codes for the parent's dropdown.

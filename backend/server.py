@@ -778,7 +778,11 @@ def validate_date_key(value):
 
 
 def _today_key() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Family lives in Indonesia (GMT+7). Using UTC here caused tasks created
+    # after local midnight to be filed under the previous day. The frontend
+    # sends explicit local date_keys for anything user-facing; this is only a
+    # fallback, but it should still match the family's wall clock.
+    return (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%Y-%m-%d")
 
 
 async def _build_task_doc(
@@ -979,6 +983,37 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
     return open_tasks[0] if open_tasks else None
 
 
+def _now_local():
+    """Family wall-clock (GMT+7)."""
+    return datetime.now(timezone.utc) + timedelta(hours=7)
+
+
+def _check_time_window(task):
+    """Enforce that a time-boxed task is only started within its window on its
+    own day. Mirrors the frontend gate so kids can't bypass via direct API."""
+    due_time = task.get("due_time")
+    date_key = task.get("date_key")
+    if not due_time or not date_key:
+        return  # no time constraint
+    now = _now_local()
+    today = now.strftime("%Y-%m-%d")
+    if date_key != today:
+        # Only enforce the intraday window on the task's actual day. For past
+        # days we simply block (can't act on history); future days blocked too.
+        if date_key < today:
+            raise HTTPException(status_code=409, detail="Misi ini sudah lewat harinya")
+        raise HTTPException(status_code=409, detail="Misi ini belum waktunya (hari yang akan datang)")
+    dh, dm = map(int, due_time.split(":"))
+    due_min = dh * 60 + dm
+    now_min = now.hour * 60 + now.minute
+    dur = task.get("duration_minutes") or 120
+    open_min = due_min - dur
+    if now_min < open_min:
+        raise HTTPException(status_code=409, detail=f"Belum waktunya — misi ini bisa dimulai menjelang jam {due_time}")
+    if now_min > due_min:
+        raise HTTPException(status_code=409, detail=f"Waktunya sudah lewat (jam {due_time})")
+
+
 @api.post("/tasks/{task_id}/start")
 async def start_task_timer(task_id: str, user: dict = Depends(get_current_user)):
     """Kid clicks Start → records timer_started_at. Only the next actionable
@@ -989,7 +1024,8 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Misi tidak bisa dimulai")
 
-    # Bonuses can be started any time. Required tasks must be the next in line.
+    # Bonuses can be started any time (subject to time window). Required tasks
+    # must be the next in line.
     if not task.get("is_bonus"):
         nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
         if nxt and nxt["id"] != task_id:
@@ -997,6 +1033,8 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
                 status_code=409,
                 detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
             )
+
+    _check_time_window(task)
 
     await db.tasks.update_one({"id": task_id}, {"$set": {"timer_started_at": now_iso()}})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})

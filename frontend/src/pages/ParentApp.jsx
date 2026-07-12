@@ -24,6 +24,7 @@ import FamilyDayMonitor from "@/components/FamilyDayMonitor";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
+import { todayKey } from "@/lib/dates";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -968,7 +969,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [desc, setDesc] = useState("");
   const [points, setPoints] = useState(10);
   const [penalty, setPenalty] = useState(0);
-  const [dateKey, setDateKey] = useState(new Date().toISOString().slice(0, 10));
+  const [dateKey, setDateKey] = useState(todayKey());
   const [dueTime, setDueTime] = useState("");
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
@@ -989,7 +990,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setDesc(editTask.description || "");
       setPoints(editTask.points ?? 10);
       setPenalty(editTask.penalty_points ?? 0);
-      setDateKey(editTask.date_key || new Date().toISOString().slice(0, 10));
+      setDateKey(editTask.date_key || todayKey());
       setDueTime(editTask.due_time || "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
@@ -999,7 +1000,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
     } else {
       setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
       setTitle(""); setDesc(""); setPoints(10); setPenalty(0);
-      setDateKey(new Date().toISOString().slice(0, 10));
+      setDateKey(todayKey());
       setDueTime(""); setDuration(""); setIsBonus(false);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }

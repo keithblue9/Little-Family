@@ -1,28 +1,23 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Calendar, Target, Sparkles, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES } from "@/lib/questThemes";
 import { styleMeta } from "@/lib/personality";
-
-const todayKey = () => new Date().toISOString().slice(0, 10);
-const shiftDate = (key, days) => {
-  const d = new Date(key + "T00:00:00");
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
-};
-const humanDate = (key) => {
-  if (key === todayKey()) return "Hari Ini";
-  const d = new Date(key + "T00:00:00");
-  return d.toLocaleDateString("id-ID", { weekday: "long", day: "numeric", month: "long" });
-};
+import { todayKey, shiftDateKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
 
 export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [dateKey, setDateKey] = useState(todayKey());
   const [progress, setProgress] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState(null);
+  // Live clock — re-renders every 30s so time-gated tasks unlock/lock in real time.
+  const [nowHHMM, setNowHHMM] = useState(localTimeHHMM());
+  useEffect(() => {
+    const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
+    return () => clearInterval(t);
+  }, []);
 
   const load = useCallback(async () => {
     if (!child?.id) return;
@@ -90,25 +85,46 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   };
 
   const isToday = dateKey === todayKey();
-  const isFuture = dateKey > todayKey();
+  const isFuture = isFutureDate(dateKey);
+
+  // Real-time gate for a single task on TODAY. A task with a due_time can only
+  // be worked on within a sensible window: from (due_time − lead) up to due_time.
+  // Lead defaults to the task's own duration, else 2 hours.
+  // Returns { allowed, reason } where reason is "early" | "late" | null.
+  const timeGate = (task) => {
+    if (!isToday) {
+      // Past days: viewing history only, can't act. Future: can't act.
+      return { allowed: false, reason: isFuture ? "future" : "past" };
+    }
+    if (!task.due_time) return { allowed: true, reason: null }; // no time constraint
+    const [dh, dm] = task.due_time.split(":").map(Number);
+    const [nh, nm] = nowHHMM.split(":").map(Number);
+    const dueMin = dh * 60 + dm;
+    const nowMin = nh * 60 + nm;
+    const lead = task.duration_minutes && task.duration_minutes > 0 ? task.duration_minutes : 120;
+    const openMin = dueMin - lead;
+    if (nowMin < openMin) return { allowed: false, reason: "early" };
+    if (nowMin > dueMin) return { allowed: false, reason: "late" };
+    return { allowed: true, reason: null };
+  };
 
   return (
     <div className="space-y-4">
       {/* Date navigation */}
       <div className="flex items-center gap-2 bg-white rounded-2xl px-3 py-2 border-2 border-slate-100 chunky-shadow">
         <button
-          onClick={() => setDateKey(shiftDate(dateKey, -1))}
+          onClick={() => setDateKey(shiftDateKey(dateKey, -1))}
           className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600"
         >
           <ChevronLeft className="w-5 h-5" />
         </button>
         <div className="flex-1 text-center">
-          <div className="font-fun font-bold text-slate-900 text-sm">{humanDate(dateKey)}</div>
+          <div className="font-fun font-bold text-slate-900 text-sm">{humanDateKey(dateKey)}</div>
           <div className="text-xs text-slate-400">{dateKey}</div>
         </div>
         <button
-          onClick={() => setDateKey(shiftDate(dateKey, 1))}
-          className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600"
+          onClick={() => setDateKey(shiftDateKey(dateKey, 1))}
+          className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600 disabled:opacity-40"
           disabled={isFuture}
         >
           <ChevronRight className="w-5 h-5" />
@@ -228,9 +244,10 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
               </div>
 
               <div className="relative z-10 space-y-2">
-                {required.map((t, idx) => {
+                {required.map((t) => {
                   const isActive = next?.id === t.id;
                   const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
+                  const gate = timeGate(t);
                   return (
                     <QuestCard
                       key={t.id}
@@ -239,8 +256,9 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       isDone={isDone}
                       theme={theme}
                       busy={busyId === t.id}
-                      canStart={isActive && !t.timer_started_at && !isFuture}
-                      canFinish={isActive && !!t.timer_started_at && !isFuture}
+                      gate={gate}
+                      canStart={isActive && !t.timer_started_at && gate.allowed}
+                      canFinish={isActive && !!t.timer_started_at && gate.allowed}
                       onStart={() => startTimer(t)}
                       onFinish={() => finishTask(t)}
                       onSkip={() => skipTask(t)}
@@ -262,6 +280,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
               <div className="space-y-2">
                 {bonus.map((t) => {
                   const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
+                  const gate = timeGate(t);
                   return (
                     <QuestCard
                       key={t.id}
@@ -270,8 +289,9 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       isDone={isDone}
                       theme={theme}
                       busy={busyId === t.id}
-                      canStart={!isDone && !t.timer_started_at && !isFuture}
-                      canFinish={!isDone && !!t.timer_started_at && !isFuture}
+                      gate={gate}
+                      canStart={!isDone && !t.timer_started_at && gate.allowed}
+                      canFinish={!isDone && !!t.timer_started_at && gate.allowed}
                       onStart={() => startTimer(t)}
                       onFinish={() => finishTask(t)}
                       isBonus
@@ -306,11 +326,17 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 }
 
 /** ==================== QuestCard with live timer ==================== */
-function QuestCard({ task, isActive, isDone, theme, busy, canStart, canFinish, onStart, onFinish, onSkip, isBonus }) {
+function QuestCard({ task, isActive, isDone, theme, busy, gate, canStart, canFinish, onStart, onFinish, onSkip, isBonus }) {
   const c = theme.colors;
   const bg = isDone ? c.nodeDone : isActive ? c.node : c.nodeLocked;
   const icon = isDone ? theme.doneIcon : isActive ? theme.activeIcon : theme.lockedIcon;
   const style = task.task_style ? styleMeta(task.task_style) : null;
+  const started = !!task.timer_started_at;
+
+  // Gate messaging for time-locked tasks (today only)
+  const gateReason = gate?.reason;
+  const showEarly = isActive && !isDone && !started && gateReason === "early";
+  const showLate = isActive && !isDone && !started && gateReason === "late";
 
   return (
     <motion.div
@@ -324,8 +350,8 @@ function QuestCard({ task, isActive, isDone, theme, busy, canStart, canFinish, o
       }}
     >
       <motion.div
-        animate={isActive && !isDone ? { scale: [1, 1.05, 1] } : {}}
-        transition={isActive ? { duration: 2, repeat: Infinity } : {}}
+        animate={isActive && !isDone && started ? { scale: [1, 1.05, 1] } : {}}
+        transition={isActive && started ? { duration: 2, repeat: Infinity } : {}}
         className="w-12 h-12 md:w-14 md:h-14 rounded-full flex items-center justify-center text-2xl md:text-3xl shrink-0"
         style={{ background: bg, color: "white", boxShadow: isActive ? `0 4px 16px ${bg}80` : "0 2px 6px rgba(0,0,0,0.15)" }}
       >
@@ -370,8 +396,18 @@ function QuestCard({ task, isActive, isDone, theme, busy, canStart, canFinish, o
             </span>
           )}
         </div>
-        {task.timer_started_at && !isDone && (
+        {started && !isDone && (
           <LiveTimer startedAt={task.timer_started_at} durationMinutes={task.duration_minutes} />
+        )}
+        {showEarly && (
+          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
+            🔒 Belum waktunya (mulai dekat jam {task.due_time})
+          </div>
+        )}
+        {showLate && (
+          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-600">
+            ⌛ Waktunya sudah lewat (jam {task.due_time})
+          </div>
         )}
       </div>
 
@@ -444,6 +480,7 @@ function LiveTimer({ startedAt, durationMinutes }) {
   );
 }
 
-// AnimatePresence not used here, just keep exports minimal
-export { QuestCard };
-void AnimatePresence;
+function LiveTimerEnd() {
+  return null;
+}
+export { LiveTimerEnd };

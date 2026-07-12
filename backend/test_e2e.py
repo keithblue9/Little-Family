@@ -393,6 +393,51 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get("/api/auth/me")
     check("lifecycle: session survives refresh", r.status_code == 200 and r.json()["id"] == adskhan["id"], r.text[:200])
 
+    # ================= 23. REAL-TIME TIME WINDOW =================
+    # A task due far in the future today can't be started yet ("too early");
+    # a task whose due_time already passed can't be started ("too late").
+    import datetime as _dt
+    now_local = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=7)
+    today_local = now_local.strftime("%Y-%m-%d")
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # Task due 2 min ago -> too late
+    late_min = (now_local - _dt.timedelta(minutes=2))
+    late_hhmm = late_min.strftime("%H:%M")
+    r = c.post("/api/tasks", json={
+        "title": "Bangun pagi", "points": 5, "date_key": today_local,
+        "target_children": [syila["id"]], "due_time": late_hhmm, "duration_minutes": 10,
+    })
+    late_task = r.json()
+    # Task due in 6 hours -> too early (window is due-duration .. due)
+    early_dt = (now_local + _dt.timedelta(hours=6))
+    early_hhmm = early_dt.strftime("%H:%M")
+    r = c.post("/api/tasks", json={
+        "title": "Mandi sore", "points": 5, "date_key": today_local,
+        "target_children": [syila["id"]], "due_time": early_hhmm, "duration_minutes": 10,
+    })
+    early_task = r.json()
+
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    # NOTE: sequence rule — need these to be the actionable ones. Since Syila
+    # may have other pending tasks from earlier sections, we just assert the
+    # time-gate errors specifically (409) when we attempt them directly.
+    r = c.post(f"/api/tasks/{late_task['id']}/start")
+    check("time-gate: too-late task blocked", r.status_code == 409, f"{r.status_code} {r.text[:100]}")
+    r = c.post(f"/api/tasks/{early_task['id']}/start")
+    check("time-gate: too-early task blocked", r.status_code == 409, f"{r.status_code} {r.text[:100]}")
+
+    # A task with no due_time is not time-gated (only sequence-gated)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={
+        "title": "Tugas bebas waktu", "points": 5, "date_key": today_local,
+        "target_children": [syila["id"]], "is_bonus": True,  # bonus to skip sequence
+    })
+    free_task = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{free_task['id']}/start")
+    check("time-gate: no-due-time bonus startable now", r.status_code == 200, f"{r.status_code} {r.text[:100]}")
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

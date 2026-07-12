@@ -4,18 +4,7 @@ import { ChevronLeft, ChevronRight, Calendar, Target, Trophy, CheckCircle2, Cloc
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES, pickQuestTheme } from "@/lib/questThemes";
-
-const todayKey = () => new Date().toISOString().slice(0, 10);
-const shiftDate = (key, days) => {
-  const d = new Date(key + "T00:00:00");
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
-};
-const humanDate = (key) => {
-  if (key === todayKey()) return "Hari Ini";
-  const d = new Date(key + "T00:00:00");
-  return d.toLocaleDateString("id-ID", { weekday: "long", day: "numeric", month: "long" });
-};
+import { todayKey, shiftDateKey, humanDateKey, isFutureDate } from "@/lib/dates";
 
 const statusLabel = {
   pending: { icon: Clock, label: "Belum", color: "text-slate-400" },
@@ -49,14 +38,14 @@ export default function FamilyDayMonitor() {
     <div className="space-y-4">
       {/* Date navigation */}
       <div className="bg-white rounded-2xl border-2 border-slate-100 chunky-shadow p-3 flex items-center gap-2">
-        <button onClick={() => setDateKey(shiftDate(dateKey, -1))} className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600">
+        <button onClick={() => setDateKey(shiftDateKey(dateKey, -1))} className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600">
           <ChevronLeft className="w-5 h-5" />
         </button>
         <div className="flex-1 text-center">
-          <div className="font-parent font-bold text-slate-900">{humanDate(dateKey)}</div>
+          <div className="font-parent font-bold text-slate-900">{humanDateKey(dateKey)}</div>
           <div className="text-xs text-slate-400">{dateKey}</div>
         </div>
-        <button onClick={() => setDateKey(shiftDate(dateKey, 1))} className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600">
+        <button onClick={() => setDateKey(shiftDateKey(dateKey, 1))} disabled={isFutureDate(dateKey)} className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600 disabled:opacity-40">
           <ChevronRight className="w-5 h-5" />
         </button>
         {!isToday && (

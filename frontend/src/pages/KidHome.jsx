@@ -16,6 +16,7 @@ import Leaderboard from "@/components/Leaderboard";
 import Achievements from "@/components/Achievements";
 import MoneyExchange from "@/components/MoneyExchange";
 import ProfileEditor from "@/components/ProfileEditor";
+import { personalityMeta, styleMeta } from "@/lib/personality";
 
 const TABS = [
   { key: "tasks", label: "Misi", icon: Map, testId: TEST_IDS.kid.tabTasks },
@@ -214,6 +215,25 @@ export default function KidHome() {
                 Selesaikan misi secara berurutan. Misi berikutnya terbuka setelah yang sebelumnya selesai!
               </p>
 
+              {child.mbti && personalityMeta(child.mbti) && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.97 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="mb-4 rounded-2xl p-4 flex items-center gap-3 text-white chunky-shadow"
+                  style={{ background: personalityMeta(child.mbti).color }}
+                >
+                  <div className="text-3xl">{personalityMeta(child.mbti).emoji}</div>
+                  <div className="min-w-0">
+                    <div className="font-fun font-bold text-sm opacity-90">
+                      {personalityMeta(child.mbti).nickname}
+                    </div>
+                    <div className="font-body text-sm leading-snug">
+                      {personalityMeta(child.mbti).motivation}
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+
               {questLine.length === 0 && pendingApproval.length === 0 ? (
                 <div className="bg-white rounded-3xl p-8 text-center border-2 border-slate-100 chunky-shadow">
                   <div className="text-5xl mb-3">🎉</div>
@@ -262,9 +282,20 @@ export default function KidHome() {
                             {t.status === "rejected" && isActive && (
                               <div className="text-xs font-bold text-red-500 mt-0.5">Dikembalikan — coba lagi ya!</div>
                             )}
-                            <div className="flex items-center gap-1 mt-1">
-                              <Star className="w-3.5 h-3.5 text-[#FF9D23] fill-[#FF9D23]" />
-                              <span className="text-sm font-bold text-slate-700">+{t.points} poin</span>
+                            <div className="flex items-center gap-2 mt-1 flex-wrap">
+                              <div className="flex items-center gap-1">
+                                <Star className="w-3.5 h-3.5 text-[#FF9D23] fill-[#FF9D23]" />
+                                <span className="text-sm font-bold text-slate-700">+{t.points} poin</span>
+                              </div>
+                              {t.task_style && styleMeta(t.task_style) && (
+                                <span
+                                  className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full text-white"
+                                  style={{ background: styleMeta(t.task_style).color }}
+                                  title={styleMeta(t.task_style).desc}
+                                >
+                                  {styleMeta(t.task_style).emoji} {styleMeta(t.task_style).label}
+                                </span>
+                              )}
                             </div>
                           </div>
 

@@ -21,6 +21,7 @@ import Achievements from "@/components/Achievements";
 import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import PushNotificationManager from "@/components/PushNotificationManager";
 import { TEST_IDS } from "@/constants/testIds/app";
+import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -755,18 +756,47 @@ function SettingsView({ kids, onAdd, onRefresh }) {
           </button>
         </div>
         {kids.length === 0 ? (
-          <div className="text-sm text-slate-400 text-center py-6">No children yet.</div>
+          <div className="text-sm text-slate-400 text-center py-6">Belum ada anak.</div>
         ) : (
           <div className="divide-y divide-slate-100">
             {kids.map((c) => (
-              <div key={c.id} className="py-3 flex items-center gap-3">
+              <div key={c.id} className="py-3 flex items-center gap-3 flex-wrap">
                 <div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl" style={{ background: c.avatar_color }}>{c.avatar_emoji}</div>
-                <div className="flex-1">
-                  <div className="font-semibold text-slate-900">{c.name}</div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold text-slate-900 flex items-center gap-2 flex-wrap">
+                    {c.name}
+                    {c.mbti && (
+                      <span
+                        className="text-xs font-bold px-2 py-0.5 rounded-full text-white"
+                        style={{ background: PERSONALITY_PROFILES[c.mbti]?.color || "#94A3B8" }}
+                        title={PERSONALITY_PROFILES[c.mbti]?.nickname || c.mbti}
+                      >
+                        {c.mbti}
+                      </span>
+                    )}
+                  </div>
                   <div className="text-xs text-slate-500">
-                    {c.age ? `Age ${c.age} · ` : ""}{c.points} pts · {c.lifetime_points || 0} lifetime
+                    {c.age ? `Umur ${c.age} · ` : ""}{c.points} poin · {c.lifetime_points || 0} total
+                    {c.mbti && PERSONALITY_PROFILES[c.mbti] && ` · ${PERSONALITY_PROFILES[c.mbti].nickname}`}
                   </div>
                 </div>
+                <select
+                  value={c.mbti || ""}
+                  onChange={async (e) => {
+                    try {
+                      await api.patch(`/children/${c.id}`, { mbti: e.target.value || null });
+                      toast.success(`Kepribadian ${c.name} diperbarui`);
+                      onRefresh();
+                    } catch (err) { toast.error(formatApiError(err)); }
+                  }}
+                  className="text-xs px-2 py-1.5 rounded-lg border border-slate-200 focus:border-indigo-500 focus:outline-none"
+                  title="Ubah tipe kepribadian"
+                >
+                  <option value="">MBTI —</option>
+                  {ALL_MBTI.map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
                 <button onClick={() => delChild(c)} className={btnDanger}>
                   <Trash2 className="w-4 h-4" strokeWidth={2.5} />
                 </button>
@@ -807,12 +837,13 @@ function ChildFormModal({ open, onClose, onSaved }) {
   const [age, setAge] = useState("");
   const [color, setColor] = useState(AVATAR_COLORS[0]);
   const [emoji, setEmoji] = useState(AVATAR_EMOJIS[0]);
+  const [mbti, setMbti] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const reset = () => { setName(""); setAge(""); setColor(AVATAR_COLORS[0]); setEmoji(AVATAR_EMOJIS[0]); };
+  const reset = () => { setName(""); setAge(""); setColor(AVATAR_COLORS[0]); setEmoji(AVATAR_EMOJIS[0]); setMbti(""); };
 
   const submit = async () => {
-    if (!name.trim()) return toast.error("Name is required");
+    if (!name.trim()) return toast.error("Nama wajib diisi");
     setSaving(true);
     try {
       await api.post("/children", {
@@ -820,8 +851,9 @@ function ChildFormModal({ open, onClose, onSaved }) {
         age: age ? parseInt(age) : null,
         avatar_color: color,
         avatar_emoji: emoji,
+        mbti: mbti || null,
       });
-      toast.success(`${name} added!`);
+      toast.success(`${name} ditambahkan!`);
       reset();
       onSaved();
       onClose();
@@ -830,18 +862,32 @@ function ChildFormModal({ open, onClose, onSaved }) {
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="Add a child">
+    <Modal open={open} onClose={onClose} title="Tambah anak">
       <div className="space-y-4">
         <div>
-          <label className={labelClass}>Name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Maya" data-testid="child-name-input" />
+          <label className={labelClass}>Nama</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Adskhan" data-testid="child-name-input" />
         </div>
         <div>
-          <label className={labelClass}>Age (optional)</label>
+          <label className={labelClass}>Umur (opsional)</label>
           <input type="number" min="1" max="25" value={age} onChange={(e) => setAge(e.target.value)} className={inputClass} data-testid="child-age-input" />
         </div>
         <div>
-          <label className={labelClass}>Avatar color</label>
+          <label className={labelClass}>Tipe Kepribadian (MBTI, opsional)</label>
+          <select value={mbti} onChange={(e) => setMbti(e.target.value)} className={inputClass}>
+            <option value="">— Pilih tipe —</option>
+            {ALL_MBTI.map((t) => (
+              <option key={t} value={t}>
+                {t}{PERSONALITY_PROFILES[t] ? ` · ${PERSONALITY_PROFILES[t].nickname}` : ""}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-slate-400 mt-1">
+            Membantu aplikasi menyarankan gaya tugas & pesan motivasi yang cocok untuk anak.
+          </p>
+        </div>
+        <div>
+          <label className={labelClass}>Warna avatar</label>
           <div className="flex gap-2 flex-wrap">
             {AVATAR_COLORS.map((c) => (
               <button
@@ -869,9 +915,9 @@ function ChildFormModal({ open, onClose, onSaved }) {
           </div>
         </div>
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Cancel</button>
+          <button onClick={onClose} className={btnGhost}>Batal</button>
           <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="child-submit-btn">
-            {saving ? "Saving…" : "Add child"}
+            {saving ? "Menyimpan…" : "Tambah anak"}
           </button>
         </div>
       </div>
@@ -887,13 +933,14 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
   const [dueDate, setDueDate] = useState("");
   const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
+  const [taskStyle, setTaskStyle] = useState("");
   const [childId, setChildId] = useState(defaultChildId || (kids[0] && kids[0].id) || "");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (open) {
       setChildId(defaultChildId || (kids[0] && kids[0].id) || "");
-      setTitle(""); setDesc(""); setPoints(10); setPenalty(0); setDueDate(""); setRecurrence("none"); setOrder("");
+      setTitle(""); setDesc(""); setPoints(10); setPenalty(0); setDueDate(""); setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
   }, [open, defaultChildId, kids]);
 
@@ -911,6 +958,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
         due_date: dueDate ? new Date(dueDate).toISOString() : null,
         recurrence,
         order: order ? Number(order) : null,
+        task_style: taskStyle || null,
       });
       toast.success("Task created");
       onSaved();
@@ -970,6 +1018,18 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved }) {
           />
           <p className="text-xs text-slate-400 mt-1">
             Anak harus menyelesaikan misi sesuai urutan (konsep treasure hunt). Misi berikutnya terkunci sampai yang sebelumnya selesai/dilewati.
+          </p>
+        </div>
+        <div>
+          <label className={labelClass}>Gaya tugas (opsional)</label>
+          <select value={taskStyle} onChange={(e) => setTaskStyle(e.target.value)} className={inputClass}>
+            <option value="">— Otomatis sesuai kepribadian anak —</option>
+            {Object.entries(TASK_STYLES).map(([key, s]) => (
+              <option key={key} value={key}>{s.emoji} {s.label} — {s.desc}</option>
+            ))}
+          </select>
+          <p className="text-xs text-slate-400 mt-1">
+            Kalau dikosongkan, gaya dipilih otomatis dari tipe kepribadian anak (mis. INTJ-T → Tantangan, ESFJ-T → Membantu).
           </p>
         </div>
         <div className="flex justify-end gap-2 pt-2">

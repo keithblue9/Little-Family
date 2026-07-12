@@ -146,6 +146,43 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get("/api/admin/members-passcodes")
     check("kid can't view passcodes", r.status_code == 403, str(r.status_code))
 
+    # ---- 13. Personality (MBTI) ----
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/personality/types")
+    check("personality types list", r.status_code == 200 and len(r.json()["types"]) == 32, str(r.status_code))
+    check("INTJ-T profile present", "INTJ-T" in r.json()["profiles"])
+    check("ESFJ-T profile present", "ESFJ-T" in r.json()["profiles"])
+
+    r = c.get(f"/api/children/{adskhan['id']}/personality")
+    check("Adskhan is INTJ-T", r.json()["mbti"] == "INTJ-T", str(r.json().get("mbti")))
+    check("Adskhan nickname", r.json()["profile"]["nickname"] == "Sang Ahli Strategi", str(r.json()["profile"].get("nickname")))
+    check("Adskhan suggested challenge", "challenge" in r.json()["suggested_styles"], str(r.json().get("suggested_styles")))
+
+    r = c.get(f"/api/children/{syila['id']}/personality")
+    check("Syila is ESFJ-T", r.json()["mbti"] == "ESFJ-T", str(r.json().get("mbti")))
+    check("Syila suggested helper", "helper" in r.json()["suggested_styles"], str(r.json().get("suggested_styles")))
+
+    # New task auto-inherits style from child MBTI when not specified
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Susun strategi belajar", "points": 20})
+    check("task auto-style from INTJ", r.json().get("task_style") == "challenge", str(r.json().get("task_style")))
+    r = c.post("/api/tasks", json={"child_id": syila["id"], "title": "Bantu rapikan meja makan", "points": 15})
+    check("task auto-style from ESFJ", r.json().get("task_style") == "helper", str(r.json().get("task_style")))
+    # explicit style overrides
+    r = c.post("/api/tasks", json={"child_id": syila["id"], "title": "Gambar bebas", "points": 10, "task_style": "creative"})
+    check("explicit task_style respected", r.json().get("task_style") == "creative", str(r.json().get("task_style")))
+
+    # Update a child's MBTI and confirm it syncs to members
+    r = c.patch(f"/api/children/{syila['id']}", json={"mbti": "ENFP-T"})
+    check("update child mbti", r.status_code == 200 and r.json().get("mbti") == "ENFP-T", r.text[:120])
+    r = c.get(f"/api/children/{syila['id']}/personality")
+    check("mbti updated reads back", r.json()["mbti"] == "ENFP-T")
+    # restore
+    c.patch(f"/api/children/{syila['id']}", json={"mbti": "ESFJ-T"})
+
+    # invalid MBTI rejected by schema
+    r = c.patch(f"/api/children/{syila['id']}", json={"mbti": "XXXX-Z"})
+    check("invalid mbti rejected", r.status_code == 422, str(r.status_code))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

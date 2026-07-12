@@ -146,11 +146,24 @@ class AchievementInput(BaseModel):
     threshold_points: int = Field(ge=0)
 
 
+MBTI_TYPES = Literal[
+    "INTJ-T", "INTJ-A", "INTP-T", "INTP-A", "ENTJ-T", "ENTJ-A", "ENTP-T", "ENTP-A",
+    "INFJ-T", "INFJ-A", "INFP-T", "INFP-A", "ENFJ-T", "ENFJ-A", "ENFP-T", "ENFP-A",
+    "ISTJ-T", "ISTJ-A", "ISFJ-T", "ISFJ-A", "ESTJ-T", "ESTJ-A", "ESFJ-T", "ESFJ-A",
+    "ISTP-T", "ISTP-A", "ISFP-T", "ISFP-A", "ESTP-T", "ESTP-A", "ESFP-T", "ESFP-A",
+]
+
+# Task "styles" — how a quest is framed. Certain MBTI types respond better to
+# certain framings, which the parent UI uses to suggest a fit per child.
+TASK_STYLE = Literal["challenge", "helper", "creative", "routine", "learning", "social"]
+
+
 class ChildInput(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     age: Optional[int] = Field(default=None, ge=1, le=25)
     avatar_color: str = "#FF9D23"
     avatar_emoji: str = "🦁"
+    mbti: Optional[MBTI_TYPES] = None
 
 
 class ChildUpdate(BaseModel):
@@ -159,6 +172,7 @@ class ChildUpdate(BaseModel):
     age: Optional[int] = None
     avatar_color: Optional[str] = None
     avatar_emoji: Optional[str] = None
+    mbti: Optional[MBTI_TYPES] = None
 
 
 class TaskInput(BaseModel):
@@ -171,6 +185,7 @@ class TaskInput(BaseModel):
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
+    task_style: Optional[TASK_STYLE] = None
 
 
 class TaskUpdate(BaseModel):
@@ -183,6 +198,7 @@ class TaskUpdate(BaseModel):
     recurrence: Optional[Literal["none", "daily", "weekly"]] = None
     icon: Optional[str] = None
     order: Optional[int] = Field(default=None, ge=1)
+    task_style: Optional[TASK_STYLE] = None
 
 
 class RedeemMoneyInput(BaseModel):
@@ -493,6 +509,94 @@ async def get_child_or_404(parent_id: str, child_id: str) -> dict:
     return child
 
 
+# --------------- Personality (MBTI) ---------------
+# Kid-friendly personality profiles. Focus on how each type likes to work so
+# the app can frame quests in a way that motivates that specific child.
+PERSONALITY_PROFILES = {
+    "INTJ-T": {
+        "nickname": "Sang Ahli Strategi",
+        "emoji": "🧠",
+        "color": "#6366F1",
+        "summary": "Mandiri, suka merencanakan, dan senang tantangan yang butuh berpikir.",
+        "likes": ["Tujuan jangka panjang yang jelas", "Kebebasan menyelesaikan dengan caranya sendiri", "Tantangan logika & strategi"],
+        "best_styles": ["challenge", "learning"],
+        "motivation": "Kamu jenius strategi! Selesaikan misi ini dengan caramu sendiri. 🧩",
+        "encourage_done": "Rencana hebat berjalan sempurna! Kamu memang ahli strategi. 🎯",
+    },
+    "ESFJ-T": {
+        "nickname": "Sang Penolong Ceria",
+        "emoji": "💛",
+        "color": "#F472B6",
+        "summary": "Ramah, suka membantu, dan senang dihargai atas kebaikannya.",
+        "likes": ["Tugas membantu keluarga", "Langkah-langkah yang jelas", "Pujian & pengakuan"],
+        "best_styles": ["helper", "social", "routine"],
+        "motivation": "Keluarga senang dengan bantuanmu! Yuk selesaikan misi ini bersama. 🤗",
+        "encourage_done": "Kamu luar biasa membantu! Semua bangga padamu. 🌟",
+    },
+}
+
+STYLE_META = {
+    "challenge": {"label": "Tantangan", "emoji": "⚔️", "desc": "Misi seru yang butuh usaha & strategi"},
+    "helper": {"label": "Membantu", "emoji": "🤝", "desc": "Membantu keluarga atau orang lain"},
+    "creative": {"label": "Kreatif", "emoji": "🎨", "desc": "Berkreasi & berekspresi"},
+    "routine": {"label": "Rutin", "emoji": "🔁", "desc": "Kebiasaan baik sehari-hari"},
+    "learning": {"label": "Belajar", "emoji": "📚", "desc": "Menambah ilmu & keterampilan"},
+    "social": {"label": "Sosial", "emoji": "👥", "desc": "Bermain & berbagi bersama"},
+}
+
+
+def suggested_style_for_mbti(mbti):
+    profile = PERSONALITY_PROFILES.get(mbti or "")
+    if profile and profile.get("best_styles"):
+        return profile["best_styles"][0]
+    return None
+
+
+def personality_for(mbti):
+    if not mbti:
+        return None
+    p = PERSONALITY_PROFILES.get(mbti)
+    if not p:
+        # Unknown-but-valid type: return a neutral profile so the UI still works.
+        return {
+            "nickname": mbti,
+            "emoji": "✨",
+            "color": "#94A3B8",
+            "summary": "Setiap anak istimewa dengan caranya sendiri.",
+            "likes": [],
+            "best_styles": [],
+            "motivation": "Ayo selesaikan misimu, kamu hebat! ✨",
+            "encourage_done": "Kerja bagus! 🎉",
+        }
+    return p
+
+
+@api.get("/personality/types")
+async def list_personality_types(user: dict = Depends(get_current_user)):
+    """All MBTI options for the parent dropdown, with the two fully-authored
+    profiles surfaced richly."""
+    all_types = list(MBTI_TYPES.__args__)  # type: ignore[attr-defined]
+    return {
+        "types": all_types,
+        "profiles": PERSONALITY_PROFILES,
+        "styles": STYLE_META,
+    }
+
+
+@api.get("/children/{child_id}/personality")
+async def get_child_personality(child_id: str, user: dict = Depends(get_current_user)):
+    child = await db.children.find_one({"id": child_id}, {"_id": 0})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+    profile = personality_for(child.get("mbti"))
+    return {
+        "child_id": child_id,
+        "mbti": child.get("mbti"),
+        "profile": profile,
+        "suggested_styles": profile["best_styles"] if profile else [],
+    }
+
+
 # --------------- Children ---------------
 @api.get("/children")
 async def list_children(user: dict = Depends(get_current_user)):
@@ -511,6 +615,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "age": payload.age,
         "avatar_color": payload.avatar_color,
         "avatar_emoji": payload.avatar_emoji,
+        "mbti": payload.mbti,
         "points": 0,
         "lifetime_points": 0,
         "streak_days": 0,
@@ -586,6 +691,12 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
         last = await db.tasks.find({"child_id": payload.child_id}).sort("order", -1).to_list(1)
         order = (last[0].get("order", 0) + 1) if last else 1
 
+    # Default the task style from the child's personality if the parent didn't pick one.
+    task_style = payload.task_style
+    if task_style is None:
+        child = await db.children.find_one({"id": payload.child_id})
+        task_style = suggested_style_for_mbti(child.get("mbti") if child else None)
+
     doc = {
         "id": new_id(),
         "parent_id": FAMILY_ID,
@@ -598,6 +709,7 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
         "recurrence": payload.recurrence,
         "icon": payload.icon,
         "order": order,
+        "task_style": task_style,
         "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
         "completed_at": None,
         "approved_at": None,
@@ -1305,8 +1417,8 @@ async def seed_default_family():
         {"id": new_id(), "name": "Ummi", "role": "parent", "avatar_emoji": "👩", "avatar_color": "#F472B6"},
     ]
     children = [
-        {"id": new_id(), "name": "Adskhan", "role": "child", "age": 11, "avatar_emoji": "🦸‍♂️", "avatar_color": "#4DB8FF"},
-        {"id": new_id(), "name": "Syila", "role": "child", "age": 8, "avatar_emoji": "🦋", "avatar_color": "#F472B6"},
+        {"id": new_id(), "name": "Adskhan", "role": "child", "age": 11, "avatar_emoji": "🦸‍♂️", "avatar_color": "#4DB8FF", "mbti": "INTJ-T"},
+        {"id": new_id(), "name": "Syila", "role": "child", "age": 8, "avatar_emoji": "🦋", "avatar_color": "#F472B6", "mbti": "ESFJ-T"},
     ]
 
     for p in parents:
@@ -1334,6 +1446,7 @@ async def seed_default_family():
             "age": c["age"],
             "avatar_color": c["avatar_color"],
             "avatar_emoji": c["avatar_emoji"],
+            "mbti": c.get("mbti"),
             "points": 0,
             "lifetime_points": 0,
             "streak_days": 0,
@@ -1360,6 +1473,19 @@ async def migrate_existing_data():
             if t.get("order") is None:
                 max_order += 1
                 await db.tasks.update_one({"id": t["id"]}, {"$set": {"order": max_order}})
+
+
+    # 3. Assign personality types to the two known children if not yet set.
+    mbti_by_name = {"Adskhan": "INTJ-T", "Syila": "ESFJ-T"}
+    for name, mbti in mbti_by_name.items():
+        await db.children.update_many(
+            {"name": name, "$or": [{"mbti": {"$exists": False}}, {"mbti": None}]},
+            {"$set": {"mbti": mbti}},
+        )
+        await db.members.update_many(
+            {"name": name, "role": "child", "$or": [{"mbti": {"$exists": False}}, {"mbti": None}]},
+            {"$set": {"mbti": mbti}},
+        )
 
 
 # --------------- Startup ---------------

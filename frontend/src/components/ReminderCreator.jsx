@@ -15,13 +15,6 @@ export default function ReminderCreator({ childId, childName }) {
     message: "",
   });
 
-  useEffect(() => {
-    if (childId) {
-      fetchReminders();
-      fetchTasks();
-    }
-  }, [childId, fetchReminders, fetchTasks]);
-
   const fetchReminders = useCallback(async () => {
     try {
       const response = await api.get("/reminders", {
@@ -45,6 +38,13 @@ export default function ReminderCreator({ childId, childName }) {
       setLoading(false);
     }
   }, [childId]);
+
+  useEffect(() => {
+    if (childId) {
+      fetchReminders();
+      fetchTasks();
+    }
+  }, [childId, fetchReminders, fetchTasks]);
 
   const handleAddReminder = async () => {
     if (!formData.task_id || !formData.time) {

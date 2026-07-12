@@ -177,6 +177,7 @@ class ChildInput(BaseModel):
     avatar_color: str = "#FF9D23"
     avatar_emoji: str = "🦁"
     mbti: Optional[MBTI_TYPES] = None
+    quest_theme: Optional[Literal["space", "garden", "ninja", "rainbow", "ocean"]] = None
 
 
 class ChildUpdate(BaseModel):
@@ -186,6 +187,7 @@ class ChildUpdate(BaseModel):
     avatar_color: Optional[str] = None
     avatar_emoji: Optional[str] = None
     mbti: Optional[MBTI_TYPES] = None
+    quest_theme: Optional[Literal["space", "garden", "ninja", "rainbow", "ocean"]] = None
 
 
 class TaskInput(BaseModel):
@@ -232,6 +234,7 @@ class SelfProfileInput(BaseModel):
     model_config = ConfigDict(extra="ignore")
     avatar_emoji: Optional[str] = Field(default=None, max_length=10)
     avatar_color: Optional[str] = Field(default=None, max_length=20)
+    quest_theme: Optional[Literal["space", "garden", "ninja", "rainbow", "ocean"]] = None
 
 
 class RewardInput(BaseModel):
@@ -307,6 +310,8 @@ async def me(user: dict = Depends(get_current_user)):
         "age": user.get("age"),
         "avatar_emoji": user.get("avatar_emoji", "🦁"),
         "avatar_color": user.get("avatar_color", "#FF9D23"),
+        "mbti": user.get("mbti"),
+        "quest_theme": user.get("quest_theme"),
     }
 
 

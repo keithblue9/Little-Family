@@ -226,6 +226,22 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"child_id": syila["id"], "title": "x", "points": 1})
     check("kid still can't create", r.status_code == 403, str(r.status_code))
 
+    # ---- 17. Quest theme ----
+    # kid sets own quest theme
+    r = c.patch("/api/me/profile", json={"quest_theme": "rainbow"})
+    check("kid sets own quest_theme", r.status_code == 200 and r.json().get("quest_theme") == "rainbow", r.text[:150])
+    # invalid theme rejected
+    r = c.patch("/api/me/profile", json={"quest_theme": "bogus"})
+    check("invalid quest_theme rejected", r.status_code == 422, str(r.status_code))
+    # parent updates child quest theme
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.patch(f"/api/children/{adskhan['id']}", json={"quest_theme": "space"})
+    check("parent sets child quest_theme", r.status_code == 200 and r.json().get("quest_theme") == "space", r.text[:150])
+    # theme survives on children list
+    kids_list = c.get("/api/children").json()
+    ads_row = next(k for k in kids_list if k["id"] == adskhan["id"])
+    check("quest_theme persists in children list", ads_row.get("quest_theme") == "space", str(ads_row.get("quest_theme")))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

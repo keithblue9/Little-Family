@@ -22,6 +22,7 @@ import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import PushNotificationManager from "@/components/PushNotificationManager";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
+import { QUEST_THEME_LIST } from "@/lib/questThemes";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -811,6 +812,23 @@ function SettingsView({ kids, onAdd, onRefresh }) {
                   <option value="">MBTI —</option>
                   {ALL_MBTI.map((t) => (
                     <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+                <select
+                  value={c.quest_theme || ""}
+                  onChange={async (e) => {
+                    try {
+                      await api.patch(`/children/${c.id}`, { quest_theme: e.target.value || null });
+                      toast.success(`Tema misi ${c.name} diperbarui`);
+                      onRefresh();
+                    } catch (err) { toast.error(formatApiError(err)); }
+                  }}
+                  className="text-xs px-2 py-1.5 rounded-lg border border-slate-200 focus:border-amber-500 focus:outline-none"
+                  title="Ubah tema petualangan"
+                >
+                  <option value="">Tema misi —</option>
+                  {QUEST_THEME_LIST.map((t) => (
+                    <option key={t.key} value={t.key}>{t.emoji} {t.label}</option>
                   ))}
                 </select>
                 <button onClick={() => delChild(c)} className={btnDanger}>

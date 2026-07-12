@@ -42,12 +42,6 @@ export default function ThemeSwitcher({ childId, onThemeChange }) {
   const [loading, setLoading] = useState(true);
   const [switching, setSwitching] = useState(false);
 
-  useEffect(() => {
-    if (childId) {
-      fetchTheme();
-    }
-  }, [childId, fetchTheme]);
-
   const fetchTheme = useCallback(async () => {
     try {
       const response = await api.get(`/children/${childId}/theme`);
@@ -58,6 +52,12 @@ export default function ThemeSwitcher({ childId, onThemeChange }) {
       setLoading(false);
     }
   }, [childId]);
+
+  useEffect(() => {
+    if (childId) {
+      fetchTheme();
+    }
+  }, [childId, fetchTheme]);
 
   const handleThemeChange = async (theme) => {
     if (theme === currentTheme) return;

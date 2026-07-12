@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
-import { KeyRound, Palette, Check } from "lucide-react";
+import { KeyRound, Palette, Check, Map } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
+import { QUEST_THEME_LIST } from "@/lib/questThemes";
 
 const EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝", "🦋", "🦸‍♂️", "🧜‍♀️", "🚀", "👨", "👩", "😎", "🌟"];
 const COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6", "#FBBF24", "#2DD4BF"];
@@ -18,6 +19,21 @@ export default function ProfileEditor() {
   const [newCode, setNewCode] = useState("");
   const [confirmCode, setConfirmCode] = useState("");
   const [savingCode, setSavingCode] = useState(false);
+
+  const [savingTheme, setSavingTheme] = useState(false);
+
+  const saveQuestTheme = async (key) => {
+    setSavingTheme(true);
+    try {
+      await api.patch("/me/profile", { quest_theme: key });
+      await refresh();
+      toast.success("Tema petualangan diganti! Buka tab Misi ya ✨");
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setSavingTheme(false);
+    }
+  };
 
   const saveAvatar = async () => {
     setSavingAvatar(true);
@@ -124,6 +140,45 @@ export default function ProfileEditor() {
           {savingAvatar ? "Menyimpan…" : "Simpan Avatar"}
         </button>
       </div>
+
+      {user?.role === "child" && (
+        <div className="border-t border-slate-100 pt-6">
+          <h3 className="font-fun font-bold text-lg text-slate-900 flex items-center gap-2 mb-1">
+            <Map className="w-5 h-5 text-amber-500" /> Tema Petualangan
+          </h3>
+          <p className="text-sm text-slate-500 mb-4">Pilih gaya visual untuk peta misimu.</p>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+            {QUEST_THEME_LIST.map((t) => {
+              const active = (user?.quest_theme || "") === t.key;
+              return (
+                <button
+                  key={t.key}
+                  onClick={() => saveQuestTheme(t.key)}
+                  disabled={savingTheme}
+                  className={`press-btn rounded-2xl p-3 text-left border-2 transition-all ${
+                    active ? "ring-2 ring-offset-2 ring-slate-900 scale-[1.02]" : ""
+                  }`}
+                  style={{ background: t.colors.bg, color: t.colors.text, borderColor: active ? t.colors.accent : "transparent" }}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-3xl">{t.emoji}</span>
+                    <div className="font-fun font-bold text-sm truncate">{t.label}</div>
+                  </div>
+                  <div className="text-[10px] opacity-80 mt-1 line-clamp-2" style={{ color: t.colors.textDim }}>
+                    {t.tagline}
+                  </div>
+                  {active && (
+                    <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold" style={{ color: t.colors.accent }}>
+                      <Check className="w-3 h-3" /> Aktif
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       <div className="border-t border-slate-100 pt-6">
         <h3 className="font-fun font-bold text-lg text-slate-900 flex items-center gap-2 mb-1">

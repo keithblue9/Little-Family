@@ -16,7 +16,9 @@ import Leaderboard from "@/components/Leaderboard";
 import Achievements from "@/components/Achievements";
 import MoneyExchange from "@/components/MoneyExchange";
 import ProfileEditor from "@/components/ProfileEditor";
+import TreasureMap from "@/components/TreasureMap";
 import { personalityMeta, styleMeta } from "@/lib/personality";
+import { QUEST_THEME_LIST, pickQuestTheme } from "@/lib/questThemes";
 
 const TABS = [
   { key: "tasks", label: "Misi", icon: Map, testId: TEST_IDS.kid.tabTasks },
@@ -241,99 +243,14 @@ export default function KidHome() {
                   <div className="text-slate-500 text-sm">Cek lagi nanti untuk petualangan baru.</div>
                 </div>
               ) : (
-                <div className="relative">
-                  {/* Quest path line */}
-                  <div className="absolute left-7 top-8 bottom-8 w-1 bg-slate-200 rounded-full" />
-
-                  <div className="space-y-3">
-                    {questLine.map((t, idx) => {
-                      const isActive = idx === 0;
-                      return (
-                        <motion.div
-                          key={t.id}
-                          initial={{ opacity: 0, x: -10 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: idx * 0.05 }}
-                          data-testid={`${TEST_IDS.kid.taskItem}-${t.id}`}
-                          className={`relative rounded-3xl p-4 border-2 flex items-center gap-4 ${
-                            isActive
-                              ? "bg-white border-[#FF9D23] chunky-shadow-lg"
-                              : "bg-slate-50/80 border-slate-100 opacity-75"
-                          }`}
-                        >
-                          {/* Step number / lock */}
-                          <div
-                            className={`relative z-10 w-14 h-14 rounded-full flex items-center justify-center flex-shrink-0 font-fun font-bold text-lg ${
-                              isActive
-                                ? "bg-gradient-to-br from-[#FF9D23] to-[#FF6B00] text-white chunky-shadow"
-                                : "bg-slate-200 text-slate-400"
-                            }`}
-                          >
-                            {isActive ? t.order || idx + 1 : <Lock className="w-5 h-5" strokeWidth={2.5} />}
-                          </div>
-
-                          <div className="flex-1 min-w-0">
-                            <div className={`font-fun font-bold text-lg truncate ${isActive ? "text-slate-900" : "text-slate-500"}`}>
-                              {t.title}
-                            </div>
-                            {t.description && (
-                              <div className="text-sm text-slate-500 truncate">{t.description}</div>
-                            )}
-                            {t.status === "rejected" && isActive && (
-                              <div className="text-xs font-bold text-red-500 mt-0.5">Dikembalikan — coba lagi ya!</div>
-                            )}
-                            <div className="flex items-center gap-2 mt-1 flex-wrap">
-                              <div className="flex items-center gap-1">
-                                <Star className="w-3.5 h-3.5 text-[#FF9D23] fill-[#FF9D23]" />
-                                <span className="text-sm font-bold text-slate-700">+{t.points} poin</span>
-                              </div>
-                              {t.task_style && styleMeta(t.task_style) && (
-                                <span
-                                  className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full text-white"
-                                  style={{ background: styleMeta(t.task_style).color }}
-                                  title={styleMeta(t.task_style).desc}
-                                >
-                                  {styleMeta(t.task_style).emoji} {styleMeta(t.task_style).label}
-                                </span>
-                              )}
-                              {t.due_time && (
-                                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700">
-                                  🕒 sebelum {t.due_time}
-                                </span>
-                              )}
-                              {t.duration_minutes && (
-                                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">
-                                  ⏱️ {t.duration_minutes} menit
-                                </span>
-                              )}
-                            </div>
-                          </div>
-
-                          {isActive ? (
-                            <div className="flex flex-col gap-2 flex-shrink-0">
-                              <button
-                                onClick={() => completeTask(t)}
-                                data-testid={`${TEST_IDS.kid.completeTaskBtn}-${t.id}`}
-                                className="press-btn chunky-shadow bg-[#34D399] hover:bg-[#2bbf88] text-white font-fun font-bold px-4 py-2.5 rounded-2xl flex items-center gap-1.5 text-sm"
-                              >
-                                <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Selesai!
-                              </button>
-                              <button
-                                onClick={() => skipTask(t)}
-                                className="press-btn bg-slate-100 hover:bg-slate-200 text-slate-600 font-fun font-semibold px-4 py-1.5 rounded-2xl flex items-center gap-1.5 text-xs"
-                                title={`Bayar ${skipCost} poin untuk melewati`}
-                              >
-                                <FastForward className="w-3.5 h-3.5" /> Lewati ({skipCost} ⭐)
-                              </button>
-                            </div>
-                          ) : (
-                            <div className="text-xs font-bold text-slate-400 flex-shrink-0">Terkunci</div>
-                          )}
-                        </motion.div>
-                      );
-                    })}
-                  </div>
-                </div>
+                <TreasureMap
+                  theme={pickQuestTheme(child)}
+                  quests={questLine}
+                  done={doneTasks}
+                  onComplete={completeTask}
+                  onSkip={skipTask}
+                  skipCost={skipCost}
+                />
               )}
 
               {pendingApproval.length > 0 && (

@@ -18,10 +18,6 @@ export default function Achievements({ childId }) {
 
   const PRESET_ICONS = ["⭐", "🏆", "🎯", "💎", "🚀", "👑", "🌟", "💪"];
 
-  useEffect(() => {
-    fetchAchievements();
-  }, [fetchAchievements]);
-
   const fetchAchievements = useCallback(async () => {
     try {
       const [achRes, earnedRes] = await Promise.all([
@@ -36,6 +32,10 @@ export default function Achievements({ childId }) {
       setLoading(false);
     }
   }, [childId]);
+
+  useEffect(() => {
+    fetchAchievements();
+  }, [fetchAchievements]);
 
   const handleAddAchievement = async () => {
     if (!formData.name.trim()) {

@@ -8,6 +8,7 @@ import ParentApp from "@/pages/ParentApp";
 import KidHome from "@/pages/KidHome";
 import ChildPicker from "@/pages/ChildPicker";
 import InstallPrompt from "@/components/InstallPrompt";
+import PushPermissionPrompt from "@/components/PushPermissionPrompt";
 
 function Protected({ children, role }) {
   const { user } = useAuth();
@@ -75,6 +76,7 @@ function App() {
         </BrowserRouter>
         <Toaster position="top-center" richColors />
         <InstallPrompt />
+        <PushPermissionPrompt />
       </AuthProvider>
     </ErrorBoundary>
   );

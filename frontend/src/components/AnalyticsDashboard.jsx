@@ -8,10 +8,6 @@ export default function AnalyticsDashboard({ childId }) {
   const [analytics, setAnalytics] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchAnalytics();
-  }, [fetchAnalytics]);
-
   const fetchAnalytics = useCallback(async () => {
     try {
       const response = childId
@@ -25,6 +21,10 @@ export default function AnalyticsDashboard({ childId }) {
       setLoading(false);
     }
   }, [childId]);
+
+  useEffect(() => {
+    fetchAnalytics();
+  }, [fetchAnalytics]);
 
   if (loading) {
     return <div className="text-center text-slate-400 py-8">Loading analytics...</div>;

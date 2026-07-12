@@ -684,7 +684,7 @@ function ConsequencesView({ consequences, kids, onAdd, onRefresh, onApply }) {
                 <div className="flex items-center justify-between">
                   <button
                     onClick={() => onApply(c)}
-                    disabled={children.length === 0}
+                    disabled={kids.length === 0}
                     data-testid={`${TEST_IDS.parent.applyConsequenceBtn}-${c.id}`}
                     className="press-btn inline-flex items-center gap-1 bg-[#FF5C5C] disabled:bg-slate-200 text-white font-semibold px-3 py-1.5 rounded-lg text-sm"
                   >

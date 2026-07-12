@@ -88,8 +88,6 @@ export default function KidHome() {
     return <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">Memuat…</div>;
   }
 
-  const skipCost = config.skip_cost_points ?? 20;
-
   return (
     <div className="min-h-screen kid-shell grain relative font-body pb-28 safe-x" data-testid={TEST_IDS.kid.home}>
       {celebrate && (

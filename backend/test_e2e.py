@@ -328,6 +328,71 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={tomorrow}")
     check("kid can see own progress", r.status_code == 200)
 
+    # ================= 22. FULL LIFECYCLE REGRESSION =================
+    # Covers the exact flows reported broken: create task -> kid does it ->
+    # start/finish timer -> points awarded -> spend in reward shop -> convert
+    # to rupiah -> change theme -> change avatar -> change passcode -> upload
+    # profile photo -> session survives a simulated "refresh".
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    life_date = "2026-09-01"
+
+    r = c.post("/api/tasks", json={
+        "title": "Sikat gigi", "points": 5, "date_key": life_date,
+        "child_id": adskhan["id"], "is_bonus": False, "recurrence": "none",
+    })
+    check("lifecycle: create task", r.status_code == 200, r.text[:200])
+    life_task = r.json()
+
+    r = c.get("/api/tasks")
+    check("lifecycle: task appears in parent list", any(t["id"] == life_task["id"] for t in r.json()))
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={life_date}")
+    check("lifecycle: kid sees the task", any(t["id"] == life_task["id"] for t in r.json()["tasks"]), r.text[:200])
+
+    r = c.post(f"/api/tasks/{life_task['id']}/start")
+    check("lifecycle: start timer", r.status_code == 200 and r.json()["timer_started_at"])
+    r = c.post(f"/api/tasks/{life_task['id']}/complete")
+    check("lifecycle: finish task", r.status_code == 200 and r.json()["status"] == "completed")
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    r = c.post(f"/api/tasks/{life_task['id']}/approve")
+    check("lifecycle: approve task", r.status_code == 200)
+    pts_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("lifecycle: points awarded", pts_after == pts_before + 5, f"{pts_before}->{pts_after}")
+
+    r = c.post("/api/rewards", json={"name": "Permen", "description": "", "cost_points": 2})
+    reward = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    r = c.post(f"/api/rewards/{reward['id']}/redeem", params={"child_id": adskhan["id"]})
+    check("lifecycle: redeem reward (belanja poin)", r.status_code == 200, r.text[:200])
+
+    r = c.post("/api/points/redeem-money", json={"child_id": adskhan["id"], "points": 1})
+    check("lifecycle: exchange points to rupiah", r.status_code == 200, r.text[:200])
+
+    r = c.post(f"/api/children/{adskhan['id']}/theme", json={"theme": "galaxy"})
+    check("lifecycle: change visual theme", r.status_code == 200 and r.json()["theme"] == "galaxy")
+
+    r = c.patch("/api/me/profile", json={"avatar_emoji": "🐝", "avatar_color": "#FBBF24"})
+    check("lifecycle: change avatar", r.status_code == 200 and r.json()["avatar_emoji"] == "🐝")
+
+    r = c.post("/api/me/passcode", json={"old_passcode": "123456", "new_passcode": "654321"})
+    check("lifecycle: change own passcode", r.status_code == 200, r.text[:200])
+    r = c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    check("lifecycle: login with new passcode", r.status_code == 200)
+
+    # Profile photo upload — must accept JSON body {photo_url}, not a query param
+    r = c.post(f"/api/children/{adskhan['id']}/profile-photo", json={"photo_url": "data:image/png;base64,ABC123"})
+    check("lifecycle: upload profile photo via JSON body", r.status_code == 200 and r.json().get("photo_url", "").startswith("data:image"), r.text[:200])
+    r = c.post(f"/api/children/{adskhan['id']}/profile-photo", json={"photo_url": None})
+    check("lifecycle: remove profile photo", r.status_code == 200 and r.json().get("photo_url") is None)
+
+    # Simulated "refresh": /auth/me must keep working after all the above,
+    # proving the session/db-connection layer is stable across many requests.
+    r = c.get("/api/auth/me")
+    check("lifecycle: session survives refresh", r.status_code == 200 and r.json()["id"] == adskhan["id"], r.text[:200])
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

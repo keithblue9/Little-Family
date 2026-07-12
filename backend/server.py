@@ -7,6 +7,7 @@ load_dotenv(ROOT_DIR / ".env")
 import os
 import re
 import uuid
+import asyncio
 import logging
 import bcrypt
 import jwt
@@ -23,6 +24,35 @@ from pydantic import BaseModel, Field, ConfigDict
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
+
+# Serverless platforms (Vercel) can freeze a Python process between
+# invocations and later resume it under a *different* asyncio event loop.
+# A Motor client created under the old loop becomes unusable ("Event loop is
+# closed" / "attached to a different loop"), which shows up as random,
+# hard-to-reproduce 401s and failed writes. We track which loop our client
+# is bound to and transparently recreate it if the running loop changed.
+# (Skipped for the mongomock client used in tests — it has no loop affinity
+# and recreating it would wipe the in-memory test database every request.)
+_client_loop_id = None
+
+
+def _is_mongomock(obj) -> bool:
+    return any("mongomock" in str(klass) for klass in type(obj).__mro__)
+
+
+def _ensure_db_bound_to_current_loop():
+    global client, db, _client_loop_id
+    if _is_mongomock(client):
+        return  # test double — no loop binding concerns
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop_id = id(loop)
+    if _client_loop_id != loop_id:
+        client = AsyncIOMotorClient(mongo_url)
+        db = client[os.environ["DB_NAME"]]
+        _client_loop_id = loop_id
 
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_MINUTES = 60 * 24 * 30  # 30 days, shared family device
@@ -268,6 +298,13 @@ class ApplyConsequenceInput(BaseModel):
 # --------------- App ---------------
 app = FastAPI(title="My Lil Famz API")
 api = APIRouter(prefix="/api")
+
+
+@app.middleware("http")
+async def rebind_db_middleware(request: Request, call_next):
+    """Runs before every request; see _ensure_db_bound_to_current_loop above."""
+    _ensure_db_bound_to_current_loop()
+    return await call_next(request)
 
 
 # --------------- Auth Endpoints ---------------
@@ -1183,12 +1220,16 @@ async def get_app_config(user: dict = Depends(get_current_user)):
 
 
 # --------------- Child Profile Photo (Stage 3) ---------------
+class ProfilePhotoInput(BaseModel):
+    photo_url: Optional[str] = None
+
+
 @api.post("/children/{child_id}/profile-photo")
-async def set_child_profile_photo(child_id: str, photo_url: str, user: dict = Depends(get_current_user)):
+async def set_child_profile_photo(child_id: str, payload: ProfilePhotoInput, user: dict = Depends(get_current_user)):
     child = await get_child_or_404(FAMILY_ID, child_id)
-    await db.children.update_one({"id": child_id}, {"$set": {"profile_photo_url": photo_url}})
+    await db.children.update_one({"id": child_id}, {"$set": {"profile_photo_url": payload.photo_url}})
     await log_activity(FAMILY_ID, child_id, "profile_photo_updated", {"child_name": child["name"]})
-    return {"success": True, "photo_url": photo_url}
+    return {"success": True, "photo_url": payload.photo_url}
 
 
 # --------------- Reminders (Stage 3) ---------------

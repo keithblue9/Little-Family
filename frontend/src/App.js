@@ -10,6 +10,23 @@ import ChildPicker from "@/pages/ChildPicker";
 import InstallPrompt from "@/components/InstallPrompt";
 import PushPermissionPrompt from "@/components/PushPermissionPrompt";
 
+function ConnectionErrorScreen() {
+  const { refresh } = useAuth();
+  return (
+    <div className="min-h-screen kid-shell flex flex-col items-center justify-center font-parent text-slate-600 gap-3 px-6 text-center">
+      <div className="text-4xl">🔌</div>
+      <div className="font-bold">Tidak bisa terhubung ke server</div>
+      <div className="text-sm text-slate-500">Sesi kamu masih aman — coba lagi ya.</div>
+      <button
+        onClick={() => refresh()}
+        className="mt-2 bg-[#FF9D23] hover:bg-[#f08e14] text-white font-bold px-5 py-2.5 rounded-xl"
+      >
+        Coba Lagi
+      </button>
+    </div>
+  );
+}
+
 function Protected({ children, role }) {
   const { user } = useAuth();
   if (user === null) {
@@ -19,6 +36,7 @@ function Protected({ children, role }) {
       </div>
     );
   }
+  if (user === "error") return <ConnectionErrorScreen />;
   if (user === false) return <Navigate to="/login" replace />;
   if (role && user.role !== role) {
     return <Navigate to={user.role === "parent" ? "/parent" : `/kid/${user.id}`} replace />;
@@ -35,6 +53,7 @@ function HomeRedirect() {
       </div>
     );
   }
+  if (user === "error") return <ConnectionErrorScreen />;
   if (user === false) return <Navigate to="/login" replace />;
   return <Navigate to={user.role === "parent" ? "/parent" : `/kid/${user.id}`} replace />;
 }

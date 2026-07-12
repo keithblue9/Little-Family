@@ -15,39 +15,40 @@ export default function ProfilePhotoUpload({ childId, childName, currentPhoto })
 
     // Validate file type
     if (!file.type.startsWith("image/")) {
-      toast.error("Please select an image file");
+      toast.error("Pilih file gambar ya");
       return;
     }
 
-    // Validate file size (max 5MB)
-    if (file.size > 5 * 1024 * 1024) {
-      toast.error("Image must be smaller than 5MB");
+    // Validate file size (max 2.5MB — base64 encoding inflates this ~33%,
+    // and serverless platforms typically cap request bodies around 4-4.5MB)
+    if (file.size > 2.5 * 1024 * 1024) {
+      toast.error("Ukuran gambar maksimal 2.5MB");
       return;
     }
 
-    // Create preview
     const reader = new FileReader();
-    reader.onload = (e) => {
-      setPreview(e.target?.result);
+    reader.onload = async (e) => {
+      const photoUrl = e.target?.result;
+      if (!photoUrl) {
+        toast.error("Gagal membaca gambar, coba lagi ya");
+        return;
+      }
+      setPreview(photoUrl);
+      setUploading(true);
+      try {
+        await api.post(`/children/${childId}/profile-photo`, { photo_url: photoUrl });
+        toast.success("Foto profil berhasil diperbarui!");
+      } catch (err) {
+        toast.error(formatApiError(err));
+        setPreview(currentPhoto || null);
+      } finally {
+        setUploading(false);
+      }
+    };
+    reader.onerror = () => {
+      toast.error("Gagal membaca file gambar");
     };
     reader.readAsDataURL(file);
-
-    // Upload
-    setUploading(true);
-    try {
-      // In production, upload to storage service (S3, Firebase, etc)
-      // For now, we'll use the base64 directly
-      const photoUrl = reader.result;
-      await api.post(`/children/${childId}/profile-photo`, {
-        photo_url: photoUrl,
-      });
-      toast.success("Profile photo updated!");
-    } catch (err) {
-      toast.error(formatApiError(err));
-      setPreview(currentPhoto || null);
-    } finally {
-      setUploading(false);
-    }
   };
 
   const handleRemovePhoto = async () => {
@@ -118,7 +119,7 @@ export default function ProfilePhotoUpload({ childId, childName, currentPhoto })
               Upload Photo
             </button>
             <p className="text-sm text-slate-500 text-center">
-              JPG, PNG or GIF (max 5MB)
+              JPG, PNG, atau GIF (maks 2.5MB)
             </p>
           </>
         )}

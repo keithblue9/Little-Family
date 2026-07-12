@@ -7,13 +7,27 @@ export function AuthProvider({ children }) {
   const [user, setUser] = useState(null); // null=loading, false=logged out, object=logged in
   const [members, setMembers] = useState([]);
 
-  const fetchMe = useCallback(async () => {
+  const fetchMe = useCallback(async (attempt = 0) => {
     try {
       const { data } = await api.get("/auth/me");
       setUser(data);
-    } catch {
-      setUser(false);
-      localStorage.removeItem("cq_token");
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 401) {
+        // Genuinely not authenticated — clear the stale token and send to login.
+        setUser(false);
+        localStorage.removeItem("cq_token");
+      } else if (attempt < 5) {
+        // Transient error (network hiccup, cold-start 500, timeout). Don't
+        // destroy the session over this — retry with backoff instead of
+        // forcing the user back to the login screen.
+        setTimeout(() => fetchMe(attempt + 1), 1000 * (attempt + 1));
+      } else {
+        // Persistent failure that isn't a 401 — surface a distinct "connection
+        // error" state so the UI can offer a retry, rather than silently
+        // wiping the session and pretending the person logged out.
+        setUser("error");
+      }
     }
   }, []);
 

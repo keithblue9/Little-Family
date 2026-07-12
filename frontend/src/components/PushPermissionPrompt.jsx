@@ -89,7 +89,7 @@ export default function PushPermissionPrompt() {
 
       if (sub) {
         try {
-          await api.post("/push/subscribe", sub.toJSON());
+          await api.post("/push/subscribe", { subscription: sub.toJSON() });
         } catch {
           // Non-fatal.
         }

@@ -55,15 +55,17 @@ function Modal({ open, onClose, title, children }) {
       <motion.div
         initial={{ scale: 0.95, y: 10, opacity: 0 }}
         animate={{ scale: 1, y: 0, opacity: 1 }}
-        className="bg-white rounded-3xl w-full max-w-lg p-6 border border-slate-200 shadow-xl"
+        className="bg-white rounded-3xl w-full max-w-lg border border-slate-200 shadow-xl max-h-[90vh] flex flex-col"
       >
-        <div className="flex justify-between items-center mb-4">
+        <div className="flex justify-between items-center px-6 pt-6 pb-4 shrink-0">
           <h3 className="font-parent font-bold text-xl text-slate-900">{title}</h3>
           <button onClick={onClose} className="p-2 rounded-full hover:bg-slate-100" data-testid="modal-close-btn">
             <X className="w-5 h-5 text-slate-500" />
           </button>
         </div>
-        {children}
+        <div className="px-6 pb-6 overflow-y-auto">
+          {children}
+        </div>
       </motion.div>
     </div>
   );

@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
-  Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight,
+  Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -23,6 +23,7 @@ import PushNotificationManager from "@/components/PushNotificationManager";
 import FamilyDayMonitor from "@/components/FamilyDayMonitor";
 import WeeklyReport from "@/components/WeeklyReport";
 import LabelEditor from "@/components/LabelEditor";
+import FamilyChallenges from "@/components/FamilyChallenges";
 import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
@@ -448,6 +449,9 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
         </div>
       )}
 
+      {/* Family challenges */}
+      {kids.length > 0 && <FamilyChallenges kids={kids} />}
+
       {/* Merged: Weekly report */}
       {kids.length > 0 && <WeeklyReport />}
     </div>
@@ -512,6 +516,13 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   });
   const reject = (t) => act(async () => { await api.post(`/tasks/${t.id}/reject`); toast.info("Dikembalikan ke anak"); });
   const miss = (t) => act(async () => { await api.post(`/tasks/${t.id}/miss`); toast(`Ditandai terlewat${t.penalty_points ? ` · -${t.penalty_points} poin` : ""}`); });
+  const undoApproval = (t) => {
+    if (!window.confirm(`Batalkan persetujuan "${t.title}"? Poin akan dikembalikan.`)) return;
+    act(async () => {
+      await api.post(`/tasks/${t.id}/undo-approval`);
+      toast.success("Persetujuan dibatalkan, poin dikembalikan");
+    });
+  };
   const del = (t) => {
     const isGroup = t._groupTaskIds && t._groupTaskIds.length > 1;
     const msg = isGroup
@@ -608,6 +619,15 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
           {grouped.done.slice(0, 10).map((t) => (
             <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
               <span className="text-sm text-slate-400">+{t.points} poin</span>
+              {t.status === "approved" && (
+                <button
+                  onClick={() => undoApproval(t)}
+                  title="Batalkan persetujuan (dalam 30 menit)"
+                  className="press-btn inline-flex items-center gap-1 bg-white border border-amber-200 text-amber-600 font-semibold px-2.5 py-1 rounded-lg text-xs"
+                >
+                  <Undo2 className="w-3.5 h-3.5" /> Batalkan
+                </button>
+              )}
             </TaskRow>
           ))}
         </Section>
@@ -1046,6 +1066,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [dueTime, setDueTime] = useState("");
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
+  const [photoRequired, setPhotoRequired] = useState(false);
   const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
   const [taskStyle, setTaskStyle] = useState("");
@@ -1069,6 +1090,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setDueTime(editTask.due_time || "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
+      setPhotoRequired(!!editTask.photo_required);
       setRecurrence(editTask.recurrence || "none");
       setOrder(editTask.order ? String(editTask.order) : "");
       setTaskStyle(editTask.task_style || "");
@@ -1086,6 +1108,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setDueTime(editTask.due_time || "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
+      setPhotoRequired(!!editTask.photo_required);
       setRecurrence(editTask.recurrence || "none");
       setOrder(""); // fresh order
       setTaskStyle(editTask.task_style || "");
@@ -1096,7 +1119,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setScheduleMode("weekdays");
       const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
       setWeekdays([todayWd]);
-      setDueTime(""); setDuration(""); setIsBonus(false);
+      setDueTime(""); setDuration(""); setIsBonus(false); setPhotoRequired(false);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
   }, [open, defaultChildId, editTask, isDuplicate]);
@@ -1135,6 +1158,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         due_time: dueTime || null,
         duration_minutes: duration ? Number(duration) : null,
         is_bonus: isBonus,
+        photo_required: photoRequired,
         // Rutin (weekday) mode auto-repeats weekly so the task comes back each
         // week on the same day. Non-rutin uses the chosen recurrence dropdown.
         recurrence: useWeekdays ? "weekly" : recurrence,
@@ -1337,6 +1361,25 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
           <div className="flex-1 text-left">
             <div className="font-semibold text-slate-800 text-sm">✨ Tugas Bonus</div>
             <div className="text-xs text-slate-500">Tidak wajib, tidak menghalangi urutan misi. Poinnya jadi ekstra.</div>
+          </div>
+        </button>
+
+        {/* Photo verification toggle */}
+        <button
+          type="button"
+          onClick={() => setPhotoRequired(!photoRequired)}
+          className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
+            photoRequired ? "border-purple-400 bg-purple-50" : "border-slate-200 hover:bg-slate-50"
+          }`}
+        >
+          <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+            photoRequired ? "bg-purple-500 border-purple-500" : "border-slate-300"
+          }`}>
+            {photoRequired && <span className="text-white text-xs">✓</span>}
+          </div>
+          <div className="flex-1 text-left">
+            <div className="font-semibold text-slate-800 text-sm">📷 Butuh Foto Bukti</div>
+            <div className="text-xs text-slate-500">Anak harus lampirkan foto sebelum bisa menandai selesai.</div>
           </div>
         </button>
 

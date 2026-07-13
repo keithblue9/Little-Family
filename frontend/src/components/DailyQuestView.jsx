@@ -6,25 +6,7 @@ import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES } from "@/lib/questThemes";
 import { styleMeta } from "@/lib/personality";
 import { todayKey, shiftDateKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
-
-// Sound effect for task completion (tiny inline WAV)
-const playDing = () => {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.value = 880;
-    osc.type = "sine";
-    gain.gain.setValueAtTime(0.3, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.5);
-    // Haptic feedback if available
-    if (navigator.vibrate) navigator.vibrate([50, 30, 100]);
-  } catch { /* audio not available */ }
-};
+import { playSoundTheme } from "@/lib/sounds";
 
 export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [dateKey, setDateKey] = useState(todayKey());
@@ -92,17 +74,44 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     } finally { setBusyId(null); }
   };
 
-  const finishTask = async (task) => {
+  const photoInputRef = useRef(null);
+  const [pendingPhotoTask, setPendingPhotoTask] = useState(null);
+
+  const finishTask = async (task, photoUrl) => {
+    if (task.photo_required && !photoUrl) {
+      // Need a photo first — open the camera/file picker, then re-invoke this
+      // same function with the captured image once it's read.
+      setPendingPhotoTask(task);
+      photoInputRef.current?.click();
+      return;
+    }
     setBusyId(task.id);
     try {
-      await api.post(`/tasks/${task.id}/complete`);
-      playDing();
+      await api.post(`/tasks/${task.id}/complete`, photoUrl ? { photo_url: photoUrl } : {});
+      playSoundTheme(child?.sound_theme || "ding");
       onCelebrate?.();
       toast.success("Misi selesai! Menunggu dicek Abi/Ummi ⭐");
       await load();
     } catch (e) {
       toast.error(formatApiError(e));
     } finally { setBusyId(null); }
+  };
+
+  const handlePhotoSelected = (e) => {
+    const file = e.target.files?.[0];
+    const task = pendingPhotoTask;
+    setPendingPhotoTask(null);
+    e.target.value = ""; // allow picking the same file again later
+    if (!file || !task) return;
+    if (!file.type.startsWith("image/")) return toast.error("Pilih file gambar ya");
+    if (file.size > 3 * 1024 * 1024) return toast.error("Ukuran foto maksimal 3MB");
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target?.result;
+      if (dataUrl) finishTask(task, dataUrl);
+    };
+    reader.onerror = () => toast.error("Gagal membaca foto, coba lagi");
+    reader.readAsDataURL(file);
   };
 
   const skipTask = async (task) => {
@@ -119,6 +128,14 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
   return (
     <div className="space-y-4">
+      <input
+        ref={photoInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handlePhotoSelected}
+        className="hidden"
+      />
       {/* Date nav */}
       <div className="flex items-center gap-2 bg-white rounded-2xl px-3 py-2 border-2 border-slate-100 chunky-shadow">
         <button onClick={() => setDateKey(shiftDateKey(dateKey, -1))} className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600">
@@ -137,6 +154,13 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
           </button>
         )}
       </div>
+
+      {progress?.vacation_mode && (
+        <div className="bg-sky-50 border-2 border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-sky-700">
+          <span className="text-xl">🏖️</span>
+          <span className="text-sm font-semibold">Keluarga sedang liburan — misi rutin tidak menumpuk, santai dulu ya!</span>
+        </div>
+      )}
 
       {/* Daily goal progress */}
       {progress && (
@@ -334,6 +358,7 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, canS
           )}
           {task.due_time && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700">🕒 {task.due_time}</span>}
           {task.duration_minutes && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-700">⏱️ {task.duration_minutes}m</span>}
+          {task.photo_required && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-fuchsia-100 text-fuchsia-700">📷 butuh foto</span>}
         </div>
         {started && !isDone && <LiveTimer startedAt={task.timer_started_at} durationMinutes={task.duration_minutes} />}
         {isActive && !isDone && !started && gateReason === "early" && (

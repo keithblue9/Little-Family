@@ -3,5 +3,8 @@
   "outputDirectory": "frontend/build",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index" }
+  ],
+  "crons": [
+    { "path": "/api/cron/send-reminders", "schedule": "*/15 * * * *" }
   ]
 }

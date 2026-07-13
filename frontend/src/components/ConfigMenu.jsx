@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Settings, Save, Upload, Target, PiggyBank, Coins, Image as ImageIcon, X } from "lucide-react";
+import { Settings, Save, Upload, Target, PiggyBank, Coins, Image as ImageIcon, X, Plane } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 
@@ -29,8 +29,7 @@ export default function ConfigMenu() {
   const fetchConfig = async () => {
     try {
       const { data } = await api.get("/config");
-      setConfig({ ...data, weekday_goals: data.weekday_goals || {} });
-    } catch (err) {
+      setConfig({ ...data, weekday_goals: data.weekday_goals || {} });    } catch (err) {
       toast.error(formatApiError(err));
     } finally {
       setLoading(false);
@@ -175,6 +174,33 @@ export default function ConfigMenu() {
             </div>
           ))}
         </div>
+      </div>
+
+      <div className={cardCls}>
+        <div className="flex items-center justify-between">
+          <label className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+            <Plane className="w-4 h-4 text-sky-500" /> Mode Liburan / Cuti
+          </label>
+          <button
+            onClick={() => change("vacation_mode", !config.vacation_mode)}
+            className={`relative w-12 h-6 rounded-full transition-colors ${config.vacation_mode ? "bg-sky-500" : "bg-slate-200"}`}
+          >
+            <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform ${config.vacation_mode ? "translate-x-6" : "translate-x-0.5"}`} />
+          </button>
+        </div>
+        <p className="text-xs text-slate-500 mt-2">
+          Saat aktif, misi rutin (harian/mingguan) tidak akan membuat salinan baru ketika disetujui —
+          jadi tidak menumpuk selama liburan. Template misi tetap aman, tinggal matikan lagi saat pulang.
+        </p>
+        {config.vacation_mode && (
+          <input
+            type="text"
+            value={config.vacation_note || ""}
+            onChange={(e) => change("vacation_note", e.target.value.slice(0, 100))}
+            placeholder="Catatan (opsional), mis. 'Liburan ke Bali sampai 20 Juli'"
+            className={`${inputCls} mt-2 text-sm`}
+          />
+        )}
       </div>
 
       <div className={cardCls}>

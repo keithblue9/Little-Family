@@ -1,15 +1,115 @@
 import { useCallback, useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { BarChart3, TrendingUp, Flame, Trophy } from "lucide-react";
+import { BarChart3, TrendingUp, Flame, Trophy, Share2, Download } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 
 const fmtRp = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
 const DAYS_ID = ["Min", "Sen", "Sel", "Rab", "Kam", "Jum", "Sab"];
 
+/** Draws the weekly report as a shareable PNG using canvas — no extra library needed. */
+function drawReportImage(report) {
+  const W = 900;
+  const rowH = 190;
+  const H = 140 + report.children.length * rowH + 40;
+  const canvas = document.createElement("canvas");
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d");
+
+  // Background
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#EEF2FF");
+  bg.addColorStop(1, "#FFFFFF");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Header
+  ctx.fillStyle = "#1E293B";
+  ctx.font = "bold 34px sans-serif";
+  ctx.fillText("📊 Laporan Mingguan Keluarga", 32, 55);
+  ctx.font = "16px sans-serif";
+  ctx.fillStyle = "#64748B";
+  ctx.fillText(`${report.period_start} — ${report.period_end}`, 32, 85);
+
+  let y = 130;
+  report.children.forEach((entry) => {
+    const c = entry.child;
+    // Card background
+    ctx.fillStyle = "#FFFFFF";
+    ctx.strokeStyle = "#E2E8F0";
+    ctx.lineWidth = 2;
+    roundRect(ctx, 32, y, W - 64, rowH - 20, 16);
+    ctx.fill();
+    ctx.stroke();
+
+    // Name + avatar circle
+    ctx.fillStyle = c.avatar_color || "#6366F1";
+    ctx.beginPath();
+    ctx.arc(70, y + 40, 24, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = "24px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fff";
+    ctx.fillText(c.avatar_emoji || "🙂", 70, y + 49);
+    ctx.textAlign = "left";
+
+    ctx.fillStyle = "#1E293B";
+    ctx.font = "bold 22px sans-serif";
+    ctx.fillText(c.name, 110, y + 35);
+    ctx.font = "14px sans-serif";
+    ctx.fillStyle = "#64748B";
+    ctx.fillText(`${c.mbti || ""}  ·  streak ${c.streak_days || 0} hari`, 110, y + 56);
+
+    ctx.textAlign = "right";
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillStyle = "#4338CA";
+    ctx.fillText(`${entry.week_points} poin`, W - 56, y + 45);
+    ctx.textAlign = "left";
+
+    // Mini bar chart
+    const days = Object.keys(entry.days).sort();
+    const maxEarned = Math.max(1, ...days.map((dk) => entry.days[dk].earned));
+    const barAreaX = 56, barAreaY = y + 90, barAreaW = W - 112, barAreaH = 60;
+    const barW = barAreaW / days.length - 8;
+    days.forEach((dk, i) => {
+      const d = entry.days[dk];
+      const h = Math.max(3, (d.earned / maxEarned) * barAreaH);
+      const x = barAreaX + i * (barAreaW / days.length);
+      ctx.fillStyle = d.earned > 0 ? "#6366F1" : "#E2E8F0";
+      ctx.fillRect(x, barAreaY + barAreaH - h, barW, h);
+      ctx.fillStyle = "#94A3B8";
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "center";
+      const dayName = DAYS_ID[new Date(dk + "T00:00:00").getDay()];
+      ctx.fillText(dayName, x + barW / 2, barAreaY + barAreaH + 16);
+      ctx.textAlign = "left";
+    });
+
+    y += rowH;
+  });
+
+  ctx.fillStyle = "#94A3B8";
+  ctx.font = "13px sans-serif";
+  ctx.fillText("Dibuat dengan My Lil Famz 🚀", 32, H - 14);
+
+  return canvas;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
 export default function WeeklyReport() {
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -25,14 +125,56 @@ export default function WeeklyReport() {
 
   useEffect(() => { load(); }, [load]);
 
+  const handleExport = async () => {
+    if (!report) return;
+    setExporting(true);
+    try {
+      const canvas = drawReportImage(report);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("Gagal membuat gambar");
+      const file = new File([blob], `laporan-mingguan-${report.period_end}.png`, { type: "image/png" });
+
+      if (navigator.share && navigator.canShare?.({ files: [file] })) {
+        await navigator.share({
+          files: [file],
+          title: "Laporan Mingguan Keluarga",
+          text: `Laporan mingguan ${report.period_start} — ${report.period_end}`,
+        });
+      } else {
+        // Fallback: trigger a download
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = file.name;
+        a.click();
+        URL.revokeObjectURL(url);
+        toast.success("Gambar laporan diunduh!");
+      }
+    } catch (e) {
+      if (e?.name !== "AbortError") toast.error("Gagal membuat/membagikan gambar laporan");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   if (loading) return <div className="bg-white rounded-2xl p-8 text-center text-slate-400">Memuat laporan…</div>;
   if (!report) return null;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-2">
-        <BarChart3 className="w-5 h-5 text-indigo-500" />
-        <h3 className="font-parent font-bold text-lg text-slate-900">Laporan Minggu Ini</h3>
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="flex items-center gap-2">
+          <BarChart3 className="w-5 h-5 text-indigo-500" />
+          <h3 className="font-parent font-bold text-lg text-slate-900">Laporan Minggu Ini</h3>
+        </div>
+        <button
+          onClick={handleExport}
+          disabled={exporting}
+          className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-indigo-200 text-indigo-600 hover:bg-indigo-50 font-semibold px-3 py-1.5 rounded-xl text-sm disabled:opacity-60"
+        >
+          {navigator.share ? <Share2 className="w-4 h-4" /> : <Download className="w-4 h-4" />}
+          {exporting ? "Membuat…" : navigator.share ? "Bagikan" : "Unduh Gambar"}
+        </button>
       </div>
       <p className="text-sm text-slate-500 -mt-2">
         {report.period_start} — {report.period_end}

@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Bell, X } from "lucide-react";
 import { toast } from "sonner";
 import api from "@/lib/api";
+import { urlBase64ToUint8Array } from "@/lib/push";
 import { useAuth } from "@/contexts/AuthContext";
 
 /**
@@ -76,14 +77,20 @@ export default function PushPermissionPrompt() {
       const reg = await navigator.serviceWorker.ready;
       let sub = await reg.pushManager.getSubscription();
       if (!sub) {
-        // Best-effort: without a real VAPID key we skip the endpoint subscribe
-        // but still register that the user opted in so we can surface reminders
-        // via the service worker locally.
         try {
-          sub = await reg.pushManager.subscribe({ userVisibleOnly: true });
+          const { data } = await api.get("/push/vapid-public-key");
+          if (data.key) {
+            sub = await reg.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: urlBase64ToUint8Array(data.key),
+            });
+          } else {
+            // No VAPID configured on this deployment — subscribe anonymously
+            // so local notifications still work, but remote push won't.
+            sub = await reg.pushManager.subscribe({ userVisibleOnly: true });
+          }
         } catch {
-          // No VAPID configured on this deployment — that's fine, we just
-          // won't send remote push. Local reminders still work.
+          // Subscription failed outright (permission edge case, etc). Non-fatal.
         }
       }
 

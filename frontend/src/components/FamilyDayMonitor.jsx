@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES, pickQuestTheme } from "@/lib/questThemes";
 import { todayKey, shiftDateKey, humanDateKey, isFutureDate } from "@/lib/dates";
+import MonthHeatmap from "@/components/MonthHeatmap";
 
 const statusLabel = {
   pending: { icon: Clock, label: "Belum", color: "text-slate-400" },
@@ -55,16 +56,30 @@ export default function FamilyDayMonitor() {
         )}
       </div>
 
+      {data?.children?.[0]?.vacation_mode && (
+        <div className="bg-sky-50 border-2 border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-sky-700">
+          <span className="text-xl">🏖️</span>
+          <span className="text-sm font-semibold">Mode liburan aktif — misi rutin dijeda, tidak akan menumpuk.</span>
+        </div>
+      )}
+
       {loading ? (
         <div className="bg-white rounded-2xl p-8 text-center text-slate-400">Memuat…</div>
       ) : !data || data.children.length === 0 ? (
         <div className="bg-white rounded-2xl p-8 text-center text-slate-500">Belum ada anak.</div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {data.children.map((entry) => (
-            <ChildDayCard key={entry.child.id} entry={entry} />
-          ))}
-        </div>
+        <>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {data.children.map((entry) => (
+              <ChildDayCard key={entry.child.id} entry={entry} />
+            ))}
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {data.children.map((entry) => (
+              <MonthHeatmap key={entry.child.id} childId={entry.child.id} childName={entry.child.name} />
+            ))}
+          </div>
+        </>
       )}
     </div>
   );

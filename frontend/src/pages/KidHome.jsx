@@ -16,6 +16,7 @@ import Leaderboard from "@/components/Leaderboard";
 import Achievements from "@/components/Achievements";
 import MoneyExchange from "@/components/MoneyExchange";
 import PiggyBankCard from "@/components/PiggyBankCard";
+import KidChallenges from "@/components/KidChallenges";
 import ProfileEditor from "@/components/ProfileEditor";
 import DailyQuestView from "@/components/DailyQuestView";
 import { personalityMeta } from "@/lib/personality";
@@ -256,6 +257,7 @@ export default function KidHome() {
           {tab === "champs" && (
             <motion.div key="champs" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-8">
               <Leaderboard />
+              <KidChallenges />
               <Achievements childId={childId} />
             </motion.div>
           )}

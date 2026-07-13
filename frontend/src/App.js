@@ -10,6 +10,7 @@ import ChildPicker from "@/pages/ChildPicker";
 import InstallPrompt from "@/components/InstallPrompt";
 import PushPermissionPrompt from "@/components/PushPermissionPrompt";
 import LabelProvider from "@/components/LabelProvider";
+import AppBadgeSync from "@/components/AppBadgeSync";
 
 function ConnectionErrorScreen() {
   const { refresh } = useAuth();
@@ -99,6 +100,7 @@ function App() {
         <Toaster position="top-center" richColors />
         <InstallPrompt />
         <PushPermissionPrompt />
+        <AppBadgeSync />
       </AuthProvider>
     </ErrorBoundary>
   );

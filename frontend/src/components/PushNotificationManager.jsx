@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { Bell, AlertCircle, CheckCircle } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
+import { urlBase64ToUint8Array } from "@/lib/push";
 
 export default function PushNotificationManager() {
   const [pushEnabled, setPushEnabled] = useState(false);
@@ -59,13 +60,18 @@ export default function PushNotificationManager() {
       // Get service worker registration
       const reg = await navigator.serviceWorker.ready;
 
-      // Get public VAPID key from backend (ideally)
-      // For now using a placeholder - in production, get from backend
+      // Fetch the server's actual VAPID public key — a mismatched/placeholder
+      // key would let the browser "subscribe" successfully while every real
+      // push send silently fails, so this must come from the backend.
+      const { data } = await api.get("/push/vapid-public-key");
+      if (!data.key) {
+        toast.error("Notifikasi push belum diaktifkan oleh admin");
+        setSubscribing(false);
+        return;
+      }
       const subscription = await reg.pushManager.subscribe({
         userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(
-          "BCEEkAstV6XbDPRKZ4xkL4c45_4M_D6UZIYI3m_Cf3VJ5DpZTswI2kjEz5sGNe5iKUpIrBPKDlQlVsUIFZFfWYs"
-        ),
+        applicationServerKey: urlBase64ToUint8Array(data.key),
       });
 
       // Save subscription to backend
@@ -108,22 +114,6 @@ export default function PushNotificationManager() {
       setSubscribing(false);
     }
   };
-
-  // Function to convert VAPID key
-  function urlBase64ToUint8Array(base64String) {
-    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
-    const base64 = (base64String + padding)
-      .replace(/\-/g, "+")
-      .replace(/_/g, "/");
-
-    const rawData = window.atob(base64);
-    const outputArray = new Uint8Array(rawData.length);
-
-    for (let i = 0; i < rawData.length; ++i) {
-      outputArray[i] = rawData.charCodeAt(i);
-    }
-    return outputArray;
-  }
 
   if (loading) {
     return (

@@ -622,6 +622,162 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     c2.close()
 
+    # ================= 34. UNDO APPROVAL =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "UndoMe", "points": 15, "target_children": [syila["id"]], "date_key": today_local, "is_bonus": True})
+    ut = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{ut['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    r = c.post(f"/api/tasks/{ut['id']}/approve")
+    check("undo: approve ok", r.status_code == 200)
+    pts_after_approve = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("undo: points awarded", pts_after_approve == pts_before + 15, f"{pts_before}->{pts_after_approve}")
+    r = c.post(f"/api/tasks/{ut['id']}/undo-approval")
+    check("undo: succeeds within window", r.status_code == 200 and r.json()["status"] == "completed", r.text[:150])
+    pts_after_undo = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("undo: points refunded exactly", pts_after_undo == pts_before, f"expected {pts_before} got {pts_after_undo}")
+    # Undo again -> now status is "completed" not "approved" -> rejected
+    r = c.post(f"/api/tasks/{ut['id']}/undo-approval")
+    check("undo: double-undo rejected", r.status_code == 400, str(r.status_code))
+    # Undo a task that was never approved
+    r2 = c.post("/api/tasks", json={"title": "NeverApproved", "points": 5, "child_id": syila["id"], "date_key": today_local, "is_bonus": True})
+    r = c.post(f"/api/tasks/{r2.json()['id']}/undo-approval")
+    check("undo: never-approved task rejected", r.status_code == 400, str(r.status_code))
+    # Undo a task that doesn't exist
+    r = c.post("/api/tasks/nonexistent-id/undo-approval")
+    check("undo: nonexistent task 404", r.status_code == 404, str(r.status_code))
+
+    # ================= 35. VACATION MODE PAUSES RECURRENCE =================
+    r = c.post("/api/config", json={"vacation_mode": True, "vacation_note": "Liburan ke Bali"})
+    check("vacation: toggle on", r.status_code == 200)
+    r = c.get("/api/config")
+    check("vacation: reflects in config", r.json()["vacation_mode"] is True and r.json()["vacation_note"] == "Liburan ke Bali")
+    # Approving a recurring task while on vacation must NOT spawn next occurrence
+    r = c.post("/api/tasks", json={"title": "VacTest", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "recurrence": "daily", "is_bonus": True})
+    vt = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{vt['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{vt['id']}/approve")
+    tomorrow_vac = (now_local + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    spawned = [t for t in c.get(f"/api/tasks?date_key={tomorrow_vac}&child_id={adskhan['id']}").json() if t["title"] == "VacTest"]
+    check("vacation: recurrence did NOT spawn while paused", len(spawned) == 0, f"found {len(spawned)}")
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("vacation: flag visible in day-progress", r.json().get("vacation_mode") is True)
+    # Turn off vacation, spawning should resume for NEW approvals
+    c.post("/api/config", json={"vacation_mode": False})
+    r = c.post("/api/tasks", json={"title": "PostVacation", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "recurrence": "daily", "is_bonus": True})
+    pv = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{pv['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{pv['id']}/approve")
+    spawned2 = [t for t in c.get(f"/api/tasks?date_key={tomorrow_vac}&child_id={adskhan['id']}").json() if t["title"] == "PostVacation"]
+    check("vacation: recurrence resumes when off", len(spawned2) == 1, f"found {len(spawned2)}")
+
+    # ================= 36. FAMILY CHALLENGES =================
+    r = c.post("/api/challenges", json={
+        "title": "Minggu Rajin", "description": "Kumpulkan poin bareng!",
+        "participant_ids": [adskhan["id"], syila["id"]], "target_points": 20,
+        "start_date": today_local, "end_date": today_local, "reward_description": "Nonton bareng",
+    })
+    check("challenge: create ok", r.status_code == 200, r.text[:150])
+    chall = r.json()
+    r = c.get("/api/challenges")
+    check("challenge: appears in list", any(x["id"] == chall["id"] for x in r.json()))
+    found = next(x for x in r.json() if x["id"] == chall["id"])
+    check("challenge: has progress fields", "earned_points" in found and "percent" in found)
+    # Invalid: end before start
+    r = c.post("/api/challenges", json={
+        "title": "Bad", "participant_ids": [adskhan["id"]], "target_points": 10,
+        "start_date": "2026-01-10", "end_date": "2026-01-01",
+    })
+    check("challenge: end<start rejected", r.status_code == 422, str(r.status_code))
+    # Invalid: unknown participant
+    r = c.post("/api/challenges", json={
+        "title": "Bad2", "participant_ids": ["nonexistent"], "target_points": 10,
+        "start_date": today_local, "end_date": today_local,
+    })
+    check("challenge: unknown participant rejected", r.status_code == 404, str(r.status_code))
+    # Kid can only see challenges they're part of
+    r = c.post("/api/challenges", json={
+        "title": "Solo Ads", "participant_ids": [adskhan["id"]], "target_points": 5,
+        "start_date": today_local, "end_date": today_local,
+    })
+    solo = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.get("/api/challenges")
+    check("challenge: kid sees only own", not any(x["id"] == solo["id"] for x in r.json()) and any(x["id"] == chall["id"] for x in r.json()))
+    check("challenge: kid create blocked", c.post("/api/challenges", json={"title": "x", "participant_ids": [syila["id"]], "target_points": 1, "start_date": today_local, "end_date": today_local}).status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.delete(f"/api/challenges/{solo['id']}")
+    check("challenge: delete ok", r.status_code == 200)
+    r = c.delete(f"/api/challenges/{solo['id']}")
+    check("challenge: idempotent delete", r.status_code == 200)
+
+    # ================= 37. PHOTO VERIFICATION =================
+    r = c.post("/api/tasks", json={"title": "FotoWajib", "points": 10, "child_id": syila["id"], "date_key": today_local, "is_bonus": True, "photo_required": True})
+    ft = r.json()
+    check("photo: task created with flag", ft.get("photo_required") is True)
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{ft['id']}/complete")
+    check("photo: complete without photo rejected", r.status_code == 422, str(r.status_code))
+    r = c.post(f"/api/tasks/{ft['id']}/complete", json={"photo_url": "data:image/png;base64,XYZ"})
+    check("photo: complete with photo ok", r.status_code == 200 and r.json().get("completion_photo_url"), r.text[:150])
+
+    # ================= 38. SOUND THEME =================
+    r = c.patch("/api/me/profile", json={"sound_theme": "fanfare"})
+    check("sound: kid sets own theme", r.status_code == 200 and r.json()["sound_theme"] == "fanfare", r.text[:150])
+    r = c.patch("/api/me/profile", json={"sound_theme": "not-a-real-theme"})
+    check("sound: invalid theme rejected", r.status_code == 422, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.patch(f"/api/children/{adskhan['id']}", json={"sound_theme": "drum"})
+    check("sound: parent sets for child", r.status_code == 200 and r.json()["sound_theme"] == "drum")
+
+    # ================= 39. MONTH PROGRESS (calendar heatmap) =================
+    r = c.get(f"/api/children/{adskhan['id']}/month-progress", params={"year": 2026, "month": 8})
+    check("month: valid request ok", r.status_code == 200 and "days" in r.json(), r.text[:150])
+    r = c.get(f"/api/children/{adskhan['id']}/month-progress", params={"year": 2026, "month": 13})
+    check("month: invalid month rejected", r.status_code == 422, str(r.status_code))
+    r = c.get(f"/api/children/{adskhan['id']}/month-progress", params={"year": 1800, "month": 5})
+    check("month: invalid year rejected", r.status_code == 422, str(r.status_code))
+
+    # ================= 40. BADGE COUNT + VAPID KEY ENDPOINT =================
+    r = c.get("/api/badge-count")
+    check("badge: parent count returned", r.status_code == 200 and "count" in r.json())
+    r = c.get("/api/push/vapid-public-key")
+    check("push: vapid key endpoint responds (public, no auth)", r.status_code == 200 and "key" in r.json())
+
+    # ================= 41. CRON REMINDER ENDPOINT =================
+    r = c.get("/api/cron/send-reminders")
+    check("cron: no auth header rejected", r.status_code == 403, str(r.status_code))
+    r = c.get("/api/cron/send-reminders", headers={"Authorization": "Bearer wrong-secret"})
+    check("cron: wrong secret rejected", r.status_code == 403, str(r.status_code))
+
+    # ================= 42. REGRESSION: fresh-family config write must not drop new fields =================
+    # Root cause of a real bug: the "no config doc yet" branch of set_app_config
+    # only copied a handful of legacy fields, silently discarding anything else
+    # (vacation_mode, piggy split, weekday_goals, custom_labels, bg image) if it
+    # happened to be the very FIRST config write for a family. Simulate that by
+    # clearing the config collection (between requests, so no event loop is
+    # already running), then setting only vacation_mode.
+    import asyncio as _asyncio
+    _asyncio.run(server.db.app_config.delete_many({}))
+
+    r = c.post("/api/config", json={"vacation_mode": True})
+    check("regression: config write accepted", r.status_code == 200)
+    r = c.get("/api/config")
+    check("regression: vacation_mode set on fresh config doc", r.json()["vacation_mode"] is True, str(r.json().get("vacation_mode")))
+    check("regression: other defaults still sane", r.json()["daily_point_goal"] == 50 and r.json()["piggy_save_pct"] == 40, str(r.json()))
+
+    # ================= 43. REGRESSION: /auth/me must include all self-editable profile fields =================
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post("/api/me/profile", json={"sound_theme": "fanfare"})
+    r = c.get("/api/auth/me")
+    check("regression: sound_theme present in /auth/me", r.json().get("sound_theme") == "fanfare", str(r.json().get("sound_theme")))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

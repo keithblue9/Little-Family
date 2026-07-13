@@ -5,6 +5,7 @@ import { KeyRound, Palette, Check, Map } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
+import { SOUND_THEMES, playSoundTheme } from "@/lib/sounds";
 
 const EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝", "🦋", "🦸‍♂️", "🧜‍♀️", "🚀", "👨", "👩", "😎", "🌟"];
 const COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6", "#FBBF24", "#2DD4BF"];
@@ -21,6 +22,21 @@ export default function ProfileEditor() {
   const [savingCode, setSavingCode] = useState(false);
 
   const [savingTheme, setSavingTheme] = useState(false);
+  const [savingSound, setSavingSound] = useState(false);
+
+  const saveSoundTheme = async (key) => {
+    playSoundTheme(key); // instant preview
+    setSavingSound(true);
+    try {
+      await api.patch("/me/profile", { sound_theme: key });
+      await refresh();
+      toast.success("Suara misi diganti! 🔊");
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setSavingSound(false);
+    }
+  };
 
   const saveQuestTheme = async (key) => {
     setSavingTheme(true);
@@ -173,6 +189,34 @@ export default function ProfileEditor() {
                       <Check className="w-3 h-3" /> Aktif
                     </div>
                   )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {user?.role === "child" && (
+        <div className="border-t border-slate-100 pt-6">
+          <h3 className="font-fun font-bold text-lg text-slate-900 flex items-center gap-2 mb-1">
+            🔊 Suara Misi Selesai
+          </h3>
+          <p className="text-sm text-slate-500 mb-4">Pilih bunyi yang muncul saat kamu selesaikan misi. Klik untuk dengar.</p>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {SOUND_THEMES.map((s) => {
+              const active = (user?.sound_theme || "ding") === s.key;
+              return (
+                <button
+                  key={s.key}
+                  onClick={() => saveSoundTheme(s.key)}
+                  disabled={savingSound}
+                  className={`press-btn rounded-2xl p-3 text-center border-2 transition-all ${
+                    active ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+                  }`}
+                >
+                  <div className="text-2xl mb-1">{s.emoji}</div>
+                  <div className="font-fun font-bold text-xs text-slate-800">{s.label}</div>
+                  {active && <div className="text-[10px] font-bold text-indigo-500 mt-1">✓ Aktif</div>}
                 </button>
               );
             })}

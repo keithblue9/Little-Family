@@ -4,7 +4,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import { Rocket, ArrowLeft, Delete, ChevronRight, Sparkles, Star, Trophy } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
-import { formatApiError } from "@/lib/api";
+import api, { formatApiError } from "@/lib/api";
+import { DEFAULT_LABELS } from "@/lib/labels";
 
 export default function LoginPage() {
   const { login, fetchMembers } = useAuth();
@@ -16,6 +17,18 @@ export default function LoginPage() {
   const [passcode, setPasscode] = useState("");
   const [loading, setLoading] = useState(false);
   const [shake, setShake] = useState(false);
+  const [branding, setBranding] = useState({ app_name: "My Lil Famz", custom_labels: {}, slideshow_background_url: "", slideshow_background_image: "" });
+
+  // Resolve a label using branding overrides, falling back to defaults.
+  const L = (key) => {
+    const c = branding.custom_labels || {};
+    if (Object.prototype.hasOwnProperty.call(c, key)) return c[key];
+    return DEFAULT_LABELS[key] ?? key;
+  };
+
+  useEffect(() => {
+    api.get("/auth/branding").then(({ data }) => setBranding(data)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -70,14 +83,14 @@ export default function LoginPage() {
     }
   };
 
-  const roleLabel = (m) => (m.role === "parent" ? "Orang Tua" : "Anak");
+  const roleLabel = (m) => (m.role === "parent" ? (L("login.parent_tab") || "Orang Tua") : (L("login.kid_tab") || "Anak"));
 
   const LogoBlock = (
     <div className="flex items-center gap-2.5">
       <div className="w-10 h-10 rounded-2xl bg-[#FF9D23] flex items-center justify-center chunky-shadow shrink-0">
         <Rocket className="w-5 h-5 text-white" strokeWidth={2.5} />
       </div>
-      <span className="font-fun font-bold text-xl text-slate-900">My Lil Famz</span>
+      <span className="font-fun font-bold text-xl text-slate-900">{L("login.title") || branding.app_name}</span>
     </div>
   );
 
@@ -250,7 +263,16 @@ export default function LoginPage() {
         </div>
 
         {/* Right: brand panel */}
-        <div className="flex-1 relative overflow-hidden bg-gradient-to-br from-[#FF9D23] via-[#FF8A3D] to-[#FF6B00] flex items-center justify-center">
+        <div
+          className="flex-1 relative overflow-hidden bg-gradient-to-br from-[#FF9D23] via-[#FF8A3D] to-[#FF6B00] flex items-center justify-center bg-cover bg-center"
+          style={(() => {
+            const bg = branding.slideshow_background_image || branding.slideshow_background_url;
+            return bg ? { backgroundImage: `url(${bg})` } : {};
+          })()}
+        >
+          {(branding.slideshow_background_image || branding.slideshow_background_url) && (
+            <div className="absolute inset-0 bg-black/40" />
+          )}
           <div className="absolute top-16 left-16 w-40 h-40 rounded-full bg-white/10 blur-2xl" />
           <div className="absolute bottom-24 right-20 w-56 h-56 rounded-full bg-white/10 blur-3xl" />
           <div className="absolute top-1/3 right-24 w-24 h-24 rounded-full bg-white/10 blur-xl" />

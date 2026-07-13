@@ -561,6 +561,67 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={goal_date}")
     check("goal: bonus excluded from goal", r.json()["daily_goal"] == 25, str(r.json().get("daily_goal")))
 
+    # ================= 30. PER-WEEKDAY GOALS =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # Set Monday(0) goal = 99
+    r = c.post("/api/config", json={"weekday_goals": {"0": 99}})
+    check("weekday-goal: saves", r.status_code == 200)
+    r = c.get("/api/config")
+    check("weekday-goal: persists", r.json()["weekday_goals"].get("0") == 99, str(r.json().get("weekday_goals")))
+    # Find a Monday date and check the goal applies
+    import datetime as _d3
+    base = _d3.datetime.now(_d3.timezone.utc) + _d3.timedelta(hours=7)
+    days_to_mon = (0 - base.weekday()) % 7
+    monday = (base + _d3.timedelta(days=days_to_mon + 7)).strftime("%Y-%m-%d")  # a clean future Monday
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={monday}")
+    check("weekday-goal: Monday uses 99", r.json()["daily_goal"] == 99, f"{r.json().get('daily_goal')} on {monday}")
+    # Partial update doesn't wipe: set Tuesday, Monday should remain
+    c.post("/api/config", json={"weekday_goals": {"1": 50}})
+    r = c.get("/api/config")
+    check("weekday-goal: merge keeps Monday", r.json()["weekday_goals"].get("0") == 99 and r.json()["weekday_goals"].get("1") == 50, str(r.json().get("weekday_goals")))
+
+    # ================= 31. CUSTOM LABELS =================
+    r = c.post("/api/config", json={"custom_labels": {"nav.tasks": "Misi Harian", "nav.rewards": ""}})
+    check("labels: saves", r.status_code == 200)
+    r = c.get("/api/config")
+    lbls = r.json()["custom_labels"]
+    check("labels: override persists", lbls.get("nav.tasks") == "Misi Harian", str(lbls))
+    check("labels: hidden (empty) persists", lbls.get("nav.rewards") == "", str(lbls))
+    # Public branding exposes labels without auth
+    c2 = TestClient(server.app, base_url="https://testserver")
+    r = c2.get("/api/auth/branding")
+    check("labels: branding public (no auth)", r.status_code == 200 and r.json()["custom_labels"].get("nav.tasks") == "Misi Harian", r.text[:150])
+    # Clearing a label (null) removes override
+    c.post("/api/config", json={"custom_labels": {"nav.tasks": None}})
+    r = c.get("/api/config")
+    check("labels: null clears override", "nav.tasks" not in r.json()["custom_labels"], str(r.json()["custom_labels"]))
+
+    # ================= 32. BACKGROUND IMAGE =================
+    r = c.post("/api/config", json={"slideshow_background_image": "data:image/png;base64,ABC123"})
+    check("bg: image saves", r.status_code == 200)
+    r = c.get("/api/config")
+    check("bg: image persists", r.json()["slideshow_background_image"] == "data:image/png;base64,ABC123")
+    r = c2.get("/api/auth/branding")
+    check("bg: image in branding", r.json()["slideshow_background_image"] == "data:image/png;base64,ABC123")
+
+    # ================= 33. BROADCAST FORK ON EDIT =================
+    r = c.post("/api/tasks", json={"title": "Shared", "points": 5, "target_children": [], "date_key": today_local})
+    bcast = r.json()
+    check("fork: broadcast made 2", bcast.get("count") == 2, str(bcast.get("count")))
+    first_id = bcast["tasks"][0]["id"]
+    bid = bcast["tasks"][0]["broadcast_id"]
+    check("fork: siblings share broadcast_id", bid and bcast["tasks"][1]["broadcast_id"] == bid)
+    # Edit one → it detaches
+    r = c.patch(f"/api/tasks/{first_id}", json={"points": 20})
+    check("fork: edited task detached", r.json().get("broadcast_id") is None and r.json()["points"] == 20, str(r.json().get("broadcast_id")))
+    # Sibling still has broadcast_id
+    second_id = bcast["tasks"][1]["id"]
+    sib = c.get(f"/api/tasks?date_key={today_local}").json()
+    sib_task = next(t for t in sib if t["id"] == second_id)
+    check("fork: sibling keeps broadcast_id", sib_task.get("broadcast_id") == bid, str(sib_task.get("broadcast_id")))
+
+    c2.close()
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

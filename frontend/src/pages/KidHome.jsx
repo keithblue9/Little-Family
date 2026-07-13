@@ -20,19 +20,21 @@ import ProfileEditor from "@/components/ProfileEditor";
 import DailyQuestView from "@/components/DailyQuestView";
 import { personalityMeta } from "@/lib/personality";
 import { pickQuestTheme } from "@/lib/questThemes";
+import { useLabels } from "@/lib/labels";
 
 const TABS = [
-  { key: "tasks", label: "Misi", icon: Map, testId: TEST_IDS.kid.tabTasks },
-  { key: "money", label: "Tukar", icon: Banknote, testId: "tab-money" },
-  { key: "rewards", label: "Toko", icon: Gift, testId: TEST_IDS.kid.tabRewards },
-  { key: "champs", label: "Juara", icon: Trophy, testId: "tab-champs" },
-  { key: "profile", label: "Profil", icon: User, testId: "tab-profile" },
+  { key: "tasks", label: "Misi", labelKey: "kid.tab_tasks", icon: Map, testId: TEST_IDS.kid.tabTasks },
+  { key: "money", label: "Tukar", labelKey: "kid.tab_money", icon: Banknote, testId: "tab-money" },
+  { key: "rewards", label: "Toko", labelKey: "kid.tab_rewards", icon: Gift, testId: TEST_IDS.kid.tabRewards },
+  { key: "champs", label: "Juara", labelKey: "kid.tab_champs", icon: Trophy, testId: "tab-champs" },
+  { key: "profile", label: "Profil", labelKey: "kid.tab_profile", icon: User, testId: "tab-profile" },
 ];
 
 export default function KidHome() {
   const { childId } = useParams();
   const nav = useNavigate();
   const { user, logout } = useAuth();
+  const { t: L } = useLabels();
   const [child, setChild] = useState(null);
   const [rewards, setRewards] = useState([]);
   const [tab, setTab] = useState("tasks");
@@ -288,6 +290,8 @@ export default function KidHome() {
         <div className="max-w-md mx-auto bg-white rounded-full p-2 chunky-shadow-lg border-2 border-slate-100 flex items-center justify-around">
           {TABS.map((t) => {
             const active = tab === t.key;
+            const lbl = t.labelKey ? L(t.labelKey) : t.label;
+            if (lbl === "") return null; // hidden by parent
             return (
               <button
                 key={t.key}
@@ -298,7 +302,7 @@ export default function KidHome() {
                 }`}
               >
                 <t.icon className="w-5 h-5" strokeWidth={2.5} />
-                {t.label}
+                {lbl}
               </button>
             );
           })}

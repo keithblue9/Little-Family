@@ -22,6 +22,8 @@ import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import PushNotificationManager from "@/components/PushNotificationManager";
 import FamilyDayMonitor from "@/components/FamilyDayMonitor";
 import WeeklyReport from "@/components/WeeklyReport";
+import LabelEditor from "@/components/LabelEditor";
+import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
@@ -38,10 +40,7 @@ const NAV = [
   { key: "rewards", label: "Hadiah", icon: Gift, testId: TEST_IDS.parent.tabRewards },
   { key: "money", label: "Uang & Poin", icon: Gift, testId: "tab-money" },
   { key: "consequences", label: "Konsekuensi", icon: ShieldAlert, testId: TEST_IDS.parent.tabConsequences },
-  { key: "activity", label: "Aktivitas", icon: Activity, testId: TEST_IDS.parent.tabActivity },
-  { key: "leaderboard", label: "Papan Juara", icon: Users, testId: "tab-leaderboard" },
   { key: "analytics", label: "Analitik", icon: Activity, testId: "tab-analytics" },
-  { key: "weekly", label: "Laporan Mingguan", icon: Activity, testId: "tab-weekly" },
   { key: "settings", label: "Pengaturan", icon: Settings, testId: TEST_IDS.parent.tabSettings },
 ];
 
@@ -78,6 +77,12 @@ const btnDanger = "inline-flex items-center gap-2 bg-white border border-red-200
 export default function ParentApp() {
   const nav = useNavigate();
   const { user, logout } = useAuth();
+  const { t } = useLabels();
+  const navLabelKey = {
+    overview: "nav.overview", monitor: "nav.monitor", tasks: "nav.tasks",
+    rewards: "nav.rewards", money: "nav.money", consequences: "nav.consequences",
+    analytics: "nav.analytics", settings: "nav.settings",
+  };
   const [view, setView] = useState("overview");
   const [children, setChildren] = useState([]);
   const [selectedChildId, setSelectedChildId] = useState(undefined); // undefined = not yet initialized, null = "All"
@@ -85,7 +90,6 @@ export default function ParentApp() {
   const [rewards, setRewards] = useState([]);
   const [consequences, setConsequences] = useState([]);
   const [redemptions, setRedemptions] = useState([]);
-  const [activity, setActivity] = useState([]);
   const [stats, setStats] = useState(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -101,13 +105,12 @@ export default function ParentApp() {
 
   const load = useCallback(async () => {
     try {
-      const [c, t, r, cq, rd, a, s] = await Promise.all([
+      const [c, t, r, cq, rd, s] = await Promise.all([
         api.get("/children"),
         api.get("/tasks"),
         api.get("/rewards"),
         api.get("/consequences"),
         api.get("/redemptions"),
-        api.get("/activity", { params: { limit: 40 } }),
         api.get("/stats/dashboard"),
       ]);
       setChildren(c.data);
@@ -115,7 +118,6 @@ export default function ParentApp() {
       setRewards(r.data);
       setConsequences(cq.data);
       setRedemptions(rd.data);
-      setActivity(a.data);
       setStats(s.data);
       if (selectedChildId === undefined) setSelectedChildId(null);
     } catch (e) {
@@ -163,22 +165,27 @@ export default function ParentApp() {
           </span>
         </div>
         <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
-          {NAV.map((n) => (
-            <button
-              key={n.key}
-              onClick={() => { setView(n.key); setMobileNavOpen(false); }}
-              data-testid={n.testId}
-              title={n.label}
-              className={`w-full text-left flex items-center gap-3 px-3 py-2.5 rounded-xl font-parent font-semibold text-sm transition-colors ${sidebarCollapsed ? "md:justify-center" : ""} ${
-                view === n.key
-                  ? "bg-[#EEF2FF] text-[#4338CA]"
-                  : "text-slate-600 hover:bg-slate-50"
-              }`}
-            >
-              <n.icon className="w-4 h-4 shrink-0" strokeWidth={2.5} />
-              <span className={sidebarCollapsed ? "md:hidden" : ""}>{n.label}</span>
-            </button>
-          ))}
+          {NAV.map((n) => {
+            const lblKey = navLabelKey[n.key];
+            const lbl = lblKey ? t(lblKey) : n.label;
+            if (lbl === "") return null; // hidden by parent
+            return (
+              <button
+                key={n.key}
+                onClick={() => { setView(n.key); setMobileNavOpen(false); }}
+                data-testid={n.testId}
+                title={lbl}
+                className={`w-full text-left flex items-center gap-3 px-3 py-2.5 rounded-xl font-parent font-semibold text-sm transition-colors ${sidebarCollapsed ? "md:justify-center" : ""} ${
+                  view === n.key
+                    ? "bg-[#EEF2FF] text-[#4338CA]"
+                    : "text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                <n.icon className="w-4 h-4 shrink-0" strokeWidth={2.5} />
+                <span className={sidebarCollapsed ? "md:hidden" : ""}>{lbl}</span>
+              </button>
+            );
+          })}
         </nav>
         <div className="p-3 border-t border-slate-100 space-y-2">
           {/* Desktop collapse toggle */}
@@ -228,7 +235,7 @@ export default function ParentApp() {
 
         <div className="p-4 md:p-8 max-w-6xl">
           {/* Child filter tabs */}
-          {children.length > 0 && view !== "settings" && view !== "activity" && view !== "monitor" && view !== "weekly" && (
+          {children.length > 0 && view !== "settings" && view !== "monitor" && (
             <div className="flex items-center gap-2 mb-5 flex-wrap" data-testid="parent-child-tabs">
               <button
                 onClick={() => setSelectedChildId(null)}
@@ -263,7 +270,6 @@ export default function ParentApp() {
             <Overview stats={stats} kids={children} tasks={tasks} pendingRedemptions={pendingRedemptions} onAddChild={() => setChildModal(true)} onNavigate={setView} />
           )}
           {view === "monitor" && <FamilyDayMonitor />}
-          {view === "weekly" && <WeeklyReport />}
           {view === "tasks" && (
             <TasksView
               kids={children}
@@ -305,14 +311,6 @@ export default function ParentApp() {
               kids={children}
               onApply={(c) => setApplyConsModal({ consequence: c })}
             />
-          )}
-          {view === "activity" && <ActivityView activity={activity} kids={children} />}
-          
-          {/* Stage 4: Leaderboard */}
-          {view === "leaderboard" && (
-            <div className="space-y-6">
-              <Leaderboard />
-            </div>
           )}
 
           {/* Stage 4: Analytics */}
@@ -359,18 +357,26 @@ export default function ParentApp() {
 }
 
 // ─────────────────────────────────────────────────────────
-function StatCard({ label, value, sub, color = "#6366F1", icon: Icon }) {
+function StatCard({ label, value, sub, color = "#6366F1", icon: Icon, onClick }) {
+  const clickable = !!onClick;
   return (
-    <div className="bg-white rounded-2xl p-5 border border-slate-200">
+    <button
+      onClick={onClick}
+      disabled={!clickable}
+      className={`text-left bg-white rounded-2xl p-5 border border-slate-200 transition-all w-full ${
+        clickable ? "hover:border-slate-300 hover:shadow-md hover:-translate-y-0.5 cursor-pointer active:scale-[0.98]" : "cursor-default"
+      }`}
+    >
       <div className="flex items-start justify-between mb-3">
         <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: `${color}22` }}>
           <Icon className="w-5 h-5" style={{ color }} strokeWidth={2.5} />
         </div>
+        {clickable && <span className="text-xs text-slate-300">›</span>}
       </div>
       <div className="font-parent font-bold text-3xl text-slate-900">{value}</div>
       <div className="text-sm text-slate-500">{label}</div>
       {sub && <div className="text-xs text-slate-400 mt-1">{sub}</div>}
-    </div>
+    </button>
   );
 }
 
@@ -378,28 +384,22 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard label="Children" value={stats?.children_count ?? "—"} icon={Users} color="#6366F1" />
-        <StatCard label="Pending approval" value={stats?.pending_approval ?? "—"} sub="Tasks waiting for you" icon={Clock} color="#FF9D23" />
-        <StatCard label="Approved today" value={stats?.approved_today ?? "—"} icon={CheckCircle2} color="#34D399" />
-        <StatCard label="Total points" value={stats?.total_points ?? "—"} sub="Across all kids" icon={Star} color="#4DB8FF" />
+        <StatCard label="Anak" value={stats?.children_count ?? "—"} icon={Users} color="#6366F1" onClick={() => onNavigate("settings")} />
+        <StatCard label="Menunggu cek" value={stats?.pending_approval ?? "—"} sub="Tugas menunggumu" icon={Clock} color="#FF9D23" onClick={() => onNavigate("tasks")} />
+        <StatCard label="Disetujui hari ini" value={stats?.approved_today ?? "—"} icon={CheckCircle2} color="#34D399" onClick={() => onNavigate("monitor")} />
+        <StatCard label="Total poin" value={stats?.total_points ?? "—"} sub="Semua anak" icon={Star} color="#4DB8FF" onClick={() => onNavigate("money")} />
       </div>
 
       <div className="grid md:grid-cols-3 gap-6">
         <div className="md:col-span-2 bg-white rounded-2xl p-6 border border-slate-200">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="font-parent font-bold text-lg text-slate-900">Your children</h3>
-            <button
-              onClick={onAddChild}
-              data-testid={TEST_IDS.parent.addChildBtn}
-              className={btnPrimary}
-            >
-              <Plus className="w-4 h-4" strokeWidth={2.5} /> Add child
+            <h3 className="font-parent font-bold text-lg text-slate-900">Anak-anak</h3>
+            <button onClick={onAddChild} data-testid={TEST_IDS.parent.addChildBtn} className={btnPrimary}>
+              <Plus className="w-4 h-4" strokeWidth={2.5} /> Tambah anak
             </button>
           </div>
           {kids.length === 0 ? (
-            <div className="text-center py-10 text-slate-400">
-              No children yet. Add your first child to get started.
-            </div>
+            <div className="text-center py-10 text-slate-400">Belum ada anak. Tambahkan untuk mulai.</div>
           ) : (
             <div className="grid sm:grid-cols-2 gap-4">
               {kids.map((c) => {
@@ -411,11 +411,9 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="font-parent font-bold text-slate-900 truncate">{c.name}</div>
-                      <div className="text-xs text-slate-500">{c.points} pts · {c.streak_days || 0}d streak</div>
+                      <div className="text-xs text-slate-500">{c.points} poin · {c.streak_days || 0} hari streak</div>
                       {pending > 0 && (
-                        <div className="text-xs text-[#FF9D23] font-semibold mt-1">
-                          {pending} awaiting approval
-                        </div>
+                        <div className="text-xs text-[#FF9D23] font-semibold mt-1">{pending} menunggu cek</div>
                       )}
                     </div>
                   </div>
@@ -426,38 +424,75 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
         </div>
 
         <div className="bg-white rounded-2xl p-6 border border-slate-200">
-          <h3 className="font-parent font-bold text-lg text-slate-900 mb-4">Reward requests</h3>
+          <h3 className="font-parent font-bold text-lg text-slate-900 mb-4">Permintaan hadiah</h3>
           {pendingRedemptions.length === 0 ? (
-            <div className="text-sm text-slate-400 py-4">No pending rewards.</div>
+            <div className="text-sm text-slate-400 py-4">Tidak ada permintaan hadiah.</div>
           ) : (
             <div className="space-y-3">
               {pendingRedemptions.slice(0, 5).map((r) => (
                 <div key={r.id} className="text-sm">
                   <div className="font-semibold text-slate-800">{r.reward_name}</div>
-                  <div className="text-xs text-slate-500">{r.cost_points} pts</div>
+                  <div className="text-xs text-slate-500">{r.cost_points} poin</div>
                 </div>
               ))}
-              <button onClick={() => onNavigate("rewards")} className="text-sm text-[#6366F1] font-semibold mt-2">
-                Manage →
-              </button>
+              <button onClick={() => onNavigate("rewards")} className="text-sm text-[#6366F1] font-semibold mt-2">Kelola →</button>
             </div>
           )}
         </div>
       </div>
+
+      {/* Merged: Leaderboard */}
+      {kids.length > 0 && (
+        <div className="bg-white rounded-2xl p-6 border border-slate-200">
+          <Leaderboard />
+        </div>
+      )}
+
+      {/* Merged: Weekly report */}
+      {kids.length > 0 && <WeeklyReport />}
     </div>
   );
 }
 
 // ─────────────────────────────────────────────────────────
 function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild }) {
+  // When viewing "Semua" (selectedChildId === null), collapse broadcast siblings
+  // (same broadcast_id) into a single representative row that lists all the kids
+  // it was assigned to — e.g. "Adskhan & Syila". Editing/duplicating still targets
+  // the representative task; deleting removes the whole group. When a specific
+  // child is selected, tasks show individually so per-child edits are possible.
+  const kidName = (id) => kids.find((k) => k.id === id)?.name || "?";
+
+  const displayTasks = useMemo(() => {
+    if (selectedChildId) return tasks; // specific child → individual tasks
+    const groups = new Map();
+    const singles = [];
+    for (const t of tasks) {
+      if (t.broadcast_id) {
+        const key = `${t.broadcast_id}::${t.date_key}::${t.title}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(t);
+      } else {
+        singles.push(t);
+      }
+    }
+    const collapsed = [];
+    for (const [, siblings] of groups) {
+      // representative = first sibling, annotated with the group's kid names + ids
+      const rep = { ...siblings[0], _groupKidIds: siblings.map((s) => s.child_id), _groupTaskIds: siblings.map((s) => s.id) };
+      collapsed.push(rep);
+    }
+    return [...singles, ...collapsed];
+  }, [tasks, selectedChildId, kids]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const grouped = useMemo(() => {
     const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
-    const pending = tasks.filter((t) => t.status === "pending" || t.status === "rejected").sort(byOrder);
-    const awaiting = tasks.filter((t) => t.status === "completed").sort(byOrder);
-    const done = tasks.filter((t) => t.status === "approved" || t.status === "skipped").sort(byOrder);
-    const missed = tasks.filter((t) => t.status === "missed");
+    const pending = displayTasks.filter((t) => t.status === "pending" || t.status === "rejected").sort(byOrder);
+    const awaiting = displayTasks.filter((t) => t.status === "completed").sort(byOrder);
+    const done = displayTasks.filter((t) => t.status === "approved" || t.status === "skipped").sort(byOrder);
+    const missed = displayTasks.filter((t) => t.status === "missed");
     return { pending, awaiting, done, missed };
-  }, [tasks]);
+  }, [displayTasks]);
 
   const act = async (fn) => {
     try {
@@ -478,12 +513,26 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   const reject = (t) => act(async () => { await api.post(`/tasks/${t.id}/reject`); toast.info("Dikembalikan ke anak"); });
   const miss = (t) => act(async () => { await api.post(`/tasks/${t.id}/miss`); toast(`Ditandai terlewat${t.penalty_points ? ` · -${t.penalty_points} poin` : ""}`); });
   const del = (t) => {
-    if (!window.confirm(`Hapus tugas "${t.title}"?`)) return;
+    const isGroup = t._groupTaskIds && t._groupTaskIds.length > 1;
+    const msg = isGroup
+      ? `Hapus tugas "${t.title}" untuk ${t._groupKidIds.map(kidName).join(" & ")}?`
+      : `Hapus tugas "${t.title}"?`;
+    if (!window.confirm(msg)) return;
     act(async () => {
-      await api.delete(`/tasks/${t.id}`);
+      if (isGroup) {
+        await Promise.all(t._groupTaskIds.map((id) => api.delete(`/tasks/${id}`)));
+      } else {
+        await api.delete(`/tasks/${t.id}`);
+      }
       toast.success("Tugas dihapus");
     });
   };
+
+  // Display name for a task row: group kids ("Adskhan & Syila") or single kid.
+  const rowName = (t) =>
+    t._groupKidIds && t._groupKidIds.length > 1
+      ? t._groupKidIds.map(kidName).join(" & ")
+      : kidName(t.child_id);
 
   const editBtn = (t) => (
     <div className="flex gap-1 flex-wrap">
@@ -523,7 +572,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       {grouped.awaiting.length > 0 && (
         <Section title="⏳ Menunggu persetujuan" count={grouped.awaiting.length}>
           {grouped.awaiting.map((t) => (
-            <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name}>
+            <TaskRow key={t.id} task={t} childName={rowName(t)}>
               <button onClick={() => approve(t)} data-testid={`${TEST_IDS.parent.approveTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
                 <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Setujui
               </button>
@@ -539,7 +588,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
         {grouped.pending.length === 0 ? (
           <div className="text-sm text-slate-400 py-3">Tidak ada tugas aktif.</div>
         ) : grouped.pending.map((t) => (
-          <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name}>
+          <TaskRow key={t.id} task={t} childName={rowName(t)}>
             {editBtn(t)}
             <button onClick={() => miss(t)} data-testid={`${TEST_IDS.parent.missTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-white border border-red-200 text-red-600 font-semibold px-3 py-1.5 rounded-lg text-sm">
               <AlertTriangle className="w-4 h-4" strokeWidth={2.5} /> Terlewat
@@ -557,7 +606,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       {grouped.done.length > 0 && (
         <Section title="✅ Selesai" count={grouped.done.length}>
           {grouped.done.slice(0, 10).map((t) => (
-            <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name} dim>
+            <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
               <span className="text-sm text-slate-400">+{t.points} poin</span>
             </TaskRow>
           ))}
@@ -567,7 +616,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       {grouped.missed.length > 0 && (
         <Section title="❌ Terlewat" count={grouped.missed.length}>
           {grouped.missed.slice(0, 10).map((t) => (
-            <TaskRow key={t.id} task={t} childName={kids.find((c) => c.id === t.child_id)?.name} dim>
+            <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
               {editBtn(t)}
               <span className="text-sm text-red-500">−{t.penalty_points || 0} poin</span>
             </TaskRow>
@@ -599,7 +648,14 @@ function TaskRow({ task, childName, children, dim = false }) {
         </div>
       )}
       <div className="flex-1 min-w-0">
-        <div className="font-parent font-semibold text-slate-900 truncate">{task.title}</div>
+        <div className="font-parent font-semibold text-slate-900 truncate flex items-center gap-2">
+          {task.title}
+          {task._groupKidIds && task._groupKidIds.length > 1 && (
+            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-600 shrink-0" title="Tugas bersama — klik tab anak untuk edit khusus">
+              👥 Bersama
+            </span>
+          )}
+        </div>
         <div className="text-xs text-slate-500 flex gap-2 flex-wrap">
           <span>{childName}</span>
           <span>·</span>
@@ -761,52 +817,6 @@ function ConsequencesView({ consequences, kids, onAdd, onRefresh, onApply }) {
 }
 
 // ─────────────────────────────────────────────────────────
-function ActivityView({ activity, kids }) {
-  const label = {
-    task_created: "created task",
-    task_completed: "completed task",
-    task_approved: "approved task",
-    task_rejected: "rejected task",
-    task_missed: "marked task missed",
-    reward_redeemed: "redeemed reward",
-    consequence_applied: "applied consequence",
-    child_created: "added child",
-  };
-  return (
-    <div className="bg-white rounded-2xl border border-slate-200 p-6">
-      <h3 className="font-parent font-bold text-lg text-slate-900 mb-4">Recent activity</h3>
-      {activity.length === 0 ? (
-        <div className="text-sm text-slate-400 text-center py-8">Nothing yet.</div>
-      ) : (
-        <div className="divide-y divide-slate-100">
-          {activity.map((a) => {
-            const child = kids.find((c) => c.id === a.child_id);
-            const time = new Date(a.created_at).toLocaleString();
-            const details = a.details || {};
-            const detailText = details.title || details.reward || details.name || "";
-            return (
-              <div key={a.id} className="py-3 flex items-start gap-3">
-                <div className="w-8 h-8 rounded-lg bg-[#6366F1]/10 flex items-center justify-center flex-shrink-0">
-                  <Activity className="w-4 h-4 text-[#6366F1]" strokeWidth={2.5} />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm text-slate-800">
-                    <span className="font-semibold">{child?.name || "System"}</span>{" "}
-                    {label[a.action] || a.action}
-                    {detailText && <span className="text-slate-600">: {detailText}</span>}
-                  </div>
-                  <div className="text-xs text-slate-400">{time}</div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────
 function SettingsView({ kids, onAdd, onRefresh }) {
   const { user } = useAuth();
 
@@ -907,6 +917,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
       {/* Stage 2 & 3: New Features */}
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <ConfigMenu />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <LabelEditor />
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
@@ -1121,7 +1135,9 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         due_time: dueTime || null,
         duration_minutes: duration ? Number(duration) : null,
         is_bonus: isBonus,
-        recurrence,
+        // Rutin (weekday) mode auto-repeats weekly so the task comes back each
+        // week on the same day. Non-rutin uses the chosen recurrence dropdown.
+        recurrence: useWeekdays ? "weekly" : recurrence,
         order: order ? Number(order) : null,
         task_style: taskStyle || null,
       };
@@ -1234,7 +1250,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
                     scheduleMode === "weekdays" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
                   }`}
                 >
-                  📅 Pilih hari
+                  🔁 Rutin (per hari)
                 </button>
                 <button
                   type="button"
@@ -1243,11 +1259,16 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
                     scheduleMode === "date" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
                   }`}
                 >
-                  🗓️ Tanggal tertentu
+                  🗓️ Non-rutin (tanggal)
                 </button>
               </div>
               {scheduleMode === "date" ? (
-                <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
+                <div>
+                  <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
+                  <p className="text-xs text-slate-400 mt-1.5">
+                    Untuk aktivitas tidak rutin / anomali — misal ada acara khusus di tanggal tertentu.
+                  </p>
+                </div>
               ) : (
                 <div>
                   <div className="grid grid-cols-7 gap-1">
@@ -1265,7 +1286,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
                     ))}
                   </div>
                   <p className="text-xs text-slate-400 mt-1.5">
-                    Misi dibuat untuk hari terpilih minggu ini. Tiap hari bisa punya misi berbeda.
+                    Misi rutin diulang tiap minggu di hari terpilih. Tiap hari bisa punya misi berbeda.
                   </p>
                 </div>
               )}
@@ -1273,15 +1294,17 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
           )}
         </div>
 
-        {/* Repeat */}
-        <div>
-          <label className={labelClass}>Ulangi</label>
-          <select value={recurrence} onChange={(e) => setRecurrence(e.target.value)} className={inputClass}>
-            <option value="none">Sekali</option>
-            <option value="daily">Harian</option>
-            <option value="weekly">Mingguan</option>
-          </select>
-        </div>
+        {/* Repeat — only for non-rutin (date) mode; rutin auto-repeats weekly */}
+        {(isEdit || scheduleMode === "date") && (
+          <div>
+            <label className={labelClass}>Ulangi</label>
+            <select value={recurrence} onChange={(e) => setRecurrence(e.target.value)} className={inputClass}>
+              <option value="none">Sekali</option>
+              <option value="daily">Harian</option>
+              <option value="weekly">Mingguan</option>
+            </select>
+          </div>
+        )}
 
         <div className="grid grid-cols-3 gap-3">
           <div>

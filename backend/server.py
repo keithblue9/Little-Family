@@ -167,13 +167,19 @@ class AppConfigInput(BaseModel):
     app_name: Optional[str] = None
     default_theme: Optional[Literal["clean", "candy", "mermaid", "cyber", "galaxy"]] = None
     slideshow_background_url: Optional[str] = None
+    slideshow_background_image: Optional[str] = None  # base64 data URL (uploaded image)
     rupiah_per_point: Optional[int] = Field(default=None, ge=1, le=1000000)
     skip_cost_points: Optional[int] = Field(default=None, ge=0, le=100000)
     daily_point_goal: Optional[int] = Field(default=None, ge=0, le=10000)
+    # Per-weekday minimum point goals (Mon=0..Sun=6). Dict of "0".."6" -> int.
+    # When a day isn't set, falls back to the dynamic sum-of-required or daily_point_goal.
+    weekday_goals: Optional[dict] = None
     # Three piggy banks (BusyKid): auto-split earned points by percentage
     piggy_save_pct: Optional[int] = Field(default=None, ge=0, le=100)
     piggy_spend_pct: Optional[int] = Field(default=None, ge=0, le=100)
     piggy_share_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
+    custom_labels: Optional[dict] = None
 
 
 class ReminderInput(BaseModel):
@@ -325,6 +331,19 @@ async def list_members():
     order = {"parent": 0, "child": 1}
     members.sort(key=lambda m: (order.get(m.get("role"), 2), m.get("created_at", "")))
     return members
+
+
+@api.get("/auth/branding")
+async def public_branding():
+    """Public: app name, login background, and custom labels for the login screen
+    (no auth needed so branding shows before sign-in)."""
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    return {
+        "app_name": config.get("app_name", "My Lil Famz"),
+        "slideshow_background_url": config.get("slideshow_background_url", ""),
+        "slideshow_background_image": config.get("slideshow_background_image", ""),
+        "custom_labels": config.get("custom_labels", {}) or {},
+    }
 
 
 @api.post("/auth/login")
@@ -969,6 +988,12 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
     if "due_time" in updates and updates["due_time"] is not None:
         updates["due_time"] = validate_due_time(updates["due_time"])
 
+    # Editing a member of a broadcast group forks it: this child's copy becomes
+    # independent (loses broadcast_id) so the parent can customize just this one
+    # while the siblings stay as they were. Matches the requested template behavior.
+    if updates and task.get("broadcast_id"):
+        updates["broadcast_id"] = None
+
     if updates:
         await db.tasks.update_one({"id": task_id}, {"$set": updates})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
@@ -1016,7 +1041,21 @@ async def child_day_progress(
     # required tasks exist for the day, fall back to the configured default so
     # the progress card still shows something sensible.
     required_total = sum(t.get("points", 0) for t in required)
-    daily_goal = required_total if required_total > 0 else int(config.get("daily_point_goal", 50))
+    # Goal priority:
+    #   1. Explicit per-weekday minimum target set by parent (Senin=X, etc.)
+    #   2. Dynamic: sum of the day's required-task points
+    #   3. Configured global default
+    weekday_goals = config.get("weekday_goals") or {}
+    try:
+        wd = str(datetime.strptime(date_key, "%Y-%m-%d").weekday())  # "0".."6"
+    except Exception:
+        wd = None
+    if wd is not None and weekday_goals.get(wd) is not None:
+        daily_goal = int(weekday_goals[wd])
+    elif required_total > 0:
+        daily_goal = required_total
+    else:
+        daily_goal = int(config.get("daily_point_goal", 50))
 
     finished_required = sum(1 for t in required if t.get("status") in ("completed", "approved", "skipped"))
 
@@ -1347,6 +1386,14 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
     config_doc = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if config_doc:
         update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        # Merge dict-typed fields so partial updates don't wipe existing keys.
+        for dict_field in ("custom_labels", "weekday_goals"):
+            if dict_field in update_data:
+                merged = dict(config_doc.get(dict_field) or {})
+                merged.update(update_data[dict_field])
+                # Drop keys explicitly set to None (allows clearing a single label)
+                merged = {k: v for k, v in merged.items() if v is not None}
+                update_data[dict_field] = merged
         if update_data:
             await db.app_config.update_one({"parent_id": FAMILY_ID}, {"$set": update_data})
     else:
@@ -1374,23 +1421,29 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "app_name": "My Lil Famz",
             "default_theme": "clean",
             "slideshow_background_url": "",
+            "slideshow_background_image": "",
             "rupiah_per_point": 100,
             "skip_cost_points": 20,
             "daily_point_goal": 50,
+            "weekday_goals": {},
             "piggy_save_pct": 40,
             "piggy_spend_pct": 40,
             "piggy_share_pct": 20,
+            "custom_labels": {},
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
         "default_theme": config.get("default_theme", "clean"),
         "slideshow_background_url": config.get("slideshow_background_url", ""),
+        "slideshow_background_image": config.get("slideshow_background_image", ""),
         "rupiah_per_point": int(config.get("rupiah_per_point", 100)),
         "skip_cost_points": int(config.get("skip_cost_points", 20)),
         "daily_point_goal": int(config.get("daily_point_goal", 50)),
+        "weekday_goals": config.get("weekday_goals", {}) or {},
         "piggy_save_pct": int(config.get("piggy_save_pct", 40)),
         "piggy_spend_pct": int(config.get("piggy_spend_pct", 40)),
         "piggy_share_pct": int(config.get("piggy_share_pct", 20)),
+        "custom_labels": config.get("custom_labels", {}) or {},
     }
 
 

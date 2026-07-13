@@ -9,6 +9,7 @@ import KidHome from "@/pages/KidHome";
 import ChildPicker from "@/pages/ChildPicker";
 import InstallPrompt from "@/components/InstallPrompt";
 import PushPermissionPrompt from "@/components/PushPermissionPrompt";
+import LabelProvider from "@/components/LabelProvider";
 
 function ConnectionErrorScreen() {
   const { refresh } = useAuth();
@@ -63,6 +64,7 @@ function App() {
     <ErrorBoundary>
       <AuthProvider>
         <BrowserRouter>
+          <LabelProvider>
           <Routes>
             <Route path="/" element={<HomeRedirect />} />
             <Route path="/login" element={<LoginPage />} />
@@ -92,6 +94,7 @@ function App() {
             />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          </LabelProvider>
         </BrowserRouter>
         <Toaster position="top-center" richColors />
         <InstallPrompt />

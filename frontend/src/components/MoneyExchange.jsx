@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { toast } from "sonner";
-import { Banknote, Coins, ArrowRight, Clock, CheckCircle2, XCircle, PiggyBank, Pencil } from "lucide-react";
+import { Banknote, Coins, ArrowRight, Clock, CheckCircle2, XCircle, Bird, Pencil } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 
 const fmtRp = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
@@ -29,7 +29,7 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
     setSavingGoal(true);
     try {
       await api.patch("/me/profile", { savings_goal_name: goalName.trim(), savings_goal_amount: amt });
-      toast.success("Target tabungan disimpan! Semangat menabung 🐷");
+      toast.success("Target tabungan disimpan! Semangat menabung 🐔");
       setEditingGoal(false);
       onChanged?.();
     } catch (e) {
@@ -117,7 +117,7 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
       <div className="bg-gradient-to-br from-pink-50 to-rose-50 border-2 border-pink-100 rounded-3xl p-5">
         <div className="flex items-center justify-between gap-2 mb-1">
           <h4 className="font-fun font-bold text-slate-900 flex items-center gap-2">
-            <PiggyBank className="w-5 h-5 text-pink-500" /> Target Tabunganku
+            <Bird className="w-5 h-5 text-amber-500" /> Target Tabunganku
           </h4>
           <button
             onClick={() => {
@@ -179,7 +179,7 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
           </div>
         ) : (
           <p className="text-sm text-slate-500">
-            Belum ada target. Yuk tentukan mau nabung untuk apa — nanti kelihatan progresnya di sini! 🐷
+            Belum ada target. Yuk tentukan mau nabung untuk apa — nanti kelihatan progresnya di sini! 🐔
           </p>
         )}
       </div>

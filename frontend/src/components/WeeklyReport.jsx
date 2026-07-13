@@ -235,11 +235,11 @@ export default function WeeklyReport() {
                 <span className="flex items-center gap-1"><TrendingUp className="w-3 h-3 text-green-500" /> total {c.points} poin</span>
               </div>
 
-              {/* Piggy summary */}
+              {/* ChikyBank summary */}
               <div className="px-4 pb-4 grid grid-cols-3 gap-2 text-center">
-                <div className="bg-blue-50 rounded-xl py-2"><div className="text-lg">🏦</div><div className="text-xs font-bold text-blue-600">{c.piggy_save || 0}</div><div className="text-[9px] text-slate-400">Tabungan</div></div>
-                <div className="bg-amber-50 rounded-xl py-2"><div className="text-lg">🛍️</div><div className="text-xs font-bold text-amber-600">{c.piggy_spend || 0}</div><div className="text-[9px] text-slate-400">Belanja</div></div>
-                <div className="bg-pink-50 rounded-xl py-2"><div className="text-lg">💝</div><div className="text-xs font-bold text-pink-600">{c.piggy_share || 0}</div><div className="text-[9px] text-slate-400">Sedekah</div></div>
+                <div className="bg-blue-50 rounded-xl py-2"><div className="text-lg">🐔</div><div className="text-xs font-bold text-blue-600">{c.chiky_save || 0}</div><div className="text-[9px] text-slate-400">Tabungan</div></div>
+                <div className="bg-amber-50 rounded-xl py-2"><div className="text-lg">🐥</div><div className="text-xs font-bold text-amber-600">{c.chiky_spend || 0}</div><div className="text-[9px] text-slate-400">Belanja</div></div>
+                <div className="bg-pink-50 rounded-xl py-2"><div className="text-lg">🐣</div><div className="text-xs font-bold text-pink-600">{c.chiky_share || 0}</div><div className="text-[9px] text-slate-400">Sedekah</div></div>
               </div>
             </motion.div>
           );

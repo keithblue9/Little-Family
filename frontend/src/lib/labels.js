@@ -53,12 +53,12 @@ export const DEFAULT_LABELS = {
   "kid.bonus_section": "Misi Bonus",
   "kid.done_section": "Sudah selesai",
 
-  // Money / piggy
+  // Money / ChikyBank
   "money.savings_goal": "Target Tabunganku",
-  "money.three_piggy": "Tiga Celenganku",
-  "piggy.save": "Tabungan",
-  "piggy.spend": "Belanja",
-  "piggy.share": "Sedekah",
+  "money.three_chiky": "ChikyBank-ku",
+  "chiky.save": "Tabungan",
+  "chiky.spend": "Belanja",
+  "chiky.share": "Sedekah",
 };
 
 // Context holds the merged label map (defaults + overrides).
@@ -85,5 +85,5 @@ export const LABEL_GROUPS = [
   { title: "Overview", prefix: "overview." },
   { title: "Tugas", prefix: "tasks." },
   { title: "Aplikasi Anak", prefix: "kid." },
-  { title: "Uang & Celengan", prefix: "money.", extraPrefix: "piggy." },
+  { title: "Uang & ChikyBank", prefix: "money.", extraPrefix: "chiky." },
 ];

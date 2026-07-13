@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Settings, Save, Upload, Target, PiggyBank, Coins, Image as ImageIcon, X, Plane } from "lucide-react";
+import { Settings, Save, Upload, Target, Bird, Coins, Image as ImageIcon, X, Plane } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 
@@ -68,11 +68,11 @@ export default function ConfigMenu() {
     reader.readAsDataURL(file);
   };
 
-  const piggyTotal = (config?.piggy_save_pct || 0) + (config?.piggy_spend_pct || 0) + (config?.piggy_share_pct || 0);
+  const chikyTotal = (config?.chiky_save_pct || 0) + (config?.chiky_spend_pct || 0) + (config?.chiky_share_pct || 0);
 
   const handleSave = async () => {
-    if (piggyTotal !== 100) {
-      return toast.error(`Total persen celengan harus 100% (sekarang ${piggyTotal}%)`);
+    if (chikyTotal !== 100) {
+      return toast.error(`Total persen ChikyBank harus 100% (sekarang ${chikyTotal}%)`);
     }
     setSaving(true);
     try {
@@ -205,14 +205,14 @@ export default function ConfigMenu() {
 
       <div className={cardCls}>
         <label className="block text-sm font-semibold text-slate-700 mb-1 flex items-center gap-2">
-          <PiggyBank className="w-4 h-4 text-pink-500" /> Pembagian Celengan
+          <Bird className="w-4 h-4 text-amber-500" /> Pembagian ChikyBank
         </label>
         <p className="text-xs text-slate-500 mb-3">Bagaimana poin dibagi otomatis. Total harus 100%.</p>
         <div className="grid grid-cols-3 gap-2">
           {[
-            ["piggy_save_pct", "🏦 Tabungan"],
-            ["piggy_spend_pct", "🛍️ Belanja"],
-            ["piggy_share_pct", "💝 Sedekah"],
+            ["chiky_save_pct", "🐔 Tabungan"],
+            ["chiky_spend_pct", "🐥 Belanja"],
+            ["chiky_share_pct", "🐣 Sedekah"],
           ].map(([field, label]) => (
             <div key={field}>
               <span className="text-xs text-slate-500 block mb-1">{label}</span>
@@ -225,8 +225,8 @@ export default function ConfigMenu() {
             </div>
           ))}
         </div>
-        <div className={`text-xs font-semibold mt-2 ${piggyTotal === 100 ? "text-green-600" : "text-red-500"}`}>
-          Total: {piggyTotal}% {piggyTotal !== 100 && "(harus 100%)"}
+        <div className={`text-xs font-semibold mt-2 ${chikyTotal === 100 ? "text-green-600" : "text-red-500"}`}>
+          Total: {chikyTotal}% {chikyTotal !== 100 && "(harus 100%)"}
         </div>
       </div>
 

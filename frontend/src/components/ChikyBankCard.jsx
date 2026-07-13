@@ -1,23 +1,24 @@
 import { motion } from "framer-motion";
+import { Bird } from "lucide-react";
 
 const fmtRp = (n, rate) => "Rp " + (Number(n || 0) * rate).toLocaleString("id-ID");
 
-export default function PiggyBankCard({ child, rate = 100 }) {
-  const save = child?.piggy_save || 0;
-  const spend = child?.piggy_spend || 0;
-  const share = child?.piggy_share || 0;
+export default function ChikyBankCard({ child, rate = 100 }) {
+  const save = child?.chiky_save || 0;
+  const spend = child?.chiky_spend || 0;
+  const share = child?.chiky_share || 0;
   const total = save + spend + share || 1;
 
   const banks = [
-    { key: "save", label: "Tabungan", emoji: "🏦", color: "#3B82F6", pts: save, desc: "Untuk tujuanmu" },
-    { key: "spend", label: "Belanja", emoji: "🛍️", color: "#F59E0B", pts: spend, desc: "Boleh dipakai" },
-    { key: "share", label: "Sedekah", emoji: "💝", color: "#EC4899", pts: share, desc: "Berbagi kebaikan" },
+    { key: "save", label: "Tabungan", emoji: "🐔", color: "#3B82F6", pts: save, desc: "Untuk tujuanmu" },
+    { key: "spend", label: "Belanja", emoji: "🐥", color: "#F59E0B", pts: spend, desc: "Boleh dipakai" },
+    { key: "share", label: "Sedekah", emoji: "🐣", color: "#EC4899", pts: share, desc: "Berbagi kebaikan" },
   ];
 
   return (
     <div className="bg-white rounded-3xl border-2 border-slate-100 chunky-shadow p-4">
       <h3 className="font-fun font-bold text-lg text-slate-900 mb-3 flex items-center gap-2">
-        🐷 Tiga Celenganku
+        <Bird className="w-5 h-5 text-amber-500" /> ChikyBank-ku
       </h3>
 
       <div className="grid grid-cols-3 gap-2 mb-3">

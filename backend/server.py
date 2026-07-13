@@ -175,10 +175,10 @@ class AppConfigInput(BaseModel):
     # Per-weekday minimum point goals (Mon=0..Sun=6). Dict of "0".."6" -> int.
     # When a day isn't set, falls back to the dynamic sum-of-required or daily_point_goal.
     weekday_goals: Optional[dict] = None
-    # Three piggy banks (BusyKid): auto-split earned points by percentage
-    piggy_save_pct: Optional[int] = Field(default=None, ge=0, le=100)
-    piggy_spend_pct: Optional[int] = Field(default=None, ge=0, le=100)
-    piggy_share_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    # Three Chikybanks (BusyKid): auto-split earned points by percentage
+    chiky_save_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    chiky_spend_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    chiky_share_pct: Optional[int] = Field(default=None, ge=0, le=100)
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
     # Vacation/pause mode: while on, recurring (daily/weekly) tasks don't spawn
@@ -736,9 +736,9 @@ async def family_weekly_report(user: dict = Depends(require_parent)):
                 "avatar_emoji": k.get("avatar_emoji"), "avatar_color": k.get("avatar_color"),
                 "mbti": k.get("mbti"), "points": k.get("points", 0),
                 "streak_days": k.get("streak_days", 0),
-                "piggy_save": k.get("piggy_save", 0),
-                "piggy_spend": k.get("piggy_spend", 0),
-                "piggy_share": k.get("piggy_share", 0),
+                "chiky_save": k.get("chiky_save", 0),
+                "chiky_spend": k.get("chiky_spend", 0),
+                "chiky_share": k.get("chiky_share", 0),
             },
             "week_points": total_points,
             "week_tasks_done": len(completed),
@@ -939,7 +939,7 @@ async def list_tasks(
         query["date_key"] = date_key
     _UNDO_FIELDS = {
         "_undo_prev_streak": 0, "_undo_prev_last_completion": 0, "_undo_points_awarded": 0,
-        "_undo_piggy_save": 0, "_undo_piggy_spend": 0, "_undo_piggy_share": 0, "_undo_spawned_next_id": 0,
+        "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
     }
     tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(2000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
@@ -1427,11 +1427,11 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
 
     points = task["points"]
 
-    # Three piggy banks: auto-split earned points into Save/Spend/Share
+    # Three Chikybanks: auto-split earned points into Save/Spend/Share
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
-    save_pct = int(config.get("piggy_save_pct", 40))
-    spend_pct = int(config.get("piggy_spend_pct", 40))
-    share_pct = int(config.get("piggy_share_pct", 20))
+    save_pct = int(config.get("chiky_save_pct", 40))
+    spend_pct = int(config.get("chiky_spend_pct", 40))
+    share_pct = int(config.get("chiky_share_pct", 20))
     total_pct = save_pct + spend_pct + share_pct or 100
     p_save = round(points * save_pct / total_pct)
     p_spend = round(points * spend_pct / total_pct)
@@ -1444,9 +1444,9 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
                 "points": points,
                 "lifetime_points": points,
                 "tasks_completed": 1,
-                "piggy_save": p_save,
-                "piggy_spend": p_spend,
-                "piggy_share": p_share,
+                "chiky_save": p_save,
+                "chiky_spend": p_spend,
+                "chiky_share": p_share,
             },
             "$set": {"last_completion_date": today, "streak_days": streak},
         },
@@ -1515,9 +1515,9 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
                 "_undo_prev_streak": prev_streak,
                 "_undo_prev_last_completion": prev_last_completion,
                 "_undo_points_awarded": points,
-                "_undo_piggy_save": p_save,
-                "_undo_piggy_spend": p_spend,
-                "_undo_piggy_share": p_share,
+                "_undo_chiky_save": p_save,
+                "_undo_chiky_spend": p_spend,
+                "_undo_chiky_share": p_share,
                 "_undo_spawned_next_id": spawned_next_id,
             }
         },
@@ -1532,7 +1532,7 @@ UNDO_WINDOW_MINUTES = 30
 
 @api.post("/tasks/{task_id}/undo-approval")
 async def undo_task_approval(task_id: str, user: dict = Depends(require_parent)):
-    """Reverse a mistaken approval within a short window: refunds the points/piggy
+    """Reverse a mistaken approval within a short window: refunds the points/Chikybank
     split, restores the previous streak, and removes the auto-spawned next
     occurrence if it's still untouched (so recurrence doesn't double up)."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
@@ -1550,9 +1550,9 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
         raise HTTPException(status_code=409, detail=f"Batas waktu membatalkan sudah lewat ({UNDO_WINDOW_MINUTES} menit)")
 
     points = task.get("_undo_points_awarded", task.get("points", 0))
-    p_save = task.get("_undo_piggy_save", 0)
-    p_spend = task.get("_undo_piggy_spend", 0)
-    p_share = task.get("_undo_piggy_share", 0)
+    p_save = task.get("_undo_chiky_save", 0)
+    p_spend = task.get("_undo_chiky_spend", 0)
+    p_share = task.get("_undo_chiky_share", 0)
 
     await db.children.update_one(
         {"id": task["child_id"]},
@@ -1561,9 +1561,9 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "points": -points,
                 "lifetime_points": -points,
                 "tasks_completed": -1,
-                "piggy_save": -p_save,
-                "piggy_spend": -p_spend,
-                "piggy_share": -p_share,
+                "chiky_save": -p_save,
+                "chiky_spend": -p_spend,
+                "chiky_share": -p_share,
             },
             "$set": {
                 "streak_days": task.get("_undo_prev_streak", 0),
@@ -1587,8 +1587,8 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
             "$set": {"status": "completed", "approved_at": None},
             "$unset": {
                 "_undo_prev_streak": "", "_undo_prev_last_completion": "",
-                "_undo_points_awarded": "", "_undo_piggy_save": "", "_undo_piggy_spend": "",
-                "_undo_piggy_share": "", "_undo_spawned_next_id": "",
+                "_undo_points_awarded": "", "_undo_chiky_save": "", "_undo_chiky_spend": "",
+                "_undo_chiky_share": "", "_undo_spawned_next_id": "",
             },
         },
     )
@@ -1670,7 +1670,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
         # First-ever config write for this family: start from the same defaults
         # get_app_config uses, then apply whatever the payload actually sent.
         # (Previously this branch only copied a handful of legacy fields, so
-        # anything added later — vacation_mode, piggy split, weekday_goals,
+        # anything added later — vacation_mode, Chikybank split, weekday_goals,
         # custom_labels, background image — would be silently dropped if it
         # happened to be the very first settings change a family ever made.)
         defaults = {
@@ -1682,9 +1682,9 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "skip_cost_points": 20,
             "daily_point_goal": 50,
             "weekday_goals": {},
-            "piggy_save_pct": 40,
-            "piggy_spend_pct": 40,
-            "piggy_share_pct": 20,
+            "chiky_save_pct": 40,
+            "chiky_spend_pct": 40,
+            "chiky_share_pct": 20,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -1709,9 +1709,9 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "skip_cost_points": 20,
             "daily_point_goal": 50,
             "weekday_goals": {},
-            "piggy_save_pct": 40,
-            "piggy_spend_pct": 40,
-            "piggy_share_pct": 20,
+            "chiky_save_pct": 40,
+            "chiky_spend_pct": 40,
+            "chiky_share_pct": 20,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -1725,9 +1725,9 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "skip_cost_points": int(config.get("skip_cost_points", 20)),
         "daily_point_goal": int(config.get("daily_point_goal", 50)),
         "weekday_goals": config.get("weekday_goals", {}) or {},
-        "piggy_save_pct": int(config.get("piggy_save_pct", 40)),
-        "piggy_spend_pct": int(config.get("piggy_spend_pct", 40)),
-        "piggy_share_pct": int(config.get("piggy_share_pct", 20)),
+        "chiky_save_pct": int(config.get("chiky_save_pct", 40)),
+        "chiky_spend_pct": int(config.get("chiky_spend_pct", 40)),
+        "chiky_share_pct": int(config.get("chiky_share_pct", 20)),
         "custom_labels": config.get("custom_labels", {}) or {},
         "vacation_mode": bool(config.get("vacation_mode", False)),
         "vacation_note": config.get("vacation_note", ""),
@@ -2400,6 +2400,37 @@ async def migrate_existing_data():
     await db.tasks.update_many(
         {"date_key": {"$exists": False}}, {"$set": {"date_key": _today_key()}}
     )
+
+    # 5. Rebrand: "piggy bank" split fields renamed to "Chikybank" (chiky_*).
+    #    Copy any pre-existing values across so nobody's saved balance vanishes
+    #    just because we renamed the feature. Safe to run repeatedly — once the
+    #    chiky_* field exists, the $exists filter skips that document.
+    async for child in db.children.find(
+        {"$or": [{"piggy_save": {"$exists": True}}, {"piggy_spend": {"$exists": True}}, {"piggy_share": {"$exists": True}}],
+         "chiky_save": {"$exists": False}},
+        {"id": 1, "piggy_save": 1, "piggy_spend": 1, "piggy_share": 1},
+    ):
+        await db.children.update_one(
+            {"id": child["id"]},
+            {"$set": {
+                "chiky_save": child.get("piggy_save", 0),
+                "chiky_spend": child.get("piggy_spend", 0),
+                "chiky_share": child.get("piggy_share", 0),
+            }},
+        )
+    async for cfg in db.app_config.find(
+        {"$or": [{"piggy_save_pct": {"$exists": True}}, {"piggy_spend_pct": {"$exists": True}}, {"piggy_share_pct": {"$exists": True}}],
+         "chiky_save_pct": {"$exists": False}},
+        {"id": 1, "piggy_save_pct": 1, "piggy_spend_pct": 1, "piggy_share_pct": 1},
+    ):
+        await db.app_config.update_one(
+            {"id": cfg["id"]},
+            {"$set": {
+                "chiky_save_pct": cfg.get("piggy_save_pct", 40),
+                "chiky_spend_pct": cfg.get("piggy_spend_pct", 40),
+                "chiky_share_pct": cfg.get("piggy_share_pct", 20),
+            }},
+        )
 
 
 # --------------- Startup ---------------

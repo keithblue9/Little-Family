@@ -15,7 +15,7 @@ import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
 import Leaderboard from "@/components/Leaderboard";
 import Achievements from "@/components/Achievements";
 import MoneyExchange from "@/components/MoneyExchange";
-import PiggyBankCard from "@/components/PiggyBankCard";
+import ChikyBankCard from "@/components/ChikyBankCard";
 import KidChallenges from "@/components/KidChallenges";
 import ProfileEditor from "@/components/ProfileEditor";
 import DailyQuestView from "@/components/DailyQuestView";
@@ -203,7 +203,7 @@ export default function KidHome() {
 
           {tab === "money" && (
             <motion.div key="money" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-              <PiggyBankCard child={child} />
+              <ChikyBankCard child={child} />
               <MoneyExchange childId={childId} points={child.points || 0} child={child} onChanged={load} />
             </motion.div>
           )}

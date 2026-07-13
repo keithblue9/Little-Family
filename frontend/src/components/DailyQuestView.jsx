@@ -14,8 +14,13 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState(null);
   const [nowHHMM, setNowHHMM] = useState(localTimeHHMM());
+  const [nowMs, setNowMs] = useState(Date.now()); // ticks every second — precise duration-overrun detection
   useEffect(() => {
     const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
 
@@ -62,6 +67,17 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     if (nowMin < dueMin - lead) return { allowed: false, reason: "early" };
     if (nowMin > dueMin) return { allowed: false, reason: "late" };
     return { allowed: true, reason: null };
+  };
+
+  // Once a task's own timer is running, if it has a set duration and that
+  // duration has elapsed, Finish gets disabled — the countdown hitting zero
+  // is a real deadline, not just a visual. Skip stays available either way so
+  // the kid is never stuck with no way forward. Backend enforces this too.
+  const isDurationExceeded = (task) => {
+    if (!task.timer_started_at || !task.duration_minutes) return false;
+    const startMs = new Date(task.timer_started_at).getTime();
+    const elapsedMin = (nowMs - startMs) / 60000;
+    return elapsedMin > task.duration_minutes;
   };
 
   const startTimer = async (task) => {
@@ -235,12 +251,13 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     const isActive = next?.id === t.id;
                     const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
                     const gate = timeGate(t);
+                    const overdue = isDurationExceeded(t);
                     return (
                       <QuestNode key={t.id} task={t} idx={idx} total={required.length}
                         isActive={isActive} isDone={isDone} theme={theme}
-                        busy={busyId === t.id} gate={gate}
+                        busy={busyId === t.id} gate={gate} overdue={overdue}
                         canStart={isActive && !t.timer_started_at && gate.allowed}
-                        canFinish={isActive && !!t.timer_started_at && gate.allowed}
+                        canFinish={isActive && !!t.timer_started_at && gate.allowed && !overdue}
                         onStart={() => startTimer(t)} onFinish={() => finishTask(t)} onSkip={() => skipTask(t)}
                       />
                     );
@@ -266,13 +283,15 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                 {bonus.map((t) => {
                   const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
                   const gate = timeGate(t);
+                  const overdue = isDurationExceeded(t);
                   return (
                     <QuestNode key={t.id} task={t} idx={0} total={1}
                       isActive={!isDone} isDone={isDone} theme={theme}
-                      busy={busyId === t.id} gate={gate}
+                      busy={busyId === t.id} gate={gate} overdue={overdue}
                       canStart={!isDone && !t.timer_started_at && gate.allowed}
-                      canFinish={!isDone && !!t.timer_started_at && gate.allowed}
+                      canFinish={!isDone && !!t.timer_started_at && gate.allowed && !overdue}
                       onStart={() => startTimer(t)} onFinish={() => finishTask(t)}
+                      onSkip={() => skipTask(t)}
                       isBonus
                     />
                   );
@@ -303,7 +322,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 }
 
 /* ======================== QUEST NODE (treasure map stop) ======================== */
-function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, canStart, canFinish, onStart, onFinish, onSkip, isBonus }) {
+function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, canStart, canFinish, onStart, onFinish, onSkip, isBonus }) {
   const c = theme.colors;
   const bg = isDone ? c.nodeDone : isActive ? c.node : c.nodeLocked;
   const started = !!task.timer_started_at;
@@ -385,7 +404,12 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, canS
               <Square className="w-3.5 h-3.5" strokeWidth={2.5} /> Selesai!
             </button>
           )}
-          {!isBonus && onSkip && (canStart || canFinish) && (
+          {overdue && !!task.timer_started_at && (
+            <button disabled className="press-btn bg-slate-200 text-slate-400 font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 cursor-not-allowed" title="Waktu sudah habis — lewati misi ini untuk lanjut">
+              <Square className="w-3.5 h-3.5" strokeWidth={2.5} /> Waktu Habis
+            </button>
+          )}
+          {onSkip && (canStart || canFinish || overdue) && (
             <button onClick={onSkip} disabled={busy} className="press-btn bg-slate-100 hover:bg-slate-200 text-slate-600 font-fun font-semibold px-3 py-1 rounded-xl text-[10px] flex items-center gap-1 disabled:opacity-60">
               <FastForward className="w-3 h-3" /> Lewati
             </button>

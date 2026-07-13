@@ -1589,6 +1589,28 @@ class TaskCompleteInput(BaseModel):
     photo_url: Optional[str] = None
 
 
+def _check_duration_not_exceeded(task):
+    """If the task has a duration and a running timer, block Finish once that
+    duration has elapsed since Start — mirrors the frontend's disabled-button
+    behavior so a direct API call can't bypass it. The kid's way forward once
+    overdue is Skip (still available), not a late Finish."""
+    started = task.get("timer_started_at")
+    duration = task.get("duration_minutes")
+    if not started or not duration:
+        return  # no duration set, or timer never started — nothing to enforce
+    try:
+        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except Exception:
+        return
+    now = datetime.now(timezone.utc) if start_dt.tzinfo else datetime.utcnow()
+    elapsed_min = (now - start_dt).total_seconds() / 60
+    if elapsed_min > duration:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Waktu {duration} menit sudah habis — lewati misi ini untuk lanjut ke misi berikutnya.",
+        )
+
+
 @api.post("/tasks/{task_id}/complete")
 async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteInput(), user: dict = Depends(get_current_user)):
     """Kid marks a task complete → awaits parent approval. Treasure-hunt rule:
@@ -1608,6 +1630,8 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
                 status_code=409,
                 detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\" (atau lewati dengan poin)",
             )
+
+    _check_duration_not_exceeded(task)
 
     if task.get("photo_required") and not payload.photo_url:
         raise HTTPException(status_code=422, detail="Misi ini butuh foto sebagai bukti sebelum selesai")
@@ -1644,9 +1668,13 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Only open tasks can be skipped")
 
-    nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-    if nxt and nxt["id"] != task_id:
-        raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dilewati")
+    # Bonus tasks (including co-op, which are always bonus) aren't part of the
+    # required sequence, so they can be skipped any time — matches the same
+    # exemption complete_task already has. Only required tasks must be "next".
+    if not task.get("is_bonus"):
+        nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
+        if nxt and nxt["id"] != task_id:
+            raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dilewati")
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
     cost = int(config.get("skip_cost_points", 20))

@@ -963,6 +963,49 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     found_ccc = next(x for x in r.json() if x["id"] == ccc["id"])
     check("coop-cross: challenge counts split total, not doubled", found_ccc["earned_points"] >= 9, str(found_ccc["earned_points"]))
 
+    # ================= 51. DURATION OVERRUN BLOCKS FINISH =================
+    # Every task with a duration has a live countdown once started; if the kid
+    # doesn't finish within that window, Finish must be blocked server-side too
+    # (not just a disabled frontend button) — otherwise a direct API call could
+    # bypass the "time's up" signal entirely.
+    import asyncio as _asyncio3
+    import datetime as _dt2
+    utc_now = _dt2.datetime.now(_dt2.timezone.utc)
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "QuickDur", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True, "duration_minutes": 10})
+    qd = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{qd['id']}/start")
+    r = c.post(f"/api/tasks/{qd['id']}/complete")
+    check("duration: finish within window succeeds", r.status_code == 200, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "SlowDur", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True, "duration_minutes": 5})
+    sd = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{sd['id']}/start")
+    _asyncio3.run(server.db.tasks.update_one({"id": sd["id"]}, {"$set": {"timer_started_at": (utc_now - _dt2.timedelta(minutes=10)).isoformat()}}))
+    r = c.post(f"/api/tasks/{sd['id']}/complete")
+    check("duration: finish after time's up is BLOCKED (409)", r.status_code == 409, str(r.status_code))
+    check("duration: error message explains time's up", "habis" in r.json().get("detail", "").lower(), r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"skip_cost_points": 0})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{sd['id']}/skip")
+    check("duration: skip still works when overdue (kid not trapped)", r.status_code == 200, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"skip_cost_points": 20})
+
+    r = c.post("/api/tasks", json={"title": "NoDur", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    nodur = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{nodur['id']}/start")
+    _asyncio3.run(server.db.tasks.update_one({"id": nodur["id"]}, {"$set": {"timer_started_at": (utc_now - _dt2.timedelta(hours=6)).isoformat()}}))
+    r = c.post(f"/api/tasks/{nodur['id']}/complete")
+    check("duration: task with no duration set is never blocked", r.status_code == 200, r.text[:150])
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

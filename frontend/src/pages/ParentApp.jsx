@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
-  Rocket, Menu, X, PartyPopper, Clock,
+  Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -88,6 +88,7 @@ export default function ParentApp() {
   const [activity, setActivity] = useState([]);
   const [stats, setStats] = useState(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   // Modals
   const [childModal, setChildModal] = useState(false);
@@ -116,7 +117,7 @@ export default function ParentApp() {
       setRedemptions(rd.data);
       setActivity(a.data);
       setStats(s.data);
-      if (selectedChildId === undefined && c.data[0]) setSelectedChildId(c.data[0].id);
+      if (selectedChildId === undefined) setSelectedChildId(null);
     } catch (e) {
       toast.error(formatApiError(e));
     }
@@ -146,51 +147,64 @@ export default function ParentApp() {
       <aside
         className={`${
           mobileNavOpen ? "translate-x-0" : "-translate-x-full"
-        } md:translate-x-0 fixed md:sticky top-0 left-0 h-screen w-64 bg-white border-r border-slate-200 z-40 transition-transform flex flex-col`}
+        } md:translate-x-0 fixed md:sticky top-0 left-0 h-screen ${
+          sidebarCollapsed ? "md:w-20" : "w-64"
+        } bg-white border-r border-slate-200 z-40 transition-all duration-300 flex flex-col`}
       >
-        <div className="p-6 flex items-center gap-2 border-b border-slate-100">
-          <div className="w-9 h-9 rounded-xl bg-[#FF9D23] flex items-center justify-center">
+        <div className={`p-6 flex items-center gap-2 border-b border-slate-100 ${sidebarCollapsed ? "md:justify-center md:px-0" : ""}`}>
+          <div className="w-9 h-9 rounded-xl bg-[#FF9D23] flex items-center justify-center shrink-0">
             <Rocket className="w-5 h-5 text-white" strokeWidth={2.5} />
           </div>
-          <span className="font-fun font-bold text-xl text-slate-900">My Lil Famz</span>
+          <span className={`font-fun font-bold text-xl text-slate-900 ${sidebarCollapsed ? "md:hidden" : ""}`}>My Lil Famz</span>
         </div>
-        <div className="px-6 py-3 flex items-center justify-between border-b border-slate-100">
+        <div className={`px-6 py-3 flex items-center justify-between border-b border-slate-100 ${sidebarCollapsed ? "md:hidden" : ""}`}>
           <span className="text-sm text-slate-500">
             Hi, <span className="font-semibold text-slate-700">{user?.name}</span>
           </span>
         </div>
-        <nav className="flex-1 p-3 space-y-1">
+        <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
           {NAV.map((n) => (
             <button
               key={n.key}
               onClick={() => { setView(n.key); setMobileNavOpen(false); }}
               data-testid={n.testId}
-              className={`w-full text-left flex items-center gap-3 px-3 py-2.5 rounded-xl font-parent font-semibold text-sm transition-colors ${
+              title={n.label}
+              className={`w-full text-left flex items-center gap-3 px-3 py-2.5 rounded-xl font-parent font-semibold text-sm transition-colors ${sidebarCollapsed ? "md:justify-center" : ""} ${
                 view === n.key
                   ? "bg-[#EEF2FF] text-[#4338CA]"
                   : "text-slate-600 hover:bg-slate-50"
               }`}
             >
-              <n.icon className="w-4 h-4" strokeWidth={2.5} />
-              {n.label}
+              <n.icon className="w-4 h-4 shrink-0" strokeWidth={2.5} />
+              <span className={sidebarCollapsed ? "md:hidden" : ""}>{n.label}</span>
             </button>
           ))}
         </nav>
         <div className="p-3 border-t border-slate-100 space-y-2">
+          {/* Desktop collapse toggle */}
+          <button
+            onClick={() => setSidebarCollapsed((v) => !v)}
+            className={`hidden md:flex w-full items-center gap-2 justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 px-3 py-2 rounded-xl text-sm transition-colors`}
+            title={sidebarCollapsed ? "Perlebar sidebar" : "Perkecil sidebar"}
+          >
+            {sidebarCollapsed ? <ChevronRight className="w-4 h-4" /> : <><ChevronLeft className="w-4 h-4" /> <span>Sembunyikan</span></>}
+          </button>
           <button
             onClick={() => nav("/kid")}
             data-testid={TEST_IDS.parent.switchToKidBtn}
-            className="w-full flex items-center gap-2 justify-center bg-[#FFF4D1] hover:bg-[#FFE4A0] text-[#B4770F] font-semibold px-3 py-2.5 rounded-xl transition-colors"
+            title="Kid mode"
+            className={`w-full flex items-center gap-2 justify-center bg-[#FFF4D1] hover:bg-[#FFE4A0] text-[#B4770F] font-semibold px-3 py-2.5 rounded-xl transition-colors ${sidebarCollapsed ? "md:px-0" : ""}`}
           >
-            <PartyPopper className="w-4 h-4" strokeWidth={2.5} />
-            Kid mode
+            <PartyPopper className="w-4 h-4 shrink-0" strokeWidth={2.5} />
+            <span className={sidebarCollapsed ? "md:hidden" : ""}>Kid mode</span>
           </button>
           <button
             onClick={doLogout}
             data-testid={TEST_IDS.parent.logoutBtn}
-            className="w-full flex items-center gap-2 justify-center text-slate-500 hover:text-red-600 px-3 py-2 text-sm transition-colors"
+            title="Sign out"
+            className={`w-full flex items-center gap-2 justify-center text-slate-500 hover:text-red-600 px-3 py-2 text-sm transition-colors ${sidebarCollapsed ? "md:px-0" : ""}`}
           >
-            <LogOut className="w-4 h-4" strokeWidth={2.5} /> Sign out
+            <LogOut className="w-4 h-4 shrink-0" strokeWidth={2.5} /> <span className={sidebarCollapsed ? "md:hidden" : ""}>Sign out</span>
           </button>
         </div>
       </aside>
@@ -210,22 +224,41 @@ export default function ParentApp() {
             <div className="font-parent font-bold text-xl md:text-2xl text-slate-900 capitalize">{view}</div>
             <div className="text-sm text-slate-500">Hi {user?.name} · manage your family</div>
           </div>
-          {children.length > 0 && view !== "settings" && view !== "activity" && (
-            <select
-              value={selectedChildId || ""}
-              onChange={(e) => setSelectedChildId(e.target.value || null)}
-              className="hidden sm:block px-3 py-2 rounded-xl border border-slate-200 font-semibold text-sm text-slate-700 bg-white"
-              data-testid="parent-child-selector"
-            >
-              <option value="">All children</option>
-              {children.map((c) => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
-          )}
         </div>
 
         <div className="p-4 md:p-8 max-w-6xl">
+          {/* Child filter tabs */}
+          {children.length > 0 && view !== "settings" && view !== "activity" && view !== "monitor" && view !== "weekly" && (
+            <div className="flex items-center gap-2 mb-5 flex-wrap" data-testid="parent-child-tabs">
+              <button
+                onClick={() => setSelectedChildId(null)}
+                className={`press-btn px-4 py-2 rounded-xl font-parent font-semibold text-sm transition-colors ${
+                  selectedChildId === null || selectedChildId === undefined
+                    ? "bg-[#6366F1] text-white chunky-shadow"
+                    : "bg-white border-2 border-slate-200 text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                👨‍👩‍👧‍👦 Semua
+              </button>
+              {children.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setSelectedChildId(c.id)}
+                  className={`press-btn px-4 py-2 rounded-xl font-parent font-semibold text-sm transition-colors flex items-center gap-2 ${
+                    selectedChildId === c.id
+                      ? "bg-[#6366F1] text-white chunky-shadow"
+                      : "bg-white border-2 border-slate-200 text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  <span className="w-6 h-6 rounded-lg flex items-center justify-center text-sm" style={{ background: selectedChildId === c.id ? "rgba(255,255,255,0.25)" : c.avatar_color }}>
+                    {c.avatar_emoji}
+                  </span>
+                  {c.name}
+                </button>
+              ))}
+            </div>
+          )}
+
           {view === "overview" && (
             <Overview stats={stats} kids={children} tasks={tasks} pendingRedemptions={pendingRedemptions} onAddChild={() => setChildModal(true)} onNavigate={setView} />
           )}
@@ -983,6 +1016,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [points, setPoints] = useState(10);
   const [penalty, setPenalty] = useState(0);
   const [dateKey, setDateKey] = useState(todayKey());
+  const [scheduleMode, setScheduleMode] = useState("date"); // "date" | "weekdays"
+  const [weekdays, setWeekdays] = useState([]); // [0-6] Mon-Sun
   const [dueTime, setDueTime] = useState("");
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
@@ -1004,6 +1039,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setPoints(editTask.points ?? 10);
       setPenalty(editTask.penalty_points ?? 0);
       setDateKey(editTask.date_key || todayKey());
+      setScheduleMode("date"); // editing is always a single existing date
+      setWeekdays([]);
       setDueTime(editTask.due_time || "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
@@ -1014,6 +1051,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
       setTitle(""); setDesc(""); setPoints(10); setPenalty(0);
       setDateKey(todayKey());
+      setScheduleMode("date");
+      setWeekdays([]);
       setDueTime(""); setDuration(""); setIsBonus(false);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
@@ -1028,19 +1067,28 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const isBroadcast = selectedKidIds.length === 0;
   const isSingle = selectedKidIds.length === 1;
 
+  const toggleWeekday = (d) => {
+    setWeekdays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d]));
+  };
+
   const submit = async () => {
     if (!title.trim()) return toast.error("Judul tugas wajib diisi");
     if (dueTime && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(dueTime)) {
       return toast.error("Format jam harus HH:MM (contoh 18:00)");
     }
+    if (!isEdit && scheduleMode === "weekdays" && weekdays.length === 0) {
+      return toast.error("Pilih minimal satu hari");
+    }
     setSaving(true);
     try {
+      const useWeekdays = !isEdit && scheduleMode === "weekdays";
       const body = {
         title: title.trim(),
         description: desc,
         points: Number(points) || 0,
         penalty_points: Number(penalty) || 0,
-        date_key: dateKey || null,
+        date_key: useWeekdays ? null : (dateKey || null),
+        weekdays: useWeekdays ? weekdays : null,
         due_time: dueTime || null,
         duration_minutes: duration ? Number(duration) : null,
         is_bonus: isBonus,
@@ -1142,20 +1190,68 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
           )}
         </div>
 
-        {/* Date + repeat */}
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className={labelClass}>📅 Tanggal misi</label>
+        {/* Schedule: specific date OR weekdays */}
+        <div>
+          <label className={labelClass}>📅 Jadwal misi</label>
+          {isEdit ? (
             <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
-          </div>
-          <div>
-            <label className={labelClass}>Ulangi</label>
-            <select value={recurrence} onChange={(e) => setRecurrence(e.target.value)} className={inputClass}>
-              <option value="none">Sekali</option>
-              <option value="daily">Harian</option>
-              <option value="weekly">Mingguan</option>
-            </select>
-          </div>
+          ) : (
+            <>
+              <div className="flex gap-2 mb-2">
+                <button
+                  type="button"
+                  onClick={() => setScheduleMode("date")}
+                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
+                    scheduleMode === "date" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  Tanggal tertentu
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScheduleMode("weekdays")}
+                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
+                    scheduleMode === "weekdays" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  Pilih hari
+                </button>
+              </div>
+              {scheduleMode === "date" ? (
+                <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
+              ) : (
+                <div>
+                  <div className="grid grid-cols-7 gap-1">
+                    {[["Sen", 0], ["Sel", 1], ["Rab", 2], ["Kam", 3], ["Jum", 4], ["Sab", 5], ["Min", 6]].map(([label, d]) => (
+                      <button
+                        key={d}
+                        type="button"
+                        onClick={() => toggleWeekday(d)}
+                        className={`py-2 rounded-xl border-2 text-xs font-bold transition-colors ${
+                          weekdays.includes(d) ? "border-indigo-500 bg-indigo-500 text-white" : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1.5">
+                    Misi dibuat untuk hari terpilih minggu ini. Tiap hari bisa punya misi berbeda.
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Repeat */}
+        <div>
+          <label className={labelClass}>Ulangi</label>
+          <select value={recurrence} onChange={(e) => setRecurrence(e.target.value)} className={inputClass}>
+            <option value="none">Sekali</option>
+            <option value="daily">Harian</option>
+            <option value="weekly">Mingguan</option>
+          </select>
         </div>
 
         <div className="grid grid-cols-3 gap-3">

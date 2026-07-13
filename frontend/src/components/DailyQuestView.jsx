@@ -204,34 +204,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                 <motion.div animate={{ scale: [1, 1.1, 1] }} transition={{ duration: 3, repeat: Infinity }} className="text-4xl">{theme.goalIcon}</motion.div>
               </div>
 
-              {/* SVG Path connecting nodes */}
+              {/* Quest nodes — clean vertical list */}
               <div className="relative z-10 px-4">
-                <svg className="absolute left-0 top-0 w-full h-full pointer-events-none" preserveAspectRatio="none">
-                  {required.map((_, i) => {
-                    if (i === 0) return null;
-                    const y1 = 40 + (i - 1) * 80;
-                    const y2 = 40 + i * 80;
-                    const x1 = (i - 1) % 2 === 0 ? 40 : 260;
-                    const x2 = i % 2 === 0 ? 40 : 260;
-                    const mx = 150;
-                    return (
-                      <motion.path
-                        key={i}
-                        d={`M ${x1} ${y1} Q ${mx} ${(y1 + y2) / 2} ${x2} ${y2}`}
-                        fill="none"
-                        stroke={theme.colors.path}
-                        strokeWidth="3"
-                        strokeDasharray="8 4"
-                        opacity="0.5"
-                        initial={{ pathLength: 0 }}
-                        animate={{ pathLength: 1 }}
-                        transition={{ duration: 0.8, delay: i * 0.15 }}
-                      />
-                    );
-                  })}
-                </svg>
-
-                {/* Quest nodes */}
                 <div className="relative z-10 space-y-2 pb-4">
                   {required.map((t, idx) => {
                     const isActive = next?.id === t.id;
@@ -311,24 +285,25 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, canS
   const started = !!task.timer_started_at;
   const gateReason = gate?.reason;
 
-  // Zigzag alignment for the treasure-hunt path feel
-  const zigzag = !isBonus && idx % 2 !== 0;
+  // Node connector line (clean vertical, not zigzag)
+  const showConnector = !isBonus && idx > 0;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, x: zigzag ? 20 : -20, y: 10 }}
-      animate={{ opacity: 1, x: 0, y: 0 }}
-      transition={{ delay: idx * 0.08 }}
-      className={`rounded-2xl p-3 flex items-center gap-3 border-2 ${isActive && !isDone ? "ring-2 ring-white/60" : ""}`}
-      style={{
-        background: isDone ? "rgba(255,255,255,0.85)" : isActive ? "rgba(255,255,255,0.96)" : "rgba(255,255,255,0.55)",
-        borderColor: bg,
-        color: "#1E293B",
-        marginLeft: zigzag ? "15%" : "0",
-        marginRight: zigzag ? "0" : "15%",
-        maxWidth: "85%",
-      }}
-    >
+    <div className="relative">
+      {showConnector && (
+        <div className="absolute left-6 md:left-7 -top-2 h-2 w-0.5" style={{ background: theme.colors.path, opacity: 0.4 }} />
+      )}
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: idx * 0.06 }}
+        className={`rounded-2xl p-3 flex items-center gap-3 border-2 ${isActive && !isDone ? "ring-2 ring-white/60" : ""}`}
+        style={{
+          background: isDone ? "rgba(255,255,255,0.85)" : isActive ? "rgba(255,255,255,0.96)" : "rgba(255,255,255,0.55)",
+          borderColor: bg,
+          color: "#1E293B",
+        }}
+      >
       {/* Node circle with animated glow for active */}
       <motion.div
         animate={isActive && !isDone && started ? { scale: [1, 1.08, 1], boxShadow: [`0 0 0px ${bg}`, `0 0 20px ${bg}`, `0 0 0px ${bg}`] } : {}}
@@ -389,7 +364,8 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, canS
           )}
         </div>
       )}
-    </motion.div>
+      </motion.div>
+    </div>
   );
 }
 

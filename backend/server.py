@@ -241,6 +241,7 @@ class TaskInput(BaseModel):
     due_time: Optional[str] = None       # "HH:MM" 24h deadline within the day
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
     date_key: Optional[str] = None       # "YYYY-MM-DD" — which daily slot this belongs to
+    weekdays: Optional[List[int]] = None  # [0-6] Mon-Sun; create one copy per upcoming matching day
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
@@ -914,20 +915,37 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
     for cid in targets:
         await get_child_or_404(FAMILY_ID, cid)
 
-    date_key = validate_date_key(payload.date_key) or _today_key()
+    # Resolve which date_keys to create on.
+    #   - `weekdays` (Mon=0..Sun=6): create on the nearest upcoming date for each
+    #     selected weekday (so "Senin & Rabu" makes this week's Mon and Wed).
+    #   - else `date_key` (explicit single date)
+    #   - else today.
+    date_keys = []
+    if payload.weekdays:
+        valid_wds = sorted(set(w for w in payload.weekdays if 0 <= w <= 6))
+        if not valid_wds:
+            raise HTTPException(status_code=422, detail="Hari tidak valid")
+        base = _now_local().date()
+        for wd in valid_wds:
+            days_ahead = (wd - base.weekday()) % 7  # 0 = today if matches
+            target = base + timedelta(days=days_ahead)
+            date_keys.append(target.strftime("%Y-%m-%d"))
+    else:
+        date_keys = [validate_date_key(payload.date_key) or _today_key()]
 
-    # A single broadcast_id groups sibling copies so parents can edit/delete them together
-    broadcast_id = new_id() if len(targets) > 1 else None
+    multi = len(targets) > 1 or len(date_keys) > 1
+    broadcast_id = new_id() if multi else None
 
     created = []
-    for cid in targets:
-        doc = await _build_task_doc(cid, payload, date_key, payload.order, broadcast_id)
-        await db.tasks.insert_one(doc)
-        doc.pop("_id", None)
-        created.append(doc)
-        await log_activity(FAMILY_ID, cid, "task_created", {"title": payload.title, "points": payload.points, "date_key": date_key})
+    for dk in date_keys:
+        for cid in targets:
+            doc = await _build_task_doc(cid, payload, dk, payload.order, broadcast_id)
+            await db.tasks.insert_one(doc)
+            doc.pop("_id", None)
+            created.append(doc)
+            await log_activity(FAMILY_ID, cid, "task_created", {"title": payload.title, "points": payload.points, "date_key": dk})
 
-    # Backward-compatible response: single-target keeps object shape, multi-target returns list.
+    # Backward-compatible response: single copy keeps object shape; multi returns list.
     return created[0] if len(created) == 1 else {"broadcast_id": broadcast_id, "tasks": created, "count": len(created)}
 
 
@@ -982,7 +1000,6 @@ async def child_day_progress(
     tasks.sort(key=lambda t: (bool(t.get("is_bonus")), t.get("order") or 0))
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
-    daily_goal = int(config.get("daily_point_goal", 50))
 
     required = [t for t in tasks if not t.get("is_bonus")]
     bonus = [t for t in tasks if t.get("is_bonus")]
@@ -994,13 +1011,20 @@ async def child_day_progress(
     bonus_earned = earned(bonus)
     total_earned = required_earned + bonus_earned
 
+    # Daily goal is DYNAMIC: the sum of the day's required-task points. That way
+    # the target always reflects the actual work assigned for the day. If no
+    # required tasks exist for the day, fall back to the configured default so
+    # the progress card still shows something sensible.
+    required_total = sum(t.get("points", 0) for t in required)
+    daily_goal = required_total if required_total > 0 else int(config.get("daily_point_goal", 50))
+
     finished_required = sum(1 for t in required if t.get("status") in ("completed", "approved", "skipped"))
 
     return {
         "child_id": child_id,
         "date_key": dk,
         "daily_goal": daily_goal,
-        "required_total": sum(t.get("points", 0) for t in required),
+        "required_total": required_total,
         "required_earned": required_earned,
         "bonus_earned": bonus_earned,
         "total_earned": total_earned,

@@ -524,6 +524,43 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get("/api/family/weekly-report")
     check("weekly: kid blocked", r.status_code == 403)
 
+    # ================= 28. WEEKDAYS-BASED TASK CREATION =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # Create task on Mon+Wed+Fri (0,2,4) for one child
+    r = c.post("/api/tasks", json={"title": "Olahraga", "points": 10, "target_children": [adskhan["id"]], "weekdays": [0, 2, 4]})
+    check("weekday: creates 3 copies", r.status_code == 200 and r.json().get("count") == 3, r.text[:200])
+    wd_tasks = r.json()["tasks"]
+    # all 3 have distinct date_keys
+    dks = set(t["date_key"] for t in wd_tasks)
+    check("weekday: 3 distinct dates", len(dks) == 3, str(dks))
+    # each date_key's weekday matches one of requested
+    import datetime as _d2
+    wds = set(_d2.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday() for t in wd_tasks)
+    check("weekday: dates match requested days", wds == {0, 2, 4}, str(wds))
+
+    # weekday + broadcast = days x kids
+    r = c.post("/api/tasks", json={"title": "Beres", "points": 5, "target_children": [], "weekdays": [0, 1]})
+    check("weekday: broadcast x days", r.json().get("count") == 4, str(r.json().get("count")))  # 2 days x 2 kids
+
+    # invalid weekday rejected
+    r = c.post("/api/tasks", json={"title": "x", "points": 1, "target_children": [adskhan["id"]], "weekdays": [9]})
+    check("weekday: invalid rejected", r.status_code == 422, str(r.status_code))
+
+    # ================= 29. DYNAMIC DAILY GOAL =================
+    goal_date = "2026-10-20"
+    # No tasks yet -> falls back to config default
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={goal_date}")
+    check("goal: empty day uses config default", r.json()["daily_goal"] == 80, str(r.json().get("daily_goal")))  # 80 set earlier
+    # Add required tasks 10 + 15 = 25 -> goal becomes 25
+    c.post("/api/tasks", json={"title": "T1", "points": 10, "target_children": [syila["id"]], "date_key": goal_date})
+    c.post("/api/tasks", json={"title": "T2", "points": 15, "target_children": [syila["id"]], "date_key": goal_date})
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={goal_date}")
+    check("goal: dynamic = sum of required points", r.json()["daily_goal"] == 25, str(r.json().get("daily_goal")))
+    # bonus task doesn't inflate the goal
+    c.post("/api/tasks", json={"title": "B1", "points": 50, "target_children": [syila["id"]], "date_key": goal_date, "is_bonus": True})
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={goal_date}")
+    check("goal: bonus excluded from goal", r.json()["daily_goal"] == 25, str(r.json().get("daily_goal")))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

@@ -272,6 +272,11 @@ export default function ParentApp() {
               onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
               onOpenTemplates={() => setTemplateModal(true)}
               onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
+              onDuplicate={(t) => {
+                // Pre-fill form with task values but as a NEW task (not edit)
+                setEditingTask({ ...t, id: null, _isDuplicate: true });
+                setTaskModal(true);
+              }}
               onRefresh={load}
               onApplyConsequence={(task) => setApplyConsModal({ task })}
               onAddChild={() => setChildModal(true)}
@@ -444,7 +449,7 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
 }
 
 // ─────────────────────────────────────────────────────────
-function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onRefresh, onApplyConsequence, onAddChild }) {
+function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild }) {
   const grouped = useMemo(() => {
     const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
     const pending = tasks.filter((t) => t.status === "pending" || t.status === "rejected").sort(byOrder);
@@ -481,9 +486,14 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   };
 
   const editBtn = (t) => (
-    <button onClick={() => onEditTask(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-sm" title="Edit tugas">
-      <Settings className="w-4 h-4" strokeWidth={2.5} /> Edit
-    </button>
+    <div className="flex gap-1 flex-wrap">
+      <button onClick={() => onEditTask(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-sm" title="Edit tugas">
+        <Settings className="w-4 h-4" strokeWidth={2.5} /> Edit
+      </button>
+      <button onClick={() => onDuplicate(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-indigo-200 text-indigo-600 font-semibold px-3 py-1.5 rounded-lg text-sm" title="Duplikat tugas ke hari/anak lain">
+        📋 Duplikat
+      </button>
+    </div>
   );
 
   if (kids.length === 0) {
@@ -1010,14 +1020,15 @@ function ChildFormModal({ open, onClose, onSaved }) {
 }
 
 function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask }) {
-  const isEdit = !!editTask;
+  const isDuplicate = editTask && editTask._isDuplicate;
+  const isEdit = !!editTask && !isDuplicate;
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
   const [points, setPoints] = useState(10);
   const [penalty, setPenalty] = useState(0);
   const [dateKey, setDateKey] = useState(todayKey());
-  const [scheduleMode, setScheduleMode] = useState("date"); // "date" | "weekdays"
-  const [weekdays, setWeekdays] = useState([]); // [0-6] Mon-Sun
+  const [scheduleMode, setScheduleMode] = useState("weekdays"); // "weekdays" default | "date"
+  const [weekdays, setWeekdays] = useState([new Date().getDay() === 0 ? 6 : new Date().getDay() - 1]); // default = today's weekday (Mon=0..Sun=6)
   const [dueTime, setDueTime] = useState("");
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
@@ -1032,7 +1043,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
 
   useEffect(() => {
     if (!open) return;
-    if (editTask) {
+    if (editTask && !isDuplicate) {
       setSelectedKidIds([editTask.child_id]);
       setTitle(editTask.title || "");
       setDesc(editTask.description || "");
@@ -1047,16 +1058,34 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setRecurrence(editTask.recurrence || "none");
       setOrder(editTask.order ? String(editTask.order) : "");
       setTaskStyle(editTask.task_style || "");
+    } else if (isDuplicate) {
+      // Pre-fill from source task but as NEW — allow changing kid/schedule
+      setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
+      setTitle(editTask.title || "");
+      setDesc(editTask.description || "");
+      setPoints(editTask.points ?? 10);
+      setPenalty(editTask.penalty_points ?? 0);
+      setDateKey(todayKey());
+      setScheduleMode("weekdays");
+      const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
+      setWeekdays([todayWd]);
+      setDueTime(editTask.due_time || "");
+      setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
+      setIsBonus(!!editTask.is_bonus);
+      setRecurrence(editTask.recurrence || "none");
+      setOrder(""); // fresh order
+      setTaskStyle(editTask.task_style || "");
     } else {
       setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
       setTitle(""); setDesc(""); setPoints(10); setPenalty(0);
       setDateKey(todayKey());
-      setScheduleMode("date");
-      setWeekdays([]);
+      setScheduleMode("weekdays");
+      const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
+      setWeekdays([todayWd]);
       setDueTime(""); setDuration(""); setIsBonus(false);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
-  }, [open, defaultChildId, editTask]);
+  }, [open, defaultChildId, editTask, isDuplicate]);
 
   const toggleKid = (id) => {
     setSelectedKidIds((prev) =>
@@ -1119,7 +1148,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   };
 
   return (
-    <Modal open={open} onClose={onClose} title={isEdit ? "Edit tugas" : "Tugas baru"}>
+    <Modal open={open} onClose={onClose} title={isEdit ? "Edit tugas" : isDuplicate ? "Duplikat tugas" : "Tugas baru"}>
       <div className="space-y-4">
         <div>
           <label className={labelClass}>Tugas</label>
@@ -1200,21 +1229,21 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
               <div className="flex gap-2 mb-2">
                 <button
                   type="button"
-                  onClick={() => setScheduleMode("date")}
-                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
-                    scheduleMode === "date" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                  }`}
-                >
-                  Tanggal tertentu
-                </button>
-                <button
-                  type="button"
                   onClick={() => setScheduleMode("weekdays")}
                   className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
                     scheduleMode === "weekdays" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
                   }`}
                 >
-                  Pilih hari
+                  📅 Pilih hari
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setScheduleMode("date")}
+                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
+                    scheduleMode === "date" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  🗓️ Tanggal tertentu
                 </button>
               </div>
               {scheduleMode === "date" ? (

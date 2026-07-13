@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Settings, Save, Upload, Target, Bird, Coins, Image as ImageIcon, X, Plane } from "lucide-react";
+import { Settings, Save, Upload, Target, Bird, Coins, Image as ImageIcon, X, Plane, Bell, Globe } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 
@@ -79,6 +79,7 @@ export default function ConfigMenu() {
       await api.post("/config", config);
       toast.success("Pengaturan disimpan!");
       setEdited(false);
+      window.dispatchEvent(new Event("labels-updated")); // picks up language/label changes immediately
     } catch (err) {
       toast.error(formatApiError(err));
     } finally {
@@ -201,6 +202,45 @@ export default function ConfigMenu() {
             className={`${inputCls} mt-2 text-sm`}
           />
         )}
+      </div>
+
+      <div className={cardCls}>
+        <div className="flex items-center justify-between">
+          <label className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+            <Bell className="w-4 h-4 text-indigo-500" /> Notifikasi Instan per Misi
+          </label>
+          <button
+            onClick={() => change("instant_task_notifications", !config.instant_task_notifications)}
+            className={`relative w-12 h-6 rounded-full transition-colors ${config.instant_task_notifications ? "bg-indigo-500" : "bg-slate-200"}`}
+          >
+            <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-transform ${config.instant_task_notifications ? "translate-x-6" : "translate-x-0.5"}`} />
+          </button>
+        </div>
+        <p className="text-xs text-slate-500 mt-2">
+          {config.instant_task_notifications
+            ? "Kamu akan dapat notifikasi setiap kali anak menyelesaikan misi apa pun — bisa cukup sering kalau anak rajin."
+            : "Mati (disarankan): sebagai gantinya kamu dapat 1 ringkasan pagi (misi hari ini) dan 1 ringkasan malam (progress & yang perlu dicek) — lebih rapi, tidak spam."}
+        </p>
+      </div>
+
+      <div className={cardCls}>
+        <label className="block text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2">
+          <Globe className="w-4 h-4 text-emerald-500" /> Bahasa Aplikasi
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={() => change("language", "id")}
+            className={`p-3 rounded-lg border-2 text-left transition-all ${config.language === "id" || !config.language ? "border-emerald-500 bg-emerald-50" : "border-slate-200 hover:border-slate-300"}`}
+          >
+            <p className="text-sm font-semibold text-slate-900">🇮🇩 Bahasa Indonesia</p>
+          </button>
+          <button
+            onClick={() => change("language", "en")}
+            className={`p-3 rounded-lg border-2 text-left transition-all ${config.language === "en" ? "border-emerald-500 bg-emerald-50" : "border-slate-200 hover:border-slate-300"}`}
+          >
+            <p className="text-sm font-semibold text-slate-900">🇬🇧 English</p>
+          </button>
+        </div>
       </div>
 
       <div className={cardCls}>

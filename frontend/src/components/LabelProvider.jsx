@@ -6,6 +6,7 @@ import api from "@/lib/api";
 export default function LabelProvider({ children }) {
   const { user } = useAuth();
   const [custom, setCustom] = useState({});
+  const [language, setLanguage] = useState("id");
 
   const refresh = useCallback(async () => {
     // Only fetch when authenticated (config endpoint requires auth)
@@ -13,6 +14,7 @@ export default function LabelProvider({ children }) {
     try {
       const { data } = await api.get("/config");
       setCustom(data.custom_labels || {});
+      setLanguage(data.language || "id");
     } catch {
       // Non-fatal: fall back to default labels
     }
@@ -28,7 +30,7 @@ export default function LabelProvider({ children }) {
   }, [refresh]);
 
   return (
-    <LabelContext.Provider value={{ custom }}>
+    <LabelContext.Provider value={{ custom, language }}>
       {children}
     </LabelContext.Provider>
   );

@@ -350,7 +350,10 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, canS
           <span className="inline-flex items-center gap-0.5 text-xs font-bold text-amber-600">
             <Star className="w-3 h-3 fill-amber-500 text-amber-500" /> +{task.points}
           </span>
-          {isBonus && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-amber-500 text-white">✨ Bonus</span>}
+          {isBonus && !task.is_coop && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-amber-500 text-white">✨ Bonus</span>}
+          {task.is_coop && (
+            <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-teal-500 text-white">🤝 Bersama</span>
+          )}
           {task.recurrence && task.recurrence !== "none" && (
             <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700">
               🔁 {task.recurrence === "daily" ? "Harian" : "Mingguan"}

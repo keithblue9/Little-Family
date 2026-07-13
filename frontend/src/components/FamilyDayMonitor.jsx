@@ -6,6 +6,7 @@ import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES, pickQuestTheme } from "@/lib/questThemes";
 import { todayKey, shiftDateKey, humanDateKey, isFutureDate } from "@/lib/dates";
 import MonthHeatmap from "@/components/MonthHeatmap";
+import GrowthTrail from "@/components/GrowthTrail";
 
 const statusLabel = {
   pending: { icon: Clock, label: "Belum", color: "text-slate-400" },
@@ -77,6 +78,11 @@ export default function FamilyDayMonitor() {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {data.children.map((entry) => (
               <MonthHeatmap key={entry.child.id} childId={entry.child.id} childName={entry.child.name} />
+            ))}
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {data.children.map((entry) => (
+              <GrowthTrail key={entry.child.id} childId={entry.child.id} childName={entry.child.name} />
             ))}
           </div>
         </>
@@ -195,6 +201,7 @@ function TaskRow({ task, bonus }) {
         </div>
         <div className="text-xs text-slate-500 flex items-center gap-2 flex-wrap">
           <span>{s.label}</span>
+          {task.is_coop && <span className="text-teal-600 font-bold">🤝 Bersama</span>}
           {task.due_time && <span>· sblm {task.due_time}</span>}
           {task.duration_minutes && <span>· {task.duration_minutes}m</span>}
         </div>

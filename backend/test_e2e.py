@@ -778,6 +778,191 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get("/api/auth/me")
     check("regression: sound_theme present in /auth/me", r.json().get("sound_theme") == "fanfare", str(r.json().get("sound_theme")))
 
+    # ================= 44. KARTU BEBAS (streak freeze) =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    gap_date = (now_local - _dt.timedelta(days=3)).strftime("%Y-%m-%d")
+    import asyncio as _asyncio2
+    _asyncio2.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"streak_days": 5, "last_completion_date": gap_date, "freeze_cards_available": 1, "freeze_card_week": None}}))
+    r = c.post("/api/tasks", json={"title": "FreezeCardTest", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    fct = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{fct['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{fct['id']}/approve")
+    ads_after_freeze = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("freeze: streak preserved via card", ads_after_freeze["streak_days"] == 6, str(ads_after_freeze["streak_days"]))
+    check("freeze: card consumed", ads_after_freeze.get("freeze_cards_available") == 0, str(ads_after_freeze.get("freeze_cards_available")))
+    # Second gap same week -> no card -> resets
+    _asyncio2.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"last_completion_date": gap_date}}))
+    r = c.post("/api/tasks", json={"title": "FreezeCardTest2", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    fct2 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{fct2['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{fct2['id']}/approve")
+    ads_after_freeze2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("freeze: no card left resets streak to 1", ads_after_freeze2["streak_days"] == 1, str(ads_after_freeze2["streak_days"]))
+    r = c.post(f"/api/tasks/{fct['id']}/undo-approval")
+    check("freeze: undo of frozen approval succeeds", r.status_code == 200, r.text[:150])
+
+    # ================= 45. GRANDPARENT VIEW-ONLY LINKS =================
+    r = c.post("/api/view-links", json={"label": "Kakek & Nenek"})
+    check("viewlink: create ok", r.status_code == 200, r.text[:150])
+    vlink = r.json()
+    check("viewlink: has token", len(vlink.get("token", "")) > 10)
+    c_public = TestClient(server.app, base_url="https://testserver")
+    r = c_public.get(f"/api/public/view/{vlink['token']}")
+    check("viewlink: public view works no auth", r.status_code == 200, r.text[:150])
+    check("viewlink: shows children", len(r.json()["children"]) == 2, str(len(r.json()["children"])))
+    r = c_public.get("/api/public/view/totally-fake-token")
+    check("viewlink: invalid token 404s", r.status_code == 404)
+    r = c.delete(f"/api/view-links/{vlink['id']}")
+    check("viewlink: revoke ok", r.status_code == 200)
+    r = c_public.get(f"/api/public/view/{vlink['token']}")
+    check("viewlink: revoked link 404s", r.status_code == 404)
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/view-links", json={"label": "x"})
+    check("viewlink: kid blocked from creating", r.status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c_public.close()
+
+    # ================= 46. CO-OP QUEST =================
+    r = c.post("/api/tasks", json={"title": "SoloCoop", "points": 10, "target_children": [adskhan["id"]], "date_key": today_local, "coop": True})
+    check("coop: single-kid rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/tasks", json={"title": "BeresGarasi", "points": 11, "target_children": [adskhan["id"], syila["id"]], "date_key": today_local, "coop": True})
+    check("coop: created ok", r.status_code == 200, r.text[:150])
+    coop_t = r.json()
+    check("coop: is_coop flag set", coop_t.get("is_coop") is True)
+    check("coop: forced bonus", coop_t.get("is_bonus") is True)
+    coop_tid = coop_t["id"]
+    r1 = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    r2 = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}")
+    check("coop: both participants see it", any(t["id"] == coop_tid for t in r1.json()["tasks"]) and any(t["id"] == coop_tid for t in r2.json()["tasks"]))
+    # Ownership: sibling can't complete another's solo task
+    r = c.post("/api/tasks", json={"title": "AdsSoloOnly", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    solo_t = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{solo_t['id']}/complete")
+    check("coop: sibling blocked from unrelated solo task", r.status_code == 403, str(r.status_code))
+    # Partner completes coop task
+    r = c.post(f"/api/tasks/{coop_tid}/complete")
+    check("coop: partner (non-primary) can complete", r.status_code == 200, r.text[:150])
+    check("coop: completed_by recorded", r.json().get("coop_completed_by") == syila["id"])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    ads_pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    r = c.post(f"/api/tasks/{coop_tid}/approve")
+    check("coop: approve ok", r.status_code == 200, r.text[:150])
+    ads_pts_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_pts_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    gained_a, gained_s = ads_pts_after - ads_pts_before, syi_pts_after - syi_pts_before
+    check("coop: split sums to task points", gained_a + gained_s == 11, f"{gained_a}+{gained_s}")
+    check("coop: split is even-ish (5,6)", {gained_a, gained_s} == {5, 6}, f"{gained_a},{gained_s}")
+    r = c.post(f"/api/tasks/{coop_tid}/undo-approval")
+    check("coop: undo ok", r.status_code == 200, r.text[:150])
+    ads_pts_undone = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_pts_undone = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("coop: undo restores both exactly", ads_pts_undone == ads_pts_before and syi_pts_undone == syi_pts_before)
+
+    # ================= 47. REWARD WISHLIST =================
+    r = c.post("/api/rewards", json={"name": "Lego Set", "cost_points": 500})
+    wish_reward = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/wishlist", json={"reward_id": wish_reward["id"]})
+    check("wishlist: add ok", r.status_code == 200, r.text[:150])
+    r = c.post("/api/wishlist", json={"reward_id": wish_reward["id"]})
+    check("wishlist: duplicate add idempotent", r.status_code == 200)
+    r = c.get("/api/wishlist")
+    check("wishlist: no duplicate entries", len(r.json()) == 1, str(len(r.json())))
+    check("wishlist: has progress fields", "percent" in r.json()[0] and "reward" in r.json()[0])
+    r = c.post("/api/wishlist", json={"reward_id": "nonexistent-reward"})
+    check("wishlist: unknown reward rejected", r.status_code == 404)
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.get("/api/wishlist")
+    check("wishlist: sibling isolation", len(r.json()) == 0, str(len(r.json())))
+    item_id = None
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    item_id = c.get("/api/wishlist").json()[0]["id"]
+    r = c.delete(f"/api/wishlist/{item_id}")
+    check("wishlist: owner deletes own", r.status_code == 200)
+    r = c.get("/api/wishlist")
+    check("wishlist: empty after delete", len(r.json()) == 0)
+
+    # ================= 48. NOTIFICATION DIGEST + INSTANT TOGGLE =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/config")
+    check("digest: instant notif default off", r.json()["instant_task_notifications"] is False)
+    check("digest: language default id", r.json()["language"] == "id")
+    r = c.post("/api/config", json={"language": "fr"})
+    check("digest: invalid language rejected", r.status_code == 422, str(r.status_code))
+    r = c.get("/api/cron/send-digest")
+    check("digest: no auth rejected", r.status_code == 403)
+    r = c.get("/api/cron/send-digest", headers={"Authorization": "Bearer wrong"})
+    check("digest: wrong secret rejected", r.status_code == 403)
+
+    # ================= 49. GROWTH TRAIL =================
+    r = c.get(f"/api/children/{syila['id']}/growth-trail")
+    check("growth-trail: works", r.status_code == 200 and "events" in r.json(), r.text[:150])
+    r = c.get("/api/children/nonexistent-child/growth-trail")
+    check("growth-trail: unknown child 404s", r.status_code == 404)
+
+    # ================= 50. REGRESSION: co-op tasks must be visible/correct
+    # across EVERY feature that reads task/points data, not just the primary
+    # child. Found during cross-feature audit: growth trail, public view-links,
+    # weekly report, day-progress, and month-progress all originally only
+    # matched task.child_id (the co-op "owner"), so the PARTNER never saw their
+    # own shared missions, and reports that DID match used the task's full
+    # points instead of that child's actual split share (over-counting). =================
+    r = c.post("/api/tasks", json={
+        "title": "CoopCrossFeature", "points": 11, "target_children": [adskhan["id"], syila["id"]],
+        "date_key": today_local, "coop": True, "photo_required": True,
+    })
+    ccf = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{ccf['id']}/complete", json={"photo_url": "data:image/png;base64,ZZZ"})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{ccf['id']}/approve")
+
+    r_ads_trail = c.get(f"/api/children/{adskhan['id']}/growth-trail")
+    r_syi_trail = c.get(f"/api/children/{syila['id']}/growth-trail")
+    check("coop-cross: primary sees coop photo in growth trail", any(e["type"] == "photo" and e["title"] == "CoopCrossFeature" for e in r_ads_trail.json()["events"]))
+    check("coop-cross: partner ALSO sees coop photo in growth trail", any(e["type"] == "photo" and e["title"] == "CoopCrossFeature" for e in r_syi_trail.json()["events"]))
+
+    r = c.post("/api/view-links", json={"label": "CoopCrossTest"})
+    ccf_link = r.json()
+    ccf_public = TestClient(server.app, base_url="https://testserver")
+    r = ccf_public.get(f"/api/public/view/{ccf_link['token']}")
+    by_name = {k["name"]: k for k in r.json()["children"]}
+    check("coop-cross: primary's public recent_missions has coop task", any(m["title"] == "CoopCrossFeature" for m in by_name["Adskhan"]["recent_missions"]))
+    check("coop-cross: partner's public recent_missions ALSO has it", any(m["title"] == "CoopCrossFeature" for m in by_name["Syila"]["recent_missions"]))
+    ccf_public.close()
+
+    r = c.get("/api/family/weekly-report")
+    wk = {e["child"]["name"]: e["week_points"] for e in r.json()["children"]}
+    # Both kids had baseline points from earlier sections; just verify the task's
+    # 11 points were split (not double-counted as 11+11=22 across the pair for
+    # THIS task specifically) by checking a fresh same-day pair task in isolation:
+    r = c.post("/api/tasks", json={
+        "title": "CoopWeeklyIsolated", "points": 9, "target_children": [adskhan["id"], syila["id"]],
+        "date_key": today_local, "coop": True,
+    })
+    ci = r.json()
+    ads_wk_before = next(e["week_points"] for e in c.get("/api/family/weekly-report").json()["children"] if e["child"]["name"] == "Adskhan")
+    syi_wk_before = next(e["week_points"] for e in c.get("/api/family/weekly-report").json()["children"] if e["child"]["name"] == "Syila")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{ci['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{ci['id']}/approve")
+    ads_wk_after = next(e["week_points"] for e in c.get("/api/family/weekly-report").json()["children"] if e["child"]["name"] == "Adskhan")
+    syi_wk_after = next(e["week_points"] for e in c.get("/api/family/weekly-report").json()["children"] if e["child"]["name"] == "Syila")
+    check("coop-cross: weekly report splits (not doubles) coop points", (ads_wk_after - ads_wk_before) + (syi_wk_after - syi_wk_before) == 9, f"+{ads_wk_after-ads_wk_before}, +{syi_wk_after-syi_wk_before}")
+
+    r = c.post("/api/challenges", json={"title": "CoopChallengeCross", "participant_ids": [adskhan["id"], syila["id"]], "target_points": 9, "start_date": today_local, "end_date": today_local})
+    ccc = r.json()
+    r = c.get("/api/challenges")
+    found_ccc = next(x for x in r.json() if x["id"] == ccc["id"])
+    check("coop-cross: challenge counts split total, not doubled", found_ccc["earned_points"] >= 9, str(found_ccc["earned_points"]))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

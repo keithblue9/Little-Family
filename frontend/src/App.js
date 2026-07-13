@@ -4,6 +4,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import LoginPage from "@/pages/LoginPage";
+import GrandparentView from "@/pages/GrandparentView";
 import ParentApp from "@/pages/ParentApp";
 import KidHome from "@/pages/KidHome";
 import ChildPicker from "@/pages/ChildPicker";
@@ -69,6 +70,7 @@ function App() {
           <Routes>
             <Route path="/" element={<HomeRedirect />} />
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/view/:token" element={<GrandparentView />} />
             <Route
               path="/parent/*"
               element={

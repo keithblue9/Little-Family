@@ -186,6 +186,11 @@ class AppConfigInput(BaseModel):
     # instead of piling up missed days. Template itself is untouched.
     vacation_mode: Optional[bool] = None
     vacation_note: Optional[str] = Field(default=None, max_length=100)
+    # Notifications: instant per-task push is OFF by default (replaced by the
+    # morning/evening digest below) since it can spam parents with an active kid.
+    # Parents who prefer instant pings can flip this back on.
+    instant_task_notifications: Optional[bool] = None
+    language: Optional[Literal["id", "en"]] = None
 
 
 class ReminderInput(BaseModel):
@@ -260,6 +265,8 @@ class TaskInput(BaseModel):
     order: Optional[int] = Field(default=None, ge=1)
     task_style: Optional[TASK_STYLE] = None
     photo_required: bool = False  # kid must attach a photo to mark this complete
+    coop: bool = False  # true = a single shared task worked on together by target_children,
+                         # not one copy per kid; points split evenly among participants on approval
 
 
 class TaskUpdate(BaseModel):
@@ -321,6 +328,11 @@ class ApplyConsequenceInput(BaseModel):
     notes: str = ""
 
 
+class ViewLinkInput(BaseModel):
+    label: str = Field(default="Kakek & Nenek", max_length=60)
+    child_ids: Optional[List[str]] = None  # None/empty = all children
+
+
 class ChallengeInput(BaseModel):
     title: str = Field(min_length=1, max_length=100)
     description: str = Field(default="", max_length=300)
@@ -363,6 +375,7 @@ async def public_branding():
         "slideshow_background_url": config.get("slideshow_background_url", ""),
         "slideshow_background_image": config.get("slideshow_background_image", ""),
         "custom_labels": config.get("custom_labels", {}) or {},
+        "language": config.get("language", "id"),
     }
 
 
@@ -628,6 +641,105 @@ async def get_child_or_404(parent_id: str, child_id: str) -> dict:
     return child
 
 
+# --------------- View-only Links (grandparents / extended family) ---------------
+@api.post("/view-links")
+async def create_view_link(payload: ViewLinkInput, user: dict = Depends(require_parent)):
+    """Parent creates a shareable read-only link — no login required to view it.
+    Never exposes passcodes, approve/edit actions, or anything beyond progress
+    and achievements."""
+    if payload.child_ids:
+        for cid in payload.child_ids:
+            await get_child_or_404(FAMILY_ID, cid)
+    doc = {
+        "id": new_id(),
+        "parent_id": FAMILY_ID,
+        "token": uuid.uuid4().hex,  # unguessable, separate from any internal id
+        "label": payload.label,
+        "child_ids": payload.child_ids or [],  # empty = all children
+        "revoked": False,
+        "created_at": now_iso(),
+        "last_viewed_at": None,
+        "view_count": 0,
+    }
+    await db.view_links.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.get("/view-links")
+async def list_view_links(user: dict = Depends(require_parent)):
+    links = await db.view_links.find({"parent_id": FAMILY_ID}, {"_id": 0, "token": 0}).sort("created_at", -1).to_list(50)
+    # Token is deliberately excluded from the list view (already shown once at
+    # creation time) to reduce how often the raw shareable secret appears in
+    # API responses; the share URL itself is handled client-side right after creation.
+    return links
+
+
+@api.get("/view-links/{link_id}/token")
+async def get_view_link_token(link_id: str, user: dict = Depends(require_parent)):
+    """Parent can re-fetch the share URL's token later (e.g. to re-share or
+    regenerate a QR code) without needing to recreate the whole link."""
+    link = await db.view_links.find_one({"id": link_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+    return {"token": link["token"]}
+
+
+@api.delete("/view-links/{link_id}")
+async def revoke_view_link(link_id: str, user: dict = Depends(require_parent)):
+    """Revoking is a soft-delete (flip revoked=True) rather than removing the
+    document, so the parent can still see it existed in their link history."""
+    await db.view_links.update_one({"id": link_id, "parent_id": FAMILY_ID}, {"$set": {"revoked": True}})
+    return {"success": True}
+
+
+@api.get("/public/view/{token}")
+async def public_view_by_token(token: str):
+    """Fully public, no auth: read-only family progress for whoever holds this
+    link. Returns only what a proud grandparent should see — points, streaks,
+    badges, recent approved missions — never passcodes, settings, or anything
+    that can change state."""
+    link = await db.view_links.find_one({"token": token}, {"_id": 0})
+    if not link or link.get("revoked"):
+        raise HTTPException(status_code=404, detail="Link tidak ditemukan atau sudah dicabut")
+
+    await db.view_links.update_one(
+        {"token": token},
+        {"$set": {"last_viewed_at": now_iso()}, "$inc": {"view_count": 1}},
+    )
+
+    child_ids = link.get("child_ids") or []
+    query = {"parent_id": FAMILY_ID}
+    if child_ids:
+        query["id"] = {"$in": child_ids}
+    kids = await db.children.find(query, {"_id": 0}).to_list(50)
+
+    out = []
+    for k in kids:
+        badges = await db.badges.find({"child_id": k["id"]}, {"_id": 0}).sort("earned_at", -1).to_list(20)
+        recent = await db.tasks.find(
+            {"status": "approved", "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}]},
+            {"_id": 0},
+        ).sort("approved_at", -1).to_list(10)
+        out.append({
+            "id": k["id"],
+            "name": k["name"],
+            "avatar_emoji": k.get("avatar_emoji"),
+            "avatar_color": k.get("avatar_color"),
+            "points": k.get("points", 0),
+            "lifetime_points": k.get("lifetime_points", 0),
+            "streak_days": k.get("streak_days", 0),
+            "tasks_completed": k.get("tasks_completed", 0),
+            "badges": badges,
+            "recent_missions": [
+                {"title": t["title"], "points": t["points"], "approved_at": t.get("approved_at"),
+                 "completion_photo_url": t.get("completion_photo_url")}
+                for t in recent
+            ],
+        })
+    return {"family_label": link.get("label", "Keluarga"), "children": out}
+
+
 # --------------- Family Challenges ---------------
 @api.post("/challenges")
 async def create_challenge(payload: ChallengeInput, user: dict = Depends(require_parent)):
@@ -655,12 +767,26 @@ async def create_challenge(payload: ChallengeInput, user: dict = Depends(require
 
 async def _challenge_progress(ch: dict) -> dict:
     """Combined points earned by all participants within the challenge window."""
+    participant_set = set(ch["participant_ids"])
     tasks = await db.tasks.find({
-        "child_id": {"$in": ch["participant_ids"]},
         "date_key": {"$gte": ch["start_date"], "$lte": ch["end_date"]},
         "status": "approved",
+        "$or": [
+            {"child_id": {"$in": ch["participant_ids"]}},
+            {"is_coop": True, "coop_participants": {"$in": ch["participant_ids"]}},
+        ],
     }, {"_id": 0}).to_list(5000)
-    earned = sum(t.get("points", 0) for t in tasks)
+    earned = 0
+    for t in tasks:
+        if t.get("is_coop"):
+            # Only count each challenge participant's own share — avoids
+            # double-counting the task's full points if one participant did it
+            # together with a sibling who isn't part of this challenge.
+            for pid in (t.get("coop_participants") or []):
+                if pid in participant_set:
+                    earned += _child_share_of_task(t, pid)
+        elif t.get("child_id") in participant_set:
+            earned += t.get("points", 0)
     percent = min(100, int((earned / ch["target_points"]) * 100)) if ch["target_points"] else 100
     today = _today_key()
     is_expired = ch["status"] == "active" and today > ch["end_date"] and earned < ch["target_points"]
@@ -698,6 +824,70 @@ async def delete_challenge(challenge_id: str, user: dict = Depends(require_paren
     return {"success": True}
 
 
+# --------------- Growth Trail (portfolio timeline) ---------------
+@api.get("/children/{child_id}/growth-trail")
+async def child_growth_trail(child_id: str, user: dict = Depends(get_current_user)):
+    """Chronological highlight reel for one child: badges earned, photo-verified
+    missions, and streak/points milestones — auto-compiled from data that
+    already exists elsewhere, so there's nothing new for parents to maintain."""
+    child = await get_child_or_404(FAMILY_ID, child_id)
+
+    events = []
+
+    badges = await db.badges.find({"child_id": child_id}, {"_id": 0}).to_list(100)
+    for b in badges:
+        events.append({
+            "type": "badge", "date": b.get("earned_at"),
+            "title": b.get("name", "Badge"), "detail": b.get("description", ""),
+            "icon": None,
+        })
+
+    photo_tasks = await db.tasks.find(
+        {
+            "status": "approved", "completion_photo_url": {"$ne": None},
+            "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+        },
+        {"_id": 0},
+    ).sort("approved_at", -1).to_list(50)
+    for t in photo_tasks:
+        events.append({
+            "type": "photo", "date": t.get("approved_at"),
+            "title": t.get("title", "Misi"), "detail": f"+{t.get('points', 0)} poin",
+            "image": t.get("completion_photo_url"),
+        })
+
+    # Milestones: every 100 lifetime points and every 7-day streak multiple,
+    # inferred from current totals (we don't have historical snapshots, so
+    # these show as "reached" milestones dated at the most recent approval
+    # that would have crossed them — approximate but good enough for a keepsake).
+    lifetime = child.get("lifetime_points", 0)
+    streak = child.get("streak_days", 0)
+    milestone_marker_date = None
+    last_approved = await db.tasks.find_one(
+        {"child_id": child_id, "status": "approved"}, {"_id": 0}, sort=[("approved_at", -1)]
+    )
+    if last_approved:
+        milestone_marker_date = last_approved.get("approved_at")
+    for threshold in (100, 250, 500, 1000, 2500, 5000):
+        if lifetime >= threshold:
+            events.append({
+                "type": "milestone", "date": milestone_marker_date,
+                "title": f"{threshold} Poin Sepanjang Masa!", "detail": "Milestone poin",
+            })
+    for threshold in (7, 14, 30, 60, 100):
+        if streak >= threshold:
+            events.append({
+                "type": "milestone", "date": milestone_marker_date,
+                "title": f"Streak {threshold} Hari!", "detail": "Konsisten luar biasa",
+            })
+
+    events.sort(key=lambda e: e.get("date") or "", reverse=True)
+    return {
+        "child": {"id": child["id"], "name": child["name"], "avatar_emoji": child.get("avatar_emoji"), "avatar_color": child.get("avatar_color")},
+        "events": events,
+    }
+
+
 # --------------- Weekly Report ---------------
 @api.get("/family/weekly-report")
 async def family_weekly_report(user: dict = Depends(require_parent)):
@@ -710,20 +900,20 @@ async def family_weekly_report(user: dict = Depends(require_parent)):
     report = []
     for k in kids:
         tasks = await db.tasks.find({
-            "child_id": k["id"],
             "date_key": {"$gte": week_ago, "$lte": today},
+            "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
         }, {"_id": 0}).to_list(2000)
 
         approved = [t for t in tasks if t.get("status") == "approved"]
         completed = [t for t in tasks if t.get("status") in ("completed", "approved")]
-        total_points = sum(t.get("points", 0) for t in approved)
+        total_points = sum(_child_share_of_task(t, k["id"]) for t in approved)
 
         # Per-day breakdown
         days = {}
         for d_offset in range(7):
             dk = (now - timedelta(days=6 - d_offset)).strftime("%Y-%m-%d")
             day_tasks = [t for t in tasks if t.get("date_key") == dk]
-            day_earned = sum(t.get("points", 0) for t in day_tasks if t.get("status") in ("completed", "approved"))
+            day_earned = sum(_child_share_of_task(t, k["id"]) for t in day_tasks if t.get("status") in ("completed", "approved"))
             days[dk] = {
                 "total": len(day_tasks),
                 "done": len([t for t in day_tasks if t.get("status") in ("completed", "approved", "skipped")]),
@@ -875,6 +1065,8 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "streak_days": 0,
         "last_completion_date": None,
         "tasks_completed": 0,
+        "freeze_cards_available": 1,
+        "freeze_card_week": None,
         "created_at": now_iso(),
     }
     await db.children.insert_one(doc)
@@ -932,7 +1124,10 @@ async def list_tasks(
 ):
     query = {"parent_id": FAMILY_ID}
     if child_id:
-        query["child_id"] = child_id
+        # Match either "this is their individual task" OR "this is a co-op task
+        # they're one of the participants in" (co-op tasks store child_id as
+        # just the primary owner, so a plain child_id match alone would miss them).
+        query["$or"] = [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}]
     if status_filter:
         query["status"] = status_filter
     if date_key:
@@ -940,6 +1135,8 @@ async def list_tasks(
     _UNDO_FIELDS = {
         "_undo_prev_streak": 0, "_undo_prev_last_completion": 0, "_undo_points_awarded": 0,
         "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
+        "_undo_used_freeze_card": 0, "_undo_prev_freeze_available": 0, "_undo_prev_freeze_week": 0,
+        "_undo_coop_snapshots": 0,
     }
     tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(2000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
@@ -1005,6 +1202,9 @@ async def _build_task_doc(
         "task_style": task_style,
         "photo_required": payload.photo_required,
         "completion_photo_url": None,
+        "is_coop": False,
+        "coop_participants": [],
+        "coop_completed_by": None,
         "timer_started_at": None,
         "timer_completed_at": None,
         "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
@@ -1053,6 +1253,28 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
 
     multi = len(targets) > 1 or len(date_keys) > 1
     broadcast_id = new_id() if multi else None
+
+    if payload.coop:
+        if len(targets) < 2:
+            raise HTTPException(status_code=422, detail="Misi bersama butuh minimal 2 anak")
+        created = []
+        for dk in date_keys:
+            doc = await _build_task_doc(targets[0], payload, dk, payload.order, broadcast_id)
+            # Co-op tasks are always bonus-type: since ONE shared task can't
+            # cleanly occupy a specific sequence slot in two different kids'
+            # individual quest lines at once, forcing bonus sidesteps that
+            # entirely — it shows up as an extra "do this together" activity
+            # without blocking or reordering anyone's required missions.
+            doc["is_bonus"] = True
+            doc["is_coop"] = True
+            doc["coop_participants"] = targets
+            doc["coop_completed_by"] = None
+            await db.tasks.insert_one(doc)
+            doc.pop("_id", None)
+            created.append(doc)
+            for cid in targets:
+                await log_activity(FAMILY_ID, cid, "task_created", {"title": payload.title, "points": payload.points, "date_key": dk, "coop": True})
+        return created[0] if len(created) == 1 else {"broadcast_id": broadcast_id, "tasks": created, "count": len(created)}
 
     created = []
     for dk in date_keys:
@@ -1118,7 +1340,8 @@ async def child_day_progress(
     dk = validate_date_key(date_key) or _today_key()
 
     tasks = await db.tasks.find(
-        {"parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk},
+        {"parent_id": FAMILY_ID, "date_key": dk,
+         "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}]},
         {"_id": 0},
     ).to_list(500)
     tasks.sort(key=lambda t: (bool(t.get("is_bonus")), t.get("order") or 0))
@@ -1129,7 +1352,7 @@ async def child_day_progress(
     bonus = [t for t in tasks if t.get("is_bonus")]
 
     def earned(bucket):
-        return sum(t.get("points", 0) for t in bucket if t.get("status") in ("completed", "approved"))
+        return sum(_child_share_of_task(t, child_id) for t in bucket if t.get("status") in ("completed", "approved"))
 
     required_earned = earned(required)
     bonus_earned = earned(bonus)
@@ -1197,9 +1420,10 @@ async def child_month_progress(
     end_key = f"{next_year:04d}-{next_month:02d}-01"  # exclusive upper bound
 
     tasks = await db.tasks.find({
-        "parent_id": FAMILY_ID, "child_id": child_id,
+        "parent_id": FAMILY_ID,
         "date_key": {"$gte": start_key, "$lt": end_key},
-    }, {"_id": 0, "date_key": 1, "points": 1, "status": 1, "is_bonus": 1}).to_list(5000)
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    }, {"_id": 0, "date_key": 1, "points": 1, "status": 1, "is_bonus": 1, "is_coop": 1, "coop_participants": 1, "child_id": 1}).to_list(5000)
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
     weekday_goals = config.get("weekday_goals") or {}
@@ -1215,7 +1439,7 @@ async def child_month_progress(
     for dk, buckets in by_day.items():
         req = buckets["required"]
         bon = buckets["bonus"]
-        earned = sum(t.get("points", 0) for t in (req + bon) if t.get("status") in ("completed", "approved"))
+        earned = sum(_child_share_of_task(t, child_id) for t in (req + bon) if t.get("status") in ("completed", "approved"))
         required_total = sum(t.get("points", 0) for t in req)
         try:
             wd = str(datetime.strptime(dk, "%Y-%m-%d").weekday())
@@ -1277,6 +1501,24 @@ def _now_local():
     return datetime.now(timezone.utc) + timedelta(hours=7)
 
 
+def _current_week_key() -> str:
+    """ISO year-week identifier (e.g. '2026-W29') for the freeze-card weekly refill."""
+    iso = _now_local().isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def _refill_freeze_card_if_new_week(child: dict) -> int:
+    """Returns how many 'Kartu Bebas' (streak freeze cards) this child has
+    available RIGHT NOW, accounting for the weekly refill. Does not write to
+    the DB — the caller folds the (possibly refilled, possibly about-to-be-
+    consumed) count into whatever $set it's already doing for this child."""
+    current_week = _current_week_key()
+    stored_week = child.get("freeze_card_week")
+    if stored_week != current_week:
+        return 1  # new week — the one weekly card is fresh regardless of prior balance
+    return int(child.get("freeze_cards_available", 1))
+
+
 def _check_time_window(task):
     """Enforce that a time-boxed task is only started within its window on its
     own day. Mirrors the frontend gate so kids can't bypass via direct API."""
@@ -1303,6 +1545,19 @@ def _check_time_window(task):
         raise HTTPException(status_code=409, detail=f"Waktunya sudah lewat (jam {due_time})")
 
 
+def _assert_child_owns_task(user: dict, task: dict):
+    """A child may only act on their own tasks — or, for a co-op task, any task
+    they're listed as a participant in. Parents bypass this (they call these
+    endpoints far less often, but nothing stops a parent from testing as a kid)."""
+    if user["role"] != "child":
+        return
+    if task.get("is_coop"):
+        if user["id"] not in (task.get("coop_participants") or []):
+            raise HTTPException(status_code=403, detail="Ini bukan misimu")
+    elif task.get("child_id") != user["id"]:
+        raise HTTPException(status_code=403, detail="Ini bukan misimu")
+
+
 @api.post("/tasks/{task_id}/start")
 async def start_task_timer(task_id: str, user: dict = Depends(get_current_user)):
     """Kid clicks Start → records timer_started_at. Only the next actionable
@@ -1310,6 +1565,7 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    _assert_child_owns_task(user, task)
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Misi tidak bisa dimulai")
 
@@ -1341,6 +1597,7 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    _assert_child_owns_task(user, task)
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Task cannot be completed in current state")
 
@@ -1360,17 +1617,20 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
         {"$set": {
             "status": "completed", "completed_at": now_iso(), "timer_completed_at": now_iso(),
             "completion_photo_url": payload.photo_url,
+            "coop_completed_by": user["id"] if task.get("is_coop") else task.get("coop_completed_by"),
         }},
     )
     await log_activity(FAMILY_ID, task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
-    child = await db.children.find_one({"id": task["child_id"]})
-    child_name = child["name"] if child else "Anak"
-    await send_push_to(
-        {"role": "parent"},
-        title=f"{child_name} menyelesaikan misi! 🎉",
-        body=f'"{task["title"]}" menunggu untuk dicek dan disetujui.',
-        url="/parent",
-    )
+    config_for_notify = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    if config_for_notify.get("instant_task_notifications"):
+        child = await db.children.find_one({"id": task["child_id"]})
+        child_name = child["name"] if child else "Anak"
+        await send_push_to(
+            {"role": "parent"},
+            title=f"{child_name} menyelesaikan misi! 🎉",
+            body=f'"{task["title"]}" menunggu untuk dicek dan disetujui.',
+            url="/parent",
+        )
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
@@ -1380,6 +1640,7 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    _assert_child_owns_task(user, task)
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Only open tasks can be skipped")
 
@@ -1403,32 +1664,58 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     return {"task": updated, "points_spent": cost}
 
 
-@api.post("/tasks/{task_id}/approve")
-async def approve_task(task_id: str, user: dict = Depends(require_parent)):
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Task must be completed first")
+def _child_share_of_task(task: dict, child_id: str) -> int:
+    """How many points THIS child actually earned from a task. For a normal
+    task that's just task.points; for a co-op task the total is split evenly
+    (remainder to the first few participants, matching the exact logic used
+    at approval time), so reports don't double- or over-count a partner's share."""
+    if not task.get("is_coop"):
+        return task.get("points", 0)
+    participants = task.get("coop_participants") or [task.get("child_id")]
+    if child_id not in participants:
+        return 0
+    n = len(participants)
+    base_share = task.get("points", 0) // n
+    remainder = task.get("points", 0) - base_share * n
+    idx = participants.index(child_id)
+    return base_share + (1 if idx < remainder else 0)
 
-    child = await db.children.find_one({"id": task["child_id"]})
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
 
-    # Update streak
-    today = datetime.now(timezone.utc).date().isoformat()
+async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> dict:
+    """Applies streak/freeze-card/Chikybank updates for ONE child earning
+    `points` from an approval. Returns a snapshot describing exactly what
+    changed, so a later undo can reverse precisely this — used for both the
+    normal single-child path and, once per participant, for co-op tasks."""
+    child = await db.children.find_one({"id": child_id})
+    today = _today_key()
+    yesterday = (_now_local() - timedelta(days=1)).strftime("%Y-%m-%d")
     last_date = child.get("last_completion_date")
+    current_week = _current_week_key()
+    prev_freeze_week = child.get("freeze_card_week")
+    prev_freeze_available = int(child.get("freeze_cards_available", 1))
+    prev_streak = child.get("streak_days", 0)
+    prev_last_completion = last_date
+
+    used_freeze_card = False
+    new_freeze_available = prev_freeze_available
+    new_freeze_week = prev_freeze_week
+
     if last_date == today:
         streak = child.get("streak_days", 0)
-    elif last_date == (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat():
+    elif last_date == yesterday:
         streak = child.get("streak_days", 0) + 1
     else:
-        streak = 1
+        available_now = _refill_freeze_card_if_new_week(child)
+        if prev_freeze_week != current_week:
+            new_freeze_week = current_week
+            new_freeze_available = available_now
+        if available_now > 0:
+            streak = child.get("streak_days", 0) + 1
+            used_freeze_card = True
+            new_freeze_available = available_now - 1
+        else:
+            streak = 1
 
-    points = task["points"]
-
-    # Three Chikybanks: auto-split earned points into Save/Spend/Share
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
     save_pct = int(config.get("chiky_save_pct", 40))
     spend_pct = int(config.get("chiky_spend_pct", 40))
     share_pct = int(config.get("chiky_share_pct", 20))
@@ -1438,72 +1725,132 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
     p_share = points - p_save - p_spend  # remainder goes to share to avoid rounding loss
 
     await db.children.update_one(
-        {"id": task["child_id"]},
+        {"id": child_id},
         {
             "$inc": {
-                "points": points,
-                "lifetime_points": points,
-                "tasks_completed": 1,
-                "chiky_save": p_save,
-                "chiky_spend": p_spend,
-                "chiky_share": p_share,
+                "points": points, "lifetime_points": points, "tasks_completed": 1,
+                "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
             },
-            "$set": {"last_completion_date": today, "streak_days": streak},
+            "$set": {
+                "last_completion_date": today, "streak_days": streak,
+                "freeze_cards_available": new_freeze_available, "freeze_card_week": new_freeze_week,
+            },
         },
     )
+    return {
+        "child_id": child_id, "points": points,
+        "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
+        "prev_streak": prev_streak, "prev_last_completion": prev_last_completion,
+        "used_freeze_card": used_freeze_card,
+        "prev_freeze_available": prev_freeze_available, "prev_freeze_week": prev_freeze_week,
+    }
 
-    prev_streak = child.get("streak_days", 0)
-    prev_last_completion = child.get("last_completion_date")
 
-    if task["recurrence"] in ("daily", "weekly") and not config.get("vacation_mode"):
-        delta_days = 1 if task["recurrence"] == "daily" else 7
-        # Next occurrence lives on the NEXT date_key, otherwise approving a
-        # daily task would duplicate it on the same day.
-        next_date_key = None
-        if task.get("date_key"):
-            try:
-                base_day = datetime.strptime(task["date_key"], "%Y-%m-%d")
-                next_date_key = (base_day + timedelta(days=delta_days)).strftime("%Y-%m-%d")
-            except Exception:
-                next_date_key = None
-        if not next_date_key:
-            next_date_key = (_now_local() + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
+    """Shared recurrence-spawn logic (used by both normal and co-op approval
+    paths). Returns the new task's id, or None if nothing was spawned."""
+    if task["recurrence"] not in ("daily", "weekly") or config.get("vacation_mode"):
+        return None
+    delta_days = 1 if task["recurrence"] == "daily" else 7
+    next_date_key = None
+    if task.get("date_key"):
+        try:
+            base_day = datetime.strptime(task["date_key"], "%Y-%m-%d")
+            next_date_key = (base_day + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+        except Exception:
+            next_date_key = None
+    if not next_date_key:
+        next_date_key = (_now_local() + timedelta(days=delta_days)).strftime("%Y-%m-%d")
 
-        next_due = None
-        if task.get("due_date"):
-            try:
-                base = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
-                next_due = (base + timedelta(days=delta_days)).isoformat()
-            except Exception:
-                next_due = None
+    next_due = None
+    if task.get("due_date"):
+        try:
+            base = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
+            next_due = (base + timedelta(days=delta_days)).isoformat()
+        except Exception:
+            next_due = None
 
-        # Guard against double-approval races creating two copies for the same
-        # day: only spawn if an identical open occurrence doesn't already exist.
-        spawned_next_id = None
-        existing = await db.tasks.find_one({
-            "child_id": task["child_id"],
-            "title": task["title"],
-            "date_key": next_date_key,
-            "recurrence": task["recurrence"],
-            "status": {"$in": ["pending", "rejected"]},
-        })
-        if not existing:
-            spawned_next_id = new_id()
-            new_task = {
-                **{k: v for k, v in task.items() if k != "_id"},
-                "id": spawned_next_id,
-                "status": "pending",
-                "completed_at": None,
-                "approved_at": None,
-                "due_date": next_due,
-                "date_key": next_date_key,
-                "timer_started_at": None,
-                "timer_completed_at": None,
-                "created_at": now_iso(),
-            }
-            await db.tasks.insert_one(new_task)
+    match_query = {
+        "title": task["title"], "date_key": next_date_key,
+        "recurrence": task["recurrence"], "status": {"$in": ["pending", "rejected"]},
+    }
+    if task.get("is_coop"):
+        match_query["is_coop"] = True
+        match_query["coop_participants"] = task.get("coop_participants")
     else:
-        spawned_next_id = None
+        match_query["child_id"] = task["child_id"]
+
+    existing = await db.tasks.find_one(match_query)
+    if existing:
+        return None
+
+    spawned_id = new_id()
+    new_task = {
+        **{k: v for k, v in task.items() if k != "_id"},
+        "id": spawned_id,
+        "status": "pending",
+        "completed_at": None,
+        "approved_at": None,
+        "due_date": next_due,
+        "date_key": next_date_key,
+        "timer_started_at": None,
+        "timer_completed_at": None,
+        "coop_completed_by": None,
+        "created_at": now_iso(),
+    }
+    await db.tasks.insert_one(new_task)
+    return spawned_id
+
+
+@api.post("/tasks/{task_id}/approve")
+async def approve_task(task_id: str, user: dict = Depends(require_parent)):
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Task must be completed first")
+
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+
+    if task.get("is_coop"):
+        participants = task.get("coop_participants") or [task["child_id"]]
+        for cid in participants:
+            if not await db.children.find_one({"id": cid}):
+                raise HTTPException(status_code=404, detail="Child not found")
+        n = len(participants)
+        base_share = task["points"] // n
+        remainder = task["points"] - base_share * n
+        snapshots = []
+        for i, cid in enumerate(participants):
+            share = base_share + (1 if i < remainder else 0)  # remainder spread across first few
+            snap = await _apply_approval_rewards(cid, share, config)
+            snapshots.append(snap)
+
+        spawned_next_id = await _spawn_recurrence_if_due(task, config)
+
+        await db.tasks.update_one(
+            {"id": task_id},
+            {"$set": {
+                "status": "approved",
+                "approved_at": now_iso(),
+                "_undo_coop_snapshots": snapshots,
+                "_undo_spawned_next_id": spawned_next_id,
+            }},
+        )
+        new_badges = []
+        for cid in participants:
+            new_badges += await award_badges(FAMILY_ID, cid)
+            await log_activity(FAMILY_ID, cid, "task_approved", {"task_id": task_id, "points": task["points"], "coop": True})
+        return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges}
+
+    # --- Normal single-child path ---
+    child = await db.children.find_one({"id": task["child_id"]})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    points = task["points"]
+    snap = await _apply_approval_rewards(task["child_id"], points, config)
+    spawned_next_id = await _spawn_recurrence_if_due(task, config)
 
     await db.tasks.update_one(
         {"id": task_id},
@@ -1512,13 +1859,16 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
                 "status": "approved",
                 "approved_at": now_iso(),
                 # Snapshot needed to precisely reverse this approval later.
-                "_undo_prev_streak": prev_streak,
-                "_undo_prev_last_completion": prev_last_completion,
+                "_undo_prev_streak": snap["prev_streak"],
+                "_undo_prev_last_completion": snap["prev_last_completion"],
                 "_undo_points_awarded": points,
-                "_undo_chiky_save": p_save,
-                "_undo_chiky_spend": p_spend,
-                "_undo_chiky_share": p_share,
+                "_undo_chiky_save": snap["chiky_save"],
+                "_undo_chiky_spend": snap["chiky_spend"],
+                "_undo_chiky_share": snap["chiky_share"],
                 "_undo_spawned_next_id": spawned_next_id,
+                "_undo_used_freeze_card": snap["used_freeze_card"],
+                "_undo_prev_freeze_available": snap["prev_freeze_available"],
+                "_undo_prev_freeze_week": snap["prev_freeze_week"],
             }
         },
     )
@@ -1549,6 +1899,43 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
     if elapsed_min > UNDO_WINDOW_MINUTES:
         raise HTTPException(status_code=409, detail=f"Batas waktu membatalkan sudah lewat ({UNDO_WINDOW_MINUTES} menit)")
 
+    if task.get("is_coop"):
+        snapshots = task.get("_undo_coop_snapshots") or []
+        total_points = 0
+        for snap in snapshots:
+            await db.children.update_one(
+                {"id": snap["child_id"]},
+                {
+                    "$inc": {
+                        "points": -snap["points"], "lifetime_points": -snap["points"], "tasks_completed": -1,
+                        "chiky_save": -snap["chiky_save"], "chiky_spend": -snap["chiky_spend"], "chiky_share": -snap["chiky_share"],
+                    },
+                    "$set": {
+                        "streak_days": snap["prev_streak"],
+                        "last_completion_date": snap["prev_last_completion"],
+                        "freeze_cards_available": snap["prev_freeze_available"],
+                        "freeze_card_week": snap["prev_freeze_week"],
+                    },
+                },
+            )
+            total_points += snap["points"]
+
+        spawned_id = task.get("_undo_spawned_next_id")
+        if spawned_id:
+            spawned = await db.tasks.find_one({"id": spawned_id})
+            if spawned and spawned.get("status") == "pending" and not spawned.get("timer_started_at"):
+                await db.tasks.delete_one({"id": spawned_id})
+
+        await db.tasks.update_one(
+            {"id": task_id},
+            {
+                "$set": {"status": "completed", "approved_at": None},
+                "$unset": {"_undo_coop_snapshots": "", "_undo_spawned_next_id": ""},
+            },
+        )
+        await log_activity(FAMILY_ID, task["child_id"], "task_approval_undone", {"task_id": task_id, "points_reversed": total_points, "coop": True})
+        return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
     points = task.get("_undo_points_awarded", task.get("points", 0))
     p_save = task.get("_undo_chiky_save", 0)
     p_spend = task.get("_undo_chiky_spend", 0)
@@ -1568,6 +1955,8 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
             "$set": {
                 "streak_days": task.get("_undo_prev_streak", 0),
                 "last_completion_date": task.get("_undo_prev_last_completion"),
+                "freeze_cards_available": task.get("_undo_prev_freeze_available", 1),
+                "freeze_card_week": task.get("_undo_prev_freeze_week"),
             },
         },
     )
@@ -1589,6 +1978,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "_undo_prev_streak": "", "_undo_prev_last_completion": "",
                 "_undo_points_awarded": "", "_undo_chiky_save": "", "_undo_chiky_spend": "",
                 "_undo_chiky_share": "", "_undo_spawned_next_id": "",
+                "_undo_used_freeze_card": "", "_undo_prev_freeze_available": "", "_undo_prev_freeze_week": "",
             },
         },
     )
@@ -1688,6 +2078,8 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
+            "instant_task_notifications": False,
+            "language": "id",
         }
         incoming = {k: v for k, v in payload.model_dump().items() if v is not None}
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
@@ -1715,6 +2107,8 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
+            "instant_task_notifications": False,
+            "language": "id",
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
@@ -1731,6 +2125,8 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "custom_labels": config.get("custom_labels", {}) or {},
         "vacation_mode": bool(config.get("vacation_mode", False)),
         "vacation_note": config.get("vacation_note", ""),
+        "instant_task_notifications": bool(config.get("instant_task_notifications", False)),
+        "language": config.get("language", "id"),
     }
 
 
@@ -1870,6 +2266,68 @@ async def fulfill_redemption(redemption_id: str, user: dict = Depends(require_pa
         raise HTTPException(status_code=404, detail="Redemption not found")
     await db.redemptions.update_one({"id": redemption_id}, {"$set": {"status": "fulfilled", "fulfilled_at": now_iso()}})
     return await db.redemptions.find_one({"id": redemption_id}, {"_id": 0})
+
+
+# --------------- Reward Wishlist ---------------
+class WishlistInput(BaseModel):
+    reward_id: str
+
+
+@api.post("/wishlist")
+async def add_wishlist_item(payload: WishlistInput, user: dict = Depends(get_current_user)):
+    """A kid marks a reward as something they're saving up for. Parents can add
+    on a kid's behalf too (e.g. helping a younger child set a goal)."""
+    reward = await db.rewards.find_one({"id": payload.reward_id, "parent_id": FAMILY_ID})
+    if not reward:
+        raise HTTPException(status_code=404, detail="Reward not found")
+    child_id = user["id"] if user["role"] == "child" else None
+    if not child_id:
+        raise HTTPException(status_code=422, detail="Tentukan anak (parent tidak punya wishlist sendiri)")
+    existing = await db.wishlist_items.find_one({"parent_id": FAMILY_ID, "child_id": child_id, "reward_id": payload.reward_id})
+    if existing:
+        existing.pop("_id", None)
+        return existing  # idempotent: already wishlisted, return as-is
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": child_id,
+        "reward_id": payload.reward_id, "created_at": now_iso(),
+    }
+    await db.wishlist_items.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.get("/wishlist")
+async def list_wishlist(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]  # kids only ever see their own wishlist
+    elif child_id:
+        query["child_id"] = child_id
+    items = await db.wishlist_items.find(query, {"_id": 0}).to_list(200)
+
+    # Enrich with reward + progress info so the frontend doesn't need a second round-trip.
+    out = []
+    for item in items:
+        reward = await db.rewards.find_one({"id": item["reward_id"], "parent_id": FAMILY_ID}, {"_id": 0})
+        if not reward:
+            continue  # reward was deleted since being wishlisted; skip silently
+        child = await db.children.find_one({"id": item["child_id"], "parent_id": FAMILY_ID}, {"_id": 0})
+        points = child.get("points", 0) if child else 0
+        percent = min(100, int((points / reward["cost_points"]) * 100)) if reward["cost_points"] else 100
+        out.append({
+            **item, "reward": reward, "current_points": points,
+            "percent": percent, "goal_met": points >= reward["cost_points"],
+        })
+    return out
+
+
+@api.delete("/wishlist/{item_id}")
+async def remove_wishlist_item(item_id: str, user: dict = Depends(get_current_user)):
+    query = {"id": item_id, "parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]  # kids can only remove their own wishlist entries
+    await db.wishlist_items.delete_one(query)  # idempotent
+    return {"success": True}
 
 
 # --------------- Consequences ---------------
@@ -2116,6 +2574,71 @@ async def cron_send_reminders(request: Request):
             )
             sent += 1
     return {"checked": len(candidates), "reminders_sent": sent}
+
+
+@api.get("/cron/send-digest")
+async def cron_send_digest(request: Request):
+    """Scheduled job (same GitHub Actions runner as reminders, called every 15
+    min) — sends a morning 'here's today's missions' digest and an evening
+    'here's how today went' summary to parents, ONCE each per day, instead of
+    a push for every single task completion (which gets spammy with an active
+    kid). Guarded by CRON_SECRET the same way /cron/send-reminders is, and by
+    a digest_log entry so repeated 15-min cron ticks within the same hour
+    don't send the same digest multiple times."""
+    expected = os.environ.get(CRON_SECRET_ENV)
+    auth_header = request.headers.get("authorization", "")
+    if not expected or auth_header != f"Bearer {expected}":
+        raise HTTPException(status_code=403, detail="Invalid or missing cron secret")
+
+    now = _now_local()
+    today = now.strftime("%Y-%m-%d")
+    sent = []
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50)
+
+    if now.hour == 7 and not await db.digest_log.find_one({"date_key": today, "type": "morning"}):
+        lines = []
+        for k in kids:
+            count = await db.tasks.count_documents({
+                "parent_id": FAMILY_ID, "date_key": today, "status": {"$in": ["pending", "rejected"]},
+                "is_bonus": {"$ne": True},
+                "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
+            })
+            if count:
+                lines.append(f"{k['name']}: {count} misi")
+        if lines:
+            await send_push_to(
+                {"role": "parent"}, title="Misi hari ini ☀️",
+                body=", ".join(lines), url="/parent",
+            )
+        await db.digest_log.insert_one({"date_key": today, "type": "morning", "sent_at": now_iso()})
+        sent.append("morning")
+
+    if now.hour == 20 and not await db.digest_log.find_one({"date_key": today, "type": "evening"}):
+        lines = []
+        for k in kids:
+            required = await db.tasks.count_documents({
+                "parent_id": FAMILY_ID, "date_key": today, "is_bonus": {"$ne": True},
+                "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
+            })
+            done = await db.tasks.count_documents({
+                "parent_id": FAMILY_ID, "date_key": today, "is_bonus": {"$ne": True},
+                "status": {"$in": ["approved", "completed", "skipped"]},
+                "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
+            })
+            pct = int((done / required) * 100) if required else 100
+            lines.append(f"{k['name']} {pct}%")
+        pending_approval = await db.tasks.count_documents({"parent_id": FAMILY_ID, "status": "completed"})
+        body = ", ".join(lines)
+        if pending_approval:
+            body += f" — {pending_approval} menunggu dicek"
+        await send_push_to(
+            {"role": "parent"}, title="Rangkuman hari ini 🌙",
+            body=body, url="/parent",
+        )
+        await db.digest_log.insert_one({"date_key": today, "type": "evening", "sent_at": now_iso()})
+        sent.append("evening")
+
+    return {"sent": sent}
 
 
 # --------------- Leaderboard & Gamification (Stage 4) ---------------

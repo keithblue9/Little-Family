@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import Confetti from "react-confetti";
 import {
   Star, Trophy, CheckCircle2, Gift, Home as HomeIcon,
-  LogOut, Flame, Lock, Sparkles, Banknote, User, FastForward, Map,
+  LogOut, Flame, Lock, Sparkles, Banknote, User, FastForward, Map, Heart,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -17,6 +17,7 @@ import Achievements from "@/components/Achievements";
 import MoneyExchange from "@/components/MoneyExchange";
 import ChikyBankCard from "@/components/ChikyBankCard";
 import KidChallenges from "@/components/KidChallenges";
+import GrowthTrail from "@/components/GrowthTrail";
 import ProfileEditor from "@/components/ProfileEditor";
 import DailyQuestView from "@/components/DailyQuestView";
 import { personalityMeta } from "@/lib/personality";
@@ -38,6 +39,7 @@ export default function KidHome() {
   const { t: L } = useLabels();
   const [child, setChild] = useState(null);
   const [rewards, setRewards] = useState([]);
+  const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
   const [tab, setTab] = useState("tasks");
   const [celebrate, setCelebrate] = useState(false);
   const [dims, setDims] = useState({ w: window.innerWidth, h: window.innerHeight });
@@ -50,9 +52,10 @@ export default function KidHome() {
 
   const load = useCallback(async () => {
     try {
-      const [cRes, rRes] = await Promise.all([
+      const [cRes, rRes, wRes] = await Promise.all([
         api.get("/children"),
         api.get("/rewards"),
+        api.get("/wishlist"),
       ]);
       const c = cRes.data.find((x) => x.id === childId);
       if (!c) {
@@ -62,12 +65,29 @@ export default function KidHome() {
       }
       setChild(c);
       setRewards(rRes.data);
+      setWishlist(wRes.data);
     } catch (e) {
       toast.error(formatApiError(e));
     }
   }, [childId, nav]);
 
   useEffect(() => { load(); }, [load]);
+
+  const toggleWishlist = async (reward) => {
+    const existing = wishlist.find((w) => w.reward_id === reward.id);
+    try {
+      if (existing) {
+        await api.delete(`/wishlist/${existing.id}`);
+        toast.success(`${reward.name} dihapus dari wishlist`);
+      } else {
+        await api.post("/wishlist", { reward_id: reward.id });
+        toast.success(`${reward.name} ditambahkan ke wishlist! ⭐`);
+      }
+      load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
+  };
 
   const redeem = async (reward) => {
     try {
@@ -115,9 +135,14 @@ export default function KidHome() {
           </motion.div>
           <div>
             <div className="font-fun font-bold text-2xl text-slate-900">Halo, {child.name}!</div>
-            <div className="flex items-center gap-2 text-sm text-slate-500">
+            <div className="flex items-center gap-2 text-sm text-slate-500 flex-wrap">
               <Flame className="w-4 h-4 text-[#FF5C5C]" strokeWidth={2.5} />
               Streak {child.streak_days || 0} hari
+              {(child.freeze_cards_available ?? 1) > 0 && (
+                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700" title="Kartu Bebas — melindungi streak-mu kalau kelewat 1 hari">
+                  🧊 {child.freeze_cards_available ?? 1} Kartu Bebas
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -211,6 +236,35 @@ export default function KidHome() {
           {tab === "rewards" && (
             <motion.div key="rewards" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <h2 className="font-fun font-bold text-2xl text-slate-900 mb-3">Toko Hadiah 🎁</h2>
+
+              {wishlist.length > 0 && (
+                <div className="mb-5">
+                  <h3 className="font-fun font-bold text-sm text-slate-500 mb-2 flex items-center gap-1.5">
+                    <Heart className="w-4 h-4 fill-pink-400 text-pink-400" /> Wishlist-ku
+                  </h3>
+                  <div className="space-y-2">
+                    {wishlist.map((w) => (
+                      <div key={w.id} className="bg-white rounded-2xl p-3 border-2 border-pink-100 flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-pink-50 flex items-center justify-center shrink-0">
+                          <Gift className="w-5 h-5 text-pink-400" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="font-fun font-bold text-sm text-slate-800 truncate">{w.reward.name}</div>
+                          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden mt-1">
+                            <div
+                              className={`h-full rounded-full ${w.goal_met ? "bg-green-500" : "bg-pink-400"}`}
+                              style={{ width: `${w.percent}%` }}
+                            />
+                          </div>
+                        </div>
+                        <div className="text-xs font-bold text-slate-500 shrink-0">
+                          {w.goal_met ? "Siap ditukar! 🎉" : `${w.percent}%`}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {rewards.length === 0 ? (
                 <div className="bg-white rounded-3xl p-8 text-center border-2 border-slate-100 chunky-shadow">
                   <Gift className="w-10 h-10 text-slate-300 mx-auto mb-3" strokeWidth={2.5} />
@@ -221,13 +275,21 @@ export default function KidHome() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {rewards.map((r) => {
                     const canAfford = (child.points || 0) >= r.cost_points;
+                    const wished = wishlist.some((w) => w.reward_id === r.id);
                     return (
-                      <div key={r.id} className="bg-white rounded-3xl p-4 border-2 border-slate-100 chunky-shadow">
+                      <div key={r.id} className="bg-white rounded-3xl p-4 border-2 border-slate-100 chunky-shadow relative">
+                        <button
+                          onClick={() => toggleWishlist(r)}
+                          className="absolute top-3 right-3 press-btn p-1.5 rounded-full hover:bg-pink-50"
+                          title={wished ? "Hapus dari wishlist" : "Tambah ke wishlist"}
+                        >
+                          <Heart className={`w-5 h-5 ${wished ? "fill-pink-500 text-pink-500" : "text-slate-300"}`} strokeWidth={2} />
+                        </button>
                         <div className="flex items-start gap-3 mb-3">
                           <div className="w-12 h-12 rounded-2xl bg-[#FF9D23]/15 flex items-center justify-center flex-shrink-0">
                             <Gift className="w-6 h-6 text-[#FF9D23]" strokeWidth={2.5} />
                           </div>
-                          <div className="flex-1 min-w-0">
+                          <div className="flex-1 min-w-0 pr-6">
                             <div className="font-fun font-bold text-lg text-slate-900">{r.name}</div>
                             {r.description && <div className="text-sm text-slate-500">{r.description}</div>}
                           </div>
@@ -259,6 +321,7 @@ export default function KidHome() {
               <Leaderboard />
               <KidChallenges />
               <Achievements childId={childId} />
+              <GrowthTrail childId={childId} childName={child.name} />
             </motion.div>
           )}
 

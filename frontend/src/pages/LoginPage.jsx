@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { Rocket, ArrowLeft, Delete, ChevronRight, Sparkles, Star, Trophy } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import api, { formatApiError } from "@/lib/api";
-import { DEFAULT_LABELS } from "@/lib/labels";
+import { DEFAULT_LABELS, EN_LABELS } from "@/lib/labels";
 
 export default function LoginPage() {
   const { login, fetchMembers } = useAuth();
@@ -17,13 +17,14 @@ export default function LoginPage() {
   const [passcode, setPasscode] = useState("");
   const [loading, setLoading] = useState(false);
   const [shake, setShake] = useState(false);
-  const [branding, setBranding] = useState({ app_name: "My Lil Famz", custom_labels: {}, slideshow_background_url: "", slideshow_background_image: "" });
+  const [branding, setBranding] = useState({ app_name: "My Lil Famz", custom_labels: {}, slideshow_background_url: "", slideshow_background_image: "", language: "id" });
 
-  // Resolve a label using branding overrides, falling back to defaults.
+  // Resolve a label using branding overrides, falling back to the active language's defaults.
   const L = (key) => {
     const c = branding.custom_labels || {};
     if (Object.prototype.hasOwnProperty.call(c, key)) return c[key];
-    return DEFAULT_LABELS[key] ?? key;
+    const base = branding.language === "en" ? EN_LABELS : DEFAULT_LABELS;
+    return base[key] ?? key;
   };
 
   useEffect(() => {

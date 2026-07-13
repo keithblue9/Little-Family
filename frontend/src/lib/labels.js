@@ -61,21 +61,79 @@ export const DEFAULT_LABELS = {
   "chiky.share": "Sedekah",
 };
 
-// Context holds the merged label map (defaults + overrides).
-export const LabelContext = createContext({ labels: {}, custom: {} });
+// English translation set — same keys as DEFAULT_LABELS (Indonesian). Custom
+// overrides from the label editor still apply on top of whichever language
+// is active, so a parent's custom wording isn't lost when switching languages.
+export const EN_LABELS = {
+  "login.title": "My Lil Famz",
+  "login.subtitle": "Fun tasks for the family",
+  "login.parent_tab": "Parent",
+  "login.kid_tab": "Kid",
+  "login.passcode_prompt": "Enter passcode",
+  "login.button": "Log In",
+
+  "nav.overview": "Overview",
+  "nav.monitor": "Daily Monitor",
+  "nav.tasks": "Tasks",
+  "nav.rewards": "Rewards",
+  "nav.money": "Money & Points",
+  "nav.consequences": "Consequences",
+  "nav.leaderboard": "Leaderboard",
+  "nav.analytics": "Analytics",
+  "nav.weekly": "Weekly Report",
+  "nav.settings": "Settings",
+
+  "overview.greeting": "Hi",
+  "overview.manage": "manage your family",
+  "overview.stat_children": "Children",
+  "overview.stat_tasks": "Active Tasks",
+  "overview.stat_pending": "Awaiting Review",
+  "overview.stat_points": "Total Points",
+
+  "tasks.new_button": "New task",
+  "tasks.template_button": "From Template",
+  "tasks.active_section": "Active",
+  "tasks.empty": "No active tasks.",
+
+  "kid.tab_tasks": "Missions",
+  "kid.tab_rewards": "Shop",
+  "kid.tab_money": "Exchange",
+  "kid.tab_champs": "Champs",
+  "kid.tab_profile": "Profile",
+  "kid.greeting": "Hi",
+  "kid.points_label": "points",
+  "kid.start_button": "Start",
+  "kid.finish_button": "Done!",
+  "kid.skip_button": "Skip",
+  "kid.daily_goal": "Today's Point Goal",
+  "kid.goal_reached": "Daily goal reached!",
+  "kid.bonus_section": "Bonus Missions",
+  "kid.done_section": "Completed",
+
+  "money.savings_goal": "My Savings Goal",
+  "money.three_chiky": "My ChikyBank",
+  "chiky.save": "Savings",
+  "chiky.spend": "Spending",
+  "chiky.share": "Sharing",
+};
+
+// Context holds the merged label map (defaults + overrides + language).
+export const LabelContext = createContext({ custom: {}, language: "id" });
 
 export function useLabels() {
-  const { custom } = useContext(LabelContext);
-  // Returns a resolver: t("key") -> custom override (may be "" to hide) or default.
+  const { custom, language } = useContext(LabelContext);
+  const base = language === "en" ? EN_LABELS : DEFAULT_LABELS;
+  // Returns a resolver: t("key") -> custom override (may be "" to hide) or the
+  // active language's default.
   const t = (key) => {
     if (custom && Object.prototype.hasOwnProperty.call(custom, key)) {
       return custom[key]; // may be "" meaning hidden
     }
-    return DEFAULT_LABELS[key] ?? key;
+    return base[key] ?? key;
   };
   // Whether a label is hidden (explicitly blanked)
   const hidden = (key) => custom && custom[key] === "";
-  return { t, hidden, custom };
+  return { t, hidden, custom, language };
 }
 
 // Label groups for the editor UI

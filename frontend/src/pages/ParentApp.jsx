@@ -23,6 +23,7 @@ import PushNotificationManager from "@/components/PushNotificationManager";
 import FamilyDayMonitor from "@/components/FamilyDayMonitor";
 import WeeklyReport from "@/components/WeeklyReport";
 import LabelEditor from "@/components/LabelEditor";
+import ViewLinksManager from "@/components/ViewLinksManager";
 import FamilyChallenges from "@/components/FamilyChallenges";
 import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
@@ -944,6 +945,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <ViewLinksManager />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <MemberPasscodeManager />
       </div>
 
@@ -1067,6 +1072,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
   const [photoRequired, setPhotoRequired] = useState(false);
+  const [isCoop, setIsCoop] = useState(false);
   const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
   const [taskStyle, setTaskStyle] = useState("");
@@ -1091,6 +1097,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
+      setIsCoop(!!editTask.is_coop);
       setRecurrence(editTask.recurrence || "none");
       setOrder(editTask.order ? String(editTask.order) : "");
       setTaskStyle(editTask.task_style || "");
@@ -1109,6 +1116,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
+      setIsCoop(false);
       setRecurrence(editTask.recurrence || "none");
       setOrder(""); // fresh order
       setTaskStyle(editTask.task_style || "");
@@ -1119,7 +1127,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setScheduleMode("weekdays");
       const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
       setWeekdays([todayWd]);
-      setDueTime(""); setDuration(""); setIsBonus(false); setPhotoRequired(false);
+      setDueTime(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
   }, [open, defaultChildId, editTask, isDuplicate]);
@@ -1145,6 +1153,9 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
     if (!isEdit && scheduleMode === "weekdays" && weekdays.length === 0) {
       return toast.error("Pilih minimal satu hari");
     }
+    if (!isEdit && isCoop && selectedKidIds.length < 2) {
+      return toast.error("Misi bersama butuh minimal 2 anak dipilih (bukan Semua/1 anak)");
+    }
     setSaving(true);
     try {
       const useWeekdays = !isEdit && scheduleMode === "weekdays";
@@ -1157,8 +1168,9 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         weekdays: useWeekdays ? weekdays : null,
         due_time: dueTime || null,
         duration_minutes: duration ? Number(duration) : null,
-        is_bonus: isBonus,
+        is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
+        coop: !isEdit && isCoop,
         // Rutin (weekday) mode auto-repeats weekly so the task comes back each
         // week on the same day. Non-rutin uses the chosen recurrence dropdown.
         recurrence: useWeekdays ? "weekly" : recurrence,
@@ -1168,6 +1180,9 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       if (isEdit) {
         await api.patch(`/tasks/${editTask.id}`, body);
         toast.success("Tugas diperbarui");
+      } else if (isCoop) {
+        await api.post("/tasks", { ...body, target_children: selectedKidIds });
+        toast.success(`Misi bersama dibuat untuk ${selectedKidIds.length} anak 🤝`);
       } else {
         // Broadcast: send empty target_children (or all kid ids). Backend treats empty as "all".
         if (isBroadcast) {
@@ -1208,21 +1223,23 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
             </div>
           ) : (
             <div className="space-y-2">
-              <button
-                type="button"
-                onClick={() => setSelectedKidIds([])}
-                className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
-                  isBroadcast ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-                }`}
-              >
-                <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-                  isBroadcast ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
-                }`}>
-                  {isBroadcast && <span className="text-white text-xs">✓</span>}
-                </div>
-                <span className="font-semibold text-slate-800">🌟 Semua anak (broadcast)</span>
-                <span className="text-xs text-slate-500 ml-auto">1 tugas untuk tiap anak</span>
-              </button>
+              {!isCoop && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedKidIds([])}
+                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
+                    isBroadcast ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+                  }`}
+                >
+                  <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+                    isBroadcast ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
+                  }`}>
+                    {isBroadcast && <span className="text-white text-xs">✓</span>}
+                  </div>
+                  <span className="font-semibold text-slate-800">🌟 Semua anak (broadcast)</span>
+                  <span className="text-xs text-slate-500 ml-auto">1 tugas untuk tiap anak</span>
+                </button>
+              )}
               <div className="grid grid-cols-2 gap-2">
                 {kids.map((c) => {
                   const checked = selectedKidIds.includes(c.id);
@@ -1249,7 +1266,11 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
                 })}
               </div>
               <p className="text-xs text-slate-400">
-                {isBroadcast
+                {isCoop
+                  ? selectedKidIds.length < 2
+                    ? "Pilih minimal 2 anak untuk misi bersama."
+                    : `Misi bersama untuk ${selectedKidIds.length} anak — poin dibagi otomatis saat disetujui.`
+                  : isBroadcast
                   ? `Akan dibuat 1 tugas untuk masing-masing dari ${kids.length} anak.`
                   : selectedKidIds.length === 0
                   ? "Pilih setidaknya satu anak, atau pilih 'Semua anak'."
@@ -1382,6 +1403,35 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
             <div className="text-xs text-slate-500">Anak harus lampirkan foto sebelum bisa menandai selesai.</div>
           </div>
         </button>
+
+        {/* Co-op quest toggle — only offered when creating (not editing), since
+            an existing task's coop-ness can't be changed after the fact. */}
+        {!isEdit && (
+          <button
+            type="button"
+            onClick={() => setIsCoop(!isCoop)}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
+              isCoop ? "border-teal-400 bg-teal-50" : "border-slate-200 hover:bg-slate-50"
+            }`}
+          >
+            <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+              isCoop ? "bg-teal-500 border-teal-500" : "border-slate-300"
+            }`}>
+              {isCoop && <span className="text-white text-xs">✓</span>}
+            </div>
+            <div className="flex-1 text-left">
+              <div className="font-semibold text-slate-800 text-sm">🤝 Misi Bersama (Co-op)</div>
+              <div className="text-xs text-slate-500">
+                Dikerjakan berdua — siapa saja dari mereka bisa menandai selesai, poin dibagi otomatis. Pilih minimal 2 anak di atas.
+              </div>
+            </div>
+          </button>
+        )}
+        {isEdit && editTask?.is_coop && (
+          <div className="text-xs text-teal-600 bg-teal-50 border border-teal-200 rounded-xl px-3 py-2">
+            🤝 Ini misi bersama — poin akan dibagi ke semua peserta saat disetujui.
+          </div>
+        )}
 
         {/* Duration & time — both optional, either or both */}
         <div className="grid grid-cols-2 gap-3 bg-slate-50 rounded-xl p-3 border border-slate-100">

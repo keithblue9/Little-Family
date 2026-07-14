@@ -53,3 +53,16 @@ export function isPastDate(key) {
 export function isFutureDate(key) {
   return key > todayKey();
 }
+
+/**
+ * Nearest date_key matching a given weekday (0=Senin..6=Minggu, same
+ * convention as the weekday picker elsewhere in the app). If today already
+ * IS that weekday, returns today (most relevant instance) rather than
+ * jumping a full week ahead.
+ */
+export function nextDateForWeekday(weekdayIndex) {
+  const now = new Date();
+  const todayWd = now.getDay() === 0 ? 6 : now.getDay() - 1; // JS getDay(): Sun=0 -> convert to Mon=0..Sun=6
+  const delta = (weekdayIndex - todayWd + 7) % 7;
+  return shiftDateKey(todayKey(), delta);
+}

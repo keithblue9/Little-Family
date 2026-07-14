@@ -32,7 +32,7 @@ import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
-import { todayKey, humanDateKey, shiftDateKey } from "@/lib/dates";
+import { todayKey, humanDateKey, shiftDateKey, nextDateForWeekday } from "@/lib/dates";
 import { ROUTINE_TEMPLATES } from "@/lib/routineTemplates";
 import { filterTaskIdeas } from "@/lib/taskIdeaBank";
 
@@ -720,6 +720,17 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
             className="px-2 py-1 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600"
             title="Pilih tanggal custom"
           />
+          <select
+            value=""
+            onChange={(e) => { if (e.target.value !== "") setDateFilter(nextDateForWeekday(Number(e.target.value))); }}
+            className="px-2 py-1 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600 bg-white"
+            title="Lompat ke hari tertentu (minggu ini/depan)"
+          >
+            <option value="">📆 Pilih Hari…</option>
+            {["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"].map((label, i) => (
+              <option key={i} value={i}>{label}</option>
+            ))}
+          </select>
           <button
             onClick={() => setDateFilter("all")}
             className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === "all" ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}

@@ -30,7 +30,7 @@ import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
-import { todayKey, humanDateKey } from "@/lib/dates";
+import { todayKey, humanDateKey, shiftDateKey } from "@/lib/dates";
 import { ROUTINE_TEMPLATES } from "@/lib/routineTemplates";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
@@ -148,10 +148,10 @@ export default function ParentApp() {
     [redemptions]
   );
   // "Aktif Hari Ini" count for the Tugas sidebar badge — mirrors TasksView's
-  // own default date filter so the number the parent sees matches what
-  // they'll find when they open the tab.
+  // own default date filter (exact today) so the number the parent sees
+  // matches what they'll find when they open the tab.
   const tasksBadgeCount = useMemo(
-    () => tasks.filter((t) => (t.status === "pending" || t.status === "rejected") && (!t.date_key || t.date_key <= todayKey())).length,
+    () => tasks.filter((t) => (t.status === "pending" || t.status === "rejected") && (!t.date_key || t.date_key === todayKey())).length,
     [tasks]
   );
 
@@ -484,18 +484,26 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   // child is selected, tasks show individually so per-child edits are possible.
   const kidName = (id) => kids.find((k) => k.id === id)?.name || "?";
 
-  // Recurring/weekday-scheduled tasks can easily produce a week's worth of
-  // upcoming pending occurrences all at once (e.g. a daily habit set for all
-  // 7 days). Without a date filter the "Aktif" list gets flooded with future
-  // days that aren't actionable yet. Default to "today (+ overdue)" so the
-  // list only shows what's actually relevant right now; "Semua Tanggal" is
-  // one tap away for anyone who wants the full picture.
-  const [dateFilter, setDateFilterState] = useState(() => sessionStorage.getItem("tasksDateFilter") || "today"); // "today" | "all"
+  // Recurring/weekday-scheduled tasks can easily produce many upcoming AND
+  // overdue pending occurrences at once. Give the parent real day-by-day
+  // navigation (Kemarin / Hari Ini / Besok / tanggal custom) instead of one
+  // fuzzy "today-ish" bucket, so what's on screen always matches one specific
+  // day — mirroring the same mental model as the kid's own calendar view.
+  const [dateFilter, setDateFilterState] = useState(() => {
+    const stored = sessionStorage.getItem("tasksDateFilter");
+    // Guard against a stale value from the previous filter format (which only
+    // ever stored the literal strings "today" or "all", not a real date) —
+    // anything that isn't "all" or a proper YYYY-MM-DD falls back to today.
+    if (stored === "all") return "all";
+    if (stored && /^\d{4}-\d{2}-\d{2}$/.test(stored)) return stored;
+    return todayKey();
+  });
   const [showCalendar, setShowCalendar] = useState(false);
   const setDateFilter = (v) => {
     setDateFilterState(v);
     try { sessionStorage.setItem("tasksDateFilter", v); } catch { /* storage unavailable — non-fatal */ }
   };
+  const isDateMode = dateFilter !== "all"; // dateFilter is either "all" or a YYYY-MM-DD string
 
   const displayTasks = useMemo(() => {
     if (selectedChildId) return tasks; // specific child → individual tasks
@@ -522,16 +530,19 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   const grouped = useMemo(() => {
     const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
     let pendingBase = displayTasks.filter((t) => t.status === "pending" || t.status === "rejected");
-    const futureCount = pendingBase.filter((t) => t.date_key && t.date_key > todayKey()).length;
-    if (dateFilter === "today") {
-      pendingBase = pendingBase.filter((t) => !t.date_key || t.date_key <= todayKey());
+    const otherDatesCount = isDateMode
+      ? pendingBase.filter((t) => t.date_key && t.date_key !== dateFilter).length
+      : 0;
+    if (isDateMode) {
+      // Exact-day match; undated tasks still show (no date to exclude them by).
+      pendingBase = pendingBase.filter((t) => !t.date_key || t.date_key === dateFilter);
     }
     const pending = pendingBase.sort(byOrder);
     const awaiting = displayTasks.filter((t) => t.status === "completed").sort(byOrder);
     const done = displayTasks.filter((t) => t.status === "approved" || t.status === "skipped").sort(byOrder);
     const missed = displayTasks.filter((t) => t.status === "missed");
-    return { pending, awaiting, done, missed, futureCount };
-  }, [displayTasks, dateFilter]);
+    return { pending, awaiting, done, missed, otherDatesCount };
+  }, [displayTasks, dateFilter, isDateMode]);
 
   const act = async (fn) => {
     try {
@@ -648,27 +659,67 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
 
       <Section title="📋 Aktif" count={grouped.pending.length}>
         <div className="flex items-center gap-2 mb-3 -mt-1 flex-wrap">
+          {isDateMode && (
+            <button
+              onClick={() => setDateFilter(shiftDateKey(dateFilter, -1))}
+              className="press-btn p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500"
+              title="Hari sebelumnya"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+            </button>
+          )}
           <button
-            onClick={() => setDateFilter("today")}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === "today" ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+            onClick={() => setDateFilter(shiftDateKey(todayKey(), -1))}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === shiftDateKey(todayKey(), -1) ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+          >
+            Kemarin
+          </button>
+          <button
+            onClick={() => setDateFilter(todayKey())}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === todayKey() ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
           >
             Hari Ini
           </button>
+          <button
+            onClick={() => setDateFilter(shiftDateKey(todayKey(), 1))}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === shiftDateKey(todayKey(), 1) ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+          >
+            Besok
+          </button>
+          {isDateMode && (
+            <button
+              onClick={() => setDateFilter(shiftDateKey(dateFilter, 1))}
+              className="press-btn p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500"
+              title="Hari berikutnya"
+            >
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          )}
+          <input
+            type="date"
+            value={isDateMode ? dateFilter : ""}
+            onChange={(e) => e.target.value && setDateFilter(e.target.value)}
+            className="px-2 py-1 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600"
+            title="Pilih tanggal custom"
+          />
           <button
             onClick={() => setDateFilter("all")}
             className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === "all" ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
           >
             Semua Tanggal
           </button>
-          {dateFilter === "today" && grouped.futureCount > 0 && (
+          {isDateMode && (
+            <span className="text-xs text-slate-500 font-semibold">{humanDateKey(dateFilter)}</span>
+          )}
+          {isDateMode && grouped.otherDatesCount > 0 && (
             <span className="text-xs text-slate-400">
-              {grouped.futureCount} misi hari mendatang disembunyikan — klik "Semua Tanggal" untuk lihat
+              {grouped.otherDatesCount} misi di tanggal lain disembunyikan
             </span>
           )}
         </div>
         {grouped.pending.length === 0 ? (
           <div className="text-sm text-slate-400 py-3">
-            {dateFilter === "today" ? "Tidak ada tugas aktif untuk hari ini." : "Tidak ada tugas aktif."}
+            {isDateMode ? `Tidak ada tugas aktif untuk ${humanDateKey(dateFilter)}.` : "Tidak ada tugas aktif."}
           </div>
         ) : grouped.pending.map((t) => (
           <TaskRow key={t.id} task={t} childName={rowName(t)}>
@@ -1362,7 +1413,17 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         <div>
           <label className={labelClass}>📅 Jadwal misi</label>
           {isEdit ? (
-            <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
+            <div>
+              <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
+              {dateKey && (
+                <p className="text-xs text-slate-500 mt-1.5">
+                  🗓️ Jatuh di hari <span className="font-semibold text-slate-700">{humanDateKey(dateKey)}</span>
+                  {recurrence !== "none" && (
+                    <> — bagian dari misi <span className="font-semibold text-indigo-600">{recurrence === "daily" ? "harian" : "mingguan"}</span>, otomatis berulang di hari yang sama tiap {recurrence === "daily" ? "hari" : "minggu"}.</>
+                  )}
+                </p>
+              )}
+            </div>
           ) : (
             <>
               <div className="flex gap-2 mb-2">

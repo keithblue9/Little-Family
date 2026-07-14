@@ -1,7 +1,7 @@
 /* My Lil Famz — service worker
    Caches the app shell so it can be installed as a PWA and work offline.
    Bump CACHE_VERSION whenever you change index.html so users get the update. */
-const CACHE_VERSION = 'mylilfamz-v4';
+const CACHE_VERSION = 'mylilfamz-v5';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -30,19 +30,26 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
 
-  // API responses: stale-while-revalidate — return cached immediately,
-  // fetch fresh in background, update cache. If offline, cached version.
+  // API responses: network-first. This app mutates data constantly (approve
+  // task, redeem reward, feed pet, choose pet...) and every action immediately
+  // re-fetches to show the result — stale-while-revalidate was serving the
+  // OLD cached response first in that exact moment, making actions look like
+  // they did nothing even though they'd actually succeeded (the fresh data
+  // only landed in the cache for NEXT time, with nothing to trigger a
+  // re-render when it arrived). Cache is now only a fallback for offline use.
   if (req.url.includes('/api/')) {
     event.respondWith(
-      caches.open(CACHE_VERSION).then((cache) =>
-        cache.match(req).then((cached) => {
-          const fetchPromise = fetch(req).then((res) => {
-            if (res.ok) cache.put(req, res.clone());
-            return res;
-          }).catch(() => cached);
-          return cached || fetchPromise;
+      fetch(req)
+        .then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE_VERSION).then((cache) => cache.put(req, copy)).catch(() => {});
+          }
+          return res;
         })
-      )
+        .catch(() =>
+          caches.open(CACHE_VERSION).then((cache) => cache.match(req))
+        )
     );
     return;
   }

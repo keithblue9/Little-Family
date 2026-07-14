@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Calendar, Target, Sparkles, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer } from "lucide-react";
+import { Calendar, Target, Sparkles, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES } from "@/lib/questThemes";
 import { styleMeta } from "@/lib/personality";
-import { todayKey, shiftDateKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
+import { todayKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
 import { playSoundTheme } from "@/lib/sounds";
+import KidMonthCalendar from "@/components/KidMonthCalendar";
 
 export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [dateKey, setDateKey] = useState(todayKey());
@@ -152,24 +153,21 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         onChange={handlePhotoSelected}
         className="hidden"
       />
-      {/* Date nav */}
-      <div className="flex items-center gap-2 bg-white rounded-2xl px-3 py-2 border-2 border-slate-100 chunky-shadow">
-        <button onClick={() => setDateKey(shiftDateKey(dateKey, -1))} className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600">
-          <ChevronLeft className="w-5 h-5" />
-        </button>
-        <div className="flex-1 text-center">
+      {/* Selected date header + quick jump to today */}
+      <div className="flex items-center justify-between bg-white rounded-2xl px-4 py-3 border-2 border-slate-100 chunky-shadow">
+        <div>
           <div className="font-fun font-bold text-slate-900 text-sm">{humanDateKey(dateKey)}</div>
           <div className="text-xs text-slate-400">{dateKey}</div>
         </div>
-        <button onClick={() => setDateKey(shiftDateKey(dateKey, 1))} disabled={isFuture} className="press-btn p-2 rounded-xl hover:bg-slate-100 text-slate-600 disabled:opacity-40">
-          <ChevronRight className="w-5 h-5" />
-        </button>
         {!isToday && (
-          <button onClick={() => setDateKey(todayKey())} className="press-btn ml-1 bg-[#FF9D23] hover:bg-[#f08e14] text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs">
+          <button onClick={() => setDateKey(todayKey())} className="press-btn bg-[#FF9D23] hover:bg-[#f08e14] text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs">
             <Calendar className="w-3.5 h-3.5 inline mr-1" /> Hari Ini
           </button>
         )}
       </div>
+
+      {/* Month calendar — tap any day to jump straight to its missions below */}
+      <KidMonthCalendar childId={child?.id} selectedDateKey={dateKey} onSelectDate={setDateKey} />
 
       {progress?.vacation_mode && (
         <div className="bg-sky-50 border-2 border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-sky-700">

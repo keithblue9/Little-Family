@@ -29,7 +29,7 @@ import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
-import { todayKey } from "@/lib/dates";
+import { todayKey, humanDateKey } from "@/lib/dates";
 import { ROUTINE_TEMPLATES } from "@/lib/routineTemplates";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
@@ -470,6 +470,14 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   // child is selected, tasks show individually so per-child edits are possible.
   const kidName = (id) => kids.find((k) => k.id === id)?.name || "?";
 
+  // Recurring/weekday-scheduled tasks can easily produce a week's worth of
+  // upcoming pending occurrences all at once (e.g. a daily habit set for all
+  // 7 days). Without a date filter the "Aktif" list gets flooded with future
+  // days that aren't actionable yet. Default to "today (+ overdue)" so the
+  // list only shows what's actually relevant right now; "Semua Tanggal" is
+  // one tap away for anyone who wants the full picture.
+  const [dateFilter, setDateFilter] = useState("today"); // "today" | "all"
+
   const displayTasks = useMemo(() => {
     if (selectedChildId) return tasks; // specific child → individual tasks
     const groups = new Map();
@@ -494,12 +502,17 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
 
   const grouped = useMemo(() => {
     const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
-    const pending = displayTasks.filter((t) => t.status === "pending" || t.status === "rejected").sort(byOrder);
+    let pendingBase = displayTasks.filter((t) => t.status === "pending" || t.status === "rejected");
+    const futureCount = pendingBase.filter((t) => t.date_key && t.date_key > todayKey()).length;
+    if (dateFilter === "today") {
+      pendingBase = pendingBase.filter((t) => !t.date_key || t.date_key <= todayKey());
+    }
+    const pending = pendingBase.sort(byOrder);
     const awaiting = displayTasks.filter((t) => t.status === "completed").sort(byOrder);
     const done = displayTasks.filter((t) => t.status === "approved" || t.status === "skipped").sort(byOrder);
     const missed = displayTasks.filter((t) => t.status === "missed");
-    return { pending, awaiting, done, missed };
-  }, [displayTasks]);
+    return { pending, awaiting, done, missed, futureCount };
+  }, [displayTasks, dateFilter]);
 
   const act = async (fn) => {
     try {
@@ -599,8 +612,29 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       )}
 
       <Section title="📋 Aktif" count={grouped.pending.length}>
+        <div className="flex items-center gap-2 mb-3 -mt-1 flex-wrap">
+          <button
+            onClick={() => setDateFilter("today")}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === "today" ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+          >
+            Hari Ini
+          </button>
+          <button
+            onClick={() => setDateFilter("all")}
+            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === "all" ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
+          >
+            Semua Tanggal
+          </button>
+          {dateFilter === "today" && grouped.futureCount > 0 && (
+            <span className="text-xs text-slate-400">
+              {grouped.futureCount} misi hari mendatang disembunyikan — klik "Semua Tanggal" untuk lihat
+            </span>
+          )}
+        </div>
         {grouped.pending.length === 0 ? (
-          <div className="text-sm text-slate-400 py-3">Tidak ada tugas aktif.</div>
+          <div className="text-sm text-slate-400 py-3">
+            {dateFilter === "today" ? "Tidak ada tugas aktif untuk hari ini." : "Tidak ada tugas aktif."}
+          </div>
         ) : grouped.pending.map((t) => (
           <TaskRow key={t.id} task={t} childName={rowName(t)}>
             {editBtn(t)}
@@ -684,7 +718,14 @@ function TaskRow({ task, childName, children, dim = false }) {
           <span>·</span>
           <span>+{task.points} pts</span>
           {task.penalty_points > 0 && <><span>·</span><span>penalty −{task.penalty_points}</span></>}
-          {task.due_date && <><span>·</span><span>tgl {new Date(task.due_date).toLocaleDateString("id-ID")}</span></>}
+          {task.date_key && (
+            <>
+              <span>·</span>
+              <span className={task.date_key < todayKey() ? "text-red-500 font-semibold" : task.date_key === todayKey() ? "text-green-600 font-semibold" : "text-slate-500"}>
+                📅 {humanDateKey(task.date_key)}
+              </span>
+            </>
+          )}
           {task.due_time && <><span>·</span><span className="text-indigo-600 font-semibold">🕒 sblm {task.due_time}</span></>}
           {task.duration_minutes && <><span>·</span><span className="text-indigo-600 font-semibold">⏱️ {task.duration_minutes} mnt</span></>}
           {task.recurrence !== "none" && <><span>·</span><span>{task.recurrence === "daily" ? "harian" : "mingguan"}</span></>}

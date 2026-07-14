@@ -1006,6 +1006,82 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post(f"/api/tasks/{nodur['id']}/complete")
     check("duration: task with no duration set is never blocked", r.status_code == 200, r.text[:150])
 
+    # ================= 52. BADGE CATALOG (sticker book) =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/badges/catalog")
+    check("catalog: returns fixed 7 badges", r.status_code == 200 and len(r.json()) == 7, str(len(r.json())))
+    check("catalog: each has key/name/desc/emoji", all(k in r.json()[0] for k in ("key", "name", "desc", "emoji")))
+
+    # ================= 53. PERSONAL BEST STREAK =================
+    r = c.post("/api/tasks", json={"title": "BestStreakT1", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    bs1 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{bs1['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{bs1['id']}/approve")
+    ads_bs = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("best-streak: field present and >= current streak", ads_bs.get("best_streak_days", -1) >= ads_bs["streak_days"], str(ads_bs.get("best_streak_days")))
+    # Force a big gap so streak resets to 1, best_streak must NOT drop
+    _asyncio3.run(server.db.children.update_one({"id": adskhan["id"]}, {
+        "$set": {"streak_days": 15, "best_streak_days": 15, "last_completion_date": (utc_now - _dt2.timedelta(days=6)).strftime("%Y-%m-%d"), "freeze_cards_available": 0},
+    }))
+    r = c.post("/api/tasks", json={"title": "BestStreakT2", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    bs2 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{bs2['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{bs2['id']}/approve")
+    ads_bs2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("best-streak: survives a reset (current=1, best stays 15)", ads_bs2["streak_days"] == 1 and ads_bs2["best_streak_days"] == 15, str(ads_bs2))
+    r = c.post(f"/api/tasks/{bs2['id']}/undo-approval")
+    check("best-streak: undo ok", r.status_code == 200)
+    ads_bs3 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("best-streak: undo restores exactly (streak=15, best=15)", ads_bs3["streak_days"] == 15 and ads_bs3["best_streak_days"] == 15, str(ads_bs3))
+
+    # ================= 54. MYSTERY BOX (perfect day) =================
+    perfect_date = "2026-12-01"
+    r = c.post("/api/tasks", json={"title": "PerfectR1", "points": 5, "child_id": adskhan["id"], "date_key": perfect_date, "order": 1})
+    pr1 = r.json()
+    r = c.post("/api/tasks", json={"title": "PerfectR2", "points": 5, "child_id": adskhan["id"], "date_key": perfect_date, "order": 2})
+    pr2 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/children/{adskhan['id']}/claim-perfect-day")
+    check("mystery: rejected — wrong date (checks TODAY only, not arbitrary date_key)", r.status_code == 400, r.text[:150])
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={perfect_date}")
+    check("mystery: perfect_day false while pending", r.json()["perfect_day"] is False)
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"skip_cost_points": 0})
+    # Clear the way: skip through any required tasks Syila already has pending
+    # today from earlier test sections (missed wouldn't count as "finished"
+    # for perfect_day purposes — must actually resolve them), so our new task
+    # is unambiguously the only thing standing between her and a perfect day.
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    for _ in range(20):
+        prog = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}").json()
+        open_required = [t for t in prog["tasks"] if not t.get("is_bonus") and t["status"] in ("pending", "rejected")]
+        if not open_required:
+            break
+        c.post(f"/api/tasks/{open_required[0]['id']}/skip")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"skip_cost_points": 20})
+    r = c.post("/api/tasks", json={"title": "PerfectToday1", "points": 5, "child_id": syila["id"], "date_key": today_local})
+    pt1 = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{pt1['id']}/start")
+    c.post(f"/api/tasks/{pt1['id']}/complete")
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}")
+    check("mystery: perfect_day true once all required completed", r.json()["perfect_day"] is True, str(r.json().get("perfect_day")))
+    check("mystery: not yet claimed", r.json()["perfect_day_claimed"] is False)
+    r = c.post(f"/api/children/{syila['id']}/claim-perfect-day")
+    check("mystery: claim succeeds", r.status_code == 200, r.text[:150])
+    check("mystery: bonus within 2-8 range", 2 <= r.json()["bonus"] <= 8, str(r.json()))
+    r = c.post(f"/api/children/{syila['id']}/claim-perfect-day")
+    check("mystery: double-claim rejected", r.status_code == 400, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/children/{syila['id']}/claim-perfect-day")
+    check("mystery: sibling blocked from claiming another's box", r.status_code == 403, str(r.status_code))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

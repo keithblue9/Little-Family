@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { motion } from "framer-motion";
-import { Calendar, Target, Sparkles, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer } from "lucide-react";
+import { Calendar, Target, Sparkles, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer, ChevronUp, ChevronDown } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES } from "@/lib/questThemes";
@@ -8,6 +8,33 @@ import { styleMeta } from "@/lib/personality";
 import { todayKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
 import { playSoundTheme } from "@/lib/sounds";
 import KidMonthCalendar from "@/components/KidMonthCalendar";
+import MysteryBox from "@/components/MysteryBox";
+import { timeOfDayOverlay, isNightTime } from "@/lib/timeOfDay";
+
+// Bonus mission display order is a small personal-preference feature — kept
+// client-side only (no backend field) since it's just "how this kid likes to
+// see their own optional extras listed today", not something that needs to
+// sync across devices or be visible to parents.
+function bonusOrderKey(childId, dateKey) {
+  return `bonusOrder:${childId}:${dateKey}`;
+}
+function getBonusOrder(childId, dateKey) {
+  if (!childId) return null;
+  try {
+    const raw = localStorage.getItem(bonusOrderKey(childId, dateKey));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null; // corrupted/unavailable storage — just fall back to default order
+  }
+}
+function saveBonusOrder(childId, dateKey, orderedIds) {
+  if (!childId) return;
+  try {
+    localStorage.setItem(bonusOrderKey(childId, dateKey), JSON.stringify(orderedIds));
+  } catch {
+    // storage unavailable (private browsing, quota) — non-fatal, order just won't persist
+  }
+}
 
 export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [dateKey, setDateKey] = useState(todayKey());
@@ -47,12 +74,33 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const { required, bonus, next, done } = useMemo(() => {
     const tasks = progress?.tasks || [];
     const req = tasks.filter((t) => !t.is_bonus).sort((a, b) => (a.order || 0) - (b.order || 0));
-    const bon = tasks.filter((t) => t.is_bonus);
+    let bon = tasks.filter((t) => t.is_bonus);
+    // Apply the kid's own custom display order for bonus missions, if they've
+    // rearranged them — a small personal-preference touch that doesn't need
+    // any backend involvement since it's purely how THEY like to see their
+    // own optional extras listed.
+    const savedOrder = getBonusOrder(child?.id, dateKey);
+    if (savedOrder && savedOrder.length) {
+      const orderIndex = new Map(savedOrder.map((id, i) => [id, i]));
+      bon = [...bon].sort((a, b) => (orderIndex.get(a.id) ?? 999) - (orderIndex.get(b.id) ?? 999));
+    }
     const openReq = req.filter((t) => t.status === "pending" || t.status === "rejected");
     const first = openReq[0] || null;
     const doneReq = req.filter((t) => t.status === "approved" || t.status === "skipped" || t.status === "completed");
     return { required: req, bonus: bon, next: first, done: doneReq };
-  }, [progress]);
+  }, [progress, child?.id, dateKey]);
+
+  const moveBonusTask = (taskId, direction) => {
+    const ids = bonus.map((t) => t.id);
+    const idx = ids.indexOf(taskId);
+    const swapWith = direction === "up" ? idx - 1 : idx + 1;
+    if (swapWith < 0 || swapWith >= ids.length) return;
+    [ids[idx], ids[swapWith]] = [ids[swapWith], ids[idx]];
+    saveBonusOrder(child?.id, dateKey, ids);
+    // Force a re-render by touching progress reference — cheapest safe way
+    // without adding a whole separate state slice just for display order.
+    setProgress((p) => (p ? { ...p } : p));
+  };
 
   const isToday = dateKey === todayKey();
   const isFuture = isFutureDate(dateKey);
@@ -209,6 +257,10 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         </motion.div>
       )}
 
+      {isToday && progress?.perfect_day && !progress?.perfect_day_claimed && (
+        <MysteryBox childId={child?.id} soundTheme={child?.sound_theme} onClaimed={load} />
+      )}
+
       {/* Treasure Map */}
       {loading ? (
         <div className="text-center text-slate-400 py-8">Memuat…</div>
@@ -222,6 +274,22 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         <>
           {required.length > 0 && (
             <div className="rounded-3xl overflow-hidden chunky-shadow-lg relative" style={{ background: theme.colors.bg, color: theme.colors.text }}>
+              {/* Time-of-day tint — same theme, but the light shifts with real time */}
+              <div className="absolute inset-0 pointer-events-none transition-all duration-1000" style={{ background: timeOfDayOverlay() }} />
+              {isNightTime() && (
+                <div className="absolute inset-0 pointer-events-none overflow-hidden">
+                  {[...Array(12)].map((_, i) => (
+                    <motion.div
+                      key={`star-${i}`}
+                      className="absolute w-1 h-1 rounded-full bg-white"
+                      style={{ top: `${(i * 17 + 5) % 60}%`, left: `${(i * 29 + 10) % 92}%` }}
+                      animate={{ opacity: [0.2, 0.9, 0.2] }}
+                      transition={{ duration: 2 + (i % 3), repeat: Infinity, delay: i * 0.2 }}
+                    />
+                  ))}
+                </div>
+              )}
+
               {/* Floating decorations */}
               {theme.decorEmojis.map((e, i) => (
                 <motion.div key={i} className="absolute select-none pointer-events-none opacity-20"
@@ -278,7 +346,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                 <h3 className="font-fun font-bold text-slate-900">Misi Bonus ✨</h3>
               </div>
               <div className="space-y-2">
-                {bonus.map((t) => {
+                {bonus.map((t, bIdx) => {
                   const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
                   const gate = timeGate(t);
                   const overdue = isDurationExceeded(t);
@@ -290,6 +358,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       canFinish={!isDone && !!t.timer_started_at && gate.allowed && !overdue}
                       onStart={() => startTimer(t)} onFinish={() => finishTask(t)}
                       onSkip={() => skipTask(t)}
+                      onMoveUp={!isDone && bIdx > 0 ? () => moveBonusTask(t.id, "up") : null}
+                      onMoveDown={!isDone && bIdx < bonus.length - 1 ? () => moveBonusTask(t.id, "down") : null}
                       isBonus
                     />
                   );
@@ -320,7 +390,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 }
 
 /* ======================== QUEST NODE (treasure map stop) ======================== */
-function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, canStart, canFinish, onStart, onFinish, onSkip, isBonus }) {
+function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, canStart, canFinish, onStart, onFinish, onSkip, onMoveUp, onMoveDown, isBonus }) {
   const c = theme.colors;
   const bg = isDone ? c.nodeDone : isActive ? c.node : c.nodeLocked;
   const started = !!task.timer_started_at;
@@ -387,6 +457,12 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
         {isActive && !isDone && !started && gateReason === "late" && (
           <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-600">⌛ Waktu sudah lewat</div>
         )}
+        {!isDone && gateReason === "past" && (
+          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">⌛ Hari ini sudah lewat</div>
+        )}
+        {!isDone && gateReason === "future" && (
+          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-500">🔮 Belum tiba harinya</div>
+        )}
       </div>
 
       {/* Actions */}
@@ -412,6 +488,26 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
               <FastForward className="w-3 h-3" /> Lewati
             </button>
           )}
+        </div>
+      )}
+      {(onMoveUp || onMoveDown) && !isDone && (
+        <div className="flex flex-col gap-0.5 shrink-0 ml-1">
+          <button
+            onClick={onMoveUp || undefined}
+            disabled={!onMoveUp}
+            title="Pindah ke atas"
+            className="press-btn p-1 rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-20 disabled:cursor-not-allowed"
+          >
+            <ChevronUp className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={onMoveDown || undefined}
+            disabled={!onMoveDown}
+            title="Pindah ke bawah"
+            className="press-btn p-1 rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-20 disabled:cursor-not-allowed"
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
       </motion.div>

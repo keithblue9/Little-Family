@@ -21,6 +21,7 @@ import Achievements from "@/components/Achievements";
 import AnalyticsDashboard from "@/components/AnalyticsDashboard";
 import PushNotificationManager from "@/components/PushNotificationManager";
 import FamilyDayMonitor from "@/components/FamilyDayMonitor";
+import MonthHeatmap from "@/components/MonthHeatmap";
 import WeeklyReport from "@/components/WeeklyReport";
 import LabelEditor from "@/components/LabelEditor";
 import ViewLinksManager from "@/components/ViewLinksManager";
@@ -146,6 +147,13 @@ export default function ParentApp() {
     () => redemptions.filter((r) => r.status === "pending"),
     [redemptions]
   );
+  // "Aktif Hari Ini" count for the Tugas sidebar badge — mirrors TasksView's
+  // own default date filter so the number the parent sees matches what
+  // they'll find when they open the tab.
+  const tasksBadgeCount = useMemo(
+    () => tasks.filter((t) => (t.status === "pending" || t.status === "rejected") && (!t.date_key || t.date_key <= todayKey())).length,
+    [tasks]
+  );
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] font-body flex" data-testid={TEST_IDS.parent.dashboard}>
@@ -173,6 +181,7 @@ export default function ParentApp() {
             const lblKey = navLabelKey[n.key];
             const lbl = lblKey ? t(lblKey) : n.label;
             if (lbl === "") return null; // hidden by parent
+            const badgeCount = n.key === "tasks" ? tasksBadgeCount : 0;
             return (
               <button
                 key={n.key}
@@ -187,6 +196,11 @@ export default function ParentApp() {
               >
                 <n.icon className="w-4 h-4 shrink-0" strokeWidth={2.5} />
                 <span className={sidebarCollapsed ? "md:hidden" : ""}>{lbl}</span>
+                {badgeCount > 0 && (
+                  <span className={`ml-auto shrink-0 bg-red-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1 ${sidebarCollapsed ? "md:hidden" : ""}`}>
+                    {badgeCount > 99 ? "99+" : badgeCount}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -476,7 +490,12 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   // days that aren't actionable yet. Default to "today (+ overdue)" so the
   // list only shows what's actually relevant right now; "Semua Tanggal" is
   // one tap away for anyone who wants the full picture.
-  const [dateFilter, setDateFilter] = useState("today"); // "today" | "all"
+  const [dateFilter, setDateFilterState] = useState(() => sessionStorage.getItem("tasksDateFilter") || "today"); // "today" | "all"
+  const [showCalendar, setShowCalendar] = useState(false);
+  const setDateFilter = (v) => {
+    setDateFilterState(v);
+    try { sessionStorage.setItem("tasksDateFilter", v); } catch { /* storage unavailable — non-fatal */ }
+  };
 
   const displayTasks = useMemo(() => {
     if (selectedChildId) return tasks; // specific child → individual tasks
@@ -587,14 +606,30 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-end gap-2 flex-wrap">
-        <button onClick={onOpenTemplates} className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-indigo-200 text-indigo-600 hover:bg-indigo-50 font-semibold px-4 py-2 rounded-xl text-sm">
-          📋 Dari Template
+      <div className="flex justify-between gap-2 flex-wrap">
+        <button
+          onClick={() => setShowCalendar((v) => !v)}
+          className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-slate-200 text-slate-600 hover:bg-slate-50 font-semibold px-4 py-2 rounded-xl text-sm"
+        >
+          📅 {showCalendar ? "Sembunyikan Kalender" : "Lihat Kalender"}
         </button>
-        <button onClick={onAddTask} data-testid={TEST_IDS.parent.addTaskBtn} className={btnPrimary}>
-          <Plus className="w-4 h-4" strokeWidth={2.5} /> Tugas baru
-        </button>
+        <div className="flex gap-2 flex-wrap">
+          <button onClick={onOpenTemplates} className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-indigo-200 text-indigo-600 hover:bg-indigo-50 font-semibold px-4 py-2 rounded-xl text-sm">
+            📋 Dari Template
+          </button>
+          <button onClick={onAddTask} data-testid={TEST_IDS.parent.addTaskBtn} className={btnPrimary}>
+            <Plus className="w-4 h-4" strokeWidth={2.5} /> Tugas baru
+          </button>
+        </div>
       </div>
+
+      {showCalendar && (
+        <div className={`grid grid-cols-1 ${selectedChildId ? "" : "md:grid-cols-2"} gap-4`}>
+          {(selectedChildId ? kids.filter((k) => k.id === selectedChildId) : kids).map((k) => (
+            <MonthHeatmap key={k.id} childId={k.id} childName={k.name} />
+          ))}
+        </div>
+      )}
 
       {grouped.awaiting.length > 0 && (
         <Section title="⏳ Menunggu persetujuan" count={grouped.awaiting.length}>

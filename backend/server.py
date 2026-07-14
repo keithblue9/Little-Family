@@ -8,6 +8,7 @@ import os
 import re
 import json
 import uuid
+import random
 import asyncio
 import logging
 import bcrypt
@@ -597,6 +598,19 @@ async def log_activity(parent_id: str, child_id: Optional[str], action: str, det
     })
 
 
+# Single source of truth for all possible badges — used both to check/award
+# them and to show a full "sticker book" (earned + locked) to the kid.
+BADGE_CATALOG = [
+    {"key": "first_step", "name": "First Step", "desc": "Complete your first task!", "emoji": "🌱"},
+    {"key": "ten_tasks", "name": "Task Master", "desc": "Completed 10 tasks", "emoji": "🎯"},
+    {"key": "fifty_tasks", "name": "Chore Champion", "desc": "Completed 50 tasks", "emoji": "🏆"},
+    {"key": "hundred_points", "name": "Point Collector", "desc": "Earned 100 lifetime points", "emoji": "💎"},
+    {"key": "five_hundred_points", "name": "Star Saver", "desc": "Earned 500 lifetime points", "emoji": "⭐"},
+    {"key": "streak_3", "name": "3-Day Streak", "desc": "3 days in a row!", "emoji": "🔥"},
+    {"key": "streak_7", "name": "Week Warrior", "desc": "7 days in a row!", "emoji": "🗓️"},
+]
+
+
 async def award_badges(parent_id: str, child_id: str):
     """Award badges based on child's stats."""
     child = await db.children.find_one({"id": child_id, "parent_id": parent_id})
@@ -609,15 +623,16 @@ async def award_badges(parent_id: str, child_id: str):
     streak = child.get("streak_days", 0)
     tasks_completed = child.get("tasks_completed", 0)
 
-    rules = [
-        ("first_step", "First Step", "Complete your first task!", tasks_completed >= 1),
-        ("ten_tasks", "Task Master", "Completed 10 tasks", tasks_completed >= 10),
-        ("fifty_tasks", "Chore Champion", "Completed 50 tasks", tasks_completed >= 50),
-        ("hundred_points", "Point Collector", "Earned 100 lifetime points", lifetime >= 100),
-        ("five_hundred_points", "Star Saver", "Earned 500 lifetime points", lifetime >= 500),
-        ("streak_3", "3-Day Streak", "3 days in a row!", streak >= 3),
-        ("streak_7", "Week Warrior", "7 days in a row!", streak >= 7),
-    ]
+    condition_by_key = {
+        "first_step": tasks_completed >= 1,
+        "ten_tasks": tasks_completed >= 10,
+        "fifty_tasks": tasks_completed >= 50,
+        "hundred_points": lifetime >= 100,
+        "five_hundred_points": lifetime >= 500,
+        "streak_3": streak >= 3,
+        "streak_7": streak >= 7,
+    }
+    rules = [(b["key"], b["name"], b["desc"], condition_by_key[b["key"]]) for b in BADGE_CATALOG]
     for key, name, desc, condition in rules:
         if condition and key not in earned_keys:
             b = {
@@ -632,6 +647,13 @@ async def award_badges(parent_id: str, child_id: str):
             await db.badges.insert_one(b)
             new_badges.append({k: v for k, v in b.items() if k != "_id"})
     return new_badges
+
+
+@api.get("/badges/catalog")
+async def get_badge_catalog(user: dict = Depends(get_current_user)):
+    """All possible badges (earned or not) — powers the 'sticker book' view
+    showing locked silhouettes alongside earned ones."""
+    return BADGE_CATALOG
 
 
 async def get_child_or_404(parent_id: str, child_id: str) -> dict:
@@ -1063,6 +1085,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "points": 0,
         "lifetime_points": 0,
         "streak_days": 0,
+        "best_streak_days": 0,
         "last_completion_date": None,
         "tasks_completed": 0,
         "freeze_cards_available": 1,
@@ -1136,7 +1159,7 @@ async def list_tasks(
         "_undo_prev_streak": 0, "_undo_prev_last_completion": 0, "_undo_points_awarded": 0,
         "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
         "_undo_used_freeze_card": 0, "_undo_prev_freeze_available": 0, "_undo_prev_freeze_week": 0,
-        "_undo_coop_snapshots": 0,
+        "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0,
     }
     tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(2000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
@@ -1380,6 +1403,8 @@ async def child_day_progress(
         daily_goal = int(config.get("daily_point_goal", 50))
 
     finished_required = sum(1 for t in required if t.get("status") in ("completed", "approved", "skipped"))
+    perfect_day = len(required) > 0 and finished_required == len(required)
+    perfect_claim = await db.perfect_day_claims.find_one({"child_id": child_id, "date_key": dk})
 
     return {
         "child_id": child_id,
@@ -1395,8 +1420,44 @@ async def child_day_progress(
         "required_done": finished_required,
         "bonus_count": len(bonus),
         "vacation_mode": bool(config.get("vacation_mode", False)),
+        "perfect_day": perfect_day,
+        "perfect_day_claimed": bool(perfect_claim),
         "tasks": tasks,
     }
+
+
+@api.post("/children/{child_id}/claim-perfect-day")
+async def claim_perfect_day(child_id: str, user: dict = Depends(get_current_user)):
+    """Mystery Box: if every required mission for TODAY is done, the kid can
+    open one surprise bonus (small random points) — once per day. Not a
+    gambling mechanic, just a little unexpected delight for a fully productive
+    day. Only the child themselves can claim their own box."""
+    if user["role"] == "child" and user["id"] != child_id:
+        raise HTTPException(status_code=403, detail="Ini bukan kotak misterimu")
+    await get_child_or_404(FAMILY_ID, child_id)
+
+    today = _today_key()
+    already = await db.perfect_day_claims.find_one({"child_id": child_id, "date_key": today})
+    if already:
+        raise HTTPException(status_code=400, detail="Kotak misteri hari ini sudah dibuka")
+
+    tasks = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": today, "is_bonus": {"$ne": True},
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    }, {"_id": 0}).to_list(500)
+    if not tasks:
+        raise HTTPException(status_code=400, detail="Belum ada misi wajib hari ini")
+    if any(t.get("status") not in ("completed", "approved", "skipped") for t in tasks):
+        raise HTTPException(status_code=400, detail="Selesaikan semua misi wajib hari ini dulu")
+
+    bonus = random.randint(2, 8)
+    await db.children.update_one({"id": child_id}, {"$inc": {"points": bonus, "lifetime_points": bonus}})
+    await db.perfect_day_claims.insert_one({
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": child_id,
+        "date_key": today, "bonus": bonus, "claimed_at": now_iso(),
+    })
+    await log_activity(FAMILY_ID, child_id, "perfect_day_claimed", {"bonus": bonus})
+    return {"bonus": bonus}
 
 
 @api.get("/children/{child_id}/month-progress")
@@ -1752,6 +1813,9 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
     p_spend = round(points * spend_pct / total_pct)
     p_share = points - p_save - p_spend  # remainder goes to share to avoid rounding loss
 
+    prev_best_streak = int(child.get("best_streak_days", 0))
+    new_best_streak = max(prev_best_streak, streak)
+
     await db.children.update_one(
         {"id": child_id},
         {
@@ -1762,6 +1826,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
             "$set": {
                 "last_completion_date": today, "streak_days": streak,
                 "freeze_cards_available": new_freeze_available, "freeze_card_week": new_freeze_week,
+                "best_streak_days": new_best_streak,
             },
         },
     )
@@ -1771,6 +1836,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
         "prev_streak": prev_streak, "prev_last_completion": prev_last_completion,
         "used_freeze_card": used_freeze_card,
         "prev_freeze_available": prev_freeze_available, "prev_freeze_week": prev_freeze_week,
+        "prev_best_streak": prev_best_streak,
     }
 
 
@@ -1897,6 +1963,7 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
                 "_undo_used_freeze_card": snap["used_freeze_card"],
                 "_undo_prev_freeze_available": snap["prev_freeze_available"],
                 "_undo_prev_freeze_week": snap["prev_freeze_week"],
+                "_undo_prev_best_streak": snap["prev_best_streak"],
             }
         },
     )
@@ -1943,6 +2010,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                         "last_completion_date": snap["prev_last_completion"],
                         "freeze_cards_available": snap["prev_freeze_available"],
                         "freeze_card_week": snap["prev_freeze_week"],
+                        "best_streak_days": snap.get("prev_best_streak", 0),
                     },
                 },
             )
@@ -1985,6 +2053,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "last_completion_date": task.get("_undo_prev_last_completion"),
                 "freeze_cards_available": task.get("_undo_prev_freeze_available", 1),
                 "freeze_card_week": task.get("_undo_prev_freeze_week"),
+                "best_streak_days": task.get("_undo_prev_best_streak", 0),
             },
         },
     )
@@ -2007,6 +2076,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "_undo_points_awarded": "", "_undo_chiky_save": "", "_undo_chiky_spend": "",
                 "_undo_chiky_share": "", "_undo_spawned_next_id": "",
                 "_undo_used_freeze_card": "", "_undo_prev_freeze_available": "", "_undo_prev_freeze_week": "",
+                "_undo_prev_best_streak": "",
             },
         },
     )
@@ -2981,6 +3051,14 @@ async def migrate_existing_data():
                 "chiky_spend_pct": cfg.get("piggy_spend_pct", 40),
                 "chiky_share_pct": cfg.get("piggy_share_pct", 20),
             }},
+        )
+
+    # 6. Personal-best streak: backfill from the current streak so an existing
+    #    12-day streak doesn't suddenly show "best: 0" the day this shipped.
+    async for child in db.children.find({"best_streak_days": {"$exists": False}}, {"id": 1, "streak_days": 1}):
+        await db.children.update_one(
+            {"id": child["id"]},
+            {"$set": {"best_streak_days": int(child.get("streak_days", 0))}},
         )
 
 

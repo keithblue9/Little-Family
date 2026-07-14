@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
-import { todayKey } from "@/lib/dates";
+import { todayKey, isPastDate } from "@/lib/dates";
 
 const MONTH_NAMES = [
   "Januari", "Februari", "Maret", "April", "Mei", "Juni",
@@ -89,6 +89,7 @@ export default function KidMonthCalendar({ childId, selectedDateKey, onSelectDat
               const info = days[dk];
               const isSelected = dk === selectedDateKey;
               const isToday = dk === todayKey();
+              const isPastEmpty = !isSelected && isPastDate(dk) && (!info || info.task_count === 0);
               return (
                 <motion.button
                   key={dk}
@@ -97,13 +98,22 @@ export default function KidMonthCalendar({ childId, selectedDateKey, onSelectDat
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ delay: i * 0.008 }}
                   whileTap={{ scale: 0.9 }}
-                  className={`press-btn aspect-square rounded-lg flex flex-col items-center justify-center text-xs font-bold transition-colors ${colorFor(info, isSelected, isToday)}`}
+                  title={isPastEmpty ? "Sudah lewat — tidak ada misi hari itu" : undefined}
+                  className={`press-btn relative aspect-square rounded-lg flex flex-col items-center justify-center text-xs font-bold transition-colors ${colorFor(info, isSelected, isToday)} ${isPastEmpty ? "opacity-50" : ""}`}
                 >
                   {day}
                   {isToday && !isSelected && <span className="w-1 h-1 rounded-full bg-indigo-400 mt-0.5" />}
+                  {isPastEmpty && (
+                    <span className="absolute inset-0 flex items-center justify-center text-slate-400 text-[9px] font-normal pointer-events-none">
+                      ⌛
+                    </span>
+                  )}
                 </motion.button>
               );
             })}
+          </div>
+          <div className="flex items-center gap-2 mt-1 text-[9px] text-slate-400 flex-wrap justify-center">
+            <span className="flex items-center gap-1">⌛ Sudah lewat, tanpa misi</span>
           </div>
           <div className="flex items-center gap-2 mt-3 text-[9px] text-slate-400 flex-wrap justify-center">
             <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-green-400 inline-block" /> Tercapai</span>

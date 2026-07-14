@@ -18,10 +18,14 @@ import MoneyExchange from "@/components/MoneyExchange";
 import ChikyBankCard from "@/components/ChikyBankCard";
 import KidChallenges from "@/components/KidChallenges";
 import GrowthTrail from "@/components/GrowthTrail";
+import StickerBook from "@/components/StickerBook";
+import VirtualPetMascot from "@/components/VirtualPetMascot";
+import DailyRecapCard from "@/components/DailyRecapCard";
 import ProfileEditor from "@/components/ProfileEditor";
 import DailyQuestView from "@/components/DailyQuestView";
 import { personalityMeta } from "@/lib/personality";
 import { pickQuestTheme } from "@/lib/questThemes";
+import { computeLevel } from "@/lib/levels";
 import { useLabels } from "@/lib/labels";
 
 const TABS = [
@@ -40,6 +44,7 @@ export default function KidHome() {
   const [child, setChild] = useState(null);
   const [rewards, setRewards] = useState([]);
   const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
+  const [showRecap, setShowRecap] = useState(false);
   const [tab, setTab] = useState("tasks");
   const [celebrate, setCelebrate] = useState(false);
   const [dims, setDims] = useState({ w: window.innerWidth, h: window.innerHeight });
@@ -112,6 +117,8 @@ export default function KidHome() {
     return <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">Memuat…</div>;
   }
 
+  const levelInfo = computeLevel(child.lifetime_points || 0);
+
   return (
     <div className="min-h-screen kid-shell grain relative font-body pb-28 safe-x" data-testid={TEST_IDS.kid.home}>
       {celebrate && (
@@ -138,6 +145,11 @@ export default function KidHome() {
             <div className="flex items-center gap-2 text-sm text-slate-500 flex-wrap">
               <Flame className="w-4 h-4 text-[#FF5C5C]" strokeWidth={2.5} />
               Streak {child.streak_days || 0} hari
+              {(child.best_streak_days || 0) > (child.streak_days || 0) && (
+                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700" title="Rekor streak terbaikmu">
+                  🏅 Rekor: {child.best_streak_days} hari
+                </span>
+              )}
               {(child.freeze_cards_available ?? 1) > 0 && (
                 <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700" title="Kartu Bebas — melindungi streak-mu kalau kelewat 1 hari">
                   🧊 {child.freeze_cards_available ?? 1} Kartu Bebas
@@ -146,15 +158,28 @@ export default function KidHome() {
             </div>
           </div>
         </div>
-        <button
-          onClick={tryExit}
-          data-testid={TEST_IDS.kid.exitKidBtn}
-          className="press-btn bg-white/80 backdrop-blur border-2 border-slate-200 p-3 rounded-2xl"
-          title={user?.role === "parent" ? "Kembali ke dashboard orang tua" : "Keluar"}
-        >
-          <LogOut className="w-5 h-5 text-slate-700" strokeWidth={2.5} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowRecap(true)}
+            className="press-btn bg-white/80 backdrop-blur border-2 border-slate-200 p-3 rounded-2xl"
+            title="Rekap hari ini"
+          >
+            <Sparkles className="w-5 h-5 text-amber-500" strokeWidth={2.5} />
+          </button>
+          <button
+            onClick={tryExit}
+            data-testid={TEST_IDS.kid.exitKidBtn}
+            className="press-btn bg-white/80 backdrop-blur border-2 border-slate-200 p-3 rounded-2xl"
+            title={user?.role === "parent" ? "Kembali ke dashboard orang tua" : "Keluar"}
+          >
+            <LogOut className="w-5 h-5 text-slate-700" strokeWidth={2.5} />
+          </button>
+        </div>
       </div>
+
+      {showRecap && (
+        <DailyRecapCard childId={childId} child={child} onClose={() => setShowRecap(false)} />
+      )}
 
       {/* Points hero */}
       <div className="relative z-10 px-5 md:px-10 pt-6">
@@ -182,6 +207,25 @@ export default function KidHome() {
               Tukar 💰
             </button>
           </div>
+
+          {/* Level bar — permanent progress from lifetime points, unaffected by spending */}
+          <div className="relative mt-4 pt-4 border-t border-white/20">
+            <div className="flex items-center justify-between text-xs font-bold text-white/90 mb-1">
+              <span>{levelInfo.emoji} Level {levelInfo.level} — {levelInfo.title}</span>
+              <span>{levelInfo.maxed ? "MAX!" : `${levelInfo.xp}/${levelInfo.nextMin} XP`}</span>
+            </div>
+            <div className="h-2.5 bg-white/20 rounded-full overflow-hidden">
+              <motion.div
+                initial={{ width: 0 }}
+                animate={{ width: `${levelInfo.percent}%` }}
+                transition={{ duration: 0.8, ease: "easeOut" }}
+                className="h-full rounded-full bg-white"
+              />
+            </div>
+            {!levelInfo.maxed && (
+              <div className="text-[10px] text-white/70 mt-1">Menuju {levelInfo.nextTitle}</div>
+            )}
+          </div>
         </motion.div>
       </div>
 
@@ -190,6 +234,9 @@ export default function KidHome() {
         <AnimatePresence mode="wait">
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+              <div className="mb-4">
+                <VirtualPetMascot child={child} />
+              </div>
               <h2 className="font-fun font-bold text-2xl text-slate-900 mb-1">Petualangan Misi 🗺️</h2>
               <p className="text-sm text-slate-500 mb-4">
                 Selesaikan misi harianmu sesuai urutan. Selesaikan target poin harianmu untuk jadi juara!
@@ -320,6 +367,7 @@ export default function KidHome() {
             <motion.div key="champs" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-8">
               <Leaderboard />
               <KidChallenges />
+              <StickerBook childId={childId} />
               <Achievements childId={childId} />
               <GrowthTrail childId={childId} childName={child.name} />
             </motion.div>

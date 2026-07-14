@@ -771,6 +771,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get("/api/config")
     check("regression: vacation_mode set on fresh config doc", r.json()["vacation_mode"] is True, str(r.json().get("vacation_mode")))
     check("regression: other defaults still sane", r.json()["daily_point_goal"] == 50 and r.json()["chiky_save_pct"] == 40, str(r.json()))
+    c.post("/api/config", json={"vacation_mode": False})  # reset — leaving this on would silently break every later test that expects recurrence to spawn
 
     # ================= 43. REGRESSION: /auth/me must include all self-editable profile fields =================
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
@@ -1264,6 +1265,67 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get("/api/cron/send-digest", headers={"Authorization": "Bearer test-cron-secret"})
     server._now_local = real_now_local2
     check("streak-warning: endpoint reachable at hour 21 (secret mismatch expected here)", r.status_code == 403, str(r.status_code))
+
+    # ================= 65. "INDIVIDUAL REQUIRED + CO-OP BONUS" PATTERN =================
+    # Real family use case: a required task everyone does individually (e.g.
+    # Sholat Subuh, 10 pts each), PLUS a co-op bonus that only pays out when
+    # done together (Sholat Subuh Berjamaah, 20 pts total -> 10 each via the
+    # existing even-split). No new feature needed — this locks in that the
+    # combination behaves correctly across days via recurrence.
+    r = c.post("/api/tasks", json={
+        "title": "Sholat Subuh", "points": 10, "target_children": [],
+        "date_key": today_local, "recurrence": "daily", "order": 1,
+    })
+    indiv_tasks = r.json()["tasks"]
+    check("berjamaah: individual broadcast creates 2 separate copies", len(indiv_tasks) == 2, str(len(indiv_tasks)))
+    ads_indiv = next(t for t in indiv_tasks if t["child_id"] == adskhan["id"])
+    syi_indiv = next(t for t in indiv_tasks if t["child_id"] == syila["id"])
+
+    r = c.post("/api/tasks", json={
+        "title": "Sholat Subuh Berjamaah", "points": 20,
+        "target_children": [adskhan["id"], syila["id"]], "coop": True,
+        "date_key": today_local, "recurrence": "daily",
+    })
+    coop_bj = r.json()
+    check("berjamaah: coop bonus task forced to is_bonus", coop_bj["is_bonus"] is True)
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{ads_indiv['id']}/start")
+    c.post(f"/api/tasks/{ads_indiv['id']}/complete")
+    c.post(f"/api/tasks/{coop_bj['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{syi_indiv['id']}/start")
+    c.post(f"/api/tasks/{syi_indiv['id']}/complete")
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    ads_bj_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_bj_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    c.post(f"/api/tasks/{ads_indiv['id']}/approve")
+    c.post(f"/api/tasks/{syi_indiv['id']}/approve")
+    c.post(f"/api/tasks/{coop_bj['id']}/approve")
+    ads_bj_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_bj_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("berjamaah: each kid gets individual(10) + coop-split(10) = 20", ads_bj_after - ads_bj_before == 20 and syi_bj_after - syi_bj_before == 20, f"ads+{ads_bj_after-ads_bj_before} syi+{syi_bj_after-syi_bj_before}")
+
+    import datetime as _dt3
+    tomorrow_bj = (_dt3.datetime.now(_dt3.timezone.utc) + _dt3.timedelta(hours=7, days=1)).strftime("%Y-%m-%d")
+    r = c.get(f"/api/tasks?date_key={tomorrow_bj}")
+    spawned_bj = [t for t in r.json() if "Sholat Subuh" in t["title"]]
+    check("berjamaah: recurrence spawns 2 individual + 1 coop tomorrow", len(spawned_bj) == 3, str([(t["title"], t.get("is_coop")) for t in spawned_bj]))
+    spawned_coop_bj = [t for t in spawned_bj if t["title"] == "Sholat Subuh Berjamaah"]
+    check("berjamaah: exactly 1 coop copy spawned (not duplicated per kid)", len(spawned_coop_bj) == 1, str(len(spawned_coop_bj)))
+    check("berjamaah: spawned coop still has both participants + 20 pts", set(spawned_coop_bj[0].get("coop_participants", [])) == {adskhan["id"], syila["id"]} and spawned_coop_bj[0]["points"] == 20)
+
+    # Negative: no berjamaah that day -> no bonus, no penalty, doesn't block anything
+    ads_solo_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    ads_tomorrow_indiv = next(t for t in spawned_bj if t["title"] == "Sholat Subuh" and t["child_id"] == adskhan["id"])
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{ads_tomorrow_indiv['id']}/start")
+    c.post(f"/api/tasks/{ads_tomorrow_indiv['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{ads_tomorrow_indiv['id']}/approve")
+    ads_solo_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("berjamaah: no berjamaah that day -> only individual 10, no bonus", ads_solo_after - ads_solo_before == 10, f"+{ads_solo_after-ads_solo_before}")
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

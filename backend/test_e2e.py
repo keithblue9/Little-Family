@@ -1082,6 +1082,90 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post(f"/api/children/{syila['id']}/claim-perfect-day")
     check("mystery: sibling blocked from claiming another's box", r.status_code == 403, str(r.status_code))
 
+    # ================= 55. VIRTUAL PET: SELECTION (10 animals) =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    for pet in ["chicken", "bird", "rabbit", "cat", "dragon", "hedgehog", "squirrel", "panda", "fox", "turtle"]:
+        c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+        r = c.patch("/api/me/profile", json={"pet_type": pet})
+        check(f"pet: '{pet}' accepted", r.status_code == 200 and r.json()["pet_type"] == pet, r.text[:150])
+    r = c.patch("/api/me/profile", json={"pet_type": "elephant"})
+    check("pet: invalid animal rejected", r.status_code == 422, str(r.status_code))
+    c.patch("/api/me/profile", json={"pet_type": "dragon"})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.patch(f"/api/children/{syila['id']}", json={"pet_type": "panda"})
+    check("pet: parent sets child's pet_type", r.status_code == 200 and r.json()["pet_type"] == "panda", r.text[:150])
+    r = c.patch(f"/api/children/{syila['id']}", json={"pet_type": "not-a-real-animal"})
+    check("pet: parent invalid pet_type rejected", r.status_code == 422, str(r.status_code))
+
+    # ================= 56. VIRTUAL PET: FEED CURRENCY (dual points system) =================
+    ads_before = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    feed_before, feed_life_before, pts_before = ads_before.get("feed_balance", 0), ads_before.get("feed_lifetime", 0), ads_before["points"]
+    r = c.post("/api/tasks", json={"title": "FeedTest1", "points": 12, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    ft1 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{ft1['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{ft1['id']}/approve")
+    ads_after = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("feed: earned 1:1 alongside points", ads_after["feed_balance"] == feed_before + 12, f"{feed_before}->{ads_after['feed_balance']}")
+    check("feed: lifetime feed increases too", ads_after["feed_lifetime"] == feed_life_before + 12)
+    check("feed: points awarded independently of feed", ads_after["points"] == pts_before + 12)
+
+    r = c.post(f"/api/tasks/{ft1['id']}/undo-approval")
+    check("feed: undo succeeds", r.status_code == 200, r.text[:150])
+    ads_undone = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("feed: undo restores feed_balance exactly", ads_undone["feed_balance"] == feed_before)
+    check("feed: undo restores feed_lifetime exactly", ads_undone["feed_lifetime"] == feed_life_before)
+
+    # ================= 57. VIRTUAL PET: FEEDING ACTION =================
+    r = c.post("/api/tasks", json={"title": "FeedTest2", "points": 20, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
+    ft2 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{ft2['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{ft2['id']}/approve")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    ads_bf = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    r = c.post(f"/api/children/{adskhan['id']}/feed-pet")
+    check("feed-pet: succeeds with sufficient balance", r.status_code == 200, r.text[:150])
+    check("feed-pet: cost of 5 deducted", r.json()["feed_balance"] == ads_bf["feed_balance"] - 5, str(r.json()))
+    check("feed-pet: lifetime feed unaffected by feeding action", r.json()["feed_lifetime"] == ads_bf["feed_lifetime"])
+    for _ in range(15):
+        r = c.post(f"/api/children/{adskhan['id']}/feed-pet")
+        if r.status_code != 200:
+            break
+    check("feed-pet: insufficient balance rejected", r.status_code == 400, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "SyiFeedSeed", "points": 20, "child_id": syila["id"], "date_key": today_local, "is_bonus": True})
+    syi_seed = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{syi_seed['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{syi_seed['id']}/approve")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/children/{syila['id']}/feed-pet")
+    check("feed-pet: sibling blocked from feeding another's pet", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/children/nonexistent-child-id/feed-pet")
+    check("feed-pet: unknown child 404s", r.status_code == 404, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.get("/api/auth/me")
+    check("auth/me: includes pet_type + feed fields", r.json().get("pet_type") == "dragon" and "feed_balance" in r.json() and "feed_lifetime" in r.json(), str(r.json()))
+
+    # ================= 58. REGRESSION: seeded family has complete field set =================
+    # Root cause of a real bug: the hand-written seed_default_family() mirror
+    # into the children collection was never updated when freeze cards / best
+    # streak / virtual pet fields were added, so "field" in child checks (and
+    # raw API responses) were silently incomplete for the very first family a
+    # fresh deployment creates — relying entirely on .get()-default patterns
+    # elsewhere in the code to paper over it. Verify the actual seeded docs.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    seeded_kids = c.get("/api/children").json()
+    for field in ("pet_type", "feed_balance", "feed_lifetime", "freeze_cards_available", "best_streak_days"):
+        check(f"regression: seeded children have '{field}' key present", all(field in k for k in seeded_kids), str([sorted(k.keys()) for k in seeded_kids]))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

@@ -235,7 +235,7 @@ export default function KidHome() {
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <div className="mb-4">
-                <VirtualPetMascot child={child} />
+                <VirtualPetMascot child={child} onChanged={load} />
               </div>
               <h2 className="font-fun font-bold text-2xl text-slate-900 mb-1">Petualangan Misi 🗺️</h2>
               <p className="text-sm text-slate-500 mb-4">

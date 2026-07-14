@@ -223,6 +223,9 @@ MBTI_TYPES = Literal[
 # certain framings, which the parent UI uses to suggest a fit per child.
 TASK_STYLE = Literal["challenge", "helper", "creative", "routine", "learning", "social"]
 
+# 10 cute pet options for the Tamagotchi-style virtual pet system.
+PET_TYPE = Literal["chicken", "bird", "rabbit", "cat", "dragon", "hedgehog", "squirrel", "panda", "fox", "turtle"]
+
 
 class ChildInput(BaseModel):
     name: str = Field(min_length=1, max_length=40)
@@ -244,6 +247,7 @@ class ChildUpdate(BaseModel):
     savings_goal_name: Optional[str] = Field(default=None, max_length=60)
     savings_goal_amount: Optional[int] = Field(default=None, ge=0, le=1000000000)
     sound_theme: Optional[Literal["ding", "fanfare", "chime", "drum"]] = None
+    pet_type: Optional[PET_TYPE] = None
 
 
 class TaskInput(BaseModel):
@@ -307,6 +311,7 @@ class SelfProfileInput(BaseModel):
     savings_goal_name: Optional[str] = Field(default=None, max_length=60)
     savings_goal_amount: Optional[int] = Field(default=None, ge=0, le=1000000000)
     sound_theme: Optional[Literal["ding", "fanfare", "chime", "drum"]] = None
+    pet_type: Optional[PET_TYPE] = None
 
 
 class RewardInput(BaseModel):
@@ -421,6 +426,9 @@ async def me(user: dict = Depends(get_current_user)):
         "mbti": user.get("mbti"),
         "quest_theme": user.get("quest_theme"),
         "sound_theme": user.get("sound_theme", "ding"),
+        "pet_type": user.get("pet_type"),
+        "feed_balance": user.get("feed_balance", 0),
+        "feed_lifetime": user.get("feed_lifetime", 0),
         "savings_goal_name": user.get("savings_goal_name"),
         "savings_goal_amount": user.get("savings_goal_amount"),
     }
@@ -1090,6 +1098,9 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "tasks_completed": 0,
         "freeze_cards_available": 1,
         "freeze_card_week": None,
+        "pet_type": None,  # kid picks on first visit to the pet feature
+        "feed_balance": 0,
+        "feed_lifetime": 0,
         "created_at": now_iso(),
     }
     await db.children.insert_one(doc)
@@ -1159,7 +1170,7 @@ async def list_tasks(
         "_undo_prev_streak": 0, "_undo_prev_last_completion": 0, "_undo_points_awarded": 0,
         "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
         "_undo_used_freeze_card": 0, "_undo_prev_freeze_available": 0, "_undo_prev_freeze_week": 0,
-        "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0,
+        "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0, "_undo_feed_earned": 0,
     }
     tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(2000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
@@ -1458,6 +1469,29 @@ async def claim_perfect_day(child_id: str, user: dict = Depends(get_current_user
     })
     await log_activity(FAMILY_ID, child_id, "perfect_day_claimed", {"bonus": bonus})
     return {"bonus": bonus}
+
+
+PET_FEED_COST = 5  # feed currency consumed per "beri makan" tap
+
+
+@api.post("/children/{child_id}/feed-pet")
+async def feed_pet(child_id: str, user: dict = Depends(get_current_user)):
+    """Kid taps 'Beri Makan' to feed their virtual pet — consumes feed_balance
+    (earned 1:1 alongside points on task approval), completely separate from
+    the spendable points economy. Only the child themselves can feed their
+    own pet."""
+    if user["role"] == "child" and user["id"] != child_id:
+        raise HTTPException(status_code=403, detail="Ini bukan hewan peliharaanmu")
+    child = await get_child_or_404(FAMILY_ID, child_id)
+
+    balance = int(child.get("feed_balance", 0))
+    if balance < PET_FEED_COST:
+        raise HTTPException(status_code=400, detail=f"Butuh {PET_FEED_COST} pakan untuk memberi makan — selesaikan misi dulu ya!")
+
+    await db.children.update_one({"id": child_id}, {"$inc": {"feed_balance": -PET_FEED_COST}})
+    await log_activity(FAMILY_ID, child_id, "pet_fed", {"cost": PET_FEED_COST})
+    updated = await db.children.find_one({"id": child_id}, {"_id": 0})
+    return {"feed_balance": updated.get("feed_balance", 0), "feed_lifetime": updated.get("feed_lifetime", 0)}
 
 
 @api.get("/children/{child_id}/month-progress")
@@ -1822,6 +1856,10 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
             "$inc": {
                 "points": points, "lifetime_points": points, "tasks_completed": 1,
                 "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
+                # Virtual pet "feed" currency — earned 1:1 alongside points so
+                # finishing missions always feeds the pet too, separate from
+                # the spendable points economy (feeding never touches points).
+                "feed_balance": points, "feed_lifetime": points,
             },
             "$set": {
                 "last_completion_date": today, "streak_days": streak,
@@ -1837,6 +1875,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
         "used_freeze_card": used_freeze_card,
         "prev_freeze_available": prev_freeze_available, "prev_freeze_week": prev_freeze_week,
         "prev_best_streak": prev_best_streak,
+        "feed_earned": points,
     }
 
 
@@ -1964,6 +2003,7 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
                 "_undo_prev_freeze_available": snap["prev_freeze_available"],
                 "_undo_prev_freeze_week": snap["prev_freeze_week"],
                 "_undo_prev_best_streak": snap["prev_best_streak"],
+                "_undo_feed_earned": snap["feed_earned"],
             }
         },
     )
@@ -2004,6 +2044,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                     "$inc": {
                         "points": -snap["points"], "lifetime_points": -snap["points"], "tasks_completed": -1,
                         "chiky_save": -snap["chiky_save"], "chiky_spend": -snap["chiky_spend"], "chiky_share": -snap["chiky_share"],
+                        "feed_balance": -snap.get("feed_earned", 0), "feed_lifetime": -snap.get("feed_earned", 0),
                     },
                     "$set": {
                         "streak_days": snap["prev_streak"],
@@ -2036,6 +2077,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
     p_save = task.get("_undo_chiky_save", 0)
     p_spend = task.get("_undo_chiky_spend", 0)
     p_share = task.get("_undo_chiky_share", 0)
+    feed_earned = task.get("_undo_feed_earned", 0)
 
     await db.children.update_one(
         {"id": task["child_id"]},
@@ -2047,6 +2089,8 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "chiky_save": -p_save,
                 "chiky_spend": -p_spend,
                 "chiky_share": -p_share,
+                "feed_balance": -feed_earned,
+                "feed_lifetime": -feed_earned,
             },
             "$set": {
                 "streak_days": task.get("_undo_prev_streak", 0),
@@ -2077,6 +2121,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "_undo_chiky_share": "", "_undo_spawned_next_id": "",
                 "_undo_used_freeze_card": "", "_undo_prev_freeze_available": "", "_undo_prev_freeze_week": "",
                 "_undo_prev_best_streak": "",
+                "_undo_feed_earned": "",
             },
         },
     )
@@ -2951,8 +2996,14 @@ async def seed_default_family():
             "points": 0,
             "lifetime_points": 0,
             "streak_days": 0,
+            "best_streak_days": 0,
             "last_completion_date": None,
             "tasks_completed": 0,
+            "freeze_cards_available": 1,
+            "freeze_card_week": None,
+            "pet_type": None,
+            "feed_balance": 0,
+            "feed_lifetime": 0,
             "created_at": ts,
         })
 
@@ -3060,6 +3111,20 @@ async def migrate_existing_data():
             {"id": child["id"]},
             {"$set": {"best_streak_days": int(child.get("streak_days", 0))}},
         )
+
+    # 7. Freeze cards + virtual pet: any child doc predating these features
+    #    (including the originally-seeded family, which built its children
+    #    mirror by hand before these fields existed) gets sane defaults so
+    #    `"field" in child` checks and raw API responses are complete rather
+    #    than relying entirely on .get()-with-default everywhere.
+    await db.children.update_many(
+        {"freeze_cards_available": {"$exists": False}},
+        {"$set": {"freeze_cards_available": 1, "freeze_card_week": None}},
+    )
+    await db.children.update_many(
+        {"pet_type": {"$exists": False}},
+        {"$set": {"pet_type": None, "feed_balance": 0, "feed_lifetime": 0}},
+    )
 
 
 # --------------- Startup ---------------

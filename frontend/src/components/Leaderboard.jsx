@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Trophy, TrendingUp } from "lucide-react";
+import { Trophy, TrendingUp, Heart } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 
-export default function Leaderboard() {
+export default function Leaderboard({ currentChildId = null }) {
   const [leaderboard, setLeaderboard] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [cheering, setCheering] = useState(null);
 
   useEffect(() => {
     fetchLeaderboard();
@@ -20,6 +21,18 @@ export default function Leaderboard() {
       toast.error(formatApiError(err));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const sendCheer = async (childId, name) => {
+    setCheering(childId);
+    try {
+      await api.post(`/children/${childId}/cheer`, { emoji: "👏", message: "Semangat terus!" });
+      toast.success(`Semangat terkirim ke ${name}! 👏`);
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setCheering(null);
     }
   };
 
@@ -100,6 +113,18 @@ export default function Leaderboard() {
               </p>
               <p className="text-xs text-slate-500">current</p>
             </div>
+
+            {/* Cheer button — only shown to a logged-in kid, for siblings (not themselves) */}
+            {currentChildId && child.id !== currentChildId && (
+              <button
+                onClick={() => sendCheer(child.id, child.name)}
+                disabled={cheering === child.id}
+                title={`Semangatin ${child.name}`}
+                className="press-btn p-2 rounded-full bg-pink-50 hover:bg-pink-100 text-pink-500 disabled:opacity-50 shrink-0"
+              >
+                <Heart className="w-4 h-4" />
+              </button>
+            )}
           </motion.div>
         ))}
       </div>

@@ -19,7 +19,7 @@ from typing import List, Optional, Literal
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status, Query
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 # --------------- Setup ---------------
@@ -226,6 +226,22 @@ TASK_STYLE = Literal["challenge", "helper", "creative", "routine", "learning", "
 # 10 cute pet options for the Tamagotchi-style virtual pet system.
 PET_TYPE = Literal["chicken", "bird", "rabbit", "cat", "dragon", "hedgehog", "squirrel", "panda", "fox", "turtle"]
 
+# Cosmetic accessories a kid can equip on their pet — purely for delight, no
+# economy impact, so validation here is light (known keys + a sane count cap)
+# rather than a strict server-enforced unlock system.
+PET_ACCESSORY_KEYS = {"glasses", "sunglasses", "hat", "crown", "bow", "scarf", "flower", "bandana"}
+
+
+def _validate_pet_accessories(v):
+    if v is None:
+        return v
+    if len(v) > 4:
+        raise ValueError("Maksimal 4 aksesori sekaligus")
+    unknown = set(v) - PET_ACCESSORY_KEYS
+    if unknown:
+        raise ValueError(f"Aksesori tidak dikenal: {', '.join(unknown)}")
+    return v
+
 
 class ChildInput(BaseModel):
     name: str = Field(min_length=1, max_length=40)
@@ -248,6 +264,8 @@ class ChildUpdate(BaseModel):
     savings_goal_amount: Optional[int] = Field(default=None, ge=0, le=1000000000)
     sound_theme: Optional[Literal["ding", "fanfare", "chime", "drum"]] = None
     pet_type: Optional[PET_TYPE] = None
+    pet_equipped: Optional[List[str]] = None
+    _check_pet_equipped = field_validator("pet_equipped")(classmethod(lambda cls, v: _validate_pet_accessories(v)))
 
 
 class TaskInput(BaseModel):
@@ -312,6 +330,8 @@ class SelfProfileInput(BaseModel):
     savings_goal_amount: Optional[int] = Field(default=None, ge=0, le=1000000000)
     sound_theme: Optional[Literal["ding", "fanfare", "chime", "drum"]] = None
     pet_type: Optional[PET_TYPE] = None
+    pet_equipped: Optional[List[str]] = None
+    _check_pet_equipped = field_validator("pet_equipped")(classmethod(lambda cls, v: _validate_pet_accessories(v)))
 
 
 class RewardInput(BaseModel):
@@ -319,6 +339,17 @@ class RewardInput(BaseModel):
     description: str = ""
     cost_points: int = Field(ge=1, le=100000)
     icon: str = "gift"
+
+
+class RewardSuggestionInput(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=200)
+    suggested_cost_points: Optional[int] = Field(default=None, ge=1, le=100000)
+
+
+class RewardSuggestionReview(BaseModel):
+    cost_points: Optional[int] = Field(default=None, ge=1, le=100000)  # parent can adjust before approving
+    note: str = Field(default="", max_length=200)
 
 
 class ConsequenceInput(BaseModel):
@@ -427,6 +458,7 @@ async def me(user: dict = Depends(get_current_user)):
         "quest_theme": user.get("quest_theme"),
         "sound_theme": user.get("sound_theme", "ding"),
         "pet_type": user.get("pet_type"),
+        "pet_equipped": user.get("pet_equipped", []),
         "feed_balance": user.get("feed_balance", 0),
         "feed_lifetime": user.get("feed_lifetime", 0),
         "savings_goal_name": user.get("savings_goal_name"),
@@ -918,6 +950,58 @@ async def child_growth_trail(child_id: str, user: dict = Depends(get_current_use
     }
 
 
+# --------------- Sibling Cheers ---------------
+CHEER_COOLDOWN_MINUTES = 30  # per (sender, recipient) pair — keeps it a genuine gesture, not spam
+
+
+class CheerInput(BaseModel):
+    emoji: str = Field(default="👏", max_length=8)
+    message: str = Field(default="", max_length=100)
+
+
+@api.post("/children/{child_id}/cheer")
+async def cheer_sibling(child_id: str, payload: CheerInput, user: dict = Depends(get_current_user)):
+    """A kid sends a quick cheer/encouragement to a sibling — visible on the
+    recipient's own page, with a push notification. Cooldown per pair keeps
+    it meaningful rather than a button to mash."""
+    if user["role"] != "child":
+        raise HTTPException(status_code=422, detail="Hanya anak yang bisa mengirim semangat")
+    if user["id"] == child_id:
+        raise HTTPException(status_code=422, detail="Tidak bisa mengirim semangat ke diri sendiri")
+    recipient = await get_child_or_404(FAMILY_ID, child_id)
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=CHEER_COOLDOWN_MINUTES)).isoformat()
+    recent = await db.cheers.find_one({
+        "parent_id": FAMILY_ID, "from_child_id": user["id"], "to_child_id": child_id,
+        "created_at": {"$gte": cutoff},
+    })
+    if recent:
+        raise HTTPException(status_code=429, detail=f"Sudah kirim semangat ke {recipient['name']} baru-baru ini — coba lagi nanti ya!")
+
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID,
+        "from_child_id": user["id"], "from_child_name": user["name"],
+        "to_child_id": child_id, "emoji": payload.emoji, "message": payload.message,
+        "created_at": now_iso(),
+    }
+    await db.cheers.insert_one(doc)
+    doc.pop("_id", None)
+    await send_push_to(
+        {"role": "child", "member_id": child_id},
+        title=f"{user['name']} menyemangatimu! {payload.emoji}",
+        body=payload.message or "Semangat terus!",
+        url=f"/kid/{child_id}",
+    )
+    return doc
+
+
+@api.get("/children/{child_id}/cheers")
+async def list_cheers_received(child_id: str, user: dict = Depends(get_current_user)):
+    await get_child_or_404(FAMILY_ID, child_id)
+    cheers = await db.cheers.find({"parent_id": FAMILY_ID, "to_child_id": child_id}, {"_id": 0}).sort("created_at", -1).to_list(20)
+    return cheers
+
+
 # --------------- Weekly Report ---------------
 @api.get("/family/weekly-report")
 async def family_weekly_report(user: dict = Depends(require_parent)):
@@ -1101,6 +1185,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "pet_type": None,  # kid picks on first visit to the pet feature
         "feed_balance": 0,
         "feed_lifetime": 0,
+        "pet_equipped": [],
         "created_at": now_iso(),
     }
     await db.children.insert_one(doc)
@@ -1170,7 +1255,7 @@ async def list_tasks(
         "_undo_prev_streak": 0, "_undo_prev_last_completion": 0, "_undo_points_awarded": 0,
         "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
         "_undo_used_freeze_card": 0, "_undo_prev_freeze_available": 0, "_undo_prev_freeze_week": 0,
-        "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0, "_undo_feed_earned": 0,
+        "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0, "_undo_feed_earned": 0, "_undo_miss_penalty": 0,
     }
     tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(2000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
@@ -1684,6 +1769,14 @@ class TaskCompleteInput(BaseModel):
     photo_url: Optional[str] = None
 
 
+class TaskApproveInput(BaseModel):
+    # A short note and/or voice clip (base64 data URL, same pattern as photo
+    # proof) the parent can attach when approving — a little personal
+    # encouragement alongside the automatic points.
+    encouragement_message: Optional[str] = Field(default=None, max_length=300)
+    encouragement_voice_url: Optional[str] = None
+
+
 def _check_duration_not_exceeded(task):
     """If the task has a duration and a running timer, block Finish once that
     duration has elapsed since Start — mirrors the frontend's disabled-button
@@ -1936,12 +2029,15 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
 
 
 @api.post("/tasks/{task_id}/approve")
-async def approve_task(task_id: str, user: dict = Depends(require_parent)):
+async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInput(), user: dict = Depends(require_parent)):
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if task["status"] != "completed":
         raise HTTPException(status_code=400, detail="Task must be completed first")
+
+    if payload.encouragement_voice_url and len(payload.encouragement_voice_url) > 2_000_000:
+        raise HTTPException(status_code=413, detail="Pesan suara terlalu besar (maks ~1.5MB)")
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
 
@@ -1968,12 +2064,22 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
                 "approved_at": now_iso(),
                 "_undo_coop_snapshots": snapshots,
                 "_undo_spawned_next_id": spawned_next_id,
+                "encouragement_message": payload.encouragement_message,
+                "encouragement_voice_url": payload.encouragement_voice_url,
             }},
         )
         new_badges = []
         for cid in participants:
             new_badges += await award_badges(FAMILY_ID, cid)
             await log_activity(FAMILY_ID, cid, "task_approved", {"task_id": task_id, "points": task["points"], "coop": True})
+        if payload.encouragement_message or payload.encouragement_voice_url:
+            for cid in participants:
+                await send_push_to(
+                    {"role": "child", "member_id": cid},
+                    title="Ada pesan semangat untukmu! 💌",
+                    body=payload.encouragement_message or "Dengarkan pesan suara dari orang tuamu!",
+                    url=f"/kid/{cid}",
+                )
         return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges}
 
     # --- Normal single-child path ---
@@ -2004,11 +2110,20 @@ async def approve_task(task_id: str, user: dict = Depends(require_parent)):
                 "_undo_prev_freeze_week": snap["prev_freeze_week"],
                 "_undo_prev_best_streak": snap["prev_best_streak"],
                 "_undo_feed_earned": snap["feed_earned"],
+                "encouragement_message": payload.encouragement_message,
+                "encouragement_voice_url": payload.encouragement_voice_url,
             }
         },
     )
     new_badges = await award_badges(FAMILY_ID, task["child_id"])
     await log_activity(FAMILY_ID, task["child_id"], "task_approved", {"task_id": task_id, "points": points})
+    if payload.encouragement_message or payload.encouragement_voice_url:
+        await send_push_to(
+            {"role": "child", "member_id": task["child_id"]},
+            title="Ada pesan semangat untukmu! 💌",
+            body=payload.encouragement_message or "Dengarkan pesan suara dari orang tuamu!",
+            url=f"/kid/{task['child_id']}",
+        )
     return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges}
 
 
@@ -2067,7 +2182,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
             {"id": task_id},
             {
                 "$set": {"status": "completed", "approved_at": None},
-                "$unset": {"_undo_coop_snapshots": "", "_undo_spawned_next_id": ""},
+                "$unset": {"_undo_coop_snapshots": "", "_undo_spawned_next_id": "", "encouragement_message": "", "encouragement_voice_url": ""},
             },
         )
         await log_activity(FAMILY_ID, task["child_id"], "task_approval_undone", {"task_id": task_id, "points_reversed": total_points, "coop": True})
@@ -2122,6 +2237,7 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "_undo_used_freeze_card": "", "_undo_prev_freeze_available": "", "_undo_prev_freeze_week": "",
                 "_undo_prev_best_streak": "",
                 "_undo_feed_earned": "",
+                "encouragement_message": "", "encouragement_voice_url": "",
             },
         },
     )
@@ -2145,11 +2261,37 @@ async def mark_task_missed(task_id: str, user: dict = Depends(require_parent)):
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] not in ("pending", "rejected"):
+        # Without this guard, calling /miss twice (double-tap, retry after a
+        # slow network response) would deduct the penalty a second time.
+        raise HTTPException(status_code=400, detail="Misi ini sudah diproses — tidak bisa ditandai terlewat lagi")
     penalty = task.get("penalty_points", 0)
     if penalty > 0:
         await db.children.update_one({"id": task["child_id"]}, {"$inc": {"points": -penalty}})
-    await db.tasks.update_one({"id": task_id}, {"$set": {"status": "missed"}})
+    await db.tasks.update_one({"id": task_id}, {"$set": {"status": "missed", "_undo_miss_penalty": penalty}})
     await log_activity(FAMILY_ID, task["child_id"], "task_missed", {"task_id": task_id, "penalty": penalty})
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+@api.post("/tasks/{task_id}/undo-miss")
+async def undo_task_missed(task_id: str, user: dict = Depends(require_parent)):
+    """Reverses a mistaken 'Terlewat' tap: refunds the penalty and returns the
+    task to pending so it's actionable again. No time window — unlike undoing
+    an approval (which affects streak/freeze-card state that only makes sense
+    to unwind quickly), a missed-task correction is safe to make anytime."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task["status"] != "missed":
+        raise HTTPException(status_code=400, detail="Hanya misi berstatus 'Terlewat' yang bisa dibatalkan")
+    penalty = task.get("_undo_miss_penalty", task.get("penalty_points", 0))
+    if penalty > 0:
+        await db.children.update_one({"id": task["child_id"]}, {"$inc": {"points": penalty}})
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {"status": "pending"}, "$unset": {"_undo_miss_penalty": ""}},
+    )
+    await log_activity(FAMILY_ID, task["child_id"], "task_missed_undone", {"task_id": task_id, "penalty_refunded": penalty})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
@@ -2363,6 +2505,88 @@ async def create_reward(payload: RewardInput, user: dict = Depends(require_paren
 async def delete_reward(reward_id: str, user: dict = Depends(require_parent)):
     # Idempotent — see delete_task.
     await db.rewards.delete_one({"id": reward_id, "parent_id": FAMILY_ID})
+    return {"success": True}
+
+
+# --------------- Reward Suggestions (kid proposes, parent reviews) ---------------
+@api.post("/reward-suggestions")
+async def suggest_reward(payload: RewardSuggestionInput, user: dict = Depends(get_current_user)):
+    """A kid proposes something they'd like added to the reward shop. Parents
+    review and either approve (creating the real reward) or reject it."""
+    if user["role"] != "child":
+        raise HTTPException(status_code=422, detail="Hanya anak yang bisa mengusulkan hadiah")
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": user["id"],
+        "name": payload.name, "description": payload.description,
+        "suggested_cost_points": payload.suggested_cost_points,
+        "status": "pending", "review_note": "",
+        "created_at": now_iso(), "reviewed_at": None,
+    }
+    await db.reward_suggestions.insert_one(doc)
+    doc.pop("_id", None)
+    await send_push_to({"role": "parent"}, title="Usulan hadiah baru! 🎁", body=f'{user["name"]} mengusulkan "{payload.name}"', url="/parent")
+    return doc
+
+
+@api.get("/reward-suggestions")
+async def list_reward_suggestions(user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]  # kids only see their own suggestions
+    items = await db.reward_suggestions.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api.post("/reward-suggestions/{suggestion_id}/approve")
+async def approve_reward_suggestion(suggestion_id: str, payload: RewardSuggestionReview, user: dict = Depends(require_parent)):
+    sug = await db.reward_suggestions.find_one({"id": suggestion_id, "parent_id": FAMILY_ID})
+    if not sug:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    if sug["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Usulan ini sudah diproses")
+    cost = payload.cost_points or sug.get("suggested_cost_points")
+    if not cost:
+        raise HTTPException(status_code=422, detail="Tentukan harga poin untuk hadiah ini")
+
+    reward_doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "name": sug["name"],
+        "description": sug.get("description", ""), "cost_points": cost,
+        "icon": "gift", "created_at": now_iso(),
+    }
+    await db.rewards.insert_one(reward_doc)
+    await db.reward_suggestions.update_one(
+        {"id": suggestion_id},
+        {"$set": {"status": "approved", "review_note": payload.note, "reviewed_at": now_iso(), "created_reward_id": reward_doc["id"]}},
+    )
+    await send_push_to({"role": "child", "member_id": sug["child_id"]}, title="Usulan hadiahmu diterima! 🎉", body=f'"{sug["name"]}" sekarang ada di toko hadiah.', url=f"/kid/{sug['child_id']}")
+    reward_doc.pop("_id", None)
+    return {"suggestion": await db.reward_suggestions.find_one({"id": suggestion_id}, {"_id": 0}), "reward": reward_doc}
+
+
+@api.post("/reward-suggestions/{suggestion_id}/reject")
+async def reject_reward_suggestion(suggestion_id: str, payload: RewardSuggestionReview, user: dict = Depends(require_parent)):
+    sug = await db.reward_suggestions.find_one({"id": suggestion_id, "parent_id": FAMILY_ID})
+    if not sug:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    if sug["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Usulan ini sudah diproses")
+    await db.reward_suggestions.update_one(
+        {"id": suggestion_id},
+        {"$set": {"status": "rejected", "review_note": payload.note, "reviewed_at": now_iso()}},
+    )
+    await send_push_to({"role": "child", "member_id": sug["child_id"]}, title="Tentang usulan hadiahmu", body=payload.note or f'"{sug["name"]}" belum bisa disetujui kali ini.', url=f"/kid/{sug['child_id']}")
+    return await db.reward_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+
+
+@api.delete("/reward-suggestions/{suggestion_id}")
+async def delete_reward_suggestion(suggestion_id: str, user: dict = Depends(get_current_user)):
+    """A kid can withdraw their own still-pending suggestion; a parent can
+    clean up any suggestion regardless of status."""
+    query = {"id": suggestion_id, "parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]
+        query["status"] = "pending"
+    await db.reward_suggestions.delete_one(query)  # idempotent
     return {"success": True}
 
 
@@ -2781,6 +3005,39 @@ async def cron_send_digest(request: Request):
         await db.digest_log.insert_one({"date_key": today, "type": "evening", "sent_at": now_iso()})
         sent.append("evening")
 
+    # Streak warning — fires an hour after the parent's evening digest, so kids
+    # get one last gentle nudge before bedtime if their daily goal isn't met
+    # yet. Only sent to kids who actually have something left to do (skips
+    # anyone with zero required missions today) and phrases the streak framing
+    # only when they actually have a streak worth protecting.
+    if now.hour == 21 and not await db.digest_log.find_one({"date_key": today, "type": "streak_warning"}):
+        for k in kids:
+            required = await db.tasks.count_documents({
+                "parent_id": FAMILY_ID, "date_key": today, "is_bonus": {"$ne": True},
+                "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
+            })
+            if not required:
+                continue
+            done = await db.tasks.count_documents({
+                "parent_id": FAMILY_ID, "date_key": today, "is_bonus": {"$ne": True},
+                "status": {"$in": ["approved", "completed", "skipped"]},
+                "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
+            })
+            if done >= required:
+                continue  # goal already met, nothing to warn about
+            streak = k.get("streak_days", 0)
+            body = (
+                f"Sayang banget kalau streak {streak} harimu putus — yuk selesaikan misi yang tersisa!"
+                if streak > 0 else
+                "Masih ada misi yang belum selesai hari ini — yuk selesaikan sebelum tidur!"
+            )
+            await send_push_to(
+                {"role": "child", "member_id": k["id"]},
+                title="Sebentar lagi malam nih! 🌙", body=body, url=f"/kid/{k['id']}",
+            )
+        await db.digest_log.insert_one({"date_key": today, "type": "streak_warning", "sent_at": now_iso()})
+        sent.append("streak_warning")
+
     return {"sent": sent}
 
 
@@ -3004,6 +3261,7 @@ async def seed_default_family():
             "pet_type": None,
             "feed_balance": 0,
             "feed_lifetime": 0,
+            "pet_equipped": [],
             "created_at": ts,
         })
 
@@ -3124,6 +3382,10 @@ async def migrate_existing_data():
     await db.children.update_many(
         {"pet_type": {"$exists": False}},
         {"$set": {"pet_type": None, "feed_balance": 0, "feed_lifetime": 0}},
+    )
+    await db.children.update_many(
+        {"pet_equipped": {"$exists": False}},
+        {"$set": {"pet_equipped": []}},
     )
 
 

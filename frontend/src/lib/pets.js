@@ -66,6 +66,25 @@ export function computeFoodTier(feedLifetime) {
   return { ...current, nextName: next?.name || null, nextMin: next?.minFeed ?? current.minFeed, maxed: !next };
 }
 
+// Cute cosmetic accessories that unlock as the pet levels up (same level
+// system as points/lifetime_points) — purely for delight, kid picks which
+// unlocked ones to display, no economy impact.
+export const ACCESSORY_CATALOG = [
+  { key: "bow", name: "Pita", emoji: "🎀", unlockLevel: 2 },
+  { key: "flower", name: "Bunga", emoji: "🌸", unlockLevel: 2 },
+  { key: "glasses", name: "Kacamata", emoji: "👓", unlockLevel: 3 },
+  { key: "bandana", name: "Bandana", emoji: "🎗️", unlockLevel: 3 },
+  { key: "sunglasses", name: "Kacamata Hitam", emoji: "🕶️", unlockLevel: 4 },
+  { key: "scarf", name: "Syal", emoji: "🧣", unlockLevel: 5 },
+  { key: "hat", name: "Topi", emoji: "🎩", unlockLevel: 6 },
+  { key: "crown", name: "Mahkota", emoji: "👑", unlockLevel: 8 },
+];
+
+export function isAccessoryUnlocked(key, level) {
+  const acc = ACCESSORY_CATALOG.find((a) => a.key === key);
+  return acc ? level >= acc.unlockLevel : false;
+}
+
 // A handful of cute reactions for when the kid taps/pets their animal —
 // purely for delight, no game-state implications.
 export const TAP_REACTIONS = ["💕", "✨", "😊", "🎵", "⭐"];

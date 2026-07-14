@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
-  Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2,
+  Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2, Copy,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -24,6 +24,8 @@ import FamilyDayMonitor from "@/components/FamilyDayMonitor";
 import MonthHeatmap from "@/components/MonthHeatmap";
 import WeeklyReport from "@/components/WeeklyReport";
 import LabelEditor from "@/components/LabelEditor";
+import EncourageModal from "@/components/EncourageModal";
+import RewardSuggestionsReview from "@/components/RewardSuggestionsReview";
 import ViewLinksManager from "@/components/ViewLinksManager";
 import FamilyChallenges from "@/components/FamilyChallenges";
 import { useLabels } from "@/lib/labels";
@@ -32,6 +34,7 @@ import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
 import { todayKey, humanDateKey, shiftDateKey } from "@/lib/dates";
 import { ROUTINE_TEMPLATES } from "@/lib/routineTemplates";
+import { filterTaskIdeas } from "@/lib/taskIdeaBank";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -499,6 +502,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
     return todayKey();
   });
   const [showCalendar, setShowCalendar] = useState(false);
+  const [encourageTask, setEncourageTask] = useState(null);
   const setDateFilter = (v) => {
     setDateFilterState(v);
     try { sessionStorage.setItem("tasksDateFilter", v); } catch { /* storage unavailable — non-fatal */ }
@@ -569,6 +573,13 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       toast.success("Persetujuan dibatalkan, poin dikembalikan");
     });
   };
+  const undoMiss = (t) => {
+    if (!window.confirm(`Batalkan status "Terlewat" untuk "${t.title}"? Penalti akan dikembalikan dan misi aktif lagi.`)) return;
+    act(async () => {
+      await api.post(`/tasks/${t.id}/undo-miss`);
+      toast.success("Status terlewat dibatalkan, penalti dikembalikan");
+    });
+  };
   const del = (t) => {
     const isGroup = t._groupTaskIds && t._groupTaskIds.length > 1;
     const msg = isGroup
@@ -592,14 +603,14 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       : kidName(t.child_id);
 
   const editBtn = (t) => (
-    <div className="flex gap-1 flex-wrap">
-      <button onClick={() => onEditTask(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-sm" title="Edit tugas">
-        <Settings className="w-4 h-4" strokeWidth={2.5} /> Edit
+    <>
+      <button onClick={() => onEditTask(t)} className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-500" title="Edit tugas">
+        <Settings className="w-4 h-4" strokeWidth={2.5} />
       </button>
-      <button onClick={() => onDuplicate(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-indigo-200 text-indigo-600 font-semibold px-3 py-1.5 rounded-lg text-sm" title="Duplikat tugas ke hari/anak lain">
-        📋 Duplikat
+      <button onClick={() => onDuplicate(t)} className="press-btn p-1.5 rounded-lg hover:bg-indigo-50 text-indigo-500" title="Duplikat tugas ke hari/anak lain">
+        <Copy className="w-4 h-4" strokeWidth={2.5} />
       </button>
-    </div>
+    </>
   );
 
   if (kids.length === 0) {
@@ -649,12 +660,19 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
               <button onClick={() => approve(t)} data-testid={`${TEST_IDS.parent.approveTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
                 <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Setujui
               </button>
-              <button onClick={() => reject(t)} data-testid={`${TEST_IDS.parent.rejectTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-600 font-semibold px-3 py-1.5 rounded-lg text-sm">
-                <XCircle className="w-4 h-4" strokeWidth={2.5} /> Tolak
+              <button onClick={() => setEncourageTask({ ...t, child_name: rowName(t) })} className="press-btn p-1.5 rounded-lg hover:bg-pink-50 text-pink-500" title="Setujui dengan pesan semangat">
+                💌
+              </button>
+              <button onClick={() => reject(t)} data-testid={`${TEST_IDS.parent.rejectTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-500" title="Tolak, kembalikan ke anak">
+                <XCircle className="w-4 h-4" strokeWidth={2.5} />
               </button>
             </TaskRow>
           ))}
         </Section>
+      )}
+
+      {encourageTask && (
+        <EncourageModal task={encourageTask} onClose={() => setEncourageTask(null)} onApproved={onRefresh} />
       )}
 
       <Section title="📋 Aktif" count={grouped.pending.length}>
@@ -722,15 +740,15 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
             {isDateMode ? `Tidak ada tugas aktif untuk ${humanDateKey(dateFilter)}.` : "Tidak ada tugas aktif."}
           </div>
         ) : grouped.pending.map((t) => (
-          <TaskRow key={t.id} task={t} childName={rowName(t)}>
+          <TaskRow key={t.id} task={t} childName={rowName(t)} currentDateFilter={dateFilter}>
             {editBtn(t)}
-            <button onClick={() => miss(t)} data-testid={`${TEST_IDS.parent.missTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-white border border-red-200 text-red-600 font-semibold px-3 py-1.5 rounded-lg text-sm">
-              <AlertTriangle className="w-4 h-4" strokeWidth={2.5} /> Terlewat
+            <button onClick={() => miss(t)} data-testid={`${TEST_IDS.parent.missTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-red-50 text-red-500" title="Tandai terlewat">
+              <AlertTriangle className="w-4 h-4" strokeWidth={2.5} />
             </button>
-            <button onClick={() => onApplyConsequence(t)} className="press-btn inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 font-semibold px-3 py-1.5 rounded-lg text-sm">
-              <ShieldAlert className="w-4 h-4" strokeWidth={2.5} /> Konsekuensi
+            <button onClick={() => onApplyConsequence(t)} className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-500" title="Terapkan konsekuensi">
+              <ShieldAlert className="w-4 h-4" strokeWidth={2.5} />
             </button>
-            <button onClick={() => del(t)} data-testid={`${TEST_IDS.parent.deleteTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-red-50 text-red-500">
+            <button onClick={() => del(t)} data-testid={`${TEST_IDS.parent.deleteTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-red-50 text-red-500" title="Hapus tugas">
               <Trash2 className="w-4 h-4" strokeWidth={2.5} />
             </button>
           </TaskRow>
@@ -762,6 +780,13 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
             <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
               {editBtn(t)}
               <span className="text-sm text-red-500">−{t.penalty_points || 0} poin</span>
+              <button
+                onClick={() => undoMiss(t)}
+                title="Batalkan status terlewat (penalti dikembalikan, misi aktif lagi)"
+                className="press-btn inline-flex items-center gap-1 bg-white border border-amber-200 text-amber-600 font-semibold px-2.5 py-1 rounded-lg text-xs"
+              >
+                <Undo2 className="w-3.5 h-3.5" /> Batalkan
+              </button>
             </TaskRow>
           ))}
         </Section>
@@ -782,43 +807,61 @@ function Section({ title, count, children }) {
   );
 }
 
-function TaskRow({ task, childName, children, dim = false }) {
+function TaskRow({ task, childName, children, dim = false, currentDateFilter = null }) {
+  // When the parent is already looking at one specific day, repeating that
+  // same date on every single row is just noise — only show the date chip
+  // when it's NOT the day currently being viewed (i.e. useful information),
+  // or always in "Semua Tanggal" mode where every row could be a different day.
+  const showDateChip = task.date_key && (currentDateFilter === "all" || task.date_key !== currentDateFilter);
+  const isOverdue = task.date_key && task.date_key < todayKey();
+
+  const Chip = ({ children: c, tone = "slate", title }) => (
+    <span
+      title={title}
+      className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full ${
+        tone === "red" ? "bg-red-50 text-red-600" :
+        tone === "green" ? "bg-green-50 text-green-600" :
+        tone === "indigo" ? "bg-indigo-50 text-indigo-600" :
+        tone === "amber" ? "bg-amber-50 text-amber-600" :
+        "bg-slate-100 text-slate-500"
+      }`}
+    >
+      {c}
+    </span>
+  );
+
   return (
-    <div className={`p-4 flex flex-wrap items-center gap-3 ${dim ? "opacity-60" : ""}`} data-testid={`${TEST_IDS.parent.taskItem}-${task.id}`}>
+    <div className={`p-3.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 ${dim ? "opacity-60" : ""}`} data-testid={`${TEST_IDS.parent.taskItem}-${task.id}`}>
       {task.order != null && (
-        <div className="w-8 h-8 rounded-full bg-indigo-100 text-indigo-600 font-bold text-sm flex items-center justify-center shrink-0" title="Urutan misi">
+        <div className="w-7 h-7 rounded-full bg-indigo-100 text-indigo-600 font-bold text-xs flex items-center justify-center shrink-0" title="Urutan misi">
           {task.order}
         </div>
       )}
       <div className="flex-1 min-w-0">
-        <div className="font-parent font-semibold text-slate-900 truncate flex items-center gap-2">
+        <div className="font-parent font-semibold text-slate-900 truncate flex items-center gap-1.5">
           {task.title}
           {task._groupKidIds && task._groupKidIds.length > 1 && (
             <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-600 shrink-0" title="Tugas bersama — klik tab anak untuk edit khusus">
-              👥 Bersama
+              👥
             </span>
           )}
         </div>
-        <div className="text-xs text-slate-500 flex gap-2 flex-wrap">
-          <span>{childName}</span>
-          <span>·</span>
-          <span>+{task.points} pts</span>
-          {task.penalty_points > 0 && <><span>·</span><span>penalty −{task.penalty_points}</span></>}
-          {task.date_key && (
-            <>
-              <span>·</span>
-              <span className={task.date_key < todayKey() ? "text-red-500 font-semibold" : task.date_key === todayKey() ? "text-green-600 font-semibold" : "text-slate-500"}>
-                📅 {humanDateKey(task.date_key)}
-              </span>
-            </>
+        <div className="flex items-center gap-1.5 flex-wrap mt-1">
+          <span className="text-xs text-slate-400">{childName}</span>
+          <Chip tone="green">+{task.points}</Chip>
+          {task.penalty_points > 0 && <Chip tone="red" title={`Penalti jika terlewat: ${task.penalty_points}`}>−{task.penalty_points}</Chip>}
+          {showDateChip && (
+            <Chip tone={isOverdue ? "red" : task.date_key === todayKey() ? "green" : "slate"}>
+              📅 {humanDateKey(task.date_key)}
+            </Chip>
           )}
-          {task.due_time && <><span>·</span><span className="text-indigo-600 font-semibold">🕒 sblm {task.due_time}</span></>}
-          {task.duration_minutes && <><span>·</span><span className="text-indigo-600 font-semibold">⏱️ {task.duration_minutes} mnt</span></>}
-          {task.recurrence !== "none" && <><span>·</span><span>{task.recurrence === "daily" ? "harian" : "mingguan"}</span></>}
-          {task.status === "skipped" && <><span>·</span><span className="text-slate-400">dilewati</span></>}
+          {task.due_time && <Chip tone="indigo" title="Batas waktu">🕒 {task.due_time}</Chip>}
+          {task.duration_minutes && <Chip title="Durasi">⏱️ {task.duration_minutes}m</Chip>}
+          {task.recurrence !== "none" && <Chip title={task.recurrence === "daily" ? "Berulang harian" : "Berulang mingguan"}>{task.recurrence === "daily" ? "🔁 harian" : "🔁 mingguan"}</Chip>}
+          {task.status === "skipped" && <Chip tone="amber">dilewati</Chip>}
         </div>
       </div>
-      <div className="flex items-center gap-2 flex-wrap">{children}</div>
+      <div className="flex items-center gap-1.5 flex-wrap shrink-0">{children}</div>
     </div>
   );
 }
@@ -844,6 +887,8 @@ function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onRef
           <Plus className="w-4 h-4" strokeWidth={2.5} /> New reward
         </button>
       </div>
+
+      <RewardSuggestionsReview kids={kids} onRewardCreated={onRefresh} />
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <h3 className="font-parent font-bold text-lg text-slate-900 mb-4">Reward store</h3>
@@ -1205,6 +1250,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
   const [taskStyle, setTaskStyle] = useState("");
+  const [showIdeaBank, setShowIdeaBank] = useState(false);
+  const [ideaStyleFilter, setIdeaStyleFilter] = useState("all");
   // Selected kid ids: [] means "everyone" (broadcast). Edit mode is always the task's own child.
   const [selectedKidIds, setSelectedKidIds] = useState(
     defaultChildId ? [defaultChildId] : []
@@ -1334,6 +1381,55 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   return (
     <Modal open={open} onClose={onClose} title={isEdit ? "Edit tugas" : isDuplicate ? "Duplikat tugas" : "Tugas baru"}>
       <div className="space-y-4">
+        {!isEdit && (
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowIdeaBank((v) => !v)}
+              className="press-btn inline-flex items-center gap-1.5 text-xs font-bold text-amber-600 bg-amber-50 hover:bg-amber-100 px-3 py-1.5 rounded-full"
+            >
+              💡 {showIdeaBank ? "Sembunyikan Ide Misi" : "Cari Ide Misi"}
+            </button>
+            {showIdeaBank && (
+              <div className="mt-2 bg-slate-50 rounded-xl p-3 border border-slate-200">
+                <div className="flex gap-1.5 flex-wrap mb-2">
+                  {[{ key: "all", label: "Semua" }, ...Object.entries(TASK_STYLES).map(([key, s]) => ({ key, label: `${s.emoji} ${s.label}` }))].map((opt) => (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      onClick={() => setIdeaStyleFilter(opt.key)}
+                      className={`px-2 py-1 rounded-full text-[11px] font-semibold ${ideaStyleFilter === opt.key ? "bg-indigo-500 text-white" : "bg-white text-slate-500 border border-slate-200"}`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="max-h-48 overflow-y-auto space-y-1">
+                  {filterTaskIdeas({
+                    age: kids.find((k) => k.id === selectedKidIds[0])?.age,
+                    style: ideaStyleFilter,
+                  }).map((idea, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      onClick={() => {
+                        setTitle(idea.title);
+                        setPoints(idea.points);
+                        setTaskStyle(idea.style);
+                        setShowIdeaBank(false);
+                        toast.success(`"${idea.title}" dipakai — sesuaikan detail lain kalau perlu`);
+                      }}
+                      className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-white text-sm text-slate-700 flex items-center gap-2"
+                    >
+                      <span>{idea.emoji}</span> {idea.title}
+                      <span className="ml-auto text-xs text-amber-600 font-bold">+{idea.points}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         <div>
           <label className={labelClass}>Tugas</label>
           <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputClass} placeholder="Rapikan tempat tidur" data-testid="task-title-input" />

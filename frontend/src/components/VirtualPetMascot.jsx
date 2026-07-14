@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { computeLevel } from "@/lib/levels";
-import { PET_CATALOG, petAppearance, computeFoodTier, TAP_REACTIONS } from "@/lib/pets";
+import { PET_CATALOG, petAppearance, computeFoodTier, TAP_REACTIONS, ACCESSORY_CATALOG, isAccessoryUnlocked } from "@/lib/pets";
 
 /**
  * Mood is a gentle, non-punitive signal: it reflects whether the kid has been
@@ -34,11 +34,37 @@ export default function VirtualPetMascot({ child, onChanged }) {
   const [feeding, setFeeding] = useState(false);
   const [taps, setTaps] = useState([]); // floating reaction emojis
   const [feedBurst, setFeedBurst] = useState(false);
+  const [showAccessories, setShowAccessories] = useState(false);
+  const [savingAccessory, setSavingAccessory] = useState(false);
 
   const levelInfo = computeLevel(child.lifetime_points || 0);
   const foodTier = computeFoodTier(child.feed_lifetime || 0);
   const feedBalance = Math.max(0, child.feed_balance || 0);
   const FEED_COST = 5;
+  const equipped = child.pet_equipped || [];
+
+  const toggleAccessory = async (key) => {
+    const isEquipped = equipped.includes(key);
+    let next;
+    if (isEquipped) {
+      next = equipped.filter((k) => k !== key);
+    } else {
+      if (equipped.length >= 4) {
+        toast.error("Maksimal 4 aksesori sekaligus — lepas satu dulu ya!");
+        return;
+      }
+      next = [...equipped, key];
+    }
+    setSavingAccessory(true);
+    try {
+      await api.patch("/me/profile", { pet_equipped: next });
+      onChanged?.();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setSavingAccessory(false);
+    }
+  };
 
   const choosePet = async (petKey) => {
     setSaving(true);
@@ -127,6 +153,17 @@ export default function VirtualPetMascot({ child, onChanged }) {
           >
             {appearance.emoji}
             <span className="absolute -bottom-1 -right-1 text-xl">{mood.face}</span>
+            {equipped.map((key, i) => {
+              const acc = ACCESSORY_CATALOG.find((a) => a.key === key);
+              if (!acc) return null;
+              // Simple fixed-position overlay slots so multiple accessories don't stack exactly on top of each other.
+              const positions = ["-top-2 left-1/2 -translate-x-1/2", "-top-1 -left-2", "-top-1 -right-2", "top-1/2 -left-3 -translate-y-1/2"];
+              return (
+                <span key={key} className={`absolute ${positions[i % positions.length]} text-lg pointer-events-none`}>
+                  {acc.emoji}
+                </span>
+              );
+            })}
             <AnimatePresence>
               {feedBurst && (
                 <motion.span
@@ -170,9 +207,38 @@ export default function VirtualPetMascot({ child, onChanged }) {
           >
             {foodTier.emoji} Beri Makan ({FEED_COST} pakan)
           </button>
+          <button
+            onClick={() => setShowAccessories((v) => !v)}
+            className="press-btn ml-2 inline-flex items-center gap-1.5 bg-white border-2 border-slate-200 hover:bg-slate-50 text-slate-600 font-fun font-bold px-3 py-1.5 rounded-xl text-xs"
+          >
+            👒 Aksesori
+          </button>
           <div className="text-[10px] text-slate-400 mt-1">
             Pakan: {feedBalance} · Level pakan: {foodTier.name} {foodTier.maxed ? "(MAX)" : `(menuju ${foodTier.nextName})`}
           </div>
+
+          {showAccessories && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="mt-2 grid grid-cols-4 gap-1.5">
+              {ACCESSORY_CATALOG.map((acc) => {
+                const unlocked = isAccessoryUnlocked(acc.key, levelInfo.level);
+                const isEquipped = equipped.includes(acc.key);
+                return (
+                  <button
+                    key={acc.key}
+                    onClick={() => unlocked && !savingAccessory && toggleAccessory(acc.key)}
+                    disabled={!unlocked || savingAccessory}
+                    title={unlocked ? acc.name : `Terbuka di Level ${acc.unlockLevel}`}
+                    className={`flex flex-col items-center gap-0.5 p-1.5 rounded-xl border-2 text-center ${
+                      isEquipped ? "border-amber-400 bg-amber-50" : unlocked ? "border-slate-100 hover:bg-slate-50" : "border-slate-100 opacity-40 cursor-not-allowed"
+                    }`}
+                  >
+                    <span className="text-lg">{unlocked ? acc.emoji : "🔒"}</span>
+                    <span className="text-[8px] font-bold text-slate-500 leading-none">{unlocked ? acc.name : `Lv${acc.unlockLevel}`}</span>
+                  </button>
+                );
+              })}
+            </motion.div>
+          )}
         </div>
       </div>
     </div>

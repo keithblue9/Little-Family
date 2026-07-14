@@ -463,6 +463,15 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
         {!isDone && gateReason === "future" && (
           <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-500">🔮 Belum tiba harinya</div>
         )}
+        {isDone && (task.encouragement_message || task.encouragement_voice_url) && (
+          <div className="mt-2 bg-pink-50 border border-pink-200 rounded-xl px-2.5 py-1.5">
+            <div className="text-[10px] font-bold text-pink-500 mb-0.5">💌 Pesan dari orang tuamu</div>
+            {task.encouragement_message && <div className="text-xs text-pink-700">{task.encouragement_message}</div>}
+            {task.encouragement_voice_url && (
+              <audio controls src={task.encouragement_voice_url} className="h-8 w-full mt-1" />
+            )}
+          </div>
+        )}
       </div>
 
       {/* Actions */}

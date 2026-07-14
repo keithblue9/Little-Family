@@ -21,6 +21,8 @@ import GrowthTrail from "@/components/GrowthTrail";
 import StickerBook from "@/components/StickerBook";
 import VirtualPetMascot from "@/components/VirtualPetMascot";
 import DailyRecapCard from "@/components/DailyRecapCard";
+import RewardSuggestions from "@/components/RewardSuggestions";
+import CheersReceived from "@/components/CheersReceived";
 import ProfileEditor from "@/components/ProfileEditor";
 import DailyQuestView from "@/components/DailyQuestView";
 import { personalityMeta } from "@/lib/personality";
@@ -284,6 +286,8 @@ export default function KidHome() {
             <motion.div key="rewards" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <h2 className="font-fun font-bold text-2xl text-slate-900 mb-3">Toko Hadiah 🎁</h2>
 
+              <RewardSuggestions />
+
               {wishlist.length > 0 && (
                 <div className="mb-5">
                   <h3 className="font-fun font-bold text-sm text-slate-500 mb-2 flex items-center gap-1.5">
@@ -365,7 +369,8 @@ export default function KidHome() {
 
           {tab === "champs" && (
             <motion.div key="champs" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-8">
-              <Leaderboard />
+              <CheersReceived childId={childId} />
+              <Leaderboard currentChildId={childId} />
               <KidChallenges />
               <StickerBook childId={childId} />
               <Achievements childId={childId} />

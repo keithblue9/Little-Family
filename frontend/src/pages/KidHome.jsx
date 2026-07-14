@@ -46,6 +46,7 @@ export default function KidHome() {
   const [child, setChild] = useState(null);
   const [rewards, setRewards] = useState([]);
   const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
+  const [levelTitles, setLevelTitles] = useState(null); // family's custom level ladder, from config
   const [showRecap, setShowRecap] = useState(false);
   const [tab, setTab] = useState("tasks");
   const [celebrate, setCelebrate] = useState(false);
@@ -59,10 +60,11 @@ export default function KidHome() {
 
   const load = useCallback(async () => {
     try {
-      const [cRes, rRes, wRes] = await Promise.all([
+      const [cRes, rRes, wRes, cfgRes] = await Promise.all([
         api.get("/children"),
         api.get("/rewards"),
         api.get("/wishlist"),
+        api.get("/config"),
       ]);
       const c = cRes.data.find((x) => x.id === childId);
       if (!c) {
@@ -73,6 +75,7 @@ export default function KidHome() {
       setChild(c);
       setRewards(rRes.data);
       setWishlist(wRes.data);
+      setLevelTitles(cfgRes.data.level_titles);
     } catch (e) {
       toast.error(formatApiError(e));
     }
@@ -119,7 +122,7 @@ export default function KidHome() {
     return <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">Memuat…</div>;
   }
 
-  const levelInfo = computeLevel(child.lifetime_points || 0);
+  const levelInfo = computeLevel(child.lifetime_points || 0, levelTitles);
 
   return (
     <div className="min-h-screen kid-shell grain relative font-body pb-28 safe-x" data-testid={TEST_IDS.kid.home}>
@@ -237,7 +240,7 @@ export default function KidHome() {
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <div className="mb-4">
-                <VirtualPetMascot child={child} onChanged={load} />
+                <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} />
               </div>
               <h2 className="font-fun font-bold text-2xl text-slate-900 mb-1">Petualangan Misi 🗺️</h2>
               <p className="text-sm text-slate-500 mb-4">

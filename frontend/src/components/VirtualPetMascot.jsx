@@ -28,7 +28,7 @@ function moodFor(child) {
   return { label: "Kangen Banget", face: "🥺", ring: "ring-slate-400", glow: "shadow-slate-200" };
 }
 
-export default function VirtualPetMascot({ child, onChanged }) {
+export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
   const [picking, setPicking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [feeding, setFeeding] = useState(false);
@@ -37,7 +37,7 @@ export default function VirtualPetMascot({ child, onChanged }) {
   const [showAccessories, setShowAccessories] = useState(false);
   const [savingAccessory, setSavingAccessory] = useState(false);
 
-  const levelInfo = computeLevel(child.lifetime_points || 0);
+  const levelInfo = computeLevel(child.lifetime_points || 0, levelTitles);
   const foodTier = computeFoodTier(child.feed_lifetime || 0);
   const feedBalance = Math.max(0, child.feed_balance || 0);
   const FEED_COST = 5;
@@ -138,7 +138,7 @@ export default function VirtualPetMascot({ child, onChanged }) {
     );
   }
 
-  const appearance = petAppearance(child.pet_type, levelInfo.level);
+  const appearance = petAppearance(child.pet_type, levelInfo.level, levelInfo.totalLevels);
   const mood = moodFor(child);
 
   return (

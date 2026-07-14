@@ -1327,6 +1327,101 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     ads_solo_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     check("berjamaah: no berjamaah that day -> only individual 10, no bonus", ads_solo_after - ads_solo_before == 10, f"+{ads_solo_after-ads_solo_before}")
 
+    # ================= 66. TOGETHER-BONUS (single task, self-reported "did it together") =================
+    r = c.post("/api/tasks", json={"title": "TB1", "points": 10, "child_id": adskhan["id"], "date_key": today_local, "together_bonus_enabled": True})
+    check("together-bonus: enabled without points rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/tasks", json={"title": "TB2", "points": 10, "target_children": [adskhan["id"], syila["id"]], "coop": True, "together_bonus_enabled": True, "together_bonus_points": 5, "date_key": today_local})
+    check("together-bonus: coop+together_bonus combo rejected", r.status_code == 422, str(r.status_code))
+
+    r = c.post("/api/tasks", json={
+        "title": "SholatSubuhTB", "points": 10, "target_children": [],
+        "date_key": today_local, "recurrence": "daily", "order": 1,
+        "together_bonus_enabled": True, "together_bonus_points": 10,
+    })
+    tb_tasks = r.json()["tasks"]
+    ads_tb = next(t for t in tb_tasks if t["child_id"] == adskhan["id"])
+    syi_tb = next(t for t in tb_tasks if t["child_id"] == syila["id"])
+    check("together-bonus: broadcast still creates 2 individual copies", len(tb_tasks) == 2)
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{ads_tb['id']}/start")
+    r = c.post(f"/api/tasks/{ads_tb['id']}/complete")
+    check("together-bonus: complete without answering the question rejected", r.status_code == 422, r.text[:150])
+    r = c.post(f"/api/tasks/{ads_tb['id']}/complete", json={"done_together": True})
+    check("together-bonus: complete with done_together=True succeeds", r.status_code == 200, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{syi_tb['id']}/start")
+    c.post(f"/api/tasks/{syi_tb['id']}/complete", json={"done_together": False})
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    ads_tb_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_tb_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    c.post(f"/api/tasks/{ads_tb['id']}/approve")
+    c.post(f"/api/tasks/{syi_tb['id']}/approve")
+    ads_tb_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_tb_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("together-bonus: said YES gets base+bonus (20)", ads_tb_after - ads_tb_before == 20, f"+{ads_tb_after-ads_tb_before}")
+    check("together-bonus: said NO gets only base (10)", syi_tb_after - syi_tb_before == 10, f"+{syi_tb_after-syi_tb_before}")
+
+    # Check spawn BEFORE any undo — undoing an approval correctly removes its
+    # just-spawned next-occurrence too (contingent on the approval standing),
+    # so checking spawn state has to happen while the approval is still intact.
+    _y, _m, _d = map(int, today_local.split("-"))
+    tb_tomorrow = (_dt2.date(_y, _m, _d) + _dt2.timedelta(days=1)).strftime("%Y-%m-%d")
+    r = c.get(f"/api/tasks?date_key={tb_tomorrow}")
+    spawned_tb = [t for t in r.json() if t["title"] == "SholatSubuhTB"]
+    ads_spawned_tb = next((t for t in spawned_tb if t["child_id"] == adskhan["id"]), None)
+    check("together-bonus: spawned copy exists tomorrow", ads_spawned_tb is not None, str(spawned_tb))
+    check("together-bonus: spawned copy's done_together reset (bug fix verified)", ads_spawned_tb is not None and ads_spawned_tb.get("done_together") is None, str(ads_spawned_tb.get("done_together") if ads_spawned_tb else None))
+
+    r = c.post(f"/api/tasks/{ads_tb['id']}/undo-approval")
+    check("together-bonus: undo reverses full amount incl. bonus", r.status_code == 200)
+    ads_tb_undone = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("together-bonus: undo restores exactly", ads_tb_undone == ads_tb_before)
+    r = c.get(f"/api/tasks?date_key={tb_tomorrow}")
+    check("together-bonus: undo correctly removes the spawned next-occurrence too (it was contingent on the approval)", not any(t["title"] == "SholatSubuhTB" and t["child_id"] == adskhan["id"] for t in r.json()))
+
+    # ================= 67. ROUTINE TEMPLATES (parent-editable CRUD) =================
+    r = c.get("/api/routine-templates")
+    check("templates: first GET seeds 5 defaults", len(r.json()) == 5, str(len(r.json())))
+    r = c.get("/api/routine-templates")
+    check("templates: second GET doesn't duplicate", len(r.json()) == 5)
+    r = c.post("/api/routine-templates", json={"label": "Weekend", "emoji": "🎉", "tasks": [{"title": "Cuci mobil", "points": 20}]})
+    check("templates: parent creates custom", r.status_code == 200, r.text[:150])
+    custom_tpl = r.json()
+    r = c.patch(f"/api/routine-templates/{custom_tpl['id']}", json={"label": "Weekend Edit", "tasks": [{"title": "x", "points": 5}, {"title": "y", "points": 5}]})
+    check("templates: edit succeeds, replaces tasks", r.status_code == 200 and len(r.json()["tasks"]) == 2, r.text[:150])
+    r = c.post("/api/routine-templates", json={"label": "Empty", "tasks": []})
+    check("templates: empty tasks rejected", r.status_code == 422, str(r.status_code))
+    r = c.delete(f"/api/routine-templates/{custom_tpl['id']}")
+    check("templates: delete succeeds", r.status_code == 200)
+    r = c.delete(f"/api/routine-templates/{custom_tpl['id']}")
+    check("templates: delete idempotent", r.status_code == 200)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/routine-templates", json={"label": "hack", "tasks": [{"title": "x"}]})
+    check("templates: kid blocked from creating", r.status_code == 403, str(r.status_code))
+
+    # ================= 68. LEVEL CONFIG (parent-editable ladder) =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/config")
+    check("level: default 10 tiers present", len(r.json()["level_titles"]) == 10)
+    check("level: first tier at 0 XP", r.json()["level_titles"][0]["min_xp"] == 0)
+    custom_levels = [{"title": "Baru", "min_xp": 0}, {"title": "Rajin", "min_xp": 100}, {"title": "Juara", "min_xp": 500}]
+    r = c.post("/api/config", json={"level_titles": custom_levels})
+    check("level: custom ladder accepted", r.status_code == 200, r.text[:150])
+    r = c.get("/api/config")
+    check("level: custom ladder persisted", len(r.json()["level_titles"]) == 3)
+    r = c.post("/api/config", json={"level_titles": [{"title": "x", "min_xp": 10}]})
+    check("level: first tier not at 0 rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"level_titles": [{"title": "A", "min_xp": 0}, {"title": "B", "min_xp": 50}, {"title": "C", "min_xp": 50}]})
+    check("level: non-increasing XP rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"level_titles": []})
+    check("level: empty list rejected", r.status_code == 422, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/config", json={"level_titles": custom_levels})
+    check("level: kid blocked from editing", r.status_code == 403, str(r.status_code))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

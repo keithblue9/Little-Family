@@ -33,8 +33,9 @@ import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
 import { todayKey, humanDateKey, shiftDateKey, nextDateForWeekday } from "@/lib/dates";
-import { ROUTINE_TEMPLATES } from "@/lib/routineTemplates";
 import { filterTaskIdeas } from "@/lib/taskIdeaBank";
+import TemplateManagerModal from "@/components/TemplateManagerModal";
+import LevelConfigEditor from "@/components/LevelConfigEditor";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -1134,6 +1135,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <LevelConfigEditor />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <MemberPasscodeManager />
       </div>
 
@@ -1258,6 +1263,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [isBonus, setIsBonus] = useState(false);
   const [photoRequired, setPhotoRequired] = useState(false);
   const [isCoop, setIsCoop] = useState(false);
+  const [togetherBonusEnabled, setTogetherBonusEnabled] = useState(false);
+  const [togetherBonusPoints, setTogetherBonusPoints] = useState(10);
   const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
   const [taskStyle, setTaskStyle] = useState("");
@@ -1285,6 +1292,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
       setIsCoop(!!editTask.is_coop);
+      setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
+      setTogetherBonusPoints(editTask.together_bonus_points || 10);
       setRecurrence(editTask.recurrence || "none");
       setOrder(editTask.order ? String(editTask.order) : "");
       setTaskStyle(editTask.task_style || "");
@@ -1304,6 +1313,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
       setIsCoop(false);
+      setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
+      setTogetherBonusPoints(editTask.together_bonus_points || 10);
       setRecurrence(editTask.recurrence || "none");
       setOrder(""); // fresh order
       setTaskStyle(editTask.task_style || "");
@@ -1315,6 +1326,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
       setWeekdays([todayWd]);
       setDueTime(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
+      setTogetherBonusEnabled(false); setTogetherBonusPoints(10);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
   }, [open, defaultChildId, editTask, isDuplicate]);
@@ -1343,6 +1355,9 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
     if (!isEdit && isCoop && selectedKidIds.length < 2) {
       return toast.error("Misi bersama butuh minimal 2 anak dipilih (bukan Semua/1 anak)");
     }
+    if (togetherBonusEnabled && (!togetherBonusPoints || Number(togetherBonusPoints) < 1)) {
+      return toast.error("Tentukan poin bonus untuk opsi 'dilakukan bersama'");
+    }
     setSaving(true);
     try {
       const useWeekdays = !isEdit && scheduleMode === "weekdays";
@@ -1358,6 +1373,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
         coop: !isEdit && isCoop,
+        together_bonus_enabled: togetherBonusEnabled,
+        together_bonus_points: togetherBonusEnabled ? Number(togetherBonusPoints) : null,
         // Rutin (weekday) mode auto-repeats weekly so the task comes back each
         // week on the same day. Non-rutin uses the chosen recurrence dropdown.
         recurrence: useWeekdays ? "weekly" : recurrence,
@@ -1652,7 +1669,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
 
         {/* Co-op quest toggle — only offered when creating (not editing), since
             an existing task's coop-ness can't be changed after the fact. */}
-        {!isEdit && (
+        {!isEdit && !togetherBonusEnabled && (
           <button
             type="button"
             onClick={() => setIsCoop(!isCoop)}
@@ -1668,7 +1685,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
             <div className="flex-1 text-left">
               <div className="font-semibold text-slate-800 text-sm">🤝 Misi Bersama (Co-op)</div>
               <div className="text-xs text-slate-500">
-                Dikerjakan berdua — siapa saja dari mereka bisa menandai selesai, poin dibagi otomatis. Pilih minimal 2 anak di atas.
+                SATU tugas dipakai berdua — siapa saja bisa menandai selesai, poin dibagi otomatis. Pilih minimal 2 anak di atas.
               </div>
             </div>
           </button>
@@ -1676,6 +1693,44 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         {isEdit && editTask?.is_coop && (
           <div className="text-xs text-teal-600 bg-teal-50 border border-teal-200 rounded-xl px-3 py-2">
             🤝 Ini misi bersama — poin akan dibagi ke semua peserta saat disetujui.
+          </div>
+        )}
+
+        {/* "Bonus dilakukan bersama" — simpler alternative to co-op: task stays
+            individual (one copy per kid via broadcast), but the kid answers a
+            yes/no question on completion and gets an extra bonus if yes. Can
+            be toggled anytime (create or edit), unlike co-op. */}
+        {!isCoop && (
+          <div>
+            <button
+              type="button"
+              onClick={() => setTogetherBonusEnabled(!togetherBonusEnabled)}
+              className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
+                togetherBonusEnabled ? "border-pink-400 bg-pink-50" : "border-slate-200 hover:bg-slate-50"
+              }`}
+            >
+              <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+                togetherBonusEnabled ? "bg-pink-500 border-pink-500" : "border-slate-300"
+              }`}>
+                {togetherBonusEnabled && <span className="text-white text-xs">✓</span>}
+              </div>
+              <div className="flex-1 text-left">
+                <div className="font-semibold text-slate-800 text-sm">🎁 Bonus Jika Dilakukan Bersama</div>
+                <div className="text-xs text-slate-500">
+                  Tugas tetap individu (mis. Sholat Subuh) — tapi kalau dilakukan bareng saudara, anak dapat poin bonus ekstra. Anak akan ditanya "dilakukan bersama?" saat menandai selesai.
+                </div>
+              </div>
+            </button>
+            {togetherBonusEnabled && (
+              <div className="mt-2 pl-8">
+                <label className={labelClass}>Poin bonus jika bersama</label>
+                <input
+                  type="number" min="1" max="1000" value={togetherBonusPoints}
+                  onChange={(e) => setTogetherBonusPoints(e.target.value.replace(/\D/g, ""))}
+                  className={`${inputClass} max-w-[140px]`}
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -1873,18 +1928,30 @@ function ApplyConsequenceModal({ open, onClose, consequences, kids, preselect, s
 }
 
 function TemplateModal({ open, onClose, kids, onSaved }) {
+  const [templates, setTemplates] = useState([]);
+  const [loadingTemplates, setLoadingTemplates] = useState(true);
   const [selectedTemplate, setSelectedTemplate] = useState(null);
   const [selectedKidIds, setSelectedKidIds] = useState([]); // [] = semua anak
   const [dateKey, setDateKey] = useState(todayKey());
   const [saving, setSaving] = useState(false);
+  const [showManager, setShowManager] = useState(false);
+
+  const loadTemplates = useCallback(() => {
+    setLoadingTemplates(true);
+    api.get("/routine-templates")
+      .then(({ data }) => setTemplates(data))
+      .catch((e) => toast.error(formatApiError(e)))
+      .finally(() => setLoadingTemplates(false));
+  }, []);
 
   useEffect(() => {
     if (open) {
       setSelectedTemplate(null);
       setSelectedKidIds([]);
       setDateKey(todayKey());
+      loadTemplates();
     }
-  }, [open]);
+  }, [open, loadTemplates]);
 
   const toggleKid = (id) => {
     setSelectedKidIds((prev) =>
@@ -1936,29 +2003,45 @@ function TemplateModal({ open, onClose, kids, onSaved }) {
   return (
     <Modal open={open} onClose={onClose} title="Buat dari Template Rutinitas">
       <div className="space-y-4">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {ROUTINE_TEMPLATES.map((tpl) => {
-            const active = selectedTemplate?.key === tpl.key;
-            return (
-              <button
-                key={tpl.key}
-                type="button"
-                onClick={() => setSelectedTemplate(tpl)}
-                className={`text-left rounded-2xl border-2 p-3 transition-colors ${
-                  active ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-                }`}
-              >
-                <div className="font-semibold text-slate-900 text-sm">
-                  {tpl.emoji} {tpl.label}
-                </div>
-                <div className="text-xs text-slate-500 mt-0.5">{tpl.desc}</div>
-                <div className="text-xs text-indigo-500 font-semibold mt-1">
-                  {tpl.tasks.length} misi · {tpl.tasks.reduce((s, t) => s + t.points, 0)} poin total
-                </div>
-              </button>
-            );
-          })}
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={() => setShowManager(true)}
+            className="press-btn inline-flex items-center gap-1 text-xs font-bold text-indigo-500 bg-indigo-50 hover:bg-indigo-100 px-2.5 py-1.5 rounded-full"
+          >
+            <Settings className="w-3.5 h-3.5" /> Kelola Template
+          </button>
         </div>
+
+        {loadingTemplates ? (
+          <div className="text-center text-slate-400 text-sm py-6">Memuat template…</div>
+        ) : templates.length === 0 ? (
+          <div className="text-center text-slate-400 text-sm py-6">Belum ada template. Klik "Kelola Template" untuk buat satu.</div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {templates.map((tpl) => {
+              const active = selectedTemplate?.id === tpl.id;
+              return (
+                <button
+                  key={tpl.id}
+                  type="button"
+                  onClick={() => setSelectedTemplate(tpl)}
+                  className={`text-left rounded-2xl border-2 p-3 transition-colors ${
+                    active ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
+                  }`}
+                >
+                  <div className="font-semibold text-slate-900 text-sm">
+                    {tpl.emoji} {tpl.label}
+                  </div>
+                  <div className="text-xs text-slate-500 mt-0.5">{tpl.desc}</div>
+                  <div className="text-xs text-indigo-500 font-semibold mt-1">
+                    {tpl.tasks.length} misi · {tpl.tasks.reduce((s, t) => s + t.points, 0)} poin total
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {selectedTemplate && (
           <div className="bg-slate-50 rounded-xl p-3 border border-slate-100">
@@ -2034,6 +2117,14 @@ function TemplateModal({ open, onClose, kids, onSaved }) {
           </button>
         </div>
       </div>
+
+      {showManager && (
+        <TemplateManagerModal
+          templates={templates}
+          onClose={() => setShowManager(false)}
+          onChanged={loadTemplates}
+        />
+      )}
     </Modal>
   );
 }

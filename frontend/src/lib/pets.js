@@ -22,17 +22,21 @@ export function getPetDef(petType) {
   return PET_CATALOG.find((p) => p.key === petType) || PET_CATALOG[0];
 }
 
-/** Growth stage index (0-3) from the kid's point-system level (1-10). */
-export function stageIndexForLevel(level) {
+/** Growth stage index (0-3) from the kid's level, scaled proportionally to
+ * however many levels the family's (customizable) ladder actually has —
+ * doesn't assume exactly 10 like the original hardcoded version did. */
+export function stageIndexForLevel(level, totalLevels = 10) {
   if (level <= 1) return 0;
-  if (level <= 3) return 1;
-  if (level <= 6) return 2;
+  if (totalLevels <= 1) return 3; // a single-tier ladder has nowhere to "grow" toward — show fully grown
+  const ratio = (level - 1) / Math.max(1, totalLevels - 1);
+  if (ratio < 0.25) return 1;
+  if (ratio < 0.6) return 2;
   return 3;
 }
 
-export function petAppearance(petType, level) {
+export function petAppearance(petType, level, totalLevels = 10) {
   const def = getPetDef(petType);
-  const idx = stageIndexForLevel(level);
+  const idx = stageIndexForLevel(level, totalLevels);
   return {
     emoji: def.stages[idx],
     stageName: STAGE_NAMES[idx],

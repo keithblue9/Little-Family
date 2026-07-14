@@ -19,7 +19,7 @@ from typing import List, Optional, Literal
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status, Query
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 
 # --------------- Setup ---------------
@@ -165,6 +165,12 @@ class ChildThemeInput(BaseModel):
     theme: Literal["clean", "candy", "mermaid", "cyber", "galaxy"]
 
 
+class LevelTierInput(BaseModel):
+    title: str = Field(min_length=1, max_length=40)
+    emoji: str = Field(default="⭐", max_length=10)
+    min_xp: int = Field(ge=0, le=1000000)
+
+
 class AppConfigInput(BaseModel):
     app_name: Optional[str] = None
     default_theme: Optional[Literal["clean", "candy", "mermaid", "cyber", "galaxy"]] = None
@@ -192,6 +198,26 @@ class AppConfigInput(BaseModel):
     # Parents who prefer instant pings can flip this back on.
     instant_task_notifications: Optional[bool] = None
     language: Optional[Literal["id", "en"]] = None
+    # Parent-editable level ladder (title/emoji/XP threshold per level),
+    # ordered lowest-to-highest — the kid's level system reads this instead of
+    # a fixed hardcoded list. Position in the list IS the level number
+    # (index 0 = level 1), so there's no separate "level number" field to
+    # keep in sync.
+    level_titles: Optional[List[LevelTierInput]] = None
+
+    @field_validator("level_titles")
+    @classmethod
+    def _validate_level_ladder(cls, v):
+        if v is None:
+            return v
+        if not (1 <= len(v) <= 20):
+            raise ValueError("Jumlah level harus antara 1 dan 20")
+        if v[0].min_xp != 0:
+            raise ValueError("Level pertama harus mulai dari 0 XP")
+        for i in range(1, len(v)):
+            if v[i].min_xp <= v[i - 1].min_xp:
+                raise ValueError("XP tiap level harus lebih besar dari level sebelumnya")
+        return v
 
 
 class ReminderInput(BaseModel):
@@ -268,6 +294,69 @@ class ChildUpdate(BaseModel):
     _check_pet_equipped = field_validator("pet_equipped")(classmethod(lambda cls, v: _validate_pet_accessories(v)))
 
 
+class RoutineTemplateTaskInput(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    points: int = Field(ge=0, le=1000, default=10)
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    due_time: Optional[str] = None
+    task_style: Optional[TASK_STYLE] = None
+
+
+class RoutineTemplateInput(BaseModel):
+    label: str = Field(min_length=1, max_length=60)
+    emoji: str = Field(default="📋", max_length=10)
+    desc: str = Field(default="", max_length=150)
+    tasks: List[RoutineTemplateTaskInput] = Field(min_length=1, max_length=15)
+
+
+# The 5 templates that used to be hardcoded on the frontend — now just the
+# seed data for a family's first-ever GET, after which they're fully
+# editable/deletable rows like anything else the parent creates.
+_DEFAULT_ROUTINE_TEMPLATES = [
+    {
+        "label": "Rutinitas Pagi", "emoji": "🌅", "desc": "Bangun sampai siap beraktivitas",
+        "tasks": [
+            {"title": "Bangun pagi & rapikan tempat tidur", "points": 10, "duration_minutes": 10, "due_time": "06:00", "task_style": "routine"},
+            {"title": "Sikat gigi & cuci muka", "points": 5, "duration_minutes": 5, "due_time": "06:15", "task_style": "routine"},
+            {"title": "Mandi pagi", "points": 10, "duration_minutes": 15, "due_time": "06:45", "task_style": "routine"},
+            {"title": "Sarapan", "points": 5, "duration_minutes": 20, "due_time": "07:15", "task_style": "routine"},
+        ],
+    },
+    {
+        "label": "Rutinitas Sore", "emoji": "🌇", "desc": "Pulang aktivitas sampai makan malam",
+        "tasks": [
+            {"title": "Rapikan tas & seragam", "points": 5, "duration_minutes": 10, "due_time": "16:00", "task_style": "routine"},
+            {"title": "Mandi sore", "points": 10, "duration_minutes": 15, "due_time": "17:00", "task_style": "routine"},
+            {"title": "Bantu siapkan makan malam", "points": 10, "duration_minutes": 20, "due_time": "18:30", "task_style": "helper"},
+        ],
+    },
+    {
+        "label": "Rutinitas Malam", "emoji": "🌙", "desc": "Beres-beres sampai tidur",
+        "tasks": [
+            {"title": "Rapikan mainan & meja belajar", "points": 10, "duration_minutes": 15, "due_time": "19:30", "task_style": "routine"},
+            {"title": "Siapkan perlengkapan besok", "points": 5, "duration_minutes": 10, "due_time": "20:00", "task_style": "routine"},
+            {"title": "Sikat gigi sebelum tidur", "points": 5, "duration_minutes": 5, "due_time": "20:30", "task_style": "routine"},
+        ],
+    },
+    {
+        "label": "Waktu Belajar", "emoji": "📚", "desc": "PR, membaca, dan mengaji",
+        "tasks": [
+            {"title": "Kerjakan PR / tugas sekolah", "points": 15, "duration_minutes": 45, "task_style": "learning"},
+            {"title": "Membaca buku 15 menit", "points": 10, "duration_minutes": 15, "task_style": "learning"},
+            {"title": "Mengaji / hafalan", "points": 15, "duration_minutes": 20, "task_style": "learning"},
+        ],
+    },
+    {
+        "label": "Beres-Beres Rumah", "emoji": "🧹", "desc": "Bantu kebersihan rumah bersama",
+        "tasks": [
+            {"title": "Sapu kamar sendiri", "points": 10, "duration_minutes": 15, "task_style": "helper"},
+            {"title": "Bantu cuci piring", "points": 10, "duration_minutes": 15, "task_style": "helper"},
+            {"title": "Buang sampah", "points": 5, "duration_minutes": 5, "task_style": "helper"},
+        ],
+    },
+]
+
+
 class TaskInput(BaseModel):
     # Assignment: pick 1 kid, several kids, or leave empty = broadcast to ALL kids.
     # `child_id` is kept for backward compatibility (equivalent to target_children=[child_id]).
@@ -290,6 +379,25 @@ class TaskInput(BaseModel):
     photo_required: bool = False  # kid must attach a photo to mark this complete
     coop: bool = False  # true = a single shared task worked on together by target_children,
                          # not one copy per kid; points split evenly among participants on approval
+    # "Bonus jika bersama": a SIMPLER alternative to full co-op — the task
+    # stays an ordinary individual task (one copy per kid via broadcast), but
+    # when completing it the kid self-reports whether they did it together
+    # with a sibling; if yes, they earn this extra bonus on top of the normal
+    # points. No second task needed for things like "Sholat Subuh Berjamaah".
+    together_bonus_enabled: bool = False
+    together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def _validate_bonus_and_coop_exclusivity(self):
+        # field_validator alone doesn't reliably fire when a field is left at
+        # its default (Pydantic v2 skips validators on unset/default values
+        # unless validate_default=True is set per-field) — a model-level
+        # check after all fields resolve is the robust way to enforce this.
+        if self.together_bonus_enabled and not self.together_bonus_points:
+            raise ValueError("Tentukan poin bonus jika opsi 'dilakukan bersama' diaktifkan")
+        if self.together_bonus_enabled and self.coop:
+            raise ValueError("Pilih salah satu: Misi Bersama (Co-op) atau Bonus Dilakukan Bersama, tidak keduanya")
+        return self
 
 
 class TaskUpdate(BaseModel):
@@ -308,6 +416,8 @@ class TaskUpdate(BaseModel):
     order: Optional[int] = Field(default=None, ge=1)
     task_style: Optional[TASK_STYLE] = None
     photo_required: Optional[bool] = None
+    together_bonus_enabled: Optional[bool] = None
+    together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
 
 
 class RedeemMoneyInput(BaseModel):
@@ -1324,6 +1434,9 @@ async def _build_task_doc(
         "is_coop": False,
         "coop_participants": [],
         "coop_completed_by": None,
+        "together_bonus_enabled": payload.together_bonus_enabled,
+        "together_bonus_points": payload.together_bonus_points,
+        "done_together": None,  # kid's self-reported answer once they complete the task
         "timer_started_at": None,
         "timer_completed_at": None,
         "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
@@ -1767,6 +1880,7 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
 
 class TaskCompleteInput(BaseModel):
     photo_url: Optional[str] = None
+    done_together: Optional[bool] = None  # answers the "was this done together?" prompt, when applicable
 
 
 class TaskApproveInput(BaseModel):
@@ -1824,12 +1938,16 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
     if task.get("photo_required") and not payload.photo_url:
         raise HTTPException(status_code=422, detail="Misi ini butuh foto sebagai bukti sebelum selesai")
 
+    if task.get("together_bonus_enabled") and payload.done_together is None:
+        raise HTTPException(status_code=422, detail="Jawab dulu: apakah misi ini dilakukan bersama?")
+
     await db.tasks.update_one(
         {"id": task_id},
         {"$set": {
             "status": "completed", "completed_at": now_iso(), "timer_completed_at": now_iso(),
             "completion_photo_url": payload.photo_url,
             "coop_completed_by": user["id"] if task.get("is_coop") else task.get("coop_completed_by"),
+            "done_together": payload.done_together if task.get("together_bonus_enabled") else None,
         }},
     )
     await log_activity(FAMILY_ID, task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
@@ -2022,6 +2140,8 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
         "timer_started_at": None,
         "timer_completed_at": None,
         "coop_completed_by": None,
+        "completion_photo_url": None,  # was previously carried over from the just-approved instance — a fresh day shouldn't start with yesterday's photo already attached
+        "done_together": None,  # same bug: a fresh day's "was this done together?" answer must start unset, not inherit yesterday's
         "created_at": now_iso(),
     }
     await db.tasks.insert_one(new_task)
@@ -2087,7 +2207,10 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
-    points = task["points"]
+    together_bonus_awarded = 0
+    if task.get("together_bonus_enabled") and task.get("done_together") is True:
+        together_bonus_awarded = task.get("together_bonus_points") or 0
+    points = task["points"] + together_bonus_awarded
     snap = await _apply_approval_rewards(task["child_id"], points, config)
     spawned_next_id = await _spawn_recurrence_if_due(task, config)
 
@@ -2326,6 +2449,23 @@ async def get_child_theme(child_id: str, user: dict = Depends(get_current_user))
 
 
 # --------------- App Config (Stage 2) ---------------
+# Default level ladder — mirrors what was previously hardcoded on the
+# frontend (frontend/src/lib/levels.js), now just the starting point for a
+# family's own editable config.
+_DEFAULT_LEVEL_TITLES = [
+    {"title": "Pemula", "emoji": "🌱", "min_xp": 0},
+    {"title": "Petualang", "emoji": "🧭", "min_xp": 50},
+    {"title": "Ksatria Muda", "emoji": "🗡️", "min_xp": 150},
+    {"title": "Ksatria Madya", "emoji": "⚔️", "min_xp": 350},
+    {"title": "Ksatria Utama", "emoji": "🛡️", "min_xp": 700},
+    {"title": "Pahlawan", "emoji": "🦸", "min_xp": 1200},
+    {"title": "Pahlawan Legendaris", "emoji": "👑", "min_xp": 2000},
+    {"title": "Juara Sejati", "emoji": "🏅", "min_xp": 3500},
+    {"title": "Master Misi", "emoji": "🌟", "min_xp": 6000},
+    {"title": "Legenda Keluarga", "emoji": "💫", "min_xp": 10000},
+]
+
+
 @api.post("/config")
 async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_parent)):
     config_doc = await db.app_config.find_one({"parent_id": FAMILY_ID})
@@ -2365,6 +2505,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "vacation_note": "",
             "instant_task_notifications": False,
             "language": "id",
+            "level_titles": _DEFAULT_LEVEL_TITLES,
         }
         incoming = {k: v for k, v in payload.model_dump().items() if v is not None}
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
@@ -2394,6 +2535,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "vacation_note": "",
             "instant_task_notifications": False,
             "language": "id",
+            "level_titles": _DEFAULT_LEVEL_TITLES,
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
@@ -2412,6 +2554,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "vacation_note": config.get("vacation_note", ""),
         "instant_task_notifications": bool(config.get("instant_task_notifications", False)),
         "language": config.get("language", "id"),
+        "level_titles": config.get("level_titles") or _DEFAULT_LEVEL_TITLES,
     }
 
 
@@ -2475,6 +2618,58 @@ async def toggle_reminder(reminder_id: str, user: dict = Depends(require_parent)
     new_state = not reminder.get("enabled", True)
     await db.reminders.update_one({"id": reminder_id}, {"$set": {"enabled": new_state}})
     return {"success": True, "enabled": new_state}
+
+
+# --------------- Routine Templates (parent-editable) ---------------
+@api.get("/routine-templates")
+async def list_routine_templates(user: dict = Depends(get_current_user)):
+    """The 5 starter templates are seeded into this family's own editable
+    collection on first access — after that, they're just rows the parent
+    can rename, retask, or delete like anything else they create."""
+    existing_count = await db.routine_templates.count_documents({"parent_id": FAMILY_ID})
+    if existing_count == 0:
+        for tpl in _DEFAULT_ROUTINE_TEMPLATES:
+            await db.routine_templates.insert_one({
+                "id": new_id(), "parent_id": FAMILY_ID,
+                "label": tpl["label"], "emoji": tpl["emoji"], "desc": tpl["desc"],
+                "tasks": tpl["tasks"], "created_at": now_iso(),
+            })
+    templates = await db.routine_templates.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", 1).to_list(100)
+    return templates
+
+
+@api.post("/routine-templates")
+async def create_routine_template(payload: RoutineTemplateInput, user: dict = Depends(require_parent)):
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID,
+        "label": payload.label, "emoji": payload.emoji, "desc": payload.desc,
+        "tasks": [t.model_dump() for t in payload.tasks],
+        "created_at": now_iso(),
+    }
+    await db.routine_templates.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.patch("/routine-templates/{template_id}")
+async def update_routine_template(template_id: str, payload: RoutineTemplateInput, user: dict = Depends(require_parent)):
+    existing = await db.routine_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Template not found")
+    await db.routine_templates.update_one(
+        {"id": template_id},
+        {"$set": {
+            "label": payload.label, "emoji": payload.emoji, "desc": payload.desc,
+            "tasks": [t.model_dump() for t in payload.tasks],
+        }},
+    )
+    return await db.routine_templates.find_one({"id": template_id}, {"_id": 0})
+
+
+@api.delete("/routine-templates/{template_id}")
+async def delete_routine_template(template_id: str, user: dict = Depends(require_parent)):
+    await db.routine_templates.delete_one({"id": template_id, "parent_id": FAMILY_ID})  # idempotent
+    return {"success": True}
 
 
 # --------------- Rewards ---------------

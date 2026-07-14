@@ -141,8 +141,9 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
   const photoInputRef = useRef(null);
   const [pendingPhotoTask, setPendingPhotoTask] = useState(null);
+  const [pendingTogetherTask, setPendingTogetherTask] = useState(null);
 
-  const finishTask = async (task, photoUrl) => {
+  const finishTask = async (task, photoUrl, doneTogether) => {
     if (task.photo_required && !photoUrl) {
       // Need a photo first — open the camera/file picker, then re-invoke this
       // same function with the captured image once it's read.
@@ -150,12 +151,25 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       photoInputRef.current?.click();
       return;
     }
+    if (task.together_bonus_enabled && doneTogether === undefined) {
+      // Ask "was this done together?" before completing — re-invoked with the
+      // answer once the kid picks Ya/Tidak.
+      setPendingTogetherTask(task);
+      return;
+    }
     setBusyId(task.id);
     try {
-      await api.post(`/tasks/${task.id}/complete`, photoUrl ? { photo_url: photoUrl } : {});
+      const body = {};
+      if (photoUrl) body.photo_url = photoUrl;
+      if (task.together_bonus_enabled) body.done_together = !!doneTogether;
+      await api.post(`/tasks/${task.id}/complete`, body);
       playSoundTheme(child?.sound_theme || "ding");
       onCelebrate?.();
-      toast.success("Misi selesai! Menunggu dicek Abi/Ummi ⭐");
+      toast.success(
+        task.together_bonus_enabled && doneTogether
+          ? `Misi selesai! +${task.together_bonus_points} poin bonus menunggu disetujui 🎉`
+          : "Misi selesai! Menunggu dicek Abi/Ummi ⭐"
+      );
       await load();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -201,6 +215,37 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         onChange={handlePhotoSelected}
         className="hidden"
       />
+
+      {pendingTogetherTask && (
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setPendingTogetherTask(null)}>
+          <motion.div
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-3xl p-6 max-w-xs w-full text-center chunky-shadow-lg"
+          >
+            <div className="text-4xl mb-2">🤝</div>
+            <div className="font-fun font-bold text-lg text-slate-900 mb-1">Dilakukan Bersama?</div>
+            <div className="text-sm text-slate-500 mb-5">
+              Apakah "{pendingTogetherTask.title}" tadi dilakukan bareng saudara? Kalau iya, dapat bonus +{pendingTogetherTask.together_bonus_points} poin!
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => { const t = pendingTogetherTask; setPendingTogetherTask(null); finishTask(t, undefined, false); }}
+                className="press-btn flex-1 py-2.5 rounded-xl font-fun font-bold bg-slate-100 hover:bg-slate-200 text-slate-600"
+              >
+                Tidak
+              </button>
+              <button
+                onClick={() => { const t = pendingTogetherTask; setPendingTogetherTask(null); finishTask(t, undefined, true); }}
+                className="press-btn flex-1 py-2.5 rounded-xl font-fun font-bold bg-pink-500 hover:bg-pink-600 text-white"
+              >
+                Iya! 🎉
+              </button>
+            </div>
+          </motion.div>
+        </div>
+      )}
       {/* Selected date header + quick jump to today */}
       <div className="flex items-center justify-between bg-white rounded-2xl px-4 py-3 border-2 border-slate-100 chunky-shadow">
         <div>
@@ -449,6 +494,8 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
           {task.due_time && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700">🕒 {task.due_time}</span>}
           {task.duration_minutes && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-700">⏱️ {task.duration_minutes}m</span>}
           {task.photo_required && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-fuchsia-100 text-fuchsia-700">📷 butuh foto</span>}
+          {task.together_bonus_enabled && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-pink-100 text-pink-700">🎁 bonus jika bersama</span>}
+          {task.together_bonus_enabled && isDone && task.done_together === true && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-pink-500 text-white">🤝 Bersama! +{task.together_bonus_points}</span>}
         </div>
         {started && !isDone && <LiveTimer startedAt={task.timer_started_at} durationMinutes={task.duration_minutes} />}
         {isActive && !isDone && !started && gateReason === "early" && (

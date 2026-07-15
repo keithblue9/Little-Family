@@ -108,6 +108,12 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const timeGate = (task) => {
     if (!isToday) return { allowed: false, reason: isFuture ? "future" : "past" };
     if (!task.due_time) return { allowed: true, reason: null };
+    // Once the timer is running, the due_time window's job is done — it only
+    // exists to gate WHEN a task can be started. Continuing to enforce it
+    // after Start would strand a kid who began right on time but finishes a
+    // minute past due_time with no way to mark it complete. Running-out-of-
+    // time-after-starting is what the separate duration/overdue check is for.
+    if (task.timer_started_at) return { allowed: true, reason: null };
     const [dh, dm] = task.due_time.split(":").map(Number);
     const [nh, nm] = nowHHMM.split(":").map(Number);
     const dueMin = dh * 60 + dm;
@@ -127,6 +133,31 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     const startMs = new Date(task.timer_started_at).getTime();
     const elapsedMin = (nowMs - startMs) / 60000;
     return elapsedMin > task.duration_minutes;
+  };
+
+  // Mirrors the backend's _task_is_time_stuck check — only show the "Bebaskan
+  // dengan Kartu Bebas" option when a required task is genuinely blocked by
+  // time (duration ran out, or the due_time window closed before it was ever
+  // started), not just because a kid hasn't gotten around to it yet.
+  const isTimeStuck = (task) => {
+    if (isDurationExceeded(task)) return true;
+    if (task.due_time && !task.timer_started_at) {
+      const [dh, dm] = task.due_time.split(":").map(Number);
+      const [nh, nm] = nowHHMM.split(":").map(Number);
+      return nh * 60 + nm > dh * 60 + dm;
+    }
+    return false;
+  };
+
+  const freeWithCard = async (task) => {
+    setBusyId(task.id);
+    try {
+      const { data } = await api.post(`/tasks/${task.id}/free-with-card`);
+      toast.success(`Misi dibebaskan dengan Kartu Bebas! Sisa: ${data.freeze_cards_available} kartu minggu ini.`);
+      await load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally { setBusyId(null); }
   };
 
   const startTimer = async (task) => {
@@ -363,13 +394,16 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
                     const gate = timeGate(t);
                     const overdue = isDurationExceeded(t);
+                    const timeStuck = isActive && !isDone && isTimeStuck(t);
                     return (
                       <QuestNode key={t.id} task={t} idx={idx} total={required.length}
                         isActive={isActive} isDone={isDone} theme={theme}
-                        busy={busyId === t.id} gate={gate} overdue={overdue}
+                        busy={busyId === t.id} gate={gate} overdue={overdue} timeStuck={timeStuck}
                         canStart={isActive && !t.timer_started_at && gate.allowed}
                         canFinish={isActive && !!t.timer_started_at && gate.allowed && !overdue}
                         onStart={() => startTimer(t)} onFinish={() => finishTask(t)} onSkip={() => skipTask(t)}
+                        onFreeWithCard={() => freeWithCard(t)}
+                        freezeCardsAvailable={child?.freeze_cards_available ?? 0}
                       />
                     );
                   })}
@@ -435,7 +469,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 }
 
 /* ======================== QUEST NODE (treasure map stop) ======================== */
-function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, canStart, canFinish, onStart, onFinish, onSkip, onMoveUp, onMoveDown, isBonus }) {
+function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, timeStuck, canStart, canFinish, onStart, onFinish, onSkip, onMoveUp, onMoveDown, onFreeWithCard, freezeCardsAvailable, isBonus }) {
   const c = theme.colors;
   const bg = isDone ? c.nodeDone : isActive ? c.node : c.nodeLocked;
   const started = !!task.timer_started_at;
@@ -537,6 +571,16 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
           {overdue && !!task.timer_started_at && (
             <button disabled className="press-btn bg-slate-200 text-slate-400 font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 cursor-not-allowed" title="Waktu sudah habis — lewati misi ini untuk lanjut">
               <Square className="w-3.5 h-3.5" strokeWidth={2.5} /> Waktu Habis
+            </button>
+          )}
+          {timeStuck && onFreeWithCard && (
+            <button
+              onClick={onFreeWithCard}
+              disabled={busy || freezeCardsAvailable < 1}
+              title={freezeCardsAvailable < 1 ? "Kartu Bebas minggu ini sudah habis" : "Bebaskan misi ini tanpa poin, pakai 1 Kartu Bebas"}
+              className="press-btn bg-sky-100 hover:bg-sky-200 text-sky-700 font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              🧊 Pakai Kartu Bebas {freezeCardsAvailable > 0 ? `(${freezeCardsAvailable})` : ""}
             </button>
           )}
           {onSkip && (canStart || canFinish || overdue) && (

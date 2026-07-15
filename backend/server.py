@@ -1290,7 +1290,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "best_streak_days": 0,
         "last_completion_date": None,
         "tasks_completed": 0,
-        "freeze_cards_available": 1,
+        "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
         "freeze_card_week": None,
         "pet_type": None,  # kid picks on first visit to the pet feature
         "feed_balance": 0,
@@ -1366,6 +1366,7 @@ async def list_tasks(
         "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
         "_undo_used_freeze_card": 0, "_undo_prev_freeze_available": 0, "_undo_prev_freeze_week": 0,
         "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0, "_undo_feed_earned": 0, "_undo_miss_penalty": 0,
+        "_undo_free_prev_available": 0, "_undo_free_prev_week": 0,
     }
     tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(2000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
@@ -1437,6 +1438,7 @@ async def _build_task_doc(
         "together_bonus_enabled": payload.together_bonus_enabled,
         "together_bonus_points": payload.together_bonus_points,
         "done_together": None,  # kid's self-reported answer once they complete the task
+        "freed_with_card": False,  # true if unblocked via Kartu Bebas instead of actually finishing
         "timer_started_at": None,
         "timer_completed_at": None,
         "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
@@ -1794,6 +1796,9 @@ def _now_local():
     return datetime.now(timezone.utc) + timedelta(hours=7)
 
 
+FREEZE_CARDS_PER_WEEK = 3  # "Kartu Bebas" weekly allotment — resets every Monday (ISO week), never accumulates unused cards
+
+
 def _current_week_key() -> str:
     """ISO year-week identifier (e.g. '2026-W29') for the freeze-card weekly refill."""
     iso = _now_local().isocalendar()
@@ -1808,8 +1813,8 @@ def _refill_freeze_card_if_new_week(child: dict) -> int:
     current_week = _current_week_key()
     stored_week = child.get("freeze_card_week")
     if stored_week != current_week:
-        return 1  # new week — the one weekly card is fresh regardless of prior balance
-    return int(child.get("freeze_cards_available", 1))
+        return FREEZE_CARDS_PER_WEEK  # new week — fresh allotment, never carries over unused cards
+    return int(child.get("freeze_cards_available", FREEZE_CARDS_PER_WEEK))
 
 
 def _check_time_window(task):
@@ -1964,6 +1969,36 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
+def _task_is_time_stuck(task: dict) -> bool:
+    """True when a REQUIRED task is blocked purely by time running out — either
+    (a) the kid started it but the duration elapsed before they could finish,
+    or (b) they never started it and the due_time window has already closed.
+    This is exactly the situation 'Kartu Bebas' (Freeze Card) exists to rescue
+    — as opposed to a kid simply not wanting to do a task that's still well
+    within its window, which is what the points-cost Skip is for."""
+    started = task.get("timer_started_at")
+    duration = task.get("duration_minutes")
+    if started and duration:
+        try:
+            start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            now_utc = datetime.now(timezone.utc) if start_dt.tzinfo else datetime.utcnow()
+            elapsed_min = (now_utc - start_dt).total_seconds() / 60
+            if elapsed_min > duration:
+                return True
+        except Exception:
+            pass
+    due_time = task.get("due_time")
+    if due_time and not started:
+        try:
+            now_local = _now_local()
+            dh, dm = map(int, due_time.split(":"))
+            if now_local.hour * 60 + now_local.minute > dh * 60 + dm:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 @api.post("/tasks/{task_id}/skip")
 async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     """Pay points to skip a blocking task and unlock the next one."""
@@ -1996,6 +2031,84 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     await log_activity(FAMILY_ID, child["id"], "task_skipped", {"task_id": task_id, "title": task["title"], "cost": cost})
     updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
     return {"task": updated, "points_spent": cost}
+
+
+@api.post("/tasks/{task_id}/free-with-card")
+async def free_task_with_card(task_id: str, user: dict = Depends(get_current_user)):
+    """'Kartu Bebas' as a stuck-task rescue: when a required task's Finish
+    button is disabled because time ran out (either mid-timer or the window
+    closed before it was ever started), this unblocks the sequence for free —
+    spending a weekly freeze card instead of the usual points-cost Skip. Only
+    usable when the task is genuinely time-stuck, not as a free shortcut
+    around a task the kid simply hasn't gotten to yet."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    _assert_child_owns_task(user, task)
+    if task["status"] not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail="Hanya misi yang masih aktif yang bisa dibebaskan")
+    if task.get("is_bonus"):
+        raise HTTPException(status_code=422, detail="Misi bonus tidak menghalangi urutan — tidak perlu kartu bebas")
+
+    nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
+    if nxt and nxt["id"] != task_id:
+        raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dibebaskan")
+
+    if not _task_is_time_stuck(task):
+        raise HTTPException(status_code=422, detail="Misi ini belum macet karena waktu — masih bisa dikerjakan atau dilewati dengan poin")
+
+    child = await db.children.find_one({"id": task["child_id"]})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    available = _refill_freeze_card_if_new_week(child)
+    if available < 1:
+        raise HTTPException(status_code=400, detail="Kartu Bebas minggu ini sudah habis")
+
+    current_week = _current_week_key()
+    prev_available = int(child.get("freeze_cards_available", FREEZE_CARDS_PER_WEEK))
+    prev_week = child.get("freeze_card_week")
+    await db.children.update_one(
+        {"id": child["id"]},
+        {"$set": {"freeze_cards_available": available - 1, "freeze_card_week": current_week}},
+    )
+    await db.tasks.update_one(
+        {"id": task_id},
+        {"$set": {
+            "status": "skipped", "completed_at": now_iso(), "freed_with_card": True,
+            "_undo_free_prev_available": prev_available, "_undo_free_prev_week": prev_week,
+        }},
+    )
+    await log_activity(FAMILY_ID, child["id"], "task_freed_with_card", {"task_id": task_id, "title": task["title"]})
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return {"task": updated, "freeze_cards_available": available - 1}
+
+
+@api.post("/tasks/{task_id}/undo-free-with-card")
+async def undo_free_task_with_card(task_id: str, user: dict = Depends(require_parent)):
+    """Reverses a mistaken 'bebaskan dengan kartu' tap — refunds the card and
+    returns the task to pending. Parent-only, matching the other undo actions."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if not task.get("freed_with_card"):
+        raise HTTPException(status_code=400, detail="Misi ini tidak dibebaskan dengan kartu bebas")
+
+    prev_available = task.get("_undo_free_prev_available", FREEZE_CARDS_PER_WEEK)
+    prev_week = task.get("_undo_free_prev_week")
+    await db.children.update_one(
+        {"id": task["child_id"]},
+        {"$set": {"freeze_cards_available": prev_available, "freeze_card_week": prev_week}},
+    )
+    await db.tasks.update_one(
+        {"id": task_id},
+        {
+            "$set": {"status": "pending", "completed_at": None, "freed_with_card": False},
+            "$unset": {"_undo_free_prev_available": "", "_undo_free_prev_week": ""},
+        },
+    )
+    await log_activity(FAMILY_ID, task["child_id"], "task_freed_with_card_undone", {"task_id": task_id})
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
 def _child_share_of_task(task: dict, child_id: str) -> int:
@@ -2142,6 +2255,7 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
         "coop_completed_by": None,
         "completion_photo_url": None,  # was previously carried over from the just-approved instance — a fresh day shouldn't start with yesterday's photo already attached
         "done_together": None,  # same bug: a fresh day's "was this done together?" answer must start unset, not inherit yesterday's
+        "freed_with_card": False,  # same reasoning — a fresh day hasn't been freed by anything yet
         "created_at": now_iso(),
     }
     await db.tasks.insert_one(new_task)
@@ -3451,7 +3565,7 @@ async def seed_default_family():
             "best_streak_days": 0,
             "last_completion_date": None,
             "tasks_completed": 0,
-            "freeze_cards_available": 1,
+            "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
             "freeze_card_week": None,
             "pet_type": None,
             "feed_balance": 0,
@@ -3572,7 +3686,17 @@ async def migrate_existing_data():
     #    than relying entirely on .get()-with-default everywhere.
     await db.children.update_many(
         {"freeze_cards_available": {"$exists": False}},
-        {"$set": {"freeze_cards_available": 1, "freeze_card_week": None}},
+        {"$set": {"freeze_cards_available": FREEZE_CARDS_PER_WEEK, "freeze_card_week": None}},
+    )
+    # Weekly allotment raised from 1 to 3 (Kartu Bebas). A family whose current
+    # week's counter is already stamped under the OLD system would otherwise
+    # only see the bump on their NEXT Monday refill (the refill logic already
+    # handles that path correctly on its own) — this just gives anyone
+    # mid-week under the old allotment the new one immediately instead of
+    # making them wait.
+    await db.children.update_many(
+        {"freeze_card_week": _current_week_key(), "freeze_cards_available": {"$lt": FREEZE_CARDS_PER_WEEK}},
+        {"$set": {"freeze_cards_available": FREEZE_CARDS_PER_WEEK}},
     )
     await db.children.update_many(
         {"pet_type": {"$exists": False}},

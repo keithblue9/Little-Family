@@ -581,6 +581,13 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       toast.success("Status terlewat dibatalkan, penalti dikembalikan");
     });
   };
+  const undoFreeWithCard = (t) => {
+    if (!window.confirm(`Batalkan pembebasan "${t.title}"? Kartu Bebas akan dikembalikan dan misi aktif lagi.`)) return;
+    act(async () => {
+      await api.post(`/tasks/${t.id}/undo-free-with-card`);
+      toast.success("Pembebasan dibatalkan, Kartu Bebas dikembalikan");
+    });
+  };
   const del = (t) => {
     const isGroup = t._groupTaskIds && t._groupTaskIds.length > 1;
     const msg = isGroup
@@ -771,12 +778,25 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
         <Section title="✅ Selesai" count={grouped.done.length}>
           {grouped.done.slice(0, 10).map((t) => (
             <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
-              <span className="text-sm text-slate-400">+{t.points} poin</span>
+              {t.freed_with_card ? (
+                <span className="text-xs font-semibold text-sky-600 bg-sky-50 px-2 py-1 rounded-full">🧊 Dibebaskan dgn Kartu</span>
+              ) : (
+                <span className="text-sm text-slate-400">+{t.points} poin</span>
+              )}
               {t.status === "approved" && (
                 <button
                   onClick={() => undoApproval(t)}
                   title="Batalkan persetujuan (dalam 30 menit)"
                   className="press-btn inline-flex items-center gap-1 bg-white border border-amber-200 text-amber-600 font-semibold px-2.5 py-1 rounded-lg text-xs"
+                >
+                  <Undo2 className="w-3.5 h-3.5" /> Batalkan
+                </button>
+              )}
+              {t.freed_with_card && (
+                <button
+                  onClick={() => undoFreeWithCard(t)}
+                  title="Batalkan pembebasan, kembalikan kartu, misi aktif lagi"
+                  className="press-btn inline-flex items-center gap-1 bg-white border border-sky-200 text-sky-600 font-semibold px-2.5 py-1 rounded-lg text-xs"
                 >
                   <Undo2 className="w-3.5 h-3.5" /> Batalkan
                 </button>

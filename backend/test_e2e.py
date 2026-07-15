@@ -783,7 +783,8 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     gap_date = (now_local - _dt.timedelta(days=3)).strftime("%Y-%m-%d")
     import asyncio as _asyncio2
-    _asyncio2.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"streak_days": 5, "last_completion_date": gap_date, "freeze_cards_available": 1, "freeze_card_week": None}}))
+    current_week_key = server._current_week_key()
+    _asyncio2.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"streak_days": 5, "last_completion_date": gap_date, "freeze_cards_available": 1, "freeze_card_week": current_week_key}}))
     r = c.post("/api/tasks", json={"title": "FreezeCardTest", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     fct = r.json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
@@ -805,6 +806,11 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("freeze: no card left resets streak to 1", ads_after_freeze2["streak_days"] == 1, str(ads_after_freeze2["streak_days"]))
     r = c.post(f"/api/tasks/{fct['id']}/undo-approval")
     check("freeze: undo of frozen approval succeeds", r.status_code == 200, r.text[:150])
+
+    # New weekly allotment is 3, not 1 — verify the actual default independently
+    _asyncio2.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {"freeze_cards_available": server.FREEZE_CARDS_PER_WEEK, "freeze_card_week": current_week_key}}))
+    syi_check = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("freeze: weekly allotment is 3 (per new request)", server.FREEZE_CARDS_PER_WEEK == 3)
 
     # ================= 45. GRANDPARENT VIEW-ONLY LINKS =================
     r = c.post("/api/view-links", json={"label": "Kakek & Nenek"})
@@ -1421,6 +1427,93 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
     r = c.post("/api/config", json={"level_titles": custom_levels})
     check("level: kid blocked from editing", r.status_code == 403, str(r.status_code))
+
+    # ================= 69. KARTU BEBAS: unstick a time-stuck required task =================
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"level_titles": server._DEFAULT_LEVEL_TITLES})  # restore defaults for any later sections
+    fc_order = [2000]
+    def _fc_next_order():
+        fc_order[0] += 1
+        return fc_order[0]
+
+    check("cards: weekly allotment is now 3", server.FREEZE_CARDS_PER_WEEK == 3)
+
+    # Clear the way: this giant shared test file may have left earlier pending
+    # required tasks for Adskhan/Syila from prior sections — skip through them
+    # first so THIS section's tasks are unambiguously "next in line".
+    c.post("/api/config", json={"skip_cost_points": 0})
+    for member, passcode in ((adskhan, "654321"), (syila, "123456")):
+        c.post("/api/auth/login", json={"member_id": member["id"], "passcode": passcode})
+        for _ in range(30):
+            prog = c.get(f"/api/children/{member['id']}/day-progress?date_key={today_local}").json()
+            open_required = [t for t in prog["tasks"] if not t.get("is_bonus") and t["status"] in ("pending", "rejected")]
+            if not open_required:
+                break
+            c.post(f"/api/tasks/{open_required[0]['id']}/skip")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"skip_cost_points": 20})
+
+    # Earlier sections (e.g. #44) deliberately exhaust Adskhan's freeze cards
+    # to test that scenario — reset to a known-clean full allotment before
+    # testing THIS feature, so we're not at the mercy of leftover state.
+    _asyncio3.run(server.db.children.update_one(
+        {"id": adskhan["id"]},
+        {"$set": {"freeze_cards_available": server.FREEZE_CARDS_PER_WEEK, "freeze_card_week": server._current_week_key()}},
+    ))
+
+    r = c.post("/api/tasks", json={"title": "FCNotStuck", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "order": _fc_next_order()})
+    fc_t1 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{fc_t1['id']}/free-with-card")
+    check("cards: not time-stuck yet -> rejected", r.status_code == 422, r.text[:150])
+    c.post(f"/api/tasks/{fc_t1['id']}/start")
+    c.post(f"/api/tasks/{fc_t1['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{fc_t1['id']}/approve")
+
+    r = c.post("/api/tasks", json={"title": "FCBonus", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True, "duration_minutes": 5})
+    fc_bonus = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{fc_bonus['id']}/start")
+    _asyncio3.run(server.db.tasks.update_one({"id": fc_bonus["id"]}, {"$set": {"timer_started_at": (utc_now - _dt2.timedelta(minutes=10)).isoformat()}}))
+    r = c.post(f"/api/tasks/{fc_bonus['id']}/free-with-card")
+    check("cards: bonus task rejected (doesn't block sequence)", r.status_code == 422, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "FCOverdue", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "duration_minutes": 5, "order": _fc_next_order()})
+    fc_overdue = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{fc_overdue['id']}/start")
+    _asyncio3.run(server.db.tasks.update_one({"id": fc_overdue["id"]}, {"$set": {"timer_started_at": (utc_now - _dt2.timedelta(minutes=10)).isoformat()}}))
+    ads_fc_before = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    r = c.post(f"/api/tasks/{fc_overdue['id']}/free-with-card")
+    check("cards: overdue task freed with card", r.status_code == 200, r.text[:150])
+    check("cards: marked skipped + freed_with_card flag", r.json()["task"]["status"] == "skipped" and r.json()["task"]["freed_with_card"] is True)
+    ads_fc_after = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("cards: card consumed, no points change", ads_fc_after["freeze_cards_available"] == ads_fc_before["freeze_cards_available"] - 1 and ads_fc_after["points"] == ads_fc_before["points"])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "FCNextInLine", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "order": _fc_next_order()})
+    fc_next = r.json()
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("cards: sequence advances to next task after freeing", any(t["id"] == fc_next["id"] and t["status"] == "pending" for t in r.json()["tasks"]))
+
+    r = c.post(f"/api/tasks/{fc_overdue['id']}/undo-free-with-card")
+    check("cards: undo succeeds and refunds", r.status_code == 200 and r.json()["status"] == "pending", r.text[:150])
+    ads_fc_undone = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("cards: undo restores card count exactly", ads_fc_undone["freeze_cards_available"] == ads_fc_before["freeze_cards_available"])
+    r = c.post(f"/api/tasks/{fc_overdue['id']}/undo-free-with-card")
+    check("cards: cannot undo twice", r.status_code == 400, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "FCSyiTask", "points": 5, "child_id": syila["id"], "date_key": today_local, "duration_minutes": 5, "order": _fc_next_order()})
+    fc_syi = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{fc_syi['id']}/start")
+    _asyncio3.run(server.db.tasks.update_one({"id": fc_syi["id"]}, {"$set": {"timer_started_at": (utc_now - _dt2.timedelta(minutes=10)).isoformat()}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{fc_syi['id']}/free-with-card")
+    check("cards: sibling blocked from freeing another's task", r.status_code == 403, str(r.status_code))
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

@@ -1117,6 +1117,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("pet: CAN switch after pet died", r.status_code == 200 and r.json()["pet_type"] == "dragon", r.text[:150])
     ads_after_revival = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     check("pet: new pet not dead right after picking", ads_after_revival["pet_is_dead"] is False)
+    check("pet: feed count reset to 0 on new pet", ads_after_revival.get("pet_feed_count") == 0, str(ads_after_revival.get("pet_feed_count")))
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.patch(f"/api/children/{syila['id']}", json={"pet_type": "panda"})
@@ -1131,6 +1132,17 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("pet-config: defaults present", r.json().get("feed_per_point") == 1 and r.json().get("feed_cost_per_meal") == 5 and r.json().get("pet_neglect_days") == 14, str(r.json().get("feed_per_point")))
     check("pet-config: default stage names", r.json().get("pet_stage_names") == ["Telur", "Bayi", "Remaja", "Dewasa"])
     check("pet-config: default thresholds", r.json().get("pet_stage_thresholds") == [0.25, 0.6])
+    check("pet-config: default feed thresholds", r.json().get("pet_stage_feed_thresholds") == [3, 8, 15], str(r.json().get("pet_stage_feed_thresholds")))
+    r = c.post("/api/config", json={"pet_stage_feed_thresholds": [2, 5, 9]})
+    check("pet-config: feed thresholds accepted", r.status_code == 200, r.text[:150])
+    r = c.get("/api/config")
+    check("pet-config: feed thresholds persisted", r.json()["pet_stage_feed_thresholds"] == [2, 5, 9])
+    r = c.post("/api/config", json={"pet_stage_feed_thresholds": [5, 3, 9]})
+    check("pet-config: non-ascending feed thresholds rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"pet_stage_feed_thresholds": [1, 2]})
+    check("pet-config: wrong feed-threshold count rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"pet_stage_feed_thresholds": [0, 2, 3]})
+    check("pet-config: feed threshold below 1 rejected", r.status_code == 422, str(r.status_code))
     r = c.post("/api/config", json={"feed_per_point": 2, "feed_cost_per_meal": 8, "pet_neglect_days": 30})
     check("pet-config: economy update accepted", r.status_code == 200, r.text[:150])
     r = c.get("/api/config")
@@ -1146,7 +1158,8 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("pet-config: non-ascending thresholds rejected", r.status_code == 422, str(r.status_code))
     # Reset back to defaults so later tests (feed 1:1 assumption) aren't affected
     r = c.post("/api/config", json={"feed_per_point": 1, "feed_cost_per_meal": 5, "pet_neglect_days": 14,
-                                     "pet_stage_names": ["Telur", "Bayi", "Remaja", "Dewasa"], "pet_stage_thresholds": [0.25, 0.6]})
+                                     "pet_stage_names": ["Telur", "Bayi", "Remaja", "Dewasa"], "pet_stage_thresholds": [0.25, 0.6],
+                                     "pet_stage_feed_thresholds": [3, 8, 15]})
     check("pet-config: reset to defaults for later tests", r.status_code == 200)
     # Kid blocked from changing config
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
@@ -1183,10 +1196,12 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post(f"/api/tasks/{ft2['id']}/approve")
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
     ads_bf = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    feed_count_before = ads_bf.get("pet_feed_count", 0)
     r = c.post(f"/api/children/{adskhan['id']}/feed-pet")
     check("feed-pet: succeeds with sufficient balance", r.status_code == 200, r.text[:150])
     check("feed-pet: cost of 5 deducted", r.json()["feed_balance"] == ads_bf["feed_balance"] - 5, str(r.json()))
     check("feed-pet: lifetime feed unaffected by feeding action", r.json()["feed_lifetime"] == ads_bf["feed_lifetime"])
+    check("feed-pet: feed count increments (drives growth)", r.json().get("pet_feed_count") == feed_count_before + 1, str(r.json().get("pet_feed_count")))
     for _ in range(15):
         r = c.post(f"/api/children/{adskhan['id']}/feed-pet")
         if r.status_code != 200:
@@ -1678,6 +1693,80 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post("/api/children/nonexistent/reset-pet")
     check("reset-pet: 404 for bad child", r.status_code == 404, str(r.status_code))
+
+    # =============== PET RESET REQUEST (kid asks, parent approves) ===============
+    # Ensure Adskhan starts fresh (parent reset), then picks a known pet to swap
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/children/{adskhan['id']}/reset-pet")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.patch("/api/me/profile", json={"pet_type": "cat"})
+    r = c.post("/api/me/request-pet-reset", json={"reason": "mau naga"})
+    check("pet-req: kid submits request", r.status_code == 200 and r.json()["status"] == "pending", r.text[:150])
+    req_id = r.json()["id"]
+    check("pet-req: captures current pet", r.json()["current_pet"] == "cat")
+    r = c.post("/api/me/request-pet-reset", json={"reason": "lagi"})
+    check("pet-req: only one pending request at a time", r.status_code == 400, r.text[:150])
+    # Kid sees their own request
+    r = c.get("/api/pet-reset-requests")
+    check("pet-req: kid sees own request", any(x["id"] == req_id for x in r.json()) and len(r.json()) >= 1)
+    # Parent sees it
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/pet-reset-requests")
+    pending = [x for x in r.json() if x["status"] == "pending"]
+    check("pet-req: parent sees pending request", any(x["id"] == req_id for x in pending))
+    # Approve → pet cleared
+    r = c.post(f"/api/pet-reset-requests/{req_id}/approve", json={"note": "boleh"})
+    check("pet-req: approve 200", r.status_code == 200 and r.json()["status"] == "approved", r.text[:150])
+    ads_after_req = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pet-req: approved request clears the pet", ads_after_req.get("pet_type") is None)
+    check("pet-req: feed count reset after approval", ads_after_req.get("pet_feed_count") == 0)
+    # Re-approve blocked
+    r = c.post(f"/api/pet-reset-requests/{req_id}/approve", json={"note": "x"})
+    check("pet-req: cannot re-approve processed request", r.status_code == 400, str(r.status_code))
+
+    # Kid without a pet can't request
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/me/request-pet-reset", json={"reason": "no pet"})
+    check("pet-req: kid with no pet cannot request", r.status_code == 400, r.text[:150])
+    # Give a pet, request, then parent REJECTS
+    c.patch("/api/me/profile", json={"pet_type": "fox"})
+    r = c.post("/api/me/request-pet-reset", json={"reason": "coba reject"})
+    reject_id = r.json()["id"]
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/pet-reset-requests/{reject_id}/reject", json={"note": "rawat dulu ya"})
+    check("pet-req: reject 200", r.status_code == 200 and r.json()["status"] == "rejected", r.text[:150])
+    ads_after_reject = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pet-req: rejected request keeps the pet", ads_after_reject.get("pet_type") == "fox")
+
+    # Kid can withdraw a pending request
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/me/request-pet-reset", json={"reason": "withdraw test"})
+    withdraw_id = r.json()["id"]
+    r = c.delete(f"/api/pet-reset-requests/{withdraw_id}")
+    check("pet-req: kid withdraws pending request", r.status_code == 200)
+    r = c.get("/api/pet-reset-requests")
+    check("pet-req: withdrawn request gone", not any(x["id"] == withdraw_id for x in r.json()))
+    # Picking a new pet after death auto-resolves a pending request
+    r = c.post("/api/me/request-pet-reset", json={"reason": "auto resolve"})
+    auto_id = r.json()["id"]
+    # kid can't switch while alive, so this pick is blocked — but a parent direct reset then a fresh pick resolves it
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/children/{adskhan['id']}/reset-pet")
+    r = c.get("/api/pet-reset-requests")
+    auto_req = next((x for x in r.json() if x["id"] == auto_id), None)
+    check("pet-req: direct parent reset resolves pending request", auto_req is not None and auto_req["status"] == "approved", str(auto_req))
+    # Kid role can't approve
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.patch("/api/me/profile", json={"pet_type": "panda"})
+    r = c.post("/api/me/request-pet-reset", json={"reason": "x"})
+    kid_req_id = r.json()["id"]
+    r = c.post(f"/api/pet-reset-requests/{kid_req_id}/approve", json={"note": "x"})
+    check("pet-req: kid blocked from approving", r.status_code == 403, str(r.status_code))
+    r = c.post("/api/pet-reset-requests/nonexistent/approve", json={"note": "x"})
+    check("pet-req: 404/403 for bad request id", r.status_code in (403, 404), str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/pet-reset-requests/nonexistent/approve", json={"note": "x"})
+    check("pet-req: parent 404 for bad request id", r.status_code == 404, str(r.status_code))
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

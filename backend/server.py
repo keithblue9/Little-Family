@@ -210,7 +210,11 @@ class AppConfigInput(BaseModel):
     feed_cost_per_meal: Optional[int] = Field(default=None, ge=1, le=1000)  # pakan spent per "Beri Makan" tap
     pet_neglect_days: Optional[int] = Field(default=None, ge=1, le=365)  # days un-fed before a pet "passes away"
     pet_stage_names: Optional[List[str]] = None  # exactly 4: egg/baby/teen/adult stage labels
-    pet_stage_thresholds: Optional[List[float]] = None  # exactly 2 ascending ratios in (0,1): baby->teen, teen->adult
+    pet_stage_thresholds: Optional[List[float]] = None  # (legacy, level-ratio based) kept for back-compat
+    # Growth is now driven by how many times the pet has been FED, not by the
+    # kid's level. Exactly 3 ascending positive ints: feeds needed to reach
+    # Bayi, Remaja, Dewasa respectively (stage 0 "Telur" is 0 feeds).
+    pet_stage_feed_thresholds: Optional[List[int]] = None
 
     @field_validator("pet_stage_names")
     @classmethod
@@ -223,6 +227,18 @@ class AppConfigInput(BaseModel):
         if any(not s for s in cleaned):
             raise ValueError("Setiap tahap pertumbuhan butuh nama")
         return cleaned
+
+    @field_validator("pet_stage_feed_thresholds")
+    @classmethod
+    def _validate_pet_feed_thresholds(cls, v):
+        if v is None:
+            return v
+        if len(v) != 3:
+            raise ValueError("Harus ada tepat 3 ambang batas pakan (Bayi, Remaja, Dewasa)")
+        f1, f2, f3 = v
+        if not (1 <= f1 < f2 < f3 <= 100000):
+            raise ValueError("Ambang pakan harus menaik: 1 ≤ Bayi < Remaja < Dewasa")
+        return [int(f1), int(f2), int(f3)]
 
     @field_validator("pet_stage_thresholds")
     @classmethod
@@ -503,6 +519,14 @@ class RewardSuggestionReview(BaseModel):
     note: str = Field(default="", max_length=200)
 
 
+class PetResetRequestInput(BaseModel):
+    reason: str = Field(default="", max_length=200)
+
+
+class PetResetReview(BaseModel):
+    note: str = Field(default="", max_length=200)
+
+
 class ConsequenceInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = ""
@@ -723,6 +747,7 @@ async def update_own_profile(payload: SelfProfileInput, user: dict = Depends(get
         now = now_iso()
         updates["pet_chosen_at"] = now
         updates["pet_last_fed_at"] = now
+        updates["pet_feed_count"] = 0
         updates["feed_balance"] = 0
         updates["feed_lifetime"] = 0
         updates["pet_equipped"] = []
@@ -731,6 +756,12 @@ async def update_own_profile(payload: SelfProfileInput, user: dict = Depends(get
         await db.members.update_one({"id": user["id"]}, {"$set": updates})
         # Children have a mirrored row used by tasks/points logic.
         await db.children.update_one({"id": user["id"]}, {"$set": updates})
+        # Picking a new pet resolves any lingering reset request for this kid.
+        if "pet_type" in updates:
+            await db.pet_reset_requests.update_many(
+                {"child_id": user["id"], "status": "pending"},
+                {"$set": {"status": "approved", "reviewed_at": now_iso(), "review_note": "Anak sudah memilih peliharaan baru"}},
+            )
     member = await db.members.find_one({"id": user["id"]}, {"_id": 0, "passcode_hash": 0, "passcode_plain": 0})
     return member
 
@@ -1370,6 +1401,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "pet_type": None,  # kid picks on first visit to the pet feature
         "pet_chosen_at": None,
         "pet_last_fed_at": None,
+        "pet_feed_count": 0,
         "feed_balance": 0,
         "feed_lifetime": 0,
         "pet_equipped": [],
@@ -1408,6 +1440,7 @@ async def update_child(child_id: str, payload: ChildUpdate, user: dict = Depends
         now = now_iso()
         updates["pet_chosen_at"] = now
         updates["pet_last_fed_at"] = now
+        updates["pet_feed_count"] = 0
         updates["feed_balance"] = 0
         updates["feed_lifetime"] = 0
         updates["pet_equipped"] = []
@@ -1470,20 +1503,16 @@ async def reset_all_children_points(user: dict = Depends(require_parent)):
     return {"success": True, "count": len(kids)}
 
 
-@api.post("/children/{child_id}/reset-pet")
-async def reset_child_pet(child_id: str, user: dict = Depends(require_parent)):
-    """Clear a child's virtual pet entirely — sends them back to the picker
-    screen with a completely blank slate, bypassing the usual 'wait for it to
-    pass away' permanence rule. For parents fixing a mistake, clearing test
-    data, or letting a kid start over without an actual neglect wait. Does NOT
-    touch points/streaks/level — only the pet itself and its feed economy."""
-    await get_child_or_404(FAMILY_ID, child_id)
+async def _clear_child_pet(child_id: str):
+    """Shared pet-wipe used by both the parent's direct reset and the
+    approve-a-request flow, so the two can never drift apart."""
     await db.children.update_one(
         {"id": child_id},
         {"$set": {
             "pet_type": None,
             "pet_chosen_at": None,
             "pet_last_fed_at": None,
+            "pet_feed_count": 0,
             "feed_balance": 0,
             "feed_lifetime": 0,
             "pet_equipped": [],
@@ -1493,8 +1522,103 @@ async def reset_child_pet(child_id: str, user: dict = Depends(require_parent)):
         {"id": child_id},
         {"$set": {"pet_type": None, "pet_equipped": []}},
     )
+
+
+@api.post("/children/{child_id}/reset-pet")
+async def reset_child_pet(child_id: str, user: dict = Depends(require_parent)):
+    """Clear a child's virtual pet entirely — sends them back to the picker
+    screen with a completely blank slate, bypassing the usual 'wait for it to
+    pass away' permanence rule. For parents fixing a mistake, clearing test
+    data, or letting a kid start over without an actual neglect wait. Does NOT
+    touch points/streaks/level — only the pet itself and its feed economy."""
+    await get_child_or_404(FAMILY_ID, child_id)
+    await _clear_child_pet(child_id)
+    # Clear any still-pending reset request now that it's been actioned directly.
+    await db.pet_reset_requests.update_many(
+        {"child_id": child_id, "status": "pending"},
+        {"$set": {"status": "approved", "reviewed_at": now_iso(), "review_note": "Direset langsung oleh orang tua"}},
+    )
     await log_activity(FAMILY_ID, child_id, "pet_reset", {})
     return await db.children.find_one({"id": child_id}, {"_id": 0})
+
+
+# --------------- Pet reset REQUESTS (kid asks, parent approves) ---------------
+@api.post("/me/request-pet-reset")
+async def request_pet_reset(payload: PetResetRequestInput, user: dict = Depends(get_current_user)):
+    """A kid asks to swap their (still-alive) pet for a new one. Because pets
+    are meant to be a lasting responsibility, the kid can't just reset on their
+    own — they submit a request and a parent decides. Only one pending request
+    per child at a time."""
+    if user["role"] != "child":
+        raise HTTPException(status_code=422, detail="Hanya anak yang bisa mengajukan ganti peliharaan")
+    child = await get_child_or_404(FAMILY_ID, user["id"])
+    if not child.get("pet_type"):
+        raise HTTPException(status_code=400, detail="Kamu belum punya peliharaan untuk diganti")
+    existing = await db.pet_reset_requests.find_one({"child_id": user["id"], "status": "pending"})
+    if existing:
+        raise HTTPException(status_code=400, detail="Kamu sudah punya permintaan yang menunggu persetujuan")
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": user["id"],
+        "child_name": child.get("name", ""), "current_pet": child.get("pet_type"),
+        "reason": payload.reason, "status": "pending", "review_note": "",
+        "created_at": now_iso(), "reviewed_at": None,
+    }
+    await db.pet_reset_requests.insert_one(doc)
+    doc.pop("_id", None)
+    await send_push_to({"role": "parent"}, title="Permintaan ganti peliharaan 🐾", body=f'{child.get("name","Anak")} ingin ganti peliharaan.', url="/parent")
+    return doc
+
+
+@api.get("/pet-reset-requests")
+async def list_pet_reset_requests(user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]  # kids see only their own
+    items = await db.pet_reset_requests.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api.post("/pet-reset-requests/{request_id}/approve")
+async def approve_pet_reset_request(request_id: str, payload: PetResetReview, user: dict = Depends(require_parent)):
+    req = await db.pet_reset_requests.find_one({"id": request_id, "parent_id": FAMILY_ID})
+    if not req:
+        raise HTTPException(status_code=404, detail="Permintaan tidak ditemukan")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Permintaan ini sudah diproses")
+    await _clear_child_pet(req["child_id"])
+    await db.pet_reset_requests.update_one(
+        {"id": request_id},
+        {"$set": {"status": "approved", "review_note": payload.note, "reviewed_at": now_iso()}},
+    )
+    await log_activity(FAMILY_ID, req["child_id"], "pet_reset", {"via": "request"})
+    await send_push_to({"role": "child", "member_id": req["child_id"]}, title="Boleh ganti peliharaan! 🎉", body="Yuk pilih peliharaan barumu di menu Profil.", url=f"/kid/{req['child_id']}")
+    return await db.pet_reset_requests.find_one({"id": request_id}, {"_id": 0})
+
+
+@api.post("/pet-reset-requests/{request_id}/reject")
+async def reject_pet_reset_request(request_id: str, payload: PetResetReview, user: dict = Depends(require_parent)):
+    req = await db.pet_reset_requests.find_one({"id": request_id, "parent_id": FAMILY_ID})
+    if not req:
+        raise HTTPException(status_code=404, detail="Permintaan tidak ditemukan")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Permintaan ini sudah diproses")
+    await db.pet_reset_requests.update_one(
+        {"id": request_id},
+        {"$set": {"status": "rejected", "review_note": payload.note, "reviewed_at": now_iso()}},
+    )
+    await send_push_to({"role": "child", "member_id": req["child_id"]}, title="Tentang permintaan peliharaanmu", body=payload.note or "Rawat dulu peliharaanmu yang sekarang ya 💛", url=f"/kid/{req['child_id']}")
+    return await db.pet_reset_requests.find_one({"id": request_id}, {"_id": 0})
+
+
+@api.delete("/pet-reset-requests/{request_id}")
+async def delete_pet_reset_request(request_id: str, user: dict = Depends(get_current_user)):
+    """Kid can withdraw their own pending request; parent can clear any."""
+    query = {"id": request_id, "parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]
+        query["status"] = "pending"
+    await db.pet_reset_requests.delete_one(query)
+    return {"success": True}
 
 
 @api.delete("/children/{child_id}")
@@ -1885,11 +2009,15 @@ async def feed_pet(child_id: str, user: dict = Depends(get_current_user)):
 
     await db.children.update_one(
         {"id": child_id},
-        {"$inc": {"feed_balance": -feed_cost}, "$set": {"pet_last_fed_at": now_iso()}},
+        {"$inc": {"feed_balance": -feed_cost, "pet_feed_count": 1}, "$set": {"pet_last_fed_at": now_iso()}},
     )
     await log_activity(FAMILY_ID, child_id, "pet_fed", {"cost": feed_cost})
     updated = await db.children.find_one({"id": child_id}, {"_id": 0})
-    return {"feed_balance": updated.get("feed_balance", 0), "feed_lifetime": updated.get("feed_lifetime", 0)}
+    return {
+        "feed_balance": updated.get("feed_balance", 0),
+        "feed_lifetime": updated.get("feed_lifetime", 0),
+        "pet_feed_count": updated.get("pet_feed_count", 0),
+    }
 
 
 @api.get("/children/{child_id}/month-progress")
@@ -2784,6 +2912,8 @@ _DEFAULT_LEVEL_TITLES = [
 # now editable per family via app_config.
 _DEFAULT_PET_STAGE_NAMES = ["Telur", "Bayi", "Remaja", "Dewasa"]
 _DEFAULT_PET_STAGE_THRESHOLDS = [0.25, 0.6]
+# Feeds needed to reach Bayi / Remaja / Dewasa. Growth is feed-count driven.
+_DEFAULT_PET_FEED_THRESHOLDS = [3, 8, 15]
 
 
 @api.post("/config")
@@ -2831,6 +2961,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "pet_neglect_days": 14,
             "pet_stage_names": _DEFAULT_PET_STAGE_NAMES,
             "pet_stage_thresholds": _DEFAULT_PET_STAGE_THRESHOLDS,
+            "pet_stage_feed_thresholds": _DEFAULT_PET_FEED_THRESHOLDS,
         }
         incoming = {k: v for k, v in payload.model_dump().items() if v is not None}
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
@@ -2866,6 +2997,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "pet_neglect_days": 14,
             "pet_stage_names": _DEFAULT_PET_STAGE_NAMES,
             "pet_stage_thresholds": _DEFAULT_PET_STAGE_THRESHOLDS,
+            "pet_stage_feed_thresholds": _DEFAULT_PET_FEED_THRESHOLDS,
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
@@ -2890,6 +3022,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "pet_neglect_days": int(config.get("pet_neglect_days", 14)),
         "pet_stage_names": config.get("pet_stage_names") or _DEFAULT_PET_STAGE_NAMES,
         "pet_stage_thresholds": config.get("pet_stage_thresholds") or _DEFAULT_PET_STAGE_THRESHOLDS,
+        "pet_stage_feed_thresholds": config.get("pet_stage_feed_thresholds") or _DEFAULT_PET_FEED_THRESHOLDS,
     }
 
 
@@ -3825,6 +3958,7 @@ async def seed_default_family():
             "pet_type": None,
             "pet_chosen_at": None,
             "pet_last_fed_at": None,
+            "pet_feed_count": 0,
             "feed_balance": 0,
             "feed_lifetime": 0,
             "pet_equipped": [],
@@ -3962,6 +4096,10 @@ async def migrate_existing_data():
     await db.children.update_many(
         {"pet_equipped": {"$exists": False}},
         {"$set": {"pet_equipped": []}},
+    )
+    await db.children.update_many(
+        {"pet_feed_count": {"$exists": False}},
+        {"$set": {"pet_feed_count": 0}},
     )
     # Existing pets (chosen before permanence/death tracking existed) get a
     # "chosen now" timestamp so they're not incorrectly considered neglected —

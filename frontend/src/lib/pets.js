@@ -6,8 +6,8 @@
 export const PET_CATALOG = [
   { key: "chicken", name: "Ayam", stages: ["🥚", "🐣", "🐥", "🐓"] },
   { key: "bird", name: "Burung", stages: ["🥚", "🐣", "🐦", "🦜"] },
-  { key: "rabbit", name: "Kelinci", stages: ["🥚", "🐰", "🐰", "🐇"] },
-  { key: "cat", name: "Kucing", stages: ["🥚", "🐱", "🐱", "🐈"] },
+  { key: "rabbit", name: "Kelinci", stages: ["🥚", "🐰", "🐇", "🐇"] },
+  { key: "cat", name: "Kucing", stages: ["🥚", "🐱", "🐈", "🐈‍⬛"] },
   { key: "dragon", name: "Naga", stages: ["🥚", "🐣", "🐲", "🐉"] },
   { key: "hedgehog", name: "Landak", stages: ["🥚", "🦔", "🦔", "🦔"] },
   { key: "squirrel", name: "Tupai", stages: ["🥚", "🐿️", "🐿️", "🐿️"] },
@@ -18,9 +18,46 @@ export const PET_CATALOG = [
 
 const DEFAULT_STAGE_NAMES = ["Telur", "Bayi", "Remaja", "Dewasa"];
 const DEFAULT_STAGE_THRESHOLDS = [0.25, 0.6];
+const DEFAULT_FEED_THRESHOLDS = [3, 8, 15];
 
 export function getPetDef(petType) {
   return PET_CATALOG.find((p) => p.key === petType) || PET_CATALOG[0];
+}
+
+/** Growth stage (0-3) from how many times the pet has been FED.
+ * thresholds = [feedsToBaby, feedsToTeen, feedsToAdult]. Below the first
+ * threshold the pet is still an egg (stage 0). */
+export function stageIndexForFeedCount(feedCount, thresholds = DEFAULT_FEED_THRESHOLDS) {
+  const t = thresholds && thresholds.length === 3 ? thresholds : DEFAULT_FEED_THRESHOLDS;
+  const n = Number(feedCount) || 0;
+  if (n >= t[2]) return 3;
+  if (n >= t[1]) return 2;
+  if (n >= t[0]) return 1;
+  return 0;
+}
+
+/** Feed-count-driven appearance. Returns emoji (legacy fallback), stage name,
+ * stage index, and progress toward the next stage for a progress bar. */
+export function petAppearanceByFeed(petType, feedCount, feedThresholds = DEFAULT_FEED_THRESHOLDS, stageNames = DEFAULT_STAGE_NAMES) {
+  const def = getPetDef(petType);
+  const idx = stageIndexForFeedCount(feedCount, feedThresholds);
+  const names = stageNames && stageNames.length === 4 ? stageNames : DEFAULT_STAGE_NAMES;
+  const t = feedThresholds && feedThresholds.length === 3 ? feedThresholds : DEFAULT_FEED_THRESHOLDS;
+  const n = Number(feedCount) || 0;
+  // progress toward next stage (0-1), and how many feeds remain
+  let feedsNeeded = null, progress = 1;
+  if (idx === 0) { const lo = 0, hi = t[0]; progress = hi ? n / hi : 1; feedsNeeded = hi - n; }
+  else if (idx === 1) { const lo = t[0], hi = t[1]; progress = (n - lo) / (hi - lo); feedsNeeded = hi - n; }
+  else if (idx === 2) { const lo = t[1], hi = t[2]; progress = (n - lo) / (hi - lo); feedsNeeded = hi - n; }
+  return {
+    emoji: def.stages[idx],
+    stageName: names[idx],
+    petName: def.name,
+    stageIndex: idx,
+    isAdult: idx === 3,
+    progress: Math.max(0, Math.min(1, progress)),
+    feedsNeeded, // null when adult (maxed)
+  };
 }
 
 /** Growth stage index (0-3) from the kid's level, scaled proportionally to
@@ -46,6 +83,7 @@ export function petAppearance(petType, level, totalLevels = 10, stageNames = DEF
     emoji: def.stages[idx],
     stageName: names[idx],
     petName: def.name,
+    stageIndex: idx,
     isAdult: idx === 3,
   };
 }

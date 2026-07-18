@@ -205,6 +205,37 @@ class AppConfigInput(BaseModel):
     # keep in sync.
     level_titles: Optional[List[LevelTierInput]] = None
 
+    # --- Virtual pet (Tamagotchi-style) economy — parent-configurable ---
+    feed_per_point: Optional[int] = Field(default=None, ge=0, le=100)  # pakan earned per point earned
+    feed_cost_per_meal: Optional[int] = Field(default=None, ge=1, le=1000)  # pakan spent per "Beri Makan" tap
+    pet_neglect_days: Optional[int] = Field(default=None, ge=1, le=365)  # days un-fed before a pet "passes away"
+    pet_stage_names: Optional[List[str]] = None  # exactly 4: egg/baby/teen/adult stage labels
+    pet_stage_thresholds: Optional[List[float]] = None  # exactly 2 ascending ratios in (0,1): baby->teen, teen->adult
+
+    @field_validator("pet_stage_names")
+    @classmethod
+    def _validate_pet_stage_names(cls, v):
+        if v is None:
+            return v
+        if len(v) != 4:
+            raise ValueError("Harus ada tepat 4 nama tahap pertumbuhan")
+        cleaned = [s.strip()[:30] for s in v]
+        if any(not s for s in cleaned):
+            raise ValueError("Setiap tahap pertumbuhan butuh nama")
+        return cleaned
+
+    @field_validator("pet_stage_thresholds")
+    @classmethod
+    def _validate_pet_stage_thresholds(cls, v):
+        if v is None:
+            return v
+        if len(v) != 2:
+            raise ValueError("Harus ada tepat 2 ambang batas pertumbuhan")
+        t1, t2 = v
+        if not (0 < t1 < t2 < 1):
+            raise ValueError("Ambang batas harus 0 < tahap-2 < tahap-3 < 1")
+        return [float(t1), float(t2)]
+
     @field_validator("level_titles")
     @classmethod
     def _validate_level_ladder(cls, v):
@@ -675,6 +706,27 @@ async def change_own_passcode(payload: SelfPasscodeInput, user: dict = Depends(g
 @api.patch("/me/profile")
 async def update_own_profile(payload: SelfProfileInput, user: dict = Depends(get_current_user)):
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+
+    # Pet choice is permanent once alive — "ganti" only becomes possible again
+    # after the current pet has passed away from neglect (see _pet_is_dead).
+    # A fresh pick always starts that pet's own journey from zero: feed stats,
+    # accessories, and the fed/chosen timestamps reset, even if switching away
+    # from a pet that was still alive isn't allowed in the first place.
+    if "pet_type" in updates:
+        current = await db.children.find_one({"id": user["id"]}) or {}
+        config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+        if current.get("pet_type") and not _pet_is_dead(current, config):
+            raise HTTPException(
+                status_code=400,
+                detail="Peliharaanmu masih hidup dan sehat — belum bisa ganti dulu ya, rawat dia sampai besar! 💛",
+            )
+        now = now_iso()
+        updates["pet_chosen_at"] = now
+        updates["pet_last_fed_at"] = now
+        updates["feed_balance"] = 0
+        updates["feed_lifetime"] = 0
+        updates["pet_equipped"] = []
+
     if updates:
         await db.members.update_one({"id": user["id"]}, {"$set": updates})
         # Children have a mirrored row used by tasks/points logic.
@@ -1290,6 +1342,9 @@ async def get_child_personality(child_id: str, user: dict = Depends(get_current_
 async def list_children(user: dict = Depends(get_current_user)):
     children = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(100)
     children.sort(key=lambda c: c.get("created_at", ""))
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    for c in children:
+        c["pet_is_dead"] = _pet_is_dead(c, config)
     return children
 
 
@@ -1313,6 +1368,8 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
         "freeze_card_week": None,
         "pet_type": None,  # kid picks on first visit to the pet feature
+        "pet_chosen_at": None,
+        "pet_last_fed_at": None,
         "feed_balance": 0,
         "feed_lifetime": 0,
         "pet_equipped": [],
@@ -1344,6 +1401,16 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
 async def update_child(child_id: str, payload: ChildUpdate, user: dict = Depends(require_parent)):
     await get_child_or_404(FAMILY_ID, child_id)
     updates = {k: v for k, v in payload.model_dump().items() if v is not None}
+    # Parents can override a child's pet anytime (e.g. fixing a mistake) —
+    # unlike the kid's own /me/profile pet_type change, this isn't locked by
+    # the "alive" check, but it still starts that pet's journey fresh.
+    if "pet_type" in updates:
+        now = now_iso()
+        updates["pet_chosen_at"] = now
+        updates["pet_last_fed_at"] = now
+        updates["feed_balance"] = 0
+        updates["feed_lifetime"] = 0
+        updates["pet_equipped"] = []
     if updates:
         await db.children.update_one({"id": child_id}, {"$set": updates})
         await db.members.update_one({"id": child_id}, {"$set": updates})
@@ -1746,22 +1813,54 @@ async def claim_perfect_day(child_id: str, user: dict = Depends(get_current_user
 PET_FEED_COST = 5  # feed currency consumed per "beri makan" tap
 
 
+def _pet_is_dead(child: dict, config: dict) -> bool:
+    """A pet 'passes away' from neglect if it hasn't been fed in
+    `pet_neglect_days` (parent-configurable). Purely a lazy/derived check —
+    computed fresh on every read rather than needing a background job, the
+    same pattern as the weekly freeze-card refill. A child with no pet at all
+    is not considered 'dead' (there's simply nothing to mourn yet)."""
+    if not child.get("pet_type"):
+        return False
+    last_interaction = child.get("pet_last_fed_at") or child.get("pet_chosen_at")
+    if not last_interaction:
+        return False  # legacy data from before these timestamps existed — don't retroactively kill it
+    try:
+        last_dt = datetime.fromisoformat(last_interaction.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    days_since = (datetime.now(timezone.utc) - last_dt).days
+    neglect_days = int(config.get("pet_neglect_days", 14))
+    return days_since >= neglect_days
+
+
 @api.post("/children/{child_id}/feed-pet")
 async def feed_pet(child_id: str, user: dict = Depends(get_current_user)):
     """Kid taps 'Beri Makan' to feed their virtual pet — consumes feed_balance
-    (earned 1:1 alongside points on task approval), completely separate from
-    the spendable points economy. Only the child themselves can feed their
-    own pet."""
+    (earned alongside points on task approval at the family's configured
+    rate), completely separate from the spendable points economy. Only the
+    child themselves can feed their own pet. Feeding is also what keeps the
+    pet alive — go too long without it and the pet passes away (see
+    _pet_is_dead), after which it can't be fed until a new one is chosen."""
     if user["role"] == "child" and user["id"] != child_id:
         raise HTTPException(status_code=403, detail="Ini bukan hewan peliharaanmu")
     child = await get_child_or_404(FAMILY_ID, child_id)
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
 
+    if not child.get("pet_type"):
+        raise HTTPException(status_code=400, detail="Kamu belum punya peliharaan — pilih dulu ya!")
+    if _pet_is_dead(child, config):
+        raise HTTPException(status_code=400, detail="Peliharaanmu sudah pergi 💔 — pilih peliharaan baru untuk mulai lagi.")
+
+    feed_cost = int(config.get("feed_cost_per_meal", PET_FEED_COST))
     balance = int(child.get("feed_balance", 0))
-    if balance < PET_FEED_COST:
-        raise HTTPException(status_code=400, detail=f"Butuh {PET_FEED_COST} pakan untuk memberi makan — selesaikan misi dulu ya!")
+    if balance < feed_cost:
+        raise HTTPException(status_code=400, detail=f"Butuh {feed_cost} pakan untuk memberi makan — selesaikan misi dulu ya!")
 
-    await db.children.update_one({"id": child_id}, {"$inc": {"feed_balance": -PET_FEED_COST}})
-    await log_activity(FAMILY_ID, child_id, "pet_fed", {"cost": PET_FEED_COST})
+    await db.children.update_one(
+        {"id": child_id},
+        {"$inc": {"feed_balance": -feed_cost}, "$set": {"pet_last_fed_at": now_iso()}},
+    )
+    await log_activity(FAMILY_ID, child_id, "pet_fed", {"cost": feed_cost})
     updated = await db.children.find_one({"id": child_id}, {"_id": 0})
     return {"feed_balance": updated.get("feed_balance", 0), "feed_lifetime": updated.get("feed_lifetime", 0)}
 
@@ -2246,16 +2345,18 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
     prev_best_streak = int(child.get("best_streak_days", 0))
     new_best_streak = max(prev_best_streak, streak)
 
+    # Virtual pet "feed" currency — earned alongside points at the family's
+    # configured rate (default 1:1), separate from the spendable points
+    # economy (feeding never touches points).
+    feed_earned = round(points * float(config.get("feed_per_point", 1)))
+
     await db.children.update_one(
         {"id": child_id},
         {
             "$inc": {
                 "points": points, "lifetime_points": points, "tasks_completed": 1,
                 "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
-                # Virtual pet "feed" currency — earned 1:1 alongside points so
-                # finishing missions always feeds the pet too, separate from
-                # the spendable points economy (feeding never touches points).
-                "feed_balance": points, "feed_lifetime": points,
+                "feed_balance": feed_earned, "feed_lifetime": feed_earned,
             },
             "$set": {
                 "last_completion_date": today, "streak_days": streak,
@@ -2271,7 +2372,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
         "used_freeze_card": used_freeze_card,
         "prev_freeze_available": prev_freeze_available, "prev_freeze_week": prev_freeze_week,
         "prev_best_streak": prev_best_streak,
-        "feed_earned": points,
+        "feed_earned": feed_earned,
     }
 
 
@@ -2651,6 +2752,12 @@ _DEFAULT_LEVEL_TITLES = [
     {"title": "Legenda Keluarga", "emoji": "💫", "min_xp": 10000},
 ]
 
+# Default pet growth-stage labels & thresholds — mirrors what was previously
+# hardcoded (frontend/src/lib/pets.js STAGE_NAMES + the 0.25/0.6 ratios),
+# now editable per family via app_config.
+_DEFAULT_PET_STAGE_NAMES = ["Telur", "Bayi", "Remaja", "Dewasa"]
+_DEFAULT_PET_STAGE_THRESHOLDS = [0.25, 0.6]
+
 
 @api.post("/config")
 async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_parent)):
@@ -2692,6 +2799,11 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "instant_task_notifications": False,
             "language": "id",
             "level_titles": _DEFAULT_LEVEL_TITLES,
+            "feed_per_point": 1,
+            "feed_cost_per_meal": 5,
+            "pet_neglect_days": 14,
+            "pet_stage_names": _DEFAULT_PET_STAGE_NAMES,
+            "pet_stage_thresholds": _DEFAULT_PET_STAGE_THRESHOLDS,
         }
         incoming = {k: v for k, v in payload.model_dump().items() if v is not None}
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
@@ -2722,6 +2834,11 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "instant_task_notifications": False,
             "language": "id",
             "level_titles": _DEFAULT_LEVEL_TITLES,
+            "feed_per_point": 1,
+            "feed_cost_per_meal": 5,
+            "pet_neglect_days": 14,
+            "pet_stage_names": _DEFAULT_PET_STAGE_NAMES,
+            "pet_stage_thresholds": _DEFAULT_PET_STAGE_THRESHOLDS,
         }
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
@@ -2741,6 +2858,11 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "instant_task_notifications": bool(config.get("instant_task_notifications", False)),
         "language": config.get("language", "id"),
         "level_titles": config.get("level_titles") or _DEFAULT_LEVEL_TITLES,
+        "feed_per_point": int(config.get("feed_per_point", 1)),
+        "feed_cost_per_meal": int(config.get("feed_cost_per_meal", 5)),
+        "pet_neglect_days": int(config.get("pet_neglect_days", 14)),
+        "pet_stage_names": config.get("pet_stage_names") or _DEFAULT_PET_STAGE_NAMES,
+        "pet_stage_thresholds": config.get("pet_stage_thresholds") or _DEFAULT_PET_STAGE_THRESHOLDS,
     }
 
 
@@ -3674,6 +3796,8 @@ async def seed_default_family():
             "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
             "freeze_card_week": None,
             "pet_type": None,
+            "pet_chosen_at": None,
+            "pet_last_fed_at": None,
             "feed_balance": 0,
             "feed_lifetime": 0,
             "pet_equipped": [],
@@ -3811,6 +3935,17 @@ async def migrate_existing_data():
     await db.children.update_many(
         {"pet_equipped": {"$exists": False}},
         {"$set": {"pet_equipped": []}},
+    )
+    # Existing pets (chosen before permanence/death tracking existed) get a
+    # "chosen now" timestamp so they're not incorrectly considered neglected —
+    # this is idempotent (only touches docs missing the field, never overwrites).
+    await db.children.update_many(
+        {"pet_type": {"$ne": None}, "pet_chosen_at": {"$exists": False}},
+        {"$set": {"pet_chosen_at": now_iso(), "pet_last_fed_at": now_iso()}},
+    )
+    await db.children.update_many(
+        {"pet_type": None, "pet_chosen_at": {"$exists": False}},
+        {"$set": {"pet_chosen_at": None, "pet_last_fed_at": None}},
     )
 
 

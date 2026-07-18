@@ -47,6 +47,9 @@ export default function KidHome() {
   const [rewards, setRewards] = useState([]);
   const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
   const [levelTitles, setLevelTitles] = useState(null); // family's custom level ladder, from config
+  const [petStageNames, setPetStageNames] = useState(null);
+  const [petStageThresholds, setPetStageThresholds] = useState(null);
+  const [feedCostPerMeal, setFeedCostPerMeal] = useState(5);
   const [showRecap, setShowRecap] = useState(false);
   const [tab, setTab] = useState("tasks");
   const [celebrate, setCelebrate] = useState(false);
@@ -76,6 +79,9 @@ export default function KidHome() {
       setRewards(rRes.data);
       setWishlist(wRes.data);
       setLevelTitles(cfgRes.data.level_titles);
+      setPetStageNames(cfgRes.data.pet_stage_names);
+      setPetStageThresholds(cfgRes.data.pet_stage_thresholds);
+      setFeedCostPerMeal(cfgRes.data.feed_cost_per_meal ?? 5);
     } catch (e) {
       toast.error(formatApiError(e));
     }
@@ -244,7 +250,7 @@ export default function KidHome() {
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <div className="mb-5">
-                <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} />
+                <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} petStageNames={petStageNames} petStageThresholds={petStageThresholds} feedCostPerMeal={feedCostPerMeal} />
               </div>
               <h2 className="font-fun font-bold text-xl text-slate-900 mb-3">Misi Hari Ini 🗺️</h2>
 

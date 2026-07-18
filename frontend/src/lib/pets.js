@@ -16,7 +16,8 @@ export const PET_CATALOG = [
   { key: "turtle", name: "Kura-kura", stages: ["🥚", "🐢", "🐢", "🐢"] },
 ];
 
-const STAGE_NAMES = ["Telur", "Bayi", "Remaja", "Dewasa"];
+const DEFAULT_STAGE_NAMES = ["Telur", "Bayi", "Remaja", "Dewasa"];
+const DEFAULT_STAGE_THRESHOLDS = [0.25, 0.6];
 
 export function getPetDef(petType) {
   return PET_CATALOG.find((p) => p.key === petType) || PET_CATALOG[0];
@@ -24,22 +25,26 @@ export function getPetDef(petType) {
 
 /** Growth stage index (0-3) from the kid's level, scaled proportionally to
  * however many levels the family's (customizable) ladder actually has —
- * doesn't assume exactly 10 like the original hardcoded version did. */
-export function stageIndexForLevel(level, totalLevels = 10) {
+ * doesn't assume exactly 10 like the original hardcoded version did.
+ * `thresholds` is [babyToTeen, teenToAdult], both parent-configurable ratios
+ * in (0,1) via app config (pet_stage_thresholds). */
+export function stageIndexForLevel(level, totalLevels = 10, thresholds = DEFAULT_STAGE_THRESHOLDS) {
   if (level <= 1) return 0;
   if (totalLevels <= 1) return 3; // a single-tier ladder has nowhere to "grow" toward — show fully grown
+  const [t1, t2] = thresholds && thresholds.length === 2 ? thresholds : DEFAULT_STAGE_THRESHOLDS;
   const ratio = (level - 1) / Math.max(1, totalLevels - 1);
-  if (ratio < 0.25) return 1;
-  if (ratio < 0.6) return 2;
+  if (ratio < t1) return 1;
+  if (ratio < t2) return 2;
   return 3;
 }
 
-export function petAppearance(petType, level, totalLevels = 10) {
+export function petAppearance(petType, level, totalLevels = 10, stageNames = DEFAULT_STAGE_NAMES, thresholds = DEFAULT_STAGE_THRESHOLDS) {
   const def = getPetDef(petType);
-  const idx = stageIndexForLevel(level, totalLevels);
+  const idx = stageIndexForLevel(level, totalLevels, thresholds);
+  const names = stageNames && stageNames.length === 4 ? stageNames : DEFAULT_STAGE_NAMES;
   return {
     emoji: def.stages[idx],
-    stageName: STAGE_NAMES[idx],
+    stageName: names[idx],
     petName: def.name,
     isAdult: idx === 3,
   };

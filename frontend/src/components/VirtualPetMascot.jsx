@@ -28,7 +28,7 @@ function moodFor(child) {
   return { label: "Kangen Banget", face: "🥺", ring: "ring-slate-400", glow: "shadow-slate-200" };
 }
 
-export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
+export default function VirtualPetMascot({ child, onChanged, levelTitles, petStageNames, petStageThresholds, feedCostPerMeal }) {
   const [picking, setPicking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [feeding, setFeeding] = useState(false);
@@ -40,8 +40,9 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
   const levelInfo = computeLevel(child.lifetime_points || 0, levelTitles);
   const foodTier = computeFoodTier(child.feed_lifetime || 0);
   const feedBalance = Math.max(0, child.feed_balance || 0);
-  const FEED_COST = 5;
+  const FEED_COST = feedCostPerMeal ?? 5;
   const equipped = child.pet_equipped || [];
+  const isDead = !!child.pet_is_dead;
 
   const toggleAccessory = async (key) => {
     const isEquipped = equipped.includes(key);
@@ -81,6 +82,7 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
   };
 
   const handleTap = () => {
+    if (isDead) return;
     const id = Date.now() + Math.random();
     const emoji = TAP_REACTIONS[Math.floor(Math.random() * TAP_REACTIONS.length)];
     setTaps((prev) => [...prev, { id, emoji }]);
@@ -108,55 +110,117 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
     }
   };
 
+  // Tamagotchi-style device shell: rounded egg-shaped body + a dark LCD screen
+  // with a faint scanline/grid texture, wrapping whatever's inside (picker,
+  // mourning state, or the live pet) so every state feels like the same toy.
+  const shell = (inner, opts = {}) => (
+    <div className="bg-gradient-to-b from-white to-slate-50 rounded-[2rem] p-4 border-2 border-slate-100 chunky-shadow">
+      <div
+        className="relative rounded-[1.5rem] p-4 overflow-hidden"
+        style={{
+          background: opts.screenBg || "linear-gradient(155deg, #cfe8c9 0%, #a9d6a1 55%, #8fc987 100%)",
+          boxShadow: "inset 0 2px 10px rgba(0,0,0,0.25), inset 0 0 0 3px rgba(255,255,255,0.35)",
+        }}
+      >
+        {/* Faint scanline texture for that retro-LCD feel */}
+        <div
+          className="absolute inset-0 pointer-events-none opacity-[0.15]"
+          style={{ backgroundImage: "repeating-linear-gradient(0deg, #000 0px, #000 1px, transparent 1px, transparent 3px)" }}
+        />
+        {inner}
+      </div>
+    </div>
+  );
+
   // No pet chosen yet — show the picker instead of the mascot card.
-  if (!child.pet_type || picking) {
-    return (
-      <div className="bg-white rounded-3xl p-5 border-2 border-slate-100 chunky-shadow">
-        <h3 className="font-fun font-bold text-slate-900 mb-1">
-          {child.pet_type ? "Ganti Peliharaan" : "Pilih Peliharaanmu! 🐾"}
-        </h3>
-        <p className="text-xs text-slate-500 mb-3">Dia akan tumbuh besar seiring kamu rajin mengerjakan misi.</p>
+  if (!child.pet_type && !picking) {
+    return shell(
+      <div className="relative">
+        <h3 className="font-fun font-bold text-slate-800 mb-1">Pilih Peliharaanmu! 🐾</h3>
+        <p className="text-xs text-slate-600 mb-3">
+          Sekali pilih, dia jadi tanggung jawabmu sampai tumbuh dewasa — nggak bisa ganti-ganti, ya!
+        </p>
         <div className="grid grid-cols-5 gap-2">
           {PET_CATALOG.map((p) => (
             <button
               key={p.key}
               onClick={() => choosePet(p.key)}
               disabled={saving}
-              className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl border-2 border-slate-100 hover:border-indigo-300 hover:bg-indigo-50 disabled:opacity-50"
+              className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl bg-white/70 hover:bg-white border-2 border-white/50 hover:border-indigo-300 disabled:opacity-50"
             >
-              <span className="text-3xl">{p.stages[2]}</span>
-              <span className="text-[10px] font-bold text-slate-600">{p.name}</span>
+              <span className="text-3xl">{p.stages[0]}</span>
+              <span className="text-[10px] font-bold text-slate-700">{p.name}</span>
             </button>
           ))}
         </div>
-        {child.pet_type && (
-          <button onClick={() => setPicking(false)} className="text-xs text-slate-400 mt-3 underline">
-            Batal
-          </button>
-        )}
       </div>
     );
   }
 
-  const appearance = petAppearance(child.pet_type, levelInfo.level, levelInfo.totalLevels);
+  // Pet died from neglect — mourning state, then a fresh pick is unlocked.
+  if (isDead && !picking) {
+    return shell(
+      <div className="relative text-center py-2">
+        <div className="text-5xl mb-2">🪦</div>
+        <div className="font-fun font-bold text-slate-800 mb-1">Peliharaanmu sudah pergi…</div>
+        <p className="text-xs text-slate-600 mb-3">
+          Kelamaan nggak dikasih makan. Yuk mulai lagi dengan peliharaan baru — kali ini rawat dia baik-baik ya!
+        </p>
+        <button
+          onClick={() => setPicking(true)}
+          className="press-btn bg-indigo-500 hover:bg-indigo-600 text-white font-fun font-bold px-4 py-2 rounded-xl text-sm"
+        >
+          Pilih Peliharaan Baru
+        </button>
+      </div>,
+      { screenBg: "linear-gradient(155deg, #cbb8c9 0%, #ab8fa6 55%, #8f748a 100%)" }
+    );
+  }
+
+  // Picker re-opened (only reachable after death, or first pick above).
+  if (picking) {
+    return shell(
+      <div className="relative">
+        <h3 className="font-fun font-bold text-slate-800 mb-1">Pilih Peliharaan Baru! 🐾</h3>
+        <p className="text-xs text-slate-600 mb-3">Dia akan tumbuh besar seiring kamu rajin mengerjakan misi.</p>
+        <div className="grid grid-cols-5 gap-2">
+          {PET_CATALOG.map((p) => (
+            <button
+              key={p.key}
+              onClick={() => choosePet(p.key)}
+              disabled={saving}
+              className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl bg-white/70 hover:bg-white border-2 border-white/50 hover:border-indigo-300 disabled:opacity-50"
+            >
+              <span className="text-3xl">{p.stages[0]}</span>
+              <span className="text-[10px] font-bold text-slate-700">{p.name}</span>
+            </button>
+          ))}
+        </div>
+        <button onClick={() => setPicking(false)} className="text-xs text-slate-600 mt-3 underline">
+          Batal
+        </button>
+      </div>
+    );
+  }
+
+  const appearance = petAppearance(child.pet_type, levelInfo.level, levelInfo.totalLevels, petStageNames, petStageThresholds);
   const mood = moodFor(child);
 
-  return (
-    <div className="bg-white rounded-3xl p-5 border-2 border-slate-100 chunky-shadow">
+  return shell(
+    <div className="relative">
       <div className="flex items-center gap-4">
         <button onClick={handleTap} className="relative shrink-0" title="Sentuh aku!">
           <motion.div
             animate={{ y: [0, -6, 0] }}
             transition={{ duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
             whileTap={{ scale: 1.15, rotate: [0, -8, 8, 0] }}
-            className={`relative w-20 h-20 rounded-full bg-gradient-to-br from-orange-50 to-amber-100 flex items-center justify-center text-5xl ring-4 ${mood.ring} shadow-lg ${mood.glow}`}
+            className={`relative w-20 h-20 rounded-full bg-white/40 flex items-center justify-center text-5xl ring-4 ${mood.ring} shadow-lg ${mood.glow}`}
           >
             {appearance.emoji}
             <span className="absolute -bottom-1 -right-1 text-xl">{mood.face}</span>
             {equipped.map((key, i) => {
               const acc = ACCESSORY_CATALOG.find((a) => a.key === key);
               if (!acc) return null;
-              // Simple fixed-position overlay slots so multiple accessories don't stack exactly on top of each other.
               const positions = ["-top-2 left-1/2 -translate-x-1/2", "-top-1 -left-2", "-top-1 -right-2", "top-1/2 -left-3 -translate-y-1/2"];
               return (
                 <span key={key} className={`absolute ${positions[i % positions.length]} text-lg pointer-events-none`}>
@@ -195,10 +259,9 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="font-fun font-bold text-slate-900">{appearance.stageName} {appearance.petName}-mu</span>
-            <button onClick={() => setPicking(true)} className="text-[10px] text-indigo-400 underline">ganti</button>
+            <span className="font-fun font-bold text-slate-800 bg-white/50 rounded-full px-2 py-0.5 text-sm">{appearance.stageName} {appearance.petName}-mu</span>
           </div>
-          <div className="text-xs text-slate-500 mb-2">Suasana hati: {mood.label}</div>
+          <div className="text-xs text-slate-700 mb-2 mt-1">Suasana hati: {mood.label}</div>
 
           <button
             onClick={feedPet}
@@ -209,11 +272,11 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
           </button>
           <button
             onClick={() => setShowAccessories((v) => !v)}
-            className="press-btn ml-2 inline-flex items-center gap-1.5 bg-white border-2 border-slate-200 hover:bg-slate-50 text-slate-600 font-fun font-bold px-3 py-1.5 rounded-xl text-xs"
+            className="press-btn ml-2 inline-flex items-center gap-1.5 bg-white/70 border-2 border-white/50 hover:bg-white text-slate-700 font-fun font-bold px-3 py-1.5 rounded-xl text-xs"
           >
             👒 Aksesori
           </button>
-          <div className="text-[10px] text-slate-400 mt-1">
+          <div className="text-[10px] text-slate-600 mt-1">
             Pakan: {feedBalance} · Level pakan: {foodTier.name} {foodTier.maxed ? "(MAX)" : `(menuju ${foodTier.nextName})`}
           </div>
 
@@ -229,11 +292,11 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles }) {
                     disabled={!unlocked || savingAccessory}
                     title={unlocked ? acc.name : `Terbuka di Level ${acc.unlockLevel}`}
                     className={`flex flex-col items-center gap-0.5 p-1.5 rounded-xl border-2 text-center ${
-                      isEquipped ? "border-amber-400 bg-amber-50" : unlocked ? "border-slate-100 hover:bg-slate-50" : "border-slate-100 opacity-40 cursor-not-allowed"
+                      isEquipped ? "border-amber-400 bg-white" : unlocked ? "border-white/40 bg-white/40 hover:bg-white/70" : "border-white/30 bg-white/20 opacity-50 cursor-not-allowed"
                     }`}
                   >
                     <span className="text-lg">{unlocked ? acc.emoji : "🔒"}</span>
-                    <span className="text-[8px] font-bold text-slate-500 leading-none">{unlocked ? acc.name : `Lv${acc.unlockLevel}`}</span>
+                    <span className="text-[8px] font-bold text-slate-700 leading-none">{unlocked ? acc.name : `Lv${acc.unlockLevel}`}</span>
                   </button>
                 );
               })}

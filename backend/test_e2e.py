@@ -1089,20 +1089,70 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post(f"/api/children/{syila['id']}/claim-perfect-day")
     check("mystery: sibling blocked from claiming another's box", r.status_code == 403, str(r.status_code))
 
-    # ================= 55. VIRTUAL PET: SELECTION (10 animals) =================
+    # ================= 55. VIRTUAL PET: SELECTION + PERMANENCE + DEATH =================
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    for pet in ["chicken", "bird", "rabbit", "cat", "dragon", "hedgehog", "squirrel", "panda", "fox", "turtle"]:
-        c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-        r = c.patch("/api/me/profile", json={"pet_type": pet})
-        check(f"pet: '{pet}' accepted", r.status_code == 200 and r.json()["pet_type"] == pet, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.patch("/api/me/profile", json={"pet_type": "chicken"})
+    check("pet: first pick accepted", r.status_code == 200 and r.json()["pet_type"] == "chicken", r.text[:150])
+    check("pet: fresh pick has feed reset to 0", r.json().get("feed_balance") == 0 and r.json().get("feed_lifetime") == 0)
+    r = c.patch("/api/me/profile", json={"pet_type": "dragon"})
+    check("pet: cannot switch while alive", r.status_code == 400, r.text[:150])
     r = c.patch("/api/me/profile", json={"pet_type": "elephant"})
     check("pet: invalid animal rejected", r.status_code == 422, str(r.status_code))
-    c.patch("/api/me/profile", json={"pet_type": "dragon"})
+    # Still 'chicken' after the rejected switch attempts
+    ads_pet_check = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pet: pet_type unchanged after blocked switch", ads_pet_check["pet_type"] == "chicken")
+    check("pet: alive child not flagged dead", ads_pet_check["pet_is_dead"] is False)
+
+    # Simulate neglect: backdate pet_last_fed_at beyond the default 14-day window
+    import asyncio as _asyncio_pet
+    import datetime as _dt_pet
+    long_ago = (_dt_pet.datetime.now(_dt_pet.timezone.utc) - _dt_pet.timedelta(days=20)).isoformat()
+    _asyncio_pet.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"pet_last_fed_at": long_ago}}))
+    ads_dead_check = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pet: neglected pet flagged dead", ads_dead_check["pet_is_dead"] is True)
+    r = c.post(f"/api/children/{adskhan['id']}/feed-pet")
+    check("pet: cannot feed a dead pet", r.status_code == 400, r.text[:150])
+    r = c.patch("/api/me/profile", json={"pet_type": "dragon"})
+    check("pet: CAN switch after pet died", r.status_code == 200 and r.json()["pet_type"] == "dragon", r.text[:150])
+    ads_after_revival = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pet: new pet not dead right after picking", ads_after_revival["pet_is_dead"] is False)
+
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.patch(f"/api/children/{syila['id']}", json={"pet_type": "panda"})
     check("pet: parent sets child's pet_type", r.status_code == 200 and r.json()["pet_type"] == "panda", r.text[:150])
+    r = c.patch(f"/api/children/{syila['id']}", json={"pet_type": "fox"})
+    check("pet: parent CAN override anytime (not locked)", r.status_code == 200 and r.json()["pet_type"] == "fox", r.text[:150])
     r = c.patch(f"/api/children/{syila['id']}", json={"pet_type": "not-a-real-animal"})
     check("pet: parent invalid pet_type rejected", r.status_code == 422, str(r.status_code))
+
+    # ================= 55b. PET ECONOMY CONFIG =================
+    r = c.get("/api/config")
+    check("pet-config: defaults present", r.json().get("feed_per_point") == 1 and r.json().get("feed_cost_per_meal") == 5 and r.json().get("pet_neglect_days") == 14, str(r.json().get("feed_per_point")))
+    check("pet-config: default stage names", r.json().get("pet_stage_names") == ["Telur", "Bayi", "Remaja", "Dewasa"])
+    check("pet-config: default thresholds", r.json().get("pet_stage_thresholds") == [0.25, 0.6])
+    r = c.post("/api/config", json={"feed_per_point": 2, "feed_cost_per_meal": 8, "pet_neglect_days": 30})
+    check("pet-config: economy update accepted", r.status_code == 200, r.text[:150])
+    r = c.get("/api/config")
+    check("pet-config: economy persisted", r.json()["feed_per_point"] == 2 and r.json()["feed_cost_per_meal"] == 8 and r.json()["pet_neglect_days"] == 30)
+    r = c.post("/api/config", json={"pet_stage_names": ["Telur", "Anakan", "Muda", "Dewasa"], "pet_stage_thresholds": [0.3, 0.7]})
+    check("pet-config: stage config accepted", r.status_code == 200)
+    r = c.get("/api/config")
+    check("pet-config: stage names persisted", r.json()["pet_stage_names"] == ["Telur", "Anakan", "Muda", "Dewasa"])
+    check("pet-config: thresholds persisted", r.json()["pet_stage_thresholds"] == [0.3, 0.7])
+    r = c.post("/api/config", json={"pet_stage_names": ["Cuma3", "Tahap", "Aja"]})
+    check("pet-config: wrong stage-name count rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"pet_stage_thresholds": [0.7, 0.3]})
+    check("pet-config: non-ascending thresholds rejected", r.status_code == 422, str(r.status_code))
+    # Reset back to defaults so later tests (feed 1:1 assumption) aren't affected
+    r = c.post("/api/config", json={"feed_per_point": 1, "feed_cost_per_meal": 5, "pet_neglect_days": 14,
+                                     "pet_stage_names": ["Telur", "Bayi", "Remaja", "Dewasa"], "pet_stage_thresholds": [0.25, 0.6]})
+    check("pet-config: reset to defaults for later tests", r.status_code == 200)
+    # Kid blocked from changing config
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/config", json={"feed_per_point": 99})
+    check("pet-config: kid blocked from editing config", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
     # ================= 56. VIRTUAL PET: FEED CURRENCY (dual points system) =================
     ads_before = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])

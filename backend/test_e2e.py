@@ -1656,6 +1656,29 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/children/nonexistent/reset-points")
     check("reset: 404/403 for bad child", r.status_code in (403, 404), str(r.status_code))
 
+    # =============== RESET PET ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # Adskhan currently has 'dragon' from the earlier pet-permanence tests
+    ads_pet_before = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("reset-pet: preconditions (has a pet)", ads_pet_before.get("pet_type") is not None, str(ads_pet_before.get("pet_type")))
+    r = c.post(f"/api/children/{adskhan['id']}/reset-pet")
+    check("reset-pet: endpoint 200", r.status_code == 200, r.text[:150])
+    check("reset-pet: pet_type cleared", r.json().get("pet_type") is None)
+    check("reset-pet: feed stats cleared", r.json().get("feed_balance") == 0 and r.json().get("feed_lifetime") == 0)
+    check("reset-pet: accessories cleared", r.json().get("pet_equipped") == [])
+    ads_pet_after = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("reset-pet: not flagged dead (just no pet)", ads_pet_after["pet_is_dead"] is False)
+    # Kid can immediately pick a brand new pet (permanence lock doesn't block this — it's a real reset)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.patch("/api/me/profile", json={"pet_type": "turtle"})
+    check("reset-pet: kid can freely pick after parent reset", r.status_code == 200 and r.json()["pet_type"] == "turtle", r.text[:150])
+    # Kid blocked from resetting their own pet (parent-only action)
+    r = c.post(f"/api/children/{adskhan['id']}/reset-pet")
+    check("reset-pet: kid blocked from resetting", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/children/nonexistent/reset-pet")
+    check("reset-pet: 404 for bad child", r.status_code == 404, str(r.status_code))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

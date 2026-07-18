@@ -5,7 +5,7 @@ import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
   Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2, Copy,
-  Pencil, RotateCcw,
+  Pencil, RotateCcw, PawPrint,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -1093,6 +1093,14 @@ function SettingsView({ kids, onAdd, onRefresh }) {
     catch (e) { toast.error(formatApiError(e)); }
   };
 
+  const resetPet = async (c) => {
+    if (!window.confirm(
+      `Reset peliharaan ${c.name}?\n\nIni menghapus peliharaan yang sedang dipelihara (beserta pakan & aksesorinya) dan membuka layar pilih peliharaan baru — tanpa harus menunggu peliharaan lama "pergi" dulu.\n\nPoin, streak, dan level TIDAK terpengaruh.`
+    )) return;
+    try { await api.post(`/children/${c.id}/reset-pet`); toast.success(`Peliharaan ${c.name} sudah direset`); onRefresh(); }
+    catch (e) { toast.error(formatApiError(e)); }
+  };
+
   const resetAllPoints = async () => {
     if (kids.length === 0) return;
     if (!window.confirm(
@@ -1199,6 +1207,14 @@ function SettingsView({ kids, onAdd, onRefresh }) {
                   data-testid={`reset-points-btn-${c.id}`}
                 >
                   <RotateCcw className="w-4 h-4" strokeWidth={2.5} />
+                </button>
+                <button
+                  onClick={() => resetPet(c)}
+                  className="press-btn inline-flex items-center justify-center border-2 border-sky-300 text-sky-700 hover:bg-sky-50 p-2 rounded-lg"
+                  title="Reset peliharaan virtual anak ini"
+                  data-testid={`reset-pet-btn-${c.id}`}
+                >
+                  <PawPrint className="w-4 h-4" strokeWidth={2.5} />
                 </button>
                 <button onClick={() => delChild(c)} className={btnDanger}>
                   <Trash2 className="w-4 h-4" strokeWidth={2.5} />

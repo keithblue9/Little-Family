@@ -1470,6 +1470,33 @@ async def reset_all_children_points(user: dict = Depends(require_parent)):
     return {"success": True, "count": len(kids)}
 
 
+@api.post("/children/{child_id}/reset-pet")
+async def reset_child_pet(child_id: str, user: dict = Depends(require_parent)):
+    """Clear a child's virtual pet entirely — sends them back to the picker
+    screen with a completely blank slate, bypassing the usual 'wait for it to
+    pass away' permanence rule. For parents fixing a mistake, clearing test
+    data, or letting a kid start over without an actual neglect wait. Does NOT
+    touch points/streaks/level — only the pet itself and its feed economy."""
+    await get_child_or_404(FAMILY_ID, child_id)
+    await db.children.update_one(
+        {"id": child_id},
+        {"$set": {
+            "pet_type": None,
+            "pet_chosen_at": None,
+            "pet_last_fed_at": None,
+            "feed_balance": 0,
+            "feed_lifetime": 0,
+            "pet_equipped": [],
+        }},
+    )
+    await db.members.update_one(
+        {"id": child_id},
+        {"$set": {"pet_type": None, "pet_equipped": []}},
+    )
+    await log_activity(FAMILY_ID, child_id, "pet_reset", {})
+    return await db.children.find_one({"id": child_id}, {"_id": 0})
+
+
 @api.delete("/children/{child_id}")
 async def delete_child(child_id: str, user: dict = Depends(require_parent)):
     await get_child_or_404(FAMILY_ID, child_id)

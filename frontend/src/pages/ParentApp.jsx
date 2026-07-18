@@ -551,7 +551,16 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
     const awaiting = displayTasks.filter((t) => t.status === "completed").sort(byOrder);
     const done = displayTasks.filter((t) => t.status === "approved" || t.status === "skipped").sort(byOrder);
     const missed = displayTasks.filter((t) => t.status === "missed");
-    return { pending, awaiting, done, missed, otherDatesCount };
+    // Sum of a group's own points — a broadcast row collapsed to one
+    // representative still only has one `points` value (same for every kid
+    // it was sent to), so a plain sum doesn't double-count per sibling.
+    const sumPoints = (list) => list.reduce((sum, t) => sum + (Number(t.points) || 0), 0);
+    return {
+      pending, awaiting, done, missed, otherDatesCount,
+      pendingPoints: sumPoints(pending),
+      awaitingPoints: sumPoints(awaiting),
+      donePoints: sumPoints(done),
+    };
   }, [displayTasks, dateFilter, isDateMode]);
 
   const act = async (fn) => {
@@ -667,7 +676,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       )}
 
       {grouped.awaiting.length > 0 && (
-        <Section title="⏳ Menunggu persetujuan" count={grouped.awaiting.length}>
+        <Section title="⏳ Menunggu persetujuan" count={grouped.awaiting.length} pointsTotal={grouped.awaitingPoints}>
           {grouped.awaiting.map((t) => (
             <TaskRow key={t.id} task={t} childName={rowName(t)}>
               <button onClick={() => approve(t)} data-testid={`${TEST_IDS.parent.approveTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
@@ -688,7 +697,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
         <EncourageModal task={encourageTask} onClose={() => setEncourageTask(null)} onApproved={onRefresh} />
       )}
 
-      <Section title="📋 Aktif" count={grouped.pending.length}>
+      <Section title="📋 Aktif" count={grouped.pending.length} pointsTotal={grouped.pendingPoints}>
         <div className="flex items-center gap-2 mb-3 -mt-1 flex-wrap">
           {isDateMode && (
             <button
@@ -780,7 +789,7 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
       </Section>
 
       {grouped.done.length > 0 && (
-        <Section title="✅ Selesai" count={grouped.done.length}>
+        <Section title="✅ Selesai" count={grouped.done.length} pointsTotal={grouped.donePoints}>
           {grouped.done.slice(0, 10).map((t) => (
             <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
               {t.freed_with_card ? (
@@ -832,12 +841,19 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   );
 }
 
-function Section({ title, count, children }) {
+function Section({ title, count, pointsTotal, children }) {
   return (
     <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
       <div className="px-5 py-3 border-b border-slate-100 flex items-center justify-between">
         <h4 className="font-parent font-bold text-slate-900">{title}</h4>
-        {typeof count === "number" && <span className="text-sm text-slate-400">{count}</span>}
+        <div className="flex items-center gap-2">
+          {typeof pointsTotal === "number" && pointsTotal !== 0 && (
+            <span className="inline-flex items-center gap-1 text-xs font-bold text-amber-600 bg-amber-50 rounded-full px-2 py-0.5">
+              <Star className="w-3 h-3" strokeWidth={2.5} /> {pointsTotal} poin
+            </span>
+          )}
+          {typeof count === "number" && <span className="text-sm text-slate-400">{count}</span>}
+        </div>
       </div>
       <div className="divide-y divide-slate-100">{children}</div>
     </div>

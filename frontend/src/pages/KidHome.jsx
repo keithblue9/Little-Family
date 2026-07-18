@@ -20,6 +20,7 @@ import KidChallenges from "@/components/KidChallenges";
 import GrowthTrail from "@/components/GrowthTrail";
 import StickerBook from "@/components/StickerBook";
 import VirtualPetMascot from "@/components/VirtualPetMascot";
+import PetManagerCard from "@/components/PetManagerCard";
 import DailyRecapCard from "@/components/DailyRecapCard";
 import RewardSuggestions from "@/components/RewardSuggestions";
 import CheersReceived from "@/components/CheersReceived";
@@ -48,7 +49,7 @@ export default function KidHome() {
   const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
   const [levelTitles, setLevelTitles] = useState(null); // family's custom level ladder, from config
   const [petStageNames, setPetStageNames] = useState(null);
-  const [petStageThresholds, setPetStageThresholds] = useState(null);
+  const [petFeedThresholds, setPetFeedThresholds] = useState(null);
   const [feedCostPerMeal, setFeedCostPerMeal] = useState(5);
   const [showRecap, setShowRecap] = useState(false);
   const [tab, setTab] = useState("tasks");
@@ -80,7 +81,7 @@ export default function KidHome() {
       setWishlist(wRes.data);
       setLevelTitles(cfgRes.data.level_titles);
       setPetStageNames(cfgRes.data.pet_stage_names);
-      setPetStageThresholds(cfgRes.data.pet_stage_thresholds);
+      setPetFeedThresholds(cfgRes.data.pet_stage_feed_thresholds);
       setFeedCostPerMeal(cfgRes.data.feed_cost_per_meal ?? 5);
     } catch (e) {
       toast.error(formatApiError(e));
@@ -250,7 +251,7 @@ export default function KidHome() {
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <div className="mb-5">
-                <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} petStageNames={petStageNames} petStageThresholds={petStageThresholds} feedCostPerMeal={feedCostPerMeal} />
+                <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} petStageNames={petStageNames} petFeedThresholds={petFeedThresholds} feedCostPerMeal={feedCostPerMeal} />
               </div>
               <h2 className="font-fun font-bold text-xl text-slate-900 mb-3">Misi Hari Ini 🗺️</h2>
 
@@ -385,6 +386,14 @@ export default function KidHome() {
 
           {tab === "profile" && (
             <motion.div key="profile" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-6">
+              <div className="bg-white rounded-3xl p-6 border-2 border-slate-100 chunky-shadow">
+                <PetManagerCard
+                  child={child}
+                  onChanged={load}
+                  petStageNames={petStageNames}
+                  petFeedThresholds={petFeedThresholds}
+                />
+              </div>
               <div className="bg-white rounded-3xl p-6 border-2 border-slate-100 chunky-shadow">
                 <ProfileEditor />
               </div>

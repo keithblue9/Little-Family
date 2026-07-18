@@ -8,7 +8,7 @@ const DEFAULTS = {
   feed_cost_per_meal: 5,
   pet_neglect_days: 14,
   pet_stage_names: ["Telur", "Bayi", "Remaja", "Dewasa"],
-  pet_stage_thresholds: [0.25, 0.6],
+  pet_stage_feed_thresholds: [3, 8, 15],
 };
 
 export default function PetConfigEditor() {
@@ -22,9 +22,9 @@ export default function PetConfigEditor() {
         feed_cost_per_meal: data.feed_cost_per_meal ?? DEFAULTS.feed_cost_per_meal,
         pet_neglect_days: data.pet_neglect_days ?? DEFAULTS.pet_neglect_days,
         pet_stage_names: data.pet_stage_names && data.pet_stage_names.length === 4 ? data.pet_stage_names : DEFAULTS.pet_stage_names,
-        // stored as ratios (0-1); edit as whole percentages for a friendlier UI
-        stage2_pct: Math.round((data.pet_stage_thresholds?.[0] ?? DEFAULTS.pet_stage_thresholds[0]) * 100),
-        stage3_pct: Math.round((data.pet_stage_thresholds?.[1] ?? DEFAULTS.pet_stage_thresholds[1]) * 100),
+        feed_baby: data.pet_stage_feed_thresholds?.[0] ?? DEFAULTS.pet_stage_feed_thresholds[0],
+        feed_teen: data.pet_stage_feed_thresholds?.[1] ?? DEFAULTS.pet_stage_feed_thresholds[1],
+        feed_adult: data.pet_stage_feed_thresholds?.[2] ?? DEFAULTS.pet_stage_feed_thresholds[2],
       }))
       .catch((e) => toast.error(formatApiError(e)));
   }, []);
@@ -42,8 +42,9 @@ export default function PetConfigEditor() {
       feed_cost_per_meal: DEFAULTS.feed_cost_per_meal,
       pet_neglect_days: DEFAULTS.pet_neglect_days,
       pet_stage_names: [...DEFAULTS.pet_stage_names],
-      stage2_pct: Math.round(DEFAULTS.pet_stage_thresholds[0] * 100),
-      stage3_pct: Math.round(DEFAULTS.pet_stage_thresholds[1] * 100),
+      feed_baby: DEFAULTS.pet_stage_feed_thresholds[0],
+      feed_teen: DEFAULTS.pet_stage_feed_thresholds[1],
+      feed_adult: DEFAULTS.pet_stage_feed_thresholds[2],
     });
   };
 
@@ -51,8 +52,8 @@ export default function PetConfigEditor() {
     if (!form.feed_cost_per_meal || Number(form.feed_cost_per_meal) < 1) return "Biaya makan minimal 1 pakan";
     if (!form.pet_neglect_days || Number(form.pet_neglect_days) < 1) return "Batas hari kelalaian minimal 1 hari";
     if (form.pet_stage_names.some((s) => !s.trim())) return "Setiap tahap pertumbuhan butuh nama";
-    const t1 = Number(form.stage2_pct), t2 = Number(form.stage3_pct);
-    if (!(t1 > 0 && t1 < t2 && t2 < 100)) return "Ambang batas harus: 0 < tahap Remaja < tahap Dewasa < 100";
+    const f1 = Number(form.feed_baby), f2 = Number(form.feed_teen), f3 = Number(form.feed_adult);
+    if (!(f1 >= 1 && f1 < f2 && f2 < f3)) return "Jumlah pemberian pakan harus menaik: Bayi < Remaja < Dewasa (min. 1)";
     return null;
   };
 
@@ -66,7 +67,7 @@ export default function PetConfigEditor() {
         feed_cost_per_meal: Number(form.feed_cost_per_meal),
         pet_neglect_days: Number(form.pet_neglect_days),
         pet_stage_names: form.pet_stage_names.map((s) => s.trim()),
-        pet_stage_thresholds: [Number(form.stage2_pct) / 100, Number(form.stage3_pct) / 100],
+        pet_stage_feed_thresholds: [Number(form.feed_baby), Number(form.feed_teen), Number(form.feed_adult)],
       });
       toast.success("Pengaturan peliharaan disimpan!");
     } catch (e) {
@@ -87,7 +88,7 @@ export default function PetConfigEditor() {
         </button>
       </div>
       <p className="text-sm text-slate-500 mb-4">
-        Atur ekonomi pakan dan tahap pertumbuhan peliharaan anak. Sekali anak memilih peliharaan, ia terkunci
+        Atur ekonomi pakan dan pertumbuhan peliharaan anak. Sekali anak memilih peliharaan, ia terkunci
         (tidak bisa ganti) sampai peliharaan itu "pergi" karena kelamaan tidak diberi makan — baru bisa pilih yang baru.
       </p>
 
@@ -136,30 +137,39 @@ export default function PetConfigEditor() {
         </div>
       </div>
 
-      <div className="grid sm:grid-cols-2 gap-3 mb-4">
+      <label className="text-xs font-bold text-slate-500 mb-1 block">Pertumbuhan berdasarkan jumlah pemberian pakan</label>
+      <div className="grid grid-cols-3 gap-3 mb-1">
         <div>
-          <label className="text-xs font-bold text-slate-500 mb-1 block">
-            % level keluarga untuk masuk "{form.pet_stage_names[2] || "Remaja"}"
-          </label>
-          <input
-            type="number" min="1" max="99" value={form.stage2_pct}
-            onChange={(e) => setForm((p) => ({ ...p, stage2_pct: e.target.value.replace(/\D/g, "") }))}
-            className="w-full px-2 py-1.5 border-2 border-slate-200 rounded-lg text-sm"
-          />
+          <div className="text-[11px] text-slate-500 mb-1">Menetas jadi <b>{form.pet_stage_names[1] || "Bayi"}</b> setelah</div>
+          <div className="flex items-center gap-1">
+            <input type="number" min="1" value={form.feed_baby}
+              onChange={(e) => setForm((p) => ({ ...p, feed_baby: e.target.value.replace(/\D/g, "") }))}
+              className="w-full px-2 py-1.5 border-2 border-slate-200 rounded-lg text-sm" />
+            <span className="text-[11px] text-slate-400">kali</span>
+          </div>
         </div>
         <div>
-          <label className="text-xs font-bold text-slate-500 mb-1 block">
-            % level keluarga untuk masuk "{form.pet_stage_names[3] || "Dewasa"}"
-          </label>
-          <input
-            type="number" min="2" max="99" value={form.stage3_pct}
-            onChange={(e) => setForm((p) => ({ ...p, stage3_pct: e.target.value.replace(/\D/g, "") }))}
-            className="w-full px-2 py-1.5 border-2 border-slate-200 rounded-lg text-sm"
-          />
+          <div className="text-[11px] text-slate-500 mb-1">Jadi <b>{form.pet_stage_names[2] || "Remaja"}</b> setelah</div>
+          <div className="flex items-center gap-1">
+            <input type="number" min="2" value={form.feed_teen}
+              onChange={(e) => setForm((p) => ({ ...p, feed_teen: e.target.value.replace(/\D/g, "") }))}
+              className="w-full px-2 py-1.5 border-2 border-slate-200 rounded-lg text-sm" />
+            <span className="text-[11px] text-slate-400">kali</span>
+          </div>
+        </div>
+        <div>
+          <div className="text-[11px] text-slate-500 mb-1">Jadi <b>{form.pet_stage_names[3] || "Dewasa"}</b> setelah</div>
+          <div className="flex items-center gap-1">
+            <input type="number" min="3" value={form.feed_adult}
+              onChange={(e) => setForm((p) => ({ ...p, feed_adult: e.target.value.replace(/\D/g, "") }))}
+              className="w-full px-2 py-1.5 border-2 border-slate-200 rounded-lg text-sm" />
+            <span className="text-[11px] text-slate-400">kali</span>
+          </div>
         </div>
       </div>
       <p className="text-[10px] text-slate-400 mb-4">
-        Persentase dihitung dari posisi anak di tangga Level (misal keluarga punya 10 level: 25% ≈ level 3, 60% ≈ level 6).
+        Jumlah total "Beri Makan" yang dibutuhkan sejak peliharaan dipilih. Contoh bawaan: menetas setelah 3×,
+        remaja setelah 8×, dewasa setelah 15× diberi makan.
       </p>
 
       <button

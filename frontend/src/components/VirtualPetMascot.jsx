@@ -3,7 +3,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { computeLevel } from "@/lib/levels";
-import { PET_CATALOG, petAppearance, computeFoodTier, TAP_REACTIONS, ACCESSORY_CATALOG, isAccessoryUnlocked } from "@/lib/pets";
+import { PET_CATALOG, petAppearanceByFeed, computeFoodTier, TAP_REACTIONS, ACCESSORY_CATALOG, isAccessoryUnlocked } from "@/lib/pets";
+import PetSprite from "@/components/PetSprite";
 
 /**
  * Mood is a gentle, non-punitive signal: it reflects whether the kid has been
@@ -28,7 +29,7 @@ function moodFor(child) {
   return { label: "Kangen Banget", face: "🥺", ring: "ring-slate-400", glow: "shadow-slate-200" };
 }
 
-export default function VirtualPetMascot({ child, onChanged, levelTitles, petStageNames, petStageThresholds, feedCostPerMeal }) {
+export default function VirtualPetMascot({ child, onChanged, levelTitles, petStageNames, petFeedThresholds, feedCostPerMeal }) {
   const [picking, setPicking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [feeding, setFeeding] = useState(false);
@@ -148,7 +149,7 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
               disabled={saving}
               className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl bg-white/70 hover:bg-white border-2 border-white/50 hover:border-indigo-300 disabled:opacity-50"
             >
-              <span className="text-3xl">{p.stages[0]}</span>
+              <PetSprite petType={p.key} stageIndex={3} size={44} />
               <span className="text-[10px] font-bold text-slate-700">{p.name}</span>
             </button>
           ))}
@@ -191,7 +192,7 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
               disabled={saving}
               className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl bg-white/70 hover:bg-white border-2 border-white/50 hover:border-indigo-300 disabled:opacity-50"
             >
-              <span className="text-3xl">{p.stages[0]}</span>
+              <PetSprite petType={p.key} stageIndex={3} size={44} />
               <span className="text-[10px] font-bold text-slate-700">{p.name}</span>
             </button>
           ))}
@@ -203,8 +204,11 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
     );
   }
 
-  const appearance = petAppearance(child.pet_type, levelInfo.level, levelInfo.totalLevels, petStageNames, petStageThresholds);
+  const appearance = petAppearanceByFeed(child.pet_type, child.pet_feed_count || 0, petFeedThresholds, petStageNames);
   const mood = moodFor(child);
+  // The pet is drawn as a real SVG creature (PetSprite) that physically grows
+  // each stage. Size scales up baby→adult so growth is unmistakable.
+  const SPRITE_SIZE_BY_STAGE = [58, 54, 66, 76];
 
   return shell(
     <div className="relative">
@@ -214,9 +218,9 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
             animate={{ y: [0, -6, 0] }}
             transition={{ duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
             whileTap={{ scale: 1.15, rotate: [0, -8, 8, 0] }}
-            className={`relative w-20 h-20 rounded-full bg-white/40 flex items-center justify-center text-5xl ring-4 ${mood.ring} shadow-lg ${mood.glow}`}
+            className={`relative w-24 h-24 rounded-full bg-white/40 flex items-center justify-center ring-4 ${mood.ring} shadow-lg ${mood.glow}`}
           >
-            {appearance.emoji}
+            <PetSprite petType={child.pet_type} stageIndex={appearance.stageIndex} size={SPRITE_SIZE_BY_STAGE[appearance.stageIndex]} />
             <span className="absolute -bottom-1 -right-1 text-xl">{mood.face}</span>
             {equipped.map((key, i) => {
               const acc = ACCESSORY_CATALOG.find((a) => a.key === key);
@@ -260,6 +264,17 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap">
             <span className="font-fun font-bold text-slate-800 bg-white/50 rounded-full px-2 py-0.5 text-sm">{appearance.stageName} {appearance.petName}-mu</span>
+          </div>
+          <div className="flex items-center gap-1 mt-1" title={`Tahap: ${appearance.stageName} (${appearance.stageIndex + 1}/4)`}>
+            {[0, 1, 2, 3].map((i) => (
+              <span key={i} className={`w-1.5 h-1.5 rounded-full ${i <= appearance.stageIndex ? "bg-emerald-500" : "bg-white/40"}`} />
+            ))}
+            {!appearance.isAdult && appearance.feedsNeeded != null && (
+              <span className="text-[10px] text-slate-600 ml-1">
+                {appearance.feedsNeeded} kali makan lagi → {["Bayi", "Remaja", "Dewasa"][appearance.stageIndex]}
+              </span>
+            )}
+            {appearance.isAdult && <span className="text-[10px] text-emerald-600 font-bold ml-1">Dewasa! 🌟</span>}
           </div>
           <div className="text-xs text-slate-700 mb-2 mt-1">Suasana hati: {mood.label}</div>
 

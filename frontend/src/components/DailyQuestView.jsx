@@ -38,6 +38,7 @@ function saveBonusOrder(childId, dateKey, orderedIds) {
 
 export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [dateKey, setDateKey] = useState(todayKey());
+  const [showCalendar, setShowCalendar] = useState(false);
   const [progress, setProgress] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState(null);
@@ -277,21 +278,39 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
           </motion.div>
         </div>
       )}
-      {/* Selected date header + quick jump to today */}
-      <div className="flex items-center justify-between bg-white rounded-2xl px-4 py-3 border-2 border-slate-100 chunky-shadow">
-        <div>
-          <div className="font-fun font-bold text-slate-900 text-sm">{humanDateKey(dateKey)}</div>
-          <div className="text-xs text-slate-400">{dateKey}</div>
+      {/* Compact date bar: shows the selected day and a calendar toggle. The
+          full month grid stays hidden by default (it dominated the screen) and
+          only expands when the kid taps "Kalender" — keeps the mission list
+          front-and-center. */}
+      <div className="flex items-center justify-between gap-2 bg-white rounded-2xl px-4 py-2.5 border-2 border-slate-100 chunky-shadow">
+        <div className="min-w-0">
+          <div className="font-fun font-bold text-slate-900 text-sm truncate">{humanDateKey(dateKey)}</div>
         </div>
-        {!isToday && (
-          <button onClick={() => setDateKey(todayKey())} className="press-btn bg-[#FF9D23] hover:bg-[#f08e14] text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs">
-            <Calendar className="w-3.5 h-3.5 inline mr-1" /> Hari Ini
+        <div className="flex items-center gap-2 shrink-0">
+          {!isToday && (
+            <button onClick={() => setDateKey(todayKey())} className="press-btn bg-[#FF9D23] hover:bg-[#f08e14] text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs">
+              Hari Ini
+            </button>
+          )}
+          <button
+            onClick={() => setShowCalendar((v) => !v)}
+            className={`press-btn font-fun font-bold px-3 py-1.5 rounded-xl text-xs inline-flex items-center gap-1 border-2 transition-colors ${
+              showCalendar ? "bg-indigo-500 border-indigo-500 text-white" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+            }`}
+            data-testid="kid-calendar-toggle"
+            title="Buka/tutup kalender"
+          >
+            <Calendar className="w-3.5 h-3.5" strokeWidth={2.5} /> Kalender
           </button>
-        )}
+        </div>
       </div>
 
-      {/* Month calendar — tap any day to jump straight to its missions below */}
-      <KidMonthCalendar childId={child?.id} selectedDateKey={dateKey} onSelectDate={setDateKey} />
+      {/* Month calendar — hidden until toggled. Tap any day to jump to its missions. */}
+      {showCalendar && (
+        <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}>
+          <KidMonthCalendar childId={child?.id} selectedDateKey={dateKey} onSelectDate={(d) => { setDateKey(d); setShowCalendar(false); }} />
+        </motion.div>
+      )}
 
       {progress?.vacation_mode && (
         <div className="bg-sky-50 border-2 border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-sky-700">

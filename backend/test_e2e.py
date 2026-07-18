@@ -1515,6 +1515,97 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post(f"/api/tasks/{fc_syi['id']}/free-with-card")
     check("cards: sibling blocked from freeing another's task", r.status_code == 403, str(r.status_code))
 
+    # =============== REWARD EDIT (PATCH) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/rewards", json={"name": "Es Krim", "description": "vanila", "cost_points": 20})
+    rw_edit = r.json()
+    check("reward-edit: created", r.status_code == 200 and rw_edit["cost_points"] == 20)
+    r = c.patch(f"/api/rewards/{rw_edit['id']}", json={"cost_points": 35})
+    check("reward-edit: cost updated", r.status_code == 200 and r.json()["cost_points"] == 35, r.text[:150])
+    check("reward-edit: name unchanged when not sent", r.json()["name"] == "Es Krim", r.json().get("name"))
+    r = c.patch(f"/api/rewards/{rw_edit['id']}", json={"name": "Es Krim Coklat", "description": "coklat"})
+    check("reward-edit: name+desc updated", r.json()["name"] == "Es Krim Coklat" and r.json()["description"] == "coklat")
+    check("reward-edit: cost persists from prior edit", r.json()["cost_points"] == 35)
+    r = c.patch(f"/api/rewards/{rw_edit['id']}", json={"description": ""})
+    check("reward-edit: description can be cleared to empty", r.json()["description"] == "")
+    r = c.patch(f"/api/rewards/{rw_edit['id']}", json={"cost_points": 0})
+    check("reward-edit: cost below 1 rejected", r.status_code == 422, str(r.status_code))
+    r = c.patch("/api/rewards/nonexistent-id", json={"cost_points": 5})
+    check("reward-edit: 404 for missing reward", r.status_code == 404, str(r.status_code))
+    # Kid can't edit rewards
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.patch(f"/api/rewards/{rw_edit['id']}", json={"cost_points": 1})
+    check("reward-edit: kid blocked from editing", r.status_code == 403, str(r.status_code))
+
+    # =============== CONSEQUENCE EDIT (PATCH) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/consequences", json={"name": "Kurang Tidur", "description": "begadang", "points_deducted": 10})
+    cq_edit = r.json()
+    check("cons-edit: created", r.status_code == 200 and cq_edit["points_deducted"] == 10)
+    r = c.patch(f"/api/consequences/{cq_edit['id']}", json={"points_deducted": 25})
+    check("cons-edit: deduction updated", r.status_code == 200 and r.json()["points_deducted"] == 25, r.text[:150])
+    check("cons-edit: name unchanged when not sent", r.json()["name"] == "Kurang Tidur")
+    r = c.patch(f"/api/consequences/{cq_edit['id']}", json={"name": "Tidur Larut", "description": "begadang lagi"})
+    check("cons-edit: name+desc updated", r.json()["name"] == "Tidur Larut" and r.json()["description"] == "begadang lagi")
+    check("cons-edit: deduction persists from prior edit", r.json()["points_deducted"] == 25)
+    r = c.patch(f"/api/consequences/{cq_edit['id']}", json={"points_deducted": 0})
+    check("cons-edit: zero deduction allowed", r.status_code == 200 and r.json()["points_deducted"] == 0)
+    r = c.patch(f"/api/consequences/{cq_edit['id']}", json={"points_deducted": 9999})
+    check("cons-edit: deduction over max rejected", r.status_code == 422, str(r.status_code))
+    r = c.patch("/api/consequences/nonexistent-id", json={"points_deducted": 5})
+    check("cons-edit: 404 for missing consequence", r.status_code == 404, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.patch(f"/api/consequences/{cq_edit['id']}", json={"points_deducted": 1})
+    check("cons-edit: kid blocked from editing", r.status_code == 403, str(r.status_code))
+
+    # =============== RESET POINTS ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # Give Syila some points + a redemption + an applied consequence to prove they all clear.
+    import asyncio as _asyncio_rst
+    _asyncio_rst.run(server.db.children.update_one(
+        {"id": syila["id"]},
+        {"$set": {"points": 80, "lifetime_points": 200, "streak_days": 7, "best_streak_days": 12,
+                  "tasks_completed": 30, "feed_balance": 15, "feed_lifetime": 40}}))
+    # A redemption + applied consequence in history
+    r = c.post("/api/consequences", json={"name": "ResetTestCons", "points_deducted": 5})
+    rst_cons = r.json()
+    c.post("/api/consequences/apply", json={"child_id": syila["id"], "consequence_id": rst_cons["id"]})
+    syi_before = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("reset: preconditions (has points & history)", syi_before["lifetime_points"] == 200 and syi_before["streak_days"] == 7)
+    applied_before = c.get(f"/api/applied-consequences?child_id={syila['id']}").json()
+    check("reset: has applied-consequence history", len(applied_before) >= 1, str(len(applied_before)))
+
+    r = c.post(f"/api/children/{syila['id']}/reset-points")
+    check("reset: endpoint 200", r.status_code == 200, r.text[:150])
+    syi_after = r.json()
+    check("reset: points zeroed", syi_after["points"] == 0 and syi_after["lifetime_points"] == 0)
+    check("reset: streaks zeroed", syi_after["streak_days"] == 0 and syi_after["best_streak_days"] == 0)
+    check("reset: tasks_completed zeroed", syi_after["tasks_completed"] == 0)
+    check("reset: feed currency zeroed", syi_after["feed_balance"] == 0 and syi_after["feed_lifetime"] == 0)
+    check("reset: freeze cards restored to full", syi_after["freeze_cards_available"] == server.FREEZE_CARDS_PER_WEEK)
+    check("reset: last_completion cleared", syi_after["last_completion_date"] is None)
+    applied_after = c.get(f"/api/applied-consequences?child_id={syila['id']}").json()
+    check("reset: applied-consequence history cleared", len(applied_after) == 0, str(len(applied_after)))
+    # Child NOT deleted — still exists & can log in, avatar/passcode intact
+    still_there = next((k for k in c.get("/api/children").json() if k["id"] == syila["id"]), None)
+    check("reset: child still exists (not deleted)", still_there is not None)
+    r = c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    check("reset: child can still log in after reset", r.status_code == 200, str(r.status_code))
+
+    # Reset-all
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _asyncio_rst.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 50, "lifetime_points": 99}}))
+    r = c.post("/api/children/reset-all-points")
+    check("reset-all: endpoint 200", r.status_code == 200 and r.json()["success"] is True, r.text[:150])
+    all_kids_after = c.get("/api/children").json()
+    check("reset-all: every child zeroed", all(k["points"] == 0 and k["lifetime_points"] == 0 for k in all_kids_after))
+    # Kid blocked from resetting
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/children/{adskhan['id']}/reset-points")
+    check("reset: kid blocked from resetting", r.status_code == 403, str(r.status_code))
+    r = c.post("/api/children/nonexistent/reset-points")
+    check("reset: 404/403 for bad child", r.status_code in (403, 404), str(r.status_code))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

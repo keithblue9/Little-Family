@@ -451,6 +451,16 @@ class RewardInput(BaseModel):
     icon: str = "gift"
 
 
+class RewardUpdate(BaseModel):
+    # All optional so the parent can edit just one field (e.g. only the cost)
+    # without having to resend the whole reward. Unset fields are left as-is.
+    model_config = ConfigDict(extra="ignore")
+    name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=500)
+    cost_points: Optional[int] = Field(default=None, ge=1, le=100000)
+    icon: Optional[str] = None
+
+
 class RewardSuggestionInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=200)
@@ -466,6 +476,16 @@ class ConsequenceInput(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = ""
     points_deducted: int = Field(ge=0, le=1000, default=0)
+
+
+class ConsequenceUpdate(BaseModel):
+    # Partial edit — same pattern as RewardUpdate. Note: editing a consequence's
+    # deduction does NOT retroactively change already-applied deductions; it only
+    # affects future applications (matches how editing a reward's cost works).
+    model_config = ConfigDict(extra="ignore")
+    name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=500)
+    points_deducted: Optional[int] = Field(default=None, ge=0, le=1000)
 
 
 class ApplyConsequenceInput(BaseModel):
@@ -1329,6 +1349,58 @@ async def update_child(child_id: str, payload: ChildUpdate, user: dict = Depends
         await db.members.update_one({"id": child_id}, {"$set": updates})
     updated = await db.children.find_one({"id": child_id}, {"_id": 0})
     return updated
+
+
+@api.post("/children/{child_id}/reset-points")
+async def reset_child_points(child_id: str, user: dict = Depends(require_parent)):
+    """Wipe a child's scoreboard back to zero — for clearing out test data or
+    starting a fresh season. Resets current & lifetime points, streaks, tasks
+    completed, pet-feed currency, and the freeze-card allotment; also clears
+    that child's redemption and applied-consequence history so the Leaderboard
+    and Uang & Poin pages start clean. Does NOT delete the child, their tasks,
+    passcode, avatar, pet choice, or theme — only the earned/spent scoreboard."""
+    await get_child_or_404(FAMILY_ID, child_id)
+    await db.children.update_one(
+        {"id": child_id},
+        {"$set": {
+            "points": 0,
+            "lifetime_points": 0,
+            "streak_days": 0,
+            "best_streak_days": 0,
+            "last_completion_date": None,
+            "tasks_completed": 0,
+            "feed_balance": 0,
+            "feed_lifetime": 0,
+            "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
+            "freeze_card_week": None,
+        }},
+    )
+    # Clear scoreboard-affecting history so the numbers genuinely start from 0.
+    await db.redemptions.delete_many({"child_id": child_id})
+    await db.applied_consequences.delete_many({"child_id": child_id})
+    await log_activity(FAMILY_ID, child_id, "points_reset", {})
+    return await db.children.find_one({"id": child_id}, {"_id": 0})
+
+
+@api.post("/children/reset-all-points")
+async def reset_all_children_points(user: dict = Depends(require_parent)):
+    """Same as reset-points but for EVERY child at once — handy after a testing
+    phase to bring the whole family's scoreboard back to zero in one tap."""
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"id": 1}).to_list(100)
+    for k in kids:
+        await db.children.update_one(
+            {"id": k["id"]},
+            {"$set": {
+                "points": 0, "lifetime_points": 0, "streak_days": 0,
+                "best_streak_days": 0, "last_completion_date": None,
+                "tasks_completed": 0, "feed_balance": 0, "feed_lifetime": 0,
+                "freeze_cards_available": FREEZE_CARDS_PER_WEEK, "freeze_card_week": None,
+            }},
+        )
+        await db.redemptions.delete_many({"child_id": k["id"]})
+        await db.applied_consequences.delete_many({"child_id": k["id"]})
+        await log_activity(FAMILY_ID, k["id"], "points_reset", {})
+    return {"success": True, "count": len(kids)}
 
 
 @api.delete("/children/{child_id}")
@@ -2810,6 +2882,25 @@ async def create_reward(payload: RewardInput, user: dict = Depends(require_paren
     return doc
 
 
+@api.patch("/rewards/{reward_id}")
+async def update_reward(reward_id: str, payload: RewardUpdate, user: dict = Depends(require_parent)):
+    """Edit an existing reward in place (name / description / cost / icon).
+    Changing the cost only affects FUTURE redemptions — points already spent
+    on past redemptions are untouched, matching parents' mental model of
+    'this is what it costs from now on'."""
+    reward = await db.rewards.find_one({"id": reward_id, "parent_id": FAMILY_ID})
+    if not reward:
+        raise HTTPException(status_code=404, detail="Reward not found")
+    # description can legitimately be cleared to ""; only name/cost/icon are
+    # skipped when None (unset). exclude_unset lets us tell "sent empty" apart
+    # from "not sent at all".
+    raw = payload.model_dump(exclude_unset=True)
+    updates = {k: v for k, v in raw.items() if v is not None}
+    if updates:
+        await db.rewards.update_one({"id": reward_id}, {"$set": updates})
+    return await db.rewards.find_one({"id": reward_id}, {"_id": 0})
+
+
 @api.delete("/rewards/{reward_id}")
 async def delete_reward(reward_id: str, user: dict = Depends(require_parent)):
     # Idempotent — see delete_task.
@@ -3026,6 +3117,21 @@ async def create_consequence(payload: ConsequenceInput, user: dict = Depends(req
     await db.consequences.insert_one(doc)
     doc.pop("_id", None)
     return doc
+
+
+@api.patch("/consequences/{consequence_id}")
+async def update_consequence(consequence_id: str, payload: ConsequenceUpdate, user: dict = Depends(require_parent)):
+    """Edit an existing consequence (name / description / deduction). Editing
+    the deduction affects only FUTURE applications — points already deducted
+    from past applications stay as they were."""
+    cons = await db.consequences.find_one({"id": consequence_id, "parent_id": FAMILY_ID})
+    if not cons:
+        raise HTTPException(status_code=404, detail="Consequence not found")
+    raw = payload.model_dump(exclude_unset=True)
+    updates = {k: v for k, v in raw.items() if v is not None}
+    if updates:
+        await db.consequences.update_one({"id": consequence_id}, {"$set": updates})
+    return await db.consequences.find_one({"id": consequence_id}, {"_id": 0})
 
 
 @api.delete("/consequences/{consequence_id}")

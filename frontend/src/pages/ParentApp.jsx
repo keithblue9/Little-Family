@@ -5,6 +5,7 @@ import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
   Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2, Copy,
+  Pencil, RotateCcw,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -109,7 +110,9 @@ export default function ParentApp() {
   const [editingTask, setEditingTask] = useState(null);
   const [templateModal, setTemplateModal] = useState(false);
   const [rewardModal, setRewardModal] = useState(false);
+  const [editingReward, setEditingReward] = useState(null);
   const [consModal, setConsModal] = useState(false);
+  const [editingCons, setEditingCons] = useState(null);
   const [applyConsModal, setApplyConsModal] = useState(null);
 
   const load = useCallback(async () => {
@@ -316,7 +319,8 @@ export default function ParentApp() {
               redemptions={redemptions}
               kids={children}
               selectedChildId={selectedChildId}
-              onAdd={() => setRewardModal(true)}
+              onAdd={() => { setEditingReward(null); setRewardModal(true); }}
+              onEdit={(r) => { setEditingReward(r); setRewardModal(true); }}
               onRefresh={load}
             />
           )}
@@ -328,7 +332,8 @@ export default function ParentApp() {
           {view === "consequences" && (
             <ConsequencesView
               consequences={consequences}
-              onAdd={() => setConsModal(true)}
+              onAdd={() => { setEditingCons(null); setConsModal(true); }}
+              onEdit={(c) => { setEditingCons(c); setConsModal(true); }}
               onRefresh={load}
               kids={children}
               onApply={(c) => setApplyConsModal({ consequence: c })}
@@ -363,8 +368,8 @@ export default function ParentApp() {
         editTask={editingTask}
       />
       <TemplateModal open={templateModal} onClose={() => setTemplateModal(false)} kids={children} onSaved={load} />
-      <RewardFormModal open={rewardModal} onClose={() => setRewardModal(false)} onSaved={load} />
-      <ConsequenceFormModal open={consModal} onClose={() => setConsModal(false)} onSaved={load} />
+      <RewardFormModal open={rewardModal} onClose={() => { setRewardModal(false); setEditingReward(null); }} onSaved={load} editReward={editingReward} />
+      <ConsequenceFormModal open={consModal} onClose={() => { setConsModal(false); setEditingCons(null); }} onSaved={load} editConsequence={editingCons} />
       <ApplyConsequenceModal
         open={!!applyConsModal}
         onClose={() => setApplyConsModal(null)}
@@ -899,7 +904,7 @@ function TaskRow({ task, childName, children, dim = false, currentDateFilter = n
 }
 
 // ─────────────────────────────────────────────────────────
-function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onRefresh }) {
+function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onEdit, onRefresh }) {
   const del = async (r) => {
     try { await api.delete(`/rewards/${r.id}`); toast.success("Reward deleted"); onRefresh(); }
     catch (e) { toast.error(formatApiError(e)); }
@@ -944,9 +949,14 @@ function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onRef
                     <Star className="w-4 h-4 text-[#FF9D23]" strokeWidth={2.5} />
                     <span className="font-bold">{r.cost_points}</span>
                   </div>
-                  <button onClick={() => del(r)} data-testid={`${TEST_IDS.parent.deleteRewardBtn}-${r.id}`} className={btnDanger}>
-                    <Trash2 className="w-4 h-4" strokeWidth={2.5} />
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => onEdit(r)} data-testid={`edit-reward-btn-${r.id}`} className={btnGhost} title="Edit hadiah">
+                      <Pencil className="w-4 h-4" strokeWidth={2.5} />
+                    </button>
+                    <button onClick={() => del(r)} data-testid={`${TEST_IDS.parent.deleteRewardBtn}-${r.id}`} className={btnDanger}>
+                      <Trash2 className="w-4 h-4" strokeWidth={2.5} />
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}
@@ -988,7 +998,7 @@ function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onRef
 }
 
 // ─────────────────────────────────────────────────────────
-function ConsequencesView({ consequences, kids, onAdd, onRefresh, onApply }) {
+function ConsequencesView({ consequences, kids, onAdd, onEdit, onRefresh, onApply }) {
   const del = async (c) => {
     try { await api.delete(`/consequences/${c.id}`); toast.success("Deleted"); onRefresh(); }
     catch (e) { toast.error(formatApiError(e)); }
@@ -1028,11 +1038,16 @@ function ConsequencesView({ consequences, kids, onAdd, onRefresh, onApply }) {
                     data-testid={`${TEST_IDS.parent.applyConsequenceBtn}-${c.id}`}
                     className="press-btn inline-flex items-center gap-1 bg-[#FF5C5C] disabled:bg-slate-200 text-white font-semibold px-3 py-1.5 rounded-lg text-sm"
                   >
-                    Apply
+                    Terapkan
                   </button>
-                  <button onClick={() => del(c)} className={btnDanger}>
-                    <Trash2 className="w-4 h-4" strokeWidth={2.5} />
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => onEdit(c)} data-testid={`edit-cons-btn-${c.id}`} className={btnGhost} title="Edit konsekuensi">
+                      <Pencil className="w-4 h-4" strokeWidth={2.5} />
+                    </button>
+                    <button onClick={() => del(c)} className={btnDanger}>
+                      <Trash2 className="w-4 h-4" strokeWidth={2.5} />
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}
@@ -1048,9 +1063,29 @@ function SettingsView({ kids, onAdd, onRefresh }) {
   const { user } = useAuth();
 
   const delChild = async (c) => {
-    if (!window.confirm(`Delete ${c.name}? This removes all their tasks and history.`)) return;
-    try { await api.delete(`/children/${c.id}`); toast.success("Child removed"); onRefresh(); }
+    if (!window.confirm(`Hapus ${c.name}? Ini menghapus semua tugas dan riwayatnya.`)) return;
+    try { await api.delete(`/children/${c.id}`); toast.success("Anak dihapus"); onRefresh(); }
     catch (e) { toast.error(formatApiError(e)); }
+  };
+
+  const resetPoints = async (c) => {
+    if (!window.confirm(
+      `Reset poin ${c.name} ke nol?\n\nIni mengembalikan poin, total poin, streak, misi selesai, dan makanan pet ke 0, serta menghapus riwayat penukaran & konsekuensi anak ini.\n\nTugas, passcode, avatar, dan pet TIDAK dihapus. Cocok untuk membersihkan data testing.`
+    )) return;
+    try { await api.post(`/children/${c.id}/reset-points`); toast.success(`Poin ${c.name} sudah direset`); onRefresh(); }
+    catch (e) { toast.error(formatApiError(e)); }
+  };
+
+  const resetAllPoints = async () => {
+    if (kids.length === 0) return;
+    if (!window.confirm(
+      `Reset poin SEMUA anak ke nol?\n\nSemua scoreboard (poin, streak, riwayat penukaran & konsekuensi) akan dikosongkan. Tugas & profil tetap aman.\n\nLanjutkan?`
+    )) return;
+    try {
+      const { data } = await api.post(`/children/reset-all-points`);
+      toast.success(`Poin ${data.count} anak sudah direset`);
+      onRefresh();
+    } catch (e) { toast.error(formatApiError(e)); }
   };
 
   return (
@@ -1063,11 +1098,23 @@ function SettingsView({ kids, onAdd, onRefresh }) {
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="font-parent font-bold text-lg text-slate-900">Children</h3>
-          <button onClick={onAdd} className={btnPrimary} data-testid={TEST_IDS.parent.addChildBtn}>
-            <Plus className="w-4 h-4" strokeWidth={2.5} /> Add child
-          </button>
+        <div className="flex justify-between items-center mb-4 flex-wrap gap-2">
+          <h3 className="font-parent font-bold text-lg text-slate-900">Anak</h3>
+          <div className="flex items-center gap-2">
+            {kids.length > 0 && (
+              <button
+                onClick={resetAllPoints}
+                className="press-btn inline-flex items-center gap-1.5 border-2 border-amber-300 text-amber-700 hover:bg-amber-50 font-semibold px-3 py-1.5 rounded-lg text-sm"
+                title="Reset poin semua anak ke nol"
+                data-testid="reset-all-points-btn"
+              >
+                <RotateCcw className="w-4 h-4" strokeWidth={2.5} /> Reset poin semua
+              </button>
+            )}
+            <button onClick={onAdd} className={btnPrimary} data-testid={TEST_IDS.parent.addChildBtn}>
+              <Plus className="w-4 h-4" strokeWidth={2.5} /> Tambah anak
+            </button>
+          </div>
         </div>
         {kids.length === 0 ? (
           <div className="text-sm text-slate-400 text-center py-6">Belum ada anak.</div>
@@ -1128,6 +1175,14 @@ function SettingsView({ kids, onAdd, onRefresh }) {
                     <option key={t.key} value={t.key}>{t.emoji} {t.label}</option>
                   ))}
                 </select>
+                <button
+                  onClick={() => resetPoints(c)}
+                  className="press-btn inline-flex items-center justify-center border-2 border-amber-300 text-amber-700 hover:bg-amber-50 p-2 rounded-lg"
+                  title="Reset poin anak ini ke nol"
+                  data-testid={`reset-points-btn-${c.id}`}
+                >
+                  <RotateCcw className="w-4 h-4" strokeWidth={2.5} />
+                </button>
                 <button onClick={() => delChild(c)} className={btnDanger}>
                   <Trash2 className="w-4 h-4" strokeWidth={2.5} />
                 </button>
@@ -1800,44 +1855,61 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   );
 }
 
-function RewardFormModal({ open, onClose, onSaved }) {
+function RewardFormModal({ open, onClose, onSaved, editReward }) {
+  const isEdit = !!editReward;
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
   const [cost, setCost] = useState(50);
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => { if (open) { setName(""); setDesc(""); setCost(50); } }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    if (isEdit) {
+      setName(editReward.name || "");
+      setDesc(editReward.description || "");
+      setCost(editReward.cost_points ?? 50);
+    } else {
+      setName(""); setDesc(""); setCost(50);
+    }
+  }, [open, isEdit, editReward]);
 
   const submit = async () => {
-    if (!name.trim()) return toast.error("Name required");
+    if (!name.trim()) return toast.error("Nama hadiah wajib diisi");
+    if (!cost || Number(cost) < 1) return toast.error("Harga minimal 1 poin");
     setSaving(true);
     try {
-      await api.post("/rewards", { name: name.trim(), description: desc, cost_points: Number(cost) || 1 });
-      toast.success("Reward added");
+      const body = { name: name.trim(), description: desc, cost_points: Number(cost) || 1 };
+      if (isEdit) {
+        await api.patch(`/rewards/${editReward.id}`, body);
+        toast.success("Hadiah diperbarui");
+      } else {
+        await api.post("/rewards", body);
+        toast.success("Hadiah ditambahkan");
+      }
       onSaved(); onClose();
     } catch (e) { toast.error(formatApiError(e)); }
     finally { setSaving(false); }
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="New reward">
+    <Modal open={open} onClose={onClose} title={isEdit ? "Edit hadiah" : "Hadiah baru"}>
       <div className="space-y-4">
         <div>
-          <label className={labelClass}>Reward name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="30 min screen time" data-testid="reward-name-input" />
+          <label className={labelClass}>Nama hadiah</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Nonton 30 menit" data-testid="reward-name-input" />
         </div>
         <div>
-          <label className={labelClass}>Description (optional)</label>
+          <label className={labelClass}>Deskripsi (opsional)</label>
           <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} />
         </div>
         <div>
-          <label className={labelClass}>Cost (points)</label>
+          <label className={labelClass}>Harga (poin)</label>
           <input type="number" min="1" value={cost} onChange={(e) => setCost(e.target.value)} className={inputClass} data-testid="reward-cost-input" />
         </div>
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Cancel</button>
+          <button onClick={onClose} className={btnGhost}>Batal</button>
           <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="reward-submit-btn">
-            {saving ? "Saving…" : "Add reward"}
+            {saving ? "Menyimpan…" : (isEdit ? "Simpan perubahan" : "Tambah hadiah")}
           </button>
         </div>
       </div>
@@ -1845,44 +1917,60 @@ function RewardFormModal({ open, onClose, onSaved }) {
   );
 }
 
-function ConsequenceFormModal({ open, onClose, onSaved }) {
+function ConsequenceFormModal({ open, onClose, onSaved, editConsequence }) {
+  const isEdit = !!editConsequence;
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
   const [deduct, setDeduct] = useState(10);
   const [saving, setSaving] = useState(false);
 
-  useEffect(() => { if (open) { setName(""); setDesc(""); setDeduct(10); } }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    if (isEdit) {
+      setName(editConsequence.name || "");
+      setDesc(editConsequence.description || "");
+      setDeduct(editConsequence.points_deducted ?? 0);
+    } else {
+      setName(""); setDesc(""); setDeduct(10);
+    }
+  }, [open, isEdit, editConsequence]);
 
   const submit = async () => {
-    if (!name.trim()) return toast.error("Name required");
+    if (!name.trim()) return toast.error("Nama konsekuensi wajib diisi");
     setSaving(true);
     try {
-      await api.post("/consequences", { name: name.trim(), description: desc, points_deducted: Number(deduct) || 0 });
-      toast.success("Consequence added");
+      const body = { name: name.trim(), description: desc, points_deducted: Number(deduct) || 0 };
+      if (isEdit) {
+        await api.patch(`/consequences/${editConsequence.id}`, body);
+        toast.success("Konsekuensi diperbarui");
+      } else {
+        await api.post("/consequences", body);
+        toast.success("Konsekuensi ditambahkan");
+      }
       onSaved(); onClose();
     } catch (e) { toast.error(formatApiError(e)); }
     finally { setSaving(false); }
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="New consequence">
+    <Modal open={open} onClose={onClose} title={isEdit ? "Edit konsekuensi" : "Konsekuensi baru"}>
       <div className="space-y-4">
         <div>
-          <label className={labelClass}>Consequence</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Lose screen time" data-testid="cons-name-input" />
+          <label className={labelClass}>Konsekuensi</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Kurangi waktu main" data-testid="cons-name-input" />
         </div>
         <div>
-          <label className={labelClass}>Description</label>
-          <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} placeholder="No TV for the evening" />
+          <label className={labelClass}>Deskripsi</label>
+          <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} placeholder="Tidak nonton TV malam ini" />
         </div>
         <div>
-          <label className={labelClass}>Points to deduct</label>
+          <label className={labelClass}>Poin dikurangi</label>
           <input type="number" min="0" value={deduct} onChange={(e) => setDeduct(e.target.value)} className={inputClass} data-testid="cons-deduct-input" />
         </div>
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Cancel</button>
+          <button onClick={onClose} className={btnGhost}>Batal</button>
           <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="cons-submit-btn">
-            {saving ? "Saving…" : "Add"}
+            {saving ? "Menyimpan…" : (isEdit ? "Simpan perubahan" : "Tambah")}
           </button>
         </div>
       </div>

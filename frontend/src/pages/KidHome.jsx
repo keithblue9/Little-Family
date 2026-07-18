@@ -147,17 +147,12 @@ export default function KidHome() {
           </motion.div>
           <div>
             <div className="font-fun font-bold text-2xl text-slate-900">Halo, {child.name}!</div>
-            <div className="flex items-center gap-2 text-sm text-slate-500 flex-wrap">
-              <Flame className="w-4 h-4 text-[#FF5C5C]" strokeWidth={2.5} />
-              Streak {child.streak_days || 0} hari
+            <div className="flex items-center gap-1.5 text-sm font-semibold text-[#FF5C5C]">
+              <Flame className="w-4 h-4" strokeWidth={2.5} />
+              <span>Streak {child.streak_days || 0} hari</span>
               {(child.best_streak_days || 0) > (child.streak_days || 0) && (
-                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700" title="Rekor streak terbaikmu">
-                  🏅 Rekor: {child.best_streak_days} hari
-                </span>
-              )}
-              {(child.freeze_cards_available ?? 1) > 0 && (
-                <span className="inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-sky-100 text-sky-700" title="Kartu Bebas — melindungi streak-mu kalau kelewat 1 hari">
-                  🧊 {child.freeze_cards_available ?? 1} Kartu Bebas
+                <span className="text-xs font-bold text-amber-600" title="Rekor streak terbaikmu">
+                  · 🏅 {child.best_streak_days}
                 </span>
               )}
             </div>
@@ -187,37 +182,49 @@ export default function KidHome() {
       )}
 
       {/* Points hero */}
-      <div className="relative z-10 px-5 md:px-10 pt-6">
+      <div className="relative z-10 px-5 md:px-10 pt-5">
         <motion.div
           initial={{ y: 20, opacity: 0 }}
           animate={{ y: 0, opacity: 1 }}
-          className="bg-gradient-to-br from-[#FF9D23] to-[#FF6B00] rounded-3xl p-6 chunky-shadow-lg text-white overflow-hidden relative"
+          className="bg-gradient-to-br from-[#7C5CFF] via-[#6B5CFF] to-[#4DB8FF] rounded-3xl p-5 chunky-shadow-lg text-white overflow-hidden relative"
         >
-          <div className="absolute -right-6 -top-6 w-32 h-32 rounded-full bg-white/10" />
-          <div className="absolute right-10 bottom-4 w-20 h-20 rounded-full bg-white/10" />
-          <div className="relative flex items-end justify-between">
+          <div className="absolute -right-8 -top-8 w-36 h-36 rounded-full bg-white/10" />
+          <div className="absolute right-12 bottom-2 w-20 h-20 rounded-full bg-white/5" />
+          <div className="relative flex items-center justify-between">
             <div>
-              <div className="flex items-center gap-2 mb-1 text-white/90 text-sm font-semibold">
-                <Sparkles className="w-4 h-4" strokeWidth={2.5} /> Poin kamu
+              <div className="flex items-center gap-1.5 mb-0.5 text-white/80 text-xs font-bold uppercase tracking-wide">
+                <Sparkles className="w-3.5 h-3.5" strokeWidth={2.5} /> Poin kamu
               </div>
               <div className="font-fun font-bold text-6xl leading-none">{child.points || 0}</div>
-              <div className="text-white/80 text-sm mt-2">
-                Total sepanjang masa: {child.lifetime_points || 0} · Misi selesai: {child.tasks_completed || 0}
-              </div>
             </div>
             <button
               onClick={() => setTab("money")}
-              className="press-btn bg-white/20 hover:bg-white/30 backdrop-blur text-white font-fun font-bold px-4 py-2 rounded-2xl text-sm"
+              className="press-btn bg-white/20 hover:bg-white/30 backdrop-blur text-white font-fun font-bold px-4 py-2.5 rounded-2xl text-sm shrink-0"
             >
               Tukar 💰
             </button>
           </div>
 
+          {/* Compact stat chips */}
+          <div className="relative flex items-center gap-2 mt-3 flex-wrap">
+            <span className="inline-flex items-center gap-1 bg-white/15 rounded-full px-2.5 py-1 text-xs font-semibold">
+              🏆 {child.lifetime_points || 0} total
+            </span>
+            <span className="inline-flex items-center gap-1 bg-white/15 rounded-full px-2.5 py-1 text-xs font-semibold">
+              ✅ {child.tasks_completed || 0} misi
+            </span>
+            {(child.freeze_cards_available ?? 0) > 0 && (
+              <span className="inline-flex items-center gap-1 bg-white/15 rounded-full px-2.5 py-1 text-xs font-semibold" title="Kartu Bebas — melindungi streak-mu kalau kelewat 1 hari">
+                🧊 {child.freeze_cards_available} Kartu Bebas
+              </span>
+            )}
+          </div>
+
           {/* Level bar — permanent progress from lifetime points, unaffected by spending */}
-          <div className="relative mt-4 pt-4 border-t border-white/20">
-            <div className="flex items-center justify-between text-xs font-bold text-white/90 mb-1">
-              <span>{levelInfo.emoji} Level {levelInfo.level} — {levelInfo.title}</span>
-              <span>{levelInfo.maxed ? "MAX!" : `${levelInfo.xp}/${levelInfo.nextMin} XP`}</span>
+          <div className="relative mt-4 pt-3.5 border-t border-white/20">
+            <div className="flex items-center justify-between text-xs font-bold text-white/90 mb-1.5">
+              <span>{levelInfo.emoji} Lvl {levelInfo.level} · {levelInfo.title}</span>
+              <span>{levelInfo.maxed ? "MAX! 🌟" : `${levelInfo.xp}/${levelInfo.nextMin} XP`}</span>
             </div>
             <div className="h-2.5 bg-white/20 rounded-full overflow-hidden">
               <motion.div
@@ -227,9 +234,6 @@ export default function KidHome() {
                 className="h-full rounded-full bg-white"
               />
             </div>
-            {!levelInfo.maxed && (
-              <div className="text-[10px] text-white/70 mt-1">Menuju {levelInfo.nextTitle}</div>
-            )}
           </div>
         </motion.div>
       </div>
@@ -239,29 +243,21 @@ export default function KidHome() {
         <AnimatePresence mode="wait">
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-              <div className="mb-4">
+              <div className="mb-5">
                 <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} />
               </div>
-              <h2 className="font-fun font-bold text-2xl text-slate-900 mb-1">Petualangan Misi 🗺️</h2>
-              <p className="text-sm text-slate-500 mb-4">
-                Selesaikan misi harianmu sesuai urutan. Selesaikan target poin harianmu untuk jadi juara!
-              </p>
+              <h2 className="font-fun font-bold text-xl text-slate-900 mb-3">Misi Hari Ini 🗺️</h2>
 
               {child.mbti && personalityMeta(child.mbti) && (
                 <motion.div
-                  initial={{ opacity: 0, scale: 0.97 }}
+                  initial={{ opacity: 0, scale: 0.98 }}
                   animate={{ opacity: 1, scale: 1 }}
-                  className="mb-4 rounded-2xl p-4 flex items-center gap-3 text-white chunky-shadow"
+                  className="mb-4 rounded-2xl px-4 py-3 flex items-center gap-3 text-white chunky-shadow"
                   style={{ background: personalityMeta(child.mbti).color }}
                 >
-                  <div className="text-3xl">{personalityMeta(child.mbti).emoji}</div>
-                  <div className="min-w-0">
-                    <div className="font-fun font-bold text-sm opacity-90">
-                      {personalityMeta(child.mbti).nickname}
-                    </div>
-                    <div className="font-body text-sm leading-snug">
-                      {personalityMeta(child.mbti).motivation}
-                    </div>
+                  <div className="text-2xl shrink-0">{personalityMeta(child.mbti).emoji}</div>
+                  <div className="font-body text-sm leading-snug min-w-0">
+                    {personalityMeta(child.mbti).motivation}
                   </div>
                 </motion.div>
               )}

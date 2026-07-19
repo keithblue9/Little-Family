@@ -47,6 +47,7 @@ export default function KidHome() {
   const [child, setChild] = useState(null);
   const [rewards, setRewards] = useState([]);
   const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
+  const [consequences, setConsequences] = useState([]);
   const [levelTitles, setLevelTitles] = useState(null); // family's custom level ladder, from config
   const [petStageNames, setPetStageNames] = useState(null);
   const [petFeedThresholds, setPetFeedThresholds] = useState(null);
@@ -64,11 +65,12 @@ export default function KidHome() {
 
   const load = useCallback(async () => {
     try {
-      const [cRes, rRes, wRes, cfgRes] = await Promise.all([
+      const [cRes, rRes, wRes, cfgRes, consRes] = await Promise.all([
         api.get("/children"),
         api.get("/rewards"),
         api.get("/wishlist"),
         api.get("/config"),
+        api.get("/consequences"),
       ]);
       const c = cRes.data.find((x) => x.id === childId);
       if (!c) {
@@ -79,6 +81,7 @@ export default function KidHome() {
       setChild(c);
       setRewards(rRes.data);
       setWishlist(wRes.data);
+      setConsequences(consRes.data);
       setLevelTitles(cfgRes.data.level_titles);
       setPetStageNames(cfgRes.data.pet_stage_names);
       setPetFeedThresholds(cfgRes.data.pet_stage_feed_thresholds);
@@ -285,6 +288,30 @@ export default function KidHome() {
             <motion.div key="money" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <ChikyBankCard child={child} />
               <MoneyExchange childId={childId} points={child.points || 0} child={child} onChanged={load} />
+
+              {/* Consequences awareness — so kids know what reduces points */}
+              {consequences.length > 0 && (
+                <div className="mt-6 bg-white rounded-3xl p-4 border-2 border-red-100 chunky-shadow">
+                  <h3 className="font-fun font-bold text-slate-900 mb-1 flex items-center gap-2">
+                    <span className="text-xl">⚠️</span> Hati-hati, ini bisa mengurangi poin
+                  </h3>
+                  <p className="text-xs text-slate-500 mb-3">Kalau melakukan ini, poinmu bisa berkurang ya.</p>
+                  <div className="space-y-2">
+                    {consequences.map((c) => (
+                      <div key={c.id} className="flex items-center gap-3 bg-red-50/60 rounded-2xl px-3 py-2 border border-red-100">
+                        <div className="w-9 h-9 rounded-xl bg-red-100 flex items-center justify-center shrink-0 text-lg">🚫</div>
+                        <div className="flex-1 min-w-0">
+                          <div className="font-fun font-bold text-sm text-slate-800 truncate">{c.name}</div>
+                          {c.description && <div className="text-xs text-slate-500 truncate">{c.description}</div>}
+                        </div>
+                        {c.points_deducted > 0 && (
+                          <div className="text-sm font-fun font-bold text-red-500 shrink-0">−{c.points_deducted}</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </motion.div>
           )}
 
@@ -302,9 +329,13 @@ export default function KidHome() {
                   <div className="space-y-2">
                     {wishlist.map((w) => (
                       <div key={w.id} className="bg-white rounded-2xl p-3 border-2 border-pink-100 flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-xl bg-pink-50 flex items-center justify-center shrink-0">
-                          <Gift className="w-5 h-5 text-pink-400" />
-                        </div>
+                        {w.reward.image ? (
+                          <img src={w.reward.image} alt={w.reward.name} className="w-12 h-12 rounded-xl object-cover shrink-0 border border-pink-100" />
+                        ) : (
+                          <div className="w-12 h-12 rounded-xl bg-pink-50 flex items-center justify-center shrink-0">
+                            <Gift className="w-6 h-6 text-pink-400" />
+                          </div>
+                        )}
                         <div className="flex-1 min-w-0">
                           <div className="font-fun font-bold text-sm text-slate-800 truncate">{w.reward.name}</div>
                           <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden mt-1">
@@ -313,9 +344,19 @@ export default function KidHome() {
                               style={{ width: `${w.percent}%` }}
                             />
                           </div>
+                          <div className="text-[11px] text-slate-500 mt-1">
+                            {w.goal_met ? (
+                              <span className="text-green-600 font-bold">Tabunganmu cukup! 🎉</span>
+                            ) : (
+                              <>
+                                Tabungan {w.current_points}/{w.reward.cost_points} · kurang <b>{w.remaining}</b>
+                                {w.days_estimate != null && <> · ~<b>{w.days_estimate} hari</b> lagi</>}
+                              </>
+                            )}
+                          </div>
                         </div>
                         <div className="text-xs font-bold text-slate-500 shrink-0">
-                          {w.goal_met ? "Siap ditukar! 🎉" : `${w.percent}%`}
+                          {w.goal_met ? "Siap!" : `${w.percent}%`}
                         </div>
                       </div>
                     ))}
@@ -331,30 +372,41 @@ export default function KidHome() {
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {rewards.map((r) => {
-                    const canAfford = (child.points || 0) >= r.cost_points;
+                    // Rewards are bought from the Tabungan (savings) bucket.
+                    const savings = child.chiky_save || 0;
+                    const canAfford = savings >= r.cost_points;
                     const wished = wishlist.some((w) => w.reward_id === r.id);
                     return (
-                      <div key={r.id} className="bg-white rounded-3xl p-4 border-2 border-slate-100 chunky-shadow relative">
+                      <div key={r.id} className="bg-white rounded-3xl p-4 border-2 border-slate-100 chunky-shadow relative overflow-hidden">
                         <button
                           onClick={() => toggleWishlist(r)}
-                          className="absolute top-3 right-3 press-btn p-1.5 rounded-full hover:bg-pink-50"
+                          className="absolute top-3 right-3 z-10 press-btn p-1.5 rounded-full bg-white/80 backdrop-blur hover:bg-pink-50"
                           title={wished ? "Hapus dari wishlist" : "Tambah ke wishlist"}
                         >
                           <Heart className={`w-5 h-5 ${wished ? "fill-pink-500 text-pink-500" : "text-slate-300"}`} strokeWidth={2} />
                         </button>
+
+                        {/* Reward image banner (if any) */}
+                        {r.image && (
+                          <img src={r.image} alt={r.name} className="w-full h-32 object-cover rounded-2xl mb-3" />
+                        )}
+
                         <div className="flex items-start gap-3 mb-3">
-                          <div className="w-12 h-12 rounded-2xl bg-[#FF9D23]/15 flex items-center justify-center flex-shrink-0">
-                            <Gift className="w-6 h-6 text-[#FF9D23]" strokeWidth={2.5} />
-                          </div>
+                          {!r.image && (
+                            <div className="w-12 h-12 rounded-2xl bg-[#FF9D23]/15 flex items-center justify-center flex-shrink-0">
+                              <Gift className="w-6 h-6 text-[#FF9D23]" strokeWidth={2.5} />
+                            </div>
+                          )}
                           <div className="flex-1 min-w-0 pr-6">
                             <div className="font-fun font-bold text-lg text-slate-900">{r.name}</div>
                             {r.description && <div className="text-sm text-slate-500">{r.description}</div>}
                           </div>
                         </div>
                         <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-1">
-                            <Star className="w-4 h-4 text-[#FF9D23] fill-[#FF9D23]" strokeWidth={2.5} />
+                          <div className="flex items-center gap-1" title="Harga diambil dari Tabungan">
+                            <span className="text-sm">🐔</span>
                             <span className="font-fun font-bold text-slate-900">{r.cost_points}</span>
+                            <span className="text-xs text-slate-400">tabungan</span>
                           </div>
                           <button
                             onClick={() => redeem(r)}

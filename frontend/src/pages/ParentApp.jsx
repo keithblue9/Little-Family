@@ -5,12 +5,14 @@ import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
   Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2, Copy,
-  Pencil, RotateCcw, PawPrint,
+  Pencil, RotateCcw, PawPrint, ImagePlus,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
+import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
 import MoneyApprovals from "@/components/MoneyApprovals";
+import CharityRequestsReview from "@/components/CharityRequestsReview";
 import ProfileEditor from "@/components/ProfileEditor";
 import ConfigMenu from "@/components/ConfigMenu";
 import MemberPasscodeManager from "@/components/ChildPasscodeManager";
@@ -34,6 +36,27 @@ import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
 import { todayKey, humanDateKey, shiftDateKey, nextDateForWeekday } from "@/lib/dates";
+
+// Format a stored ISO timestamp as the family-local wall clock (GMT+7). Used
+// in the approval list so parents can see exactly when a kid started/finished.
+function fmtClock(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
+  } catch { return ""; }
+}
+function fmtDuration(startIso, endIso) {
+  try {
+    const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
+    if (ms < 0) return "";
+    const mins = Math.floor(ms / 60000);
+    const secs = Math.floor((ms % 60000) / 1000);
+    if (mins < 1) return `${secs} dtk`;
+    if (mins < 60) return `${mins} mnt`;
+    return `${Math.floor(mins / 60)} jam ${mins % 60} mnt`;
+  } catch { return ""; }
+}
 import { filterTaskIdeas } from "@/lib/taskIdeaBank";
 import TemplateManagerModal from "@/components/TemplateManagerModal";
 import LevelConfigEditor from "@/components/LevelConfigEditor";
@@ -327,8 +350,11 @@ export default function ParentApp() {
             />
           )}
           {view === "money" && (
-            <div className="bg-white rounded-2xl border border-slate-200 p-6">
-              <MoneyApprovals />
+            <div className="space-y-4">
+              <CharityRequestsReview onChanged={load} />
+              <div className="bg-white rounded-2xl border border-slate-200 p-6">
+                <MoneyApprovals />
+              </div>
             </div>
           )}
           {view === "consequences" && (
@@ -914,7 +940,25 @@ function TaskRow({ task, childName, children, dim = false, currentDateFilter = n
           {task.duration_minutes && <Chip title="Durasi">⏱️ {task.duration_minutes}m</Chip>}
           {task.recurrence !== "none" && <Chip title={task.recurrence === "daily" ? "Berulang harian" : "Berulang mingguan"}>{task.recurrence === "daily" ? "🔁 harian" : "🔁 mingguan"}</Chip>}
           {task.status === "skipped" && <Chip tone="amber">dilewati</Chip>}
+          {task.early_bonus_awarded > 0 && <Chip tone="green" title="Bonus selesai lebih cepat">⚡ +{task.early_bonus_awarded} cepat</Chip>}
         </div>
+        {/* Start/finish timestamps — lets a parent sanity-check whether the kid
+            actually spent time on a task vs. instantly tapping through. */}
+        {(task.timer_started_at || task.completed_at) && (
+          <div className="flex items-center gap-2 flex-wrap mt-1 text-[11px] text-slate-400">
+            {task.timer_started_at && (
+              <span title="Waktu anak menekan Mulai">▶️ Mulai {fmtClock(task.timer_started_at)}</span>
+            )}
+            {task.completed_at && (
+              <span title="Waktu anak menekan Selesai">✅ Selesai {fmtClock(task.completed_at)}</span>
+            )}
+            {task.timer_started_at && task.completed_at && (
+              <span className="text-slate-500 font-semibold" title="Lama pengerjaan">
+                ⏳ {fmtDuration(task.timer_started_at, task.completed_at)}
+              </span>
+            )}
+          </div>
+        )}
       </div>
       <div className="flex items-center gap-1.5 flex-wrap shrink-0">{children}</div>
     </div>
@@ -928,7 +972,12 @@ function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onEdi
     catch (e) { toast.error(formatApiError(e)); }
   };
   const fulfill = async (r) => {
-    try { await api.post(`/redemptions/${r.id}/fulfill`); toast.success("Marked delivered"); onRefresh(); }
+    try { await api.post(`/redemptions/${r.id}/fulfill`); toast.success("Ditandai sudah diberikan"); onRefresh(); }
+    catch (e) { toast.error(formatApiError(e)); }
+  };
+  const cancelRedemption = async (r) => {
+    if (!window.confirm(`Batalkan penukaran "${r.reward_name}"? ${r.cost_points} poin akan dikembalikan ke Tabungan anak.`)) return;
+    try { await api.post(`/redemptions/${r.id}/cancel`); toast.success("Dibatalkan, tabungan dikembalikan"); onRefresh(); }
     catch (e) { toast.error(formatApiError(e)); }
   };
   const filteredRedemptions = selectedChildId
@@ -954,9 +1003,13 @@ function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onEdi
             {rewards.map((r) => (
               <div key={r.id} data-testid={`${TEST_IDS.parent.rewardItem}-${r.id}`} className="border border-slate-200 rounded-xl p-4">
                 <div className="flex items-start gap-3 mb-3">
-                  <div className="w-10 h-10 rounded-xl bg-[#FF9D23]/15 flex items-center justify-center flex-shrink-0">
-                    <Gift className="w-5 h-5 text-[#FF9D23]" strokeWidth={2.5} />
-                  </div>
+                  {r.image ? (
+                    <img src={r.image} alt={r.name} className="w-10 h-10 rounded-xl object-cover flex-shrink-0 border border-slate-200" />
+                  ) : (
+                    <div className="w-10 h-10 rounded-xl bg-[#FF9D23]/15 flex items-center justify-center flex-shrink-0">
+                      <Gift className="w-5 h-5 text-[#FF9D23]" strokeWidth={2.5} />
+                    </div>
+                  )}
                   <div className="flex-1 min-w-0">
                     <div className="font-semibold text-slate-900 truncate">{r.name}</div>
                     <div className="text-xs text-slate-500 truncate">{r.description}</div>
@@ -999,11 +1052,18 @@ function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onEdi
                     </div>
                   </div>
                   {r.status === "pending" ? (
-                    <button onClick={() => fulfill(r)} data-testid={`${TEST_IDS.parent.fulfillRedemptionBtn}-${r.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
-                      <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Mark delivered
-                    </button>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button onClick={() => fulfill(r)} data-testid={`${TEST_IDS.parent.fulfillRedemptionBtn}-${r.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
+                        <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Diberikan
+                      </button>
+                      <button onClick={() => cancelRedemption(r)} className="press-btn inline-flex items-center gap-1 border-2 border-slate-200 text-slate-500 hover:bg-slate-50 font-semibold px-2.5 py-1.5 rounded-lg text-sm" title="Batalkan & kembalikan tabungan">
+                        <XCircle className="w-4 h-4" strokeWidth={2.5} />
+                      </button>
+                    </div>
+                  ) : r.status === "cancelled" ? (
+                    <span className="text-xs text-slate-400 font-semibold shrink-0">Dibatalkan</span>
                   ) : (
-                    <span className="text-xs text-[#34D399] font-semibold">Delivered</span>
+                    <span className="text-xs text-[#34D399] font-semibold shrink-0">Diberikan</span>
                   )}
                 </div>
               );
@@ -1900,6 +1960,8 @@ function RewardFormModal({ open, onClose, onSaved, editReward }) {
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
   const [cost, setCost] = useState(50);
+  const [image, setImage] = useState("");
+  const [processing, setProcessing] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -1908,17 +1970,34 @@ function RewardFormModal({ open, onClose, onSaved, editReward }) {
       setName(editReward.name || "");
       setDesc(editReward.description || "");
       setCost(editReward.cost_points ?? 50);
+      setImage(editReward.image || "");
     } else {
-      setName(""); setDesc(""); setCost(50);
+      setName(""); setDesc(""); setCost(50); setImage("");
     }
   }, [open, isEdit, editReward]);
+
+  const pickImage = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-picking the same file
+    if (!file) return;
+    setProcessing(true);
+    try {
+      const dataUrl = await fileToDownscaledDataUrl(file, { maxDim: 640, quality: 0.8 });
+      setImage(dataUrl);
+    } catch (err) {
+      toast.error(err.message || "Gagal memproses gambar");
+    } finally {
+      setProcessing(false);
+    }
+  };
 
   const submit = async () => {
     if (!name.trim()) return toast.error("Nama hadiah wajib diisi");
     if (!cost || Number(cost) < 1) return toast.error("Harga minimal 1 poin");
     setSaving(true);
     try {
-      const body = { name: name.trim(), description: desc, cost_points: Number(cost) || 1 };
+      // image: send even when "" so an edit can clear it.
+      const body = { name: name.trim(), description: desc, cost_points: Number(cost) || 1, image };
       if (isEdit) {
         await api.patch(`/rewards/${editReward.id}`, body);
         toast.success("Hadiah diperbarui");
@@ -1942,13 +2021,45 @@ function RewardFormModal({ open, onClose, onSaved, editReward }) {
           <label className={labelClass}>Deskripsi (opsional)</label>
           <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} />
         </div>
+
+        {/* Reward image — makes the shop far more enticing for kids */}
         <div>
-          <label className={labelClass}>Harga (poin)</label>
+          <label className={labelClass}>Gambar hadiah (opsional)</label>
+          {image ? (
+            <div className="relative inline-block">
+              <img src={image} alt="Pratinjau hadiah" className="w-32 h-32 object-cover rounded-2xl border-2 border-slate-200" />
+              <button
+                type="button"
+                onClick={() => setImage("")}
+                className="absolute -top-2 -right-2 bg-red-500 hover:bg-red-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-sm"
+                title="Hapus gambar"
+              >
+                ×
+              </button>
+            </div>
+          ) : (
+            <label className="flex flex-col items-center justify-center w-32 h-32 rounded-2xl border-2 border-dashed border-slate-300 hover:border-indigo-400 hover:bg-indigo-50 cursor-pointer transition-colors">
+              {processing ? (
+                <span className="text-xs text-slate-500">Memproses…</span>
+              ) : (
+                <>
+                  <ImagePlus className="w-7 h-7 text-slate-400 mb-1" strokeWidth={2} />
+                  <span className="text-xs text-slate-500">Upload gambar</span>
+                </>
+              )}
+              <input type="file" accept="image/*" onChange={pickImage} className="hidden" disabled={processing} />
+            </label>
+          )}
+          <p className="text-xs text-slate-400 mt-1">Gambar otomatis diperkecil agar ringan.</p>
+        </div>
+
+        <div>
+          <label className={labelClass}>Harga (poin) — diambil dari Tabungan anak</label>
           <input type="number" min="1" value={cost} onChange={(e) => setCost(e.target.value)} className={inputClass} data-testid="reward-cost-input" />
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={onClose} className={btnGhost}>Batal</button>
-          <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="reward-submit-btn">
+          <button onClick={submit} disabled={saving || processing} className={btnPrimary} data-testid="reward-submit-btn">
             {saving ? "Menyimpan…" : (isEdit ? "Simpan perubahan" : "Tambah hadiah")}
           </button>
         </div>

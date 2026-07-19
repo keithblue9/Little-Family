@@ -7,6 +7,7 @@ load_dotenv(ROOT_DIR / ".env")
 import os
 import re
 import json
+import math
 import uuid
 import random
 import asyncio
@@ -186,6 +187,13 @@ class AppConfigInput(BaseModel):
     chiky_save_pct: Optional[int] = Field(default=None, ge=0, le=100)
     chiky_spend_pct: Optional[int] = Field(default=None, ge=0, le=100)
     chiky_share_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    # Early-completion bonus: extra % of a task's points awarded when the kid
+    # finishes it BEFORE its due_time. 0 = feature off. Configurable per family.
+    early_bonus_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    # Kartu Bebas (freeze card) economy — how many per week, and which weekday
+    # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
+    freeze_cards_per_week: Optional[int] = Field(default=None, ge=0, le=7)
+    freeze_reset_weekday: Optional[int] = Field(default=None, ge=0, le=6)
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
     # Vacation/pause mode: while on, recurring (daily/weekly) tasks don't spawn
@@ -472,6 +480,12 @@ class RedeemMoneyInput(BaseModel):
     points: int = Field(ge=1, le=1000000)
 
 
+class CharityRequestInput(BaseModel):
+    child_id: str
+    points: int = Field(ge=1, le=1000000)
+    note: str = Field(default="", max_length=200)
+
+
 class SelfPasscodeInput(BaseModel):
     old_passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
     new_passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
@@ -496,6 +510,14 @@ class RewardInput(BaseModel):
     description: str = ""
     cost_points: int = Field(ge=1, le=100000)
     icon: str = "gift"
+    image: str = ""  # optional base64 data URL, same storage pattern as slideshow bg
+
+    @field_validator("image")
+    @classmethod
+    def _validate_reward_image(cls, v):
+        if v and len(v) > 2_000_000:  # ~1.4MB decoded — client should downscale first
+            raise ValueError("Gambar terlalu besar (maks ~1.4MB). Coba gambar yang lebih kecil.")
+        return v
 
 
 class RewardUpdate(BaseModel):
@@ -506,6 +528,14 @@ class RewardUpdate(BaseModel):
     description: Optional[str] = Field(default=None, max_length=500)
     cost_points: Optional[int] = Field(default=None, ge=1, le=100000)
     icon: Optional[str] = None
+    image: Optional[str] = None  # "" clears the image; None leaves it unchanged
+
+    @field_validator("image")
+    @classmethod
+    def _validate_reward_image_upd(cls, v):
+        if v and len(v) > 2_000_000:
+            raise ValueError("Gambar terlalu besar (maks ~1.4MB). Coba gambar yang lebih kecil.")
+        return v
 
 
 class RewardSuggestionInput(BaseModel):
@@ -776,14 +806,17 @@ async def redeem_points_for_money(payload: RedeemMoneyInput, user: dict = Depend
     child = await db.children.find_one({"id": payload.child_id})
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
-    if child.get("points", 0) < payload.points:
-        raise HTTPException(status_code=400, detail="Poin tidak cukup")
+    # Cash-out draws from the BELANJA (spend) bucket — the pot meant for
+    # everyday spending money. Deduct from both the spend bucket and the
+    # headline points total to keep them in sync.
+    if child.get("chiky_spend", 0) < payload.points:
+        raise HTTPException(status_code=400, detail="Poin belanja tidak cukup")
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
     rate = int(config.get("rupiah_per_point", 100))
     rupiah = payload.points * rate
 
-    await db.children.update_one({"id": payload.child_id}, {"$inc": {"points": -payload.points}})
+    await db.children.update_one({"id": payload.child_id}, {"$inc": {"points": -payload.points, "chiky_spend": -payload.points}})
     doc = {
         "id": new_id(),
         "parent_id": FAMILY_ID,
@@ -833,10 +866,81 @@ async def cancel_money_redemption(redemption_id: str, user: dict = Depends(requi
         raise HTTPException(status_code=404, detail="Redemption not found")
     if r["status"] != "pending":
         raise HTTPException(status_code=400, detail="Already processed")
-    await db.children.update_one({"id": r["child_id"]}, {"$inc": {"points": r["points"]}})
+    await db.children.update_one({"id": r["child_id"]}, {"$inc": {"points": r["points"], "chiky_spend": r["points"]}})
     await db.money_redemptions.update_one({"id": redemption_id}, {"$set": {"status": "cancelled"}})
     await log_activity(FAMILY_ID, r["child_id"], "money_redemption_cancelled", {"points": r["points"]})
     return {"success": True}
+
+
+# --------------- Sedekah (Charity) requests ---------------
+@api.post("/charity/request")
+async def request_charity(payload: CharityRequestInput, user: dict = Depends(get_current_user)):
+    """A kid asks to give some of their SEDEKAH (share) points to charity. The
+    points are converted to rupiah at the family rate and held as a pending
+    request; a parent approves and hands over the cash to be donated. Points
+    leave the child's balance immediately (so they can't double-spend), and are
+    refunded if the parent rejects."""
+    if user["role"] == "child" and user["id"] != payload.child_id:
+        raise HTTPException(status_code=403, detail="Kamu hanya bisa bersedekah dari poinmu sendiri")
+    child = await db.children.find_one({"id": payload.child_id, "parent_id": FAMILY_ID})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+    if child.get("chiky_share", 0) < payload.points:
+        raise HTTPException(status_code=400, detail="Poin sedekah tidak cukup")
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    rate = int(config.get("rupiah_per_point", 100))
+    rupiah = payload.points * rate
+    await db.children.update_one({"id": payload.child_id}, {"$inc": {"points": -payload.points, "chiky_share": -payload.points}})
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": payload.child_id,
+        "child_name": child["name"], "points": payload.points, "rupiah": rupiah, "rate": rate,
+        "note": payload.note, "status": "pending", "review_note": "",
+        "created_at": now_iso(), "reviewed_at": None,
+    }
+    await db.charity_requests.insert_one(doc)
+    doc.pop("_id", None)
+    await log_activity(FAMILY_ID, payload.child_id, "charity_requested", {"points": payload.points, "rupiah": rupiah})
+    await send_push_to({"role": "parent"}, title="Permintaan sedekah 🤲", body=f'{child["name"]} ingin bersedekah {payload.points} poin.', url="/parent")
+    return doc
+
+
+@api.get("/charity-requests")
+async def list_charity_requests(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]
+    elif child_id:
+        query["child_id"] = child_id
+    items = await db.charity_requests.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api.post("/charity-requests/{request_id}/approve")
+async def approve_charity_request(request_id: str, user: dict = Depends(require_parent)):
+    """Parent confirms they've handed over the cash to be donated."""
+    req = await db.charity_requests.find_one({"id": request_id, "parent_id": FAMILY_ID})
+    if not req:
+        raise HTTPException(status_code=404, detail="Permintaan tidak ditemukan")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Permintaan ini sudah diproses")
+    await db.charity_requests.update_one({"id": request_id}, {"$set": {"status": "approved", "reviewed_at": now_iso()}})
+    await log_activity(FAMILY_ID, req["child_id"], "charity_approved", {"points": req["points"], "rupiah": req["rupiah"]})
+    await send_push_to({"role": "child", "member_id": req["child_id"]}, title="Sedekahmu diterima! 🤲", body="Terima kasih sudah berbagi kebaikan 💛", url=f"/kid/{req['child_id']}")
+    return await db.charity_requests.find_one({"id": request_id}, {"_id": 0})
+
+
+@api.post("/charity-requests/{request_id}/reject")
+async def reject_charity_request(request_id: str, user: dict = Depends(require_parent)):
+    """Parent declines the request and refunds the sedekah points."""
+    req = await db.charity_requests.find_one({"id": request_id, "parent_id": FAMILY_ID})
+    if not req:
+        raise HTTPException(status_code=404, detail="Permintaan tidak ditemukan")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Permintaan ini sudah diproses")
+    await db.children.update_one({"id": req["child_id"]}, {"$inc": {"points": req["points"], "chiky_share": req["points"]}})
+    await db.charity_requests.update_one({"id": request_id}, {"$set": {"status": "rejected", "reviewed_at": now_iso()}})
+    await log_activity(FAMILY_ID, req["child_id"], "charity_rejected", {"points": req["points"]})
+    return await db.charity_requests.find_one({"id": request_id}, {"_id": 0})
 
 
 # --------------- Helpers ---------------
@@ -2122,51 +2226,40 @@ def _now_local():
     return datetime.now(timezone.utc) + timedelta(hours=7)
 
 
-FREEZE_CARDS_PER_WEEK = 3  # "Kartu Bebas" weekly allotment — resets every Monday (ISO week), never accumulates unused cards
+FREEZE_CARDS_PER_WEEK = 3  # default "Kartu Bebas" weekly allotment; now overridable per-family via config
 
 
-def _current_week_key() -> str:
-    """ISO year-week identifier (e.g. '2026-W29') for the freeze-card weekly refill."""
-    iso = _now_local().isocalendar()
-    return f"{iso[0]}-W{iso[1]:02d}"
+def _current_week_key(reset_weekday: int = 0) -> str:
+    """Identifier for the current freeze-card cycle. The cycle is a 7-day
+    window that rolls over on `reset_weekday` (0=Mon..6=Sun). We compute it as
+    the date of the most recent reset weekday, so changing the reset day shifts
+    the boundary cleanly without cards ever accumulating."""
+    now = _now_local()
+    # days since the most recent reset weekday (Python weekday(): Mon=0..Sun=6)
+    delta = (now.weekday() - reset_weekday) % 7
+    cycle_start = (now - timedelta(days=delta)).strftime("%Y-%m-%d")
+    return f"cycle:{cycle_start}"
 
 
-def _refill_freeze_card_if_new_week(child: dict) -> int:
-    """Returns how many 'Kartu Bebas' (streak freeze cards) this child has
-    available RIGHT NOW, accounting for the weekly refill. Does not write to
-    the DB — the caller folds the (possibly refilled, possibly about-to-be-
-    consumed) count into whatever $set it's already doing for this child."""
-    current_week = _current_week_key()
+async def _freeze_config() -> tuple:
+    """(per_week, reset_weekday) from app config, with sane fallbacks."""
+    cfg = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    per_week = int(cfg.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK))
+    reset_weekday = int(cfg.get("freeze_reset_weekday", 0))
+    return per_week, reset_weekday
+
+
+def _refill_freeze_card_if_new_week(child: dict, per_week: int = FREEZE_CARDS_PER_WEEK, reset_weekday: int = 0) -> int:
+    """How many 'Kartu Bebas' this child has available RIGHT NOW, accounting
+    for the weekly refill. Does not write to the DB — the caller folds the
+    (possibly refilled, possibly about-to-be-consumed) count into its own
+    $set. Config-driven allotment + reset day."""
+    current_week = _current_week_key(reset_weekday)
     stored_week = child.get("freeze_card_week")
     if stored_week != current_week:
-        return FREEZE_CARDS_PER_WEEK  # new week — fresh allotment, never carries over unused cards
-    return int(child.get("freeze_cards_available", FREEZE_CARDS_PER_WEEK))
-
-
-def _check_time_window(task):
-    """Enforce that a time-boxed task is only started within its window on its
-    own day. Mirrors the frontend gate so kids can't bypass via direct API."""
-    due_time = task.get("due_time")
-    date_key = task.get("date_key")
-    if not due_time or not date_key:
-        return  # no time constraint
-    now = _now_local()
-    today = now.strftime("%Y-%m-%d")
-    if date_key != today:
-        # Only enforce the intraday window on the task's actual day. For past
-        # days we simply block (can't act on history); future days blocked too.
-        if date_key < today:
-            raise HTTPException(status_code=409, detail="Misi ini sudah lewat harinya")
-        raise HTTPException(status_code=409, detail="Misi ini belum waktunya (hari yang akan datang)")
-    dh, dm = map(int, due_time.split(":"))
-    due_min = dh * 60 + dm
-    now_min = now.hour * 60 + now.minute
-    dur = task.get("duration_minutes") or 120
-    open_min = due_min - dur
-    if now_min < open_min:
-        raise HTTPException(status_code=409, detail=f"Belum waktunya — misi ini bisa dimulai menjelang jam {due_time}")
-    if now_min > due_min:
-        raise HTTPException(status_code=409, detail=f"Waktunya sudah lewat (jam {due_time})")
+        return per_week  # new cycle — fresh allotment, never carries over unused cards
+    # Clamp to the configured max in case the parent lowered the allotment mid-cycle.
+    return min(int(child.get("freeze_cards_available", per_week)), per_week)
 
 
 def _assert_child_owns_task(user: dict, task: dict):
@@ -2184,8 +2277,12 @@ def _assert_child_owns_task(user: dict, task: dict):
 
 @api.post("/tasks/{task_id}/start")
 async def start_task_timer(task_id: str, user: dict = Depends(get_current_user)):
-    """Kid clicks Start → records timer_started_at. Only the next actionable
-    quest for that day can be started (except bonuses)."""
+    """Kid clicks Start → records timer_started_at. A required task can be
+    started any time on its OWN day, as long as it's the next one in sequence
+    (bonuses can be started any time and never block the sequence). We no longer
+    gate on the due_time 'window' — kids may work ahead of schedule. Overshooting
+    the due_time turns the task time-stuck (rescued via Kartu Bebas / skip),
+    handled separately at finish time."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -2193,8 +2290,16 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Misi tidak bisa dimulai")
 
-    # Bonuses can be started any time (subject to time window). Required tasks
-    # must be the next in line.
+    # Can only act on tasks for today — not past or future days.
+    date_key = task.get("date_key")
+    if date_key:
+        today = _now_local().strftime("%Y-%m-%d")
+        if date_key < today:
+            raise HTTPException(status_code=409, detail="Misi ini sudah lewat harinya")
+        if date_key > today:
+            raise HTTPException(status_code=409, detail="Misi ini belum waktunya (hari yang akan datang)")
+
+    # Required tasks must be the next in line; bonuses are free to start anytime.
     if not task.get("is_bonus"):
         nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
         if nxt and nxt["id"] != task_id:
@@ -2202,8 +2307,6 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
                 status_code=409,
                 detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
             )
-
-    _check_time_window(task)
 
     await db.tasks.update_one({"id": task_id}, {"$set": {"timer_started_at": now_iso()}})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
@@ -2387,12 +2490,13 @@ async def free_task_with_card(task_id: str, user: dict = Depends(get_current_use
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
-    available = _refill_freeze_card_if_new_week(child)
+    per_week, reset_weekday = await _freeze_config()
+    available = _refill_freeze_card_if_new_week(child, per_week, reset_weekday)
     if available < 1:
         raise HTTPException(status_code=400, detail="Kartu Bebas minggu ini sudah habis")
 
-    current_week = _current_week_key()
-    prev_available = int(child.get("freeze_cards_available", FREEZE_CARDS_PER_WEEK))
+    current_week = _current_week_key(reset_weekday)
+    prev_available = int(child.get("freeze_cards_available", per_week))
     prev_week = child.get("freeze_card_week")
     await db.children.update_one(
         {"id": child["id"]},
@@ -2454,6 +2558,39 @@ def _child_share_of_task(task: dict, child_id: str) -> int:
     return base_share + (1 if idx < remainder else 0)
 
 
+def _early_completion_bonus(task: dict, base_points: int, config: dict) -> int:
+    """Extra points for finishing a task BEFORE its due_time. Returns the bonus
+    (rounded, at least 1 if the pct would round to 0 but is configured > 0), or
+    0 when there's no due_time, no completion timestamp, it wasn't actually
+    early, or the feature is turned off (early_bonus_pct == 0)."""
+    pct = int(config.get("early_bonus_pct", 10))
+    if pct <= 0:
+        return 0
+    due_time = task.get("due_time")
+    completed_at = task.get("completed_at")
+    date_key = task.get("date_key")
+    if not due_time or not completed_at:
+        return 0
+    try:
+        # completed_at is a UTC ISO string; convert to family local (GMT+7),
+        # then compare against the due_time on the task's own local day.
+        comp_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        if comp_dt.tzinfo:
+            comp_local = comp_dt.astimezone(timezone.utc).replace(tzinfo=None) + timedelta(hours=7)
+        else:
+            comp_local = comp_dt + timedelta(hours=7)
+        dh, dm = map(int, due_time.split(":"))
+        base_date = date_key or comp_local.strftime("%Y-%m-%d")
+        y, mo, d = map(int, base_date.split("-"))
+        due_dt = comp_local.replace(year=y, month=mo, day=d, hour=dh, minute=dm, second=0, microsecond=0)
+        if comp_local < due_dt:
+            bonus = round(base_points * pct / 100)
+            return max(bonus, 1) if base_points > 0 else 0
+    except Exception:
+        return 0
+    return 0
+
+
 async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> dict:
     """Applies streak/freeze-card/Chikybank updates for ONE child earning
     `points` from an approval. Returns a snapshot describing exactly what
@@ -2463,9 +2600,11 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
     today = _today_key()
     yesterday = (_now_local() - timedelta(days=1)).strftime("%Y-%m-%d")
     last_date = child.get("last_completion_date")
-    current_week = _current_week_key()
+    per_week = int(config.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK))
+    reset_weekday = int(config.get("freeze_reset_weekday", 0))
+    current_week = _current_week_key(reset_weekday)
     prev_freeze_week = child.get("freeze_card_week")
-    prev_freeze_available = int(child.get("freeze_cards_available", 1))
+    prev_freeze_available = int(child.get("freeze_cards_available", per_week))
     prev_streak = child.get("streak_days", 0)
     prev_last_completion = last_date
 
@@ -2478,7 +2617,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
     elif last_date == yesterday:
         streak = child.get("streak_days", 0) + 1
     else:
-        available_now = _refill_freeze_card_if_new_week(child)
+        available_now = _refill_freeze_card_if_new_week(child, per_week, reset_weekday)
         if prev_freeze_week != current_week:
             new_freeze_week = current_week
             new_freeze_available = available_now
@@ -2652,7 +2791,8 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
     together_bonus_awarded = 0
     if task.get("together_bonus_enabled") and task.get("done_together") is True:
         together_bonus_awarded = task.get("together_bonus_points") or 0
-    points = task["points"] + together_bonus_awarded
+    early_bonus_awarded = _early_completion_bonus(task, task["points"], config)
+    points = task["points"] + together_bonus_awarded + early_bonus_awarded
     snap = await _apply_approval_rewards(task["child_id"], points, config)
     spawned_next_id = await _spawn_recurrence_if_due(task, config)
 
@@ -2666,6 +2806,8 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                 "_undo_prev_streak": snap["prev_streak"],
                 "_undo_prev_last_completion": snap["prev_last_completion"],
                 "_undo_points_awarded": points,
+                "early_bonus_awarded": early_bonus_awarded,
+                "together_bonus_awarded": together_bonus_awarded,
                 "_undo_chiky_save": snap["chiky_save"],
                 "_undo_chiky_spend": snap["chiky_spend"],
                 "_undo_chiky_share": snap["chiky_share"],
@@ -2950,6 +3092,9 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "chiky_save_pct": 40,
             "chiky_spend_pct": 40,
             "chiky_share_pct": 20,
+            "early_bonus_pct": 10,
+            "freeze_cards_per_week": FREEZE_CARDS_PER_WEEK,
+            "freeze_reset_weekday": 0,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -2986,6 +3131,9 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "chiky_save_pct": 40,
             "chiky_spend_pct": 40,
             "chiky_share_pct": 20,
+            "early_bonus_pct": 10,
+            "freeze_cards_per_week": FREEZE_CARDS_PER_WEEK,
+            "freeze_reset_weekday": 0,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -3011,6 +3159,9 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "chiky_save_pct": int(config.get("chiky_save_pct", 40)),
         "chiky_spend_pct": int(config.get("chiky_spend_pct", 40)),
         "chiky_share_pct": int(config.get("chiky_share_pct", 20)),
+        "early_bonus_pct": int(config.get("early_bonus_pct", 10)),
+        "freeze_cards_per_week": int(config.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK)),
+        "freeze_reset_weekday": int(config.get("freeze_reset_weekday", 0)),
         "custom_labels": config.get("custom_labels", {}) or {},
         "vacation_mode": bool(config.get("vacation_mode", False)),
         "vacation_note": config.get("vacation_note", ""),
@@ -3157,6 +3308,7 @@ async def create_reward(payload: RewardInput, user: dict = Depends(require_paren
         "description": payload.description,
         "cost_points": payload.cost_points,
         "icon": payload.icon,
+        "image": payload.image or "",
         "created_at": now_iso(),
     }
     await db.rewards.insert_one(doc)
@@ -3274,27 +3426,34 @@ async def delete_reward_suggestion(suggestion_id: str, user: dict = Depends(get_
 
 @api.post("/rewards/{reward_id}/redeem")
 async def redeem_reward(reward_id: str, child_id: str, user: dict = Depends(get_current_user)):
+    if user["role"] == "child" and user["id"] != child_id:
+        raise HTTPException(status_code=403, detail="Kamu hanya bisa menukar untuk dirimu sendiri")
     reward = await db.rewards.find_one({"id": reward_id, "parent_id": FAMILY_ID})
     if not reward:
         raise HTTPException(status_code=404, detail="Reward not found")
     child = await get_child_or_404(FAMILY_ID, child_id)
-    if child["points"] < reward["cost_points"]:
-        raise HTTPException(status_code=400, detail="Not enough points")
-    await db.children.update_one({"id": child_id}, {"$inc": {"points": -reward["cost_points"]}})
+    cost = reward["cost_points"]
+    # Rewards are bought from the SAVINGS (Tabungan) bucket — that's the pot
+    # earmarked for "things you're saving up for". We deduct from both the
+    # savings bucket and the headline points total (which is the sum of all
+    # three buckets) to keep them consistent.
+    if child.get("chiky_save", 0) < cost:
+        raise HTTPException(status_code=400, detail="Tabungan belum cukup untuk menukar hadiah ini")
+    await db.children.update_one({"id": child_id}, {"$inc": {"points": -cost, "chiky_save": -cost}})
     redemption = {
         "id": new_id(),
         "parent_id": FAMILY_ID,
         "child_id": child_id,
         "reward_id": reward_id,
         "reward_name": reward["name"],
-        "cost_points": reward["cost_points"],
+        "cost_points": cost,
         "status": "pending",  # pending -> fulfilled
         "created_at": now_iso(),
         "fulfilled_at": None,
     }
     await db.redemptions.insert_one(redemption)
     redemption.pop("_id", None)
-    await log_activity(FAMILY_ID, child_id, "reward_redeemed", {"reward": reward["name"], "cost": reward["cost_points"]})
+    await log_activity(FAMILY_ID, child_id, "reward_redeemed", {"reward": reward["name"], "cost": cost})
     return redemption
 
 
@@ -3315,6 +3474,22 @@ async def fulfill_redemption(redemption_id: str, user: dict = Depends(require_pa
         raise HTTPException(status_code=404, detail="Redemption not found")
     await db.redemptions.update_one({"id": redemption_id}, {"$set": {"status": "fulfilled", "fulfilled_at": now_iso()}})
     return await db.redemptions.find_one({"id": redemption_id}, {"_id": 0})
+
+
+@api.post("/redemptions/{redemption_id}/cancel")
+async def cancel_redemption(redemption_id: str, user: dict = Depends(require_parent)):
+    """Cancel a pending reward redemption and refund the cost back into the
+    child's Tabungan (savings) bucket — the same pot it was spent from."""
+    red = await db.redemptions.find_one({"id": redemption_id, "parent_id": FAMILY_ID})
+    if not red:
+        raise HTTPException(status_code=404, detail="Redemption not found")
+    if red["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Penukaran ini sudah diproses")
+    cost = red.get("cost_points", 0)
+    await db.children.update_one({"id": red["child_id"]}, {"$inc": {"points": cost, "chiky_save": cost}})
+    await db.redemptions.update_one({"id": redemption_id}, {"$set": {"status": "cancelled"}})
+    await log_activity(FAMILY_ID, red["child_id"], "reward_redemption_cancelled", {"cost": cost})
+    return {"success": True}
 
 
 # --------------- Reward Wishlist ---------------
@@ -3355,17 +3530,36 @@ async def list_wishlist(child_id: Optional[str] = None, user: dict = Depends(get
     items = await db.wishlist_items.find(query, {"_id": 0}).to_list(200)
 
     # Enrich with reward + progress info so the frontend doesn't need a second round-trip.
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    daily_goal = int(config.get("daily_point_goal", 50))
+    save_pct = int(config.get("chiky_save_pct", 40))
+    spend_pct = int(config.get("chiky_spend_pct", 40))
+    share_pct = int(config.get("chiky_share_pct", 20))
+    total_pct = (save_pct + spend_pct + share_pct) or 100
+    # Expected savings earned per day if the child hits their daily point goal —
+    # used to estimate "about N days to go". Deterministic and easy to explain
+    # (no dependency on messy historical data).
+    expected_daily_savings = daily_goal * save_pct / total_pct
+
     out = []
     for item in items:
         reward = await db.rewards.find_one({"id": item["reward_id"], "parent_id": FAMILY_ID}, {"_id": 0})
         if not reward:
             continue  # reward was deleted since being wishlisted; skip silently
         child = await db.children.find_one({"id": item["child_id"], "parent_id": FAMILY_ID}, {"_id": 0})
-        points = child.get("points", 0) if child else 0
-        percent = min(100, int((points / reward["cost_points"]) * 100)) if reward["cost_points"] else 100
+        # Rewards are bought from Tabungan (savings), so progress is measured
+        # against the savings bucket, not the headline points total.
+        savings = child.get("chiky_save", 0) if child else 0
+        cost = reward["cost_points"]
+        percent = min(100, int((savings / cost) * 100)) if cost else 100
+        remaining = max(0, cost - savings)
+        days_estimate = None
+        if remaining > 0 and expected_daily_savings > 0:
+            days_estimate = math.ceil(remaining / expected_daily_savings)
         out.append({
-            **item, "reward": reward, "current_points": points,
-            "percent": percent, "goal_met": points >= reward["cost_points"],
+            **item, "reward": reward, "current_points": savings,
+            "percent": percent, "goal_met": savings >= cost,
+            "remaining": remaining, "days_estimate": days_estimate,
         })
     return out
 
@@ -3974,7 +4168,7 @@ async def migrate_existing_data():
     version. On serverless this matters a lot — without the marker, every cold
     container would re-scan every task/child even though there's nothing left
     to backfill, which is the main source of 'every menu loads slowly'."""
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     marker = await db.app_config.find_one({"_schema_marker": True})
     if marker and int(marker.get("schema_version", 0)) >= SCHEMA_VERSION:
         return  # already migrated — skip all the sweeps entirely
@@ -4090,15 +4284,12 @@ async def migrate_existing_data():
         {"freeze_cards_available": {"$exists": False}},
         {"$set": {"freeze_cards_available": FREEZE_CARDS_PER_WEEK, "freeze_card_week": None}},
     )
-    # Weekly allotment raised from 1 to 3 (Kartu Bebas). A family whose current
-    # week's counter is already stamped under the OLD system would otherwise
-    # only see the bump on their NEXT Monday refill (the refill logic already
-    # handles that path correctly on its own) — this just gives anyone
-    # mid-week under the old allotment the new one immediately instead of
-    # making them wait.
+    # The freeze-card cycle key format changed (ISO-week → reset-weekday cycle).
+    # Clear the stored week marker so everyone gets a clean, correctly-formatted
+    # refill on their next check rather than trying to match an old-format key.
     await db.children.update_many(
-        {"freeze_card_week": _current_week_key(), "freeze_cards_available": {"$lt": FREEZE_CARDS_PER_WEEK}},
-        {"$set": {"freeze_cards_available": FREEZE_CARDS_PER_WEEK}},
+        {"freeze_card_week": {"$not": {"$regex": "^cycle:"}}},
+        {"$set": {"freeze_card_week": None}},
     )
     await db.children.update_many(
         {"pet_type": {"$exists": False}},
@@ -4127,7 +4318,7 @@ async def migrate_existing_data():
     # Stamp the schema marker so future cold starts skip all of the above.
     await db.app_config.update_one(
         {"_schema_marker": True},
-        {"$set": {"_schema_marker": True, "schema_version": 3, "parent_id": "__schema_marker__"}},
+        {"$set": {"_schema_marker": True, "schema_version": 4, "parent_id": "__schema_marker__"}},
         upsert=True,
     )
 

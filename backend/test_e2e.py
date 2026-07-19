@@ -87,9 +87,13 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post(f"/api/tasks/{t[2]['id']}/complete")
     check("task#3 now unlocked", r.status_code == 200, f"{r.status_code} {r.text[:100]}")
 
-    # ---- 9. Redeem points → money (5 pts left × 500 = 2500) ----
-    r = c.post("/api/points/redeem-money", json={"child_id": adskhan["id"], "points": 5})
-    check("redeem 5 pts", r.status_code == 200 and r.json()["rupiah"] == 2500, r.text[:200])
+    # ---- 9. Redeem BELANJA points → money. Money now draws from the spend
+    # bucket (40% of earnings by default), not the headline points. ----
+    ads_now = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    spend_avail = ads_now.get("chiky_spend", 0)
+    check("kid has spend bucket funded", spend_avail >= 1, str(spend_avail))
+    r = c.post("/api/points/redeem-money", json={"child_id": adskhan["id"], "points": spend_avail})
+    check("redeem spend pts", r.status_code == 200 and r.json()["rupiah"] == spend_avail * 500, r.text[:200])
     r = c.post("/api/points/redeem-money", json={"child_id": adskhan["id"], "points": 999})
     check("over-redeem blocked", r.status_code == 400, str(r.status_code))
     r = c.post("/api/points/redeem-money", json={"child_id": syila["id"], "points": 1})
@@ -244,8 +248,15 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     # ---- 18. Broadcast tasks & daily quest system ----
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    # cleanup: give kids fresh state for this section
-    tomorrow = "2026-08-15"
+    # cleanup: give kids fresh state for this section.
+    # NOTE: kids can only START/COMPLETE tasks on the current day, so this
+    # section uses TODAY as its working day (a fixed future date would be
+    # correctly rejected by the past/future-day guard). Clear any pre-existing
+    # tasks first so the treasure-hunt sequence starts clean.
+    import datetime as _dt_today
+    tomorrow = (_dt_today.datetime.utcnow() + _dt_today.timedelta(hours=7)).strftime("%Y-%m-%d")
+    import asyncio as _aio_clear
+    _aio_clear.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
     # Broadcast (target_children empty) → both kids get a copy
     r = c.post("/api/tasks", json={"title": "Sikat gigi", "points": 5, "date_key": tomorrow})
     check("broadcast task creates for all kids", r.status_code == 200 and r.json().get("count") == 2, r.text[:200])
@@ -334,7 +345,10 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # to rupiah -> change theme -> change avatar -> change passcode -> upload
     # profile photo -> session survives a simulated "refresh".
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    life_date = "2026-09-01"
+    import datetime as _dt_life
+    life_date = (_dt_life.datetime.utcnow() + _dt_life.timedelta(hours=7)).strftime("%Y-%m-%d")
+    import asyncio as _aio_life
+    _aio_life.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
 
     r = c.post("/api/tasks", json={
         "title": "Sikat gigi", "points": 5, "date_key": life_date,
@@ -362,14 +376,22 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     pts_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     check("lifecycle: points awarded", pts_after == pts_before + 5, f"{pts_before}->{pts_after}")
 
-    r = c.post("/api/rewards", json={"name": "Permen", "description": "", "cost_points": 2})
+    ads_life = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    # Reward is bought from savings (Tabungan); make cost fit current savings.
+    reward_cost = max(1, min(2, ads_life.get("chiky_save", 0)))
+    r = c.post("/api/rewards", json={"name": "Permen", "description": "", "cost_points": reward_cost})
     reward = r.json()
+    save_before = ads_life.get("chiky_save", 0)
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
     r = c.post(f"/api/rewards/{reward['id']}/redeem", params={"child_id": adskhan["id"]})
-    check("lifecycle: redeem reward (belanja poin)", r.status_code == 200, r.text[:200])
+    check("lifecycle: redeem reward (from savings)", r.status_code == 200, r.text[:200])
+    ads_after_redeem = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("lifecycle: savings deducted by reward cost", ads_after_redeem.get("chiky_save", 0) == save_before - reward_cost, f"{save_before}->{ads_after_redeem.get('chiky_save')}")
 
-    r = c.post("/api/points/redeem-money", json={"child_id": adskhan["id"], "points": 1})
-    check("lifecycle: exchange points to rupiah", r.status_code == 200, r.text[:200])
+    spend_life = ads_after_redeem.get("chiky_spend", 0)
+    if spend_life >= 1:
+        r = c.post("/api/points/redeem-money", json={"child_id": adskhan["id"], "points": 1})
+        check("lifecycle: exchange spend points to rupiah", r.status_code == 200, r.text[:200])
 
     r = c.post(f"/api/children/{adskhan['id']}/theme", json={"theme": "galaxy"})
     check("lifecycle: change visual theme", r.status_code == 200 and r.json()["theme"] == "galaxy")
@@ -395,48 +417,68 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     # ================= 23. REAL-TIME TIME WINDOW =================
     # A task due far in the future today can't be started yet ("too early");
-    # a task whose due_time already passed can't be started ("too late").
+    # ================= 23. FLEXIBLE START + EARLY BONUS =================
+    # New rules: a task can be started any time on its own day (in sequence),
+    # regardless of due_time — kids may work ahead. A task whose due_time has
+    # passed without being started becomes "time-stuck" (rescued via Kartu
+    # Bebas / skip). Finishing BEFORE due_time earns the early bonus.
     import datetime as _dt
     now_local = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=7)
     today_local = now_local.strftime("%Y-%m-%d")
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    # Task due 2 min ago -> too late
-    late_min = (now_local - _dt.timedelta(minutes=2))
+    # Clean slate so sequence is deterministic for Syila.
+    import asyncio as _aio_tg
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+
+    # A task due later today (safely same-day, ~30 min ahead) — startable now
+    # (work ahead) and finishing now counts as "before due_time" → early bonus.
+    early_dt = (now_local + _dt.timedelta(minutes=30))
+    if early_dt.strftime("%Y-%m-%d") != today_local:
+        early_dt = now_local.replace(hour=23, minute=59, second=0, microsecond=0)
+    early_hhmm = early_dt.strftime("%H:%M")
+    r = c.post("/api/tasks", json={
+        "title": "Mandi sore", "points": 10, "date_key": today_local,
+        "target_children": [syila["id"]], "due_time": early_hhmm, "duration_minutes": 30,
+    })
+    early_task = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{early_task['id']}/start")
+    check("flex-start: can start ahead of due_time", r.status_code == 200 and r.json().get("timer_started_at"), f"{r.status_code} {r.text[:100]}")
+    r = c.post(f"/api/tasks/{early_task['id']}/complete")
+    check("flex-start: can finish early", r.status_code == 200, r.text[:120])
+    # Approve → early bonus applied (default 10% of 10 = 1)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{early_task['id']}/approve")
+    check("early-bonus: approved", r.status_code == 200)
+    approved_early = c.get(f"/api/tasks?child_id={syila['id']}&date_key={today_local}").json()
+    et = next((t for t in approved_early if t["id"] == early_task["id"]), None)
+    check("early-bonus: bonus recorded on task", et and et.get("early_bonus_awarded", 0) >= 1, str(et and et.get("early_bonus_awarded")))
+
+    # A task whose due_time already passed (never started) is time-stuck.
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    late_min = (now_local - _dt.timedelta(minutes=5))
     late_hhmm = late_min.strftime("%H:%M")
     r = c.post("/api/tasks", json={
         "title": "Bangun pagi", "points": 5, "date_key": today_local,
         "target_children": [syila["id"]], "due_time": late_hhmm, "duration_minutes": 10,
     })
     late_task = r.json()
-    # Task due in 6 hours -> too early (window is due-duration .. due)
-    early_dt = (now_local + _dt.timedelta(hours=6))
-    early_hhmm = early_dt.strftime("%H:%M")
-    r = c.post("/api/tasks", json={
-        "title": "Mandi sore", "points": 5, "date_key": today_local,
-        "target_children": [syila["id"]], "due_time": early_hhmm, "duration_minutes": 10,
-    })
-    early_task = r.json()
-
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    # NOTE: sequence rule — need these to be the actionable ones. Since Syila
-    # may have other pending tasks from earlier sections, we just assert the
-    # time-gate errors specifically (409) when we attempt them directly.
-    r = c.post(f"/api/tasks/{late_task['id']}/start")
-    check("time-gate: too-late task blocked", r.status_code == 409, f"{r.status_code} {r.text[:100]}")
-    r = c.post(f"/api/tasks/{early_task['id']}/start")
-    check("time-gate: too-early task blocked", r.status_code == 409, f"{r.status_code} {r.text[:100]}")
+    # It's the sequence-actionable task and overdue → rescue via Kartu Bebas works.
+    r = c.post(f"/api/tasks/{late_task['id']}/free-with-card")
+    check("time-stuck: overdue task rescuable via Kartu Bebas", r.status_code == 200, f"{r.status_code} {r.text[:120]}")
 
-    # A task with no due_time is not time-gated (only sequence-gated)
+    # A no-due_time bonus is startable anytime (only sequence-gated, and bonuses skip sequence).
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post("/api/tasks", json={
         "title": "Tugas bebas waktu", "points": 5, "date_key": today_local,
-        "target_children": [syila["id"]], "is_bonus": True,  # bonus to skip sequence
+        "target_children": [syila["id"]], "is_bonus": True,
     })
     free_task = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
     r = c.post(f"/api/tasks/{free_task['id']}/start")
-    check("time-gate: no-due-time bonus startable now", r.status_code == 200, f"{r.status_code} {r.text[:100]}")
+    check("flex-start: no-due-time bonus startable now", r.status_code == 200, f"{r.status_code} {r.text[:100]}")
 
     # ================= 24. IDEMPOTENT DELETES & RECURRENCE DEDUP =================
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
@@ -1794,6 +1836,182 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     _perf_calls = _aio_perf.run(_perf_check())
     check("perf: migration skips task sweeps when already stamped", _perf_calls["tasks"] == 0, str(_perf_calls))
     check("perf: migration skips child sweeps when already stamped", _perf_calls["children"] == 0, str(_perf_calls))
+
+    # =============== REWARD IMAGE ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    tiny_img = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    r = c.post("/api/rewards", json={"name": "Mainan", "cost_points": 10, "image": tiny_img})
+    img_reward = r.json()
+    check("reward-img: created with image", r.status_code == 200 and img_reward["image"] == tiny_img, r.text[:120])
+    r = c.patch(f"/api/rewards/{img_reward['id']}", json={"image": ""})
+    check("reward-img: can clear image", r.status_code == 200 and r.json()["image"] == "", r.text[:120])
+    r = c.patch(f"/api/rewards/{img_reward['id']}", json={"image": tiny_img})
+    check("reward-img: can set image via patch", r.json()["image"] == tiny_img)
+    r = c.post("/api/rewards", json={"name": "Besar", "cost_points": 5, "image": "data:image/png;base64," + ("A" * 2_000_001)})
+    check("reward-img: oversized image rejected", r.status_code == 422, str(r.status_code))
+
+    # =============== BUCKET-BASED REDEMPTIONS ===============
+    import asyncio as _aio_bucket
+    _aio_bucket.run(server.db.children.update_one(
+        {"id": syila["id"]},
+        {"$set": {"points": 100, "chiky_save": 50, "chiky_spend": 30, "chiky_share": 20}}))
+    r = c.post("/api/rewards", json={"name": "Buku", "cost_points": 40})
+    buku = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/rewards/{buku['id']}/redeem", params={"child_id": syila["id"]})
+    check("bucket: reward redeem from savings ok", r.status_code == 200, r.text[:120])
+    syi_b = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("bucket: savings reduced by reward cost", syi_b["chiky_save"] == 10, str(syi_b["chiky_save"]))
+    check("bucket: headline points reduced too", syi_b["points"] == 60, str(syi_b["points"]))
+    check("bucket: spend/share untouched by reward", syi_b["chiky_spend"] == 30 and syi_b["chiky_share"] == 20)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/rewards", json={"name": "Mahal", "cost_points": 25})
+    mahal = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/rewards/{mahal['id']}/redeem", params={"child_id": syila["id"]})
+    check("bucket: reward blocked when savings short (even if points ok)", r.status_code == 400, str(r.status_code))
+    r = c.post("/api/points/redeem-money", json={"child_id": syila["id"], "points": 30})
+    check("bucket: money redeem from spend ok", r.status_code == 200, r.text[:120])
+    syi_b2 = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("bucket: spend emptied", syi_b2["chiky_spend"] == 0, str(syi_b2["chiky_spend"]))
+    check("bucket: points reduced by money redeem", syi_b2["points"] == 30, str(syi_b2["points"]))
+    r = c.post("/api/points/redeem-money", json={"child_id": syila["id"], "points": 1})
+    check("bucket: money blocked when spend empty", r.status_code == 400, str(r.status_code))
+
+    # =============== SEDEKAH (CHARITY) FLOW ===============
+    _rate_now = c.get("/api/config").json()["rupiah_per_point"]
+    r = c.post("/api/charity/request", json={"child_id": syila["id"], "points": 15, "note": "buat masjid"})
+    check("charity: request ok", r.status_code == 200 and r.json()["rupiah"] == 15 * _rate_now, r.text[:150])
+    charity_id = r.json()["id"]
+    syi_c = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("charity: share bucket reduced", syi_c["chiky_share"] == 5, str(syi_c["chiky_share"]))
+    check("charity: headline points reduced", syi_c["points"] == 15, str(syi_c["points"]))
+    r = c.post("/api/charity/request", json={"child_id": syila["id"], "points": 999})
+    check("charity: over-request blocked", r.status_code == 400, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/charity/request", json={"child_id": syila["id"], "points": 1})
+    check("charity: sibling blocked", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/charity-requests")
+    check("charity: parent sees request", any(x["id"] == charity_id for x in r.json()))
+    r = c.post(f"/api/charity-requests/{charity_id}/approve")
+    check("charity: approve ok", r.status_code == 200 and r.json()["status"] == "approved", r.text[:150])
+    syi_c2 = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("charity: approved does NOT refund", syi_c2["chiky_share"] == 5, str(syi_c2["chiky_share"]))
+    r = c.post(f"/api/charity-requests/{charity_id}/approve")
+    check("charity: cannot re-approve", r.status_code == 400, str(r.status_code))
+    r = c.post("/api/charity/request", json={"child_id": syila["id"], "points": 5})
+    reject_charity_id = r.json()["id"]
+    r = c.post(f"/api/charity-requests/{reject_charity_id}/reject")
+    check("charity: reject ok", r.status_code == 200 and r.json()["status"] == "rejected", r.text[:150])
+    syi_c4 = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("charity: reject refunds share bucket", syi_c4["chiky_share"] == 5, str(syi_c4["chiky_share"]))
+    check("charity: reject refunds headline points", syi_c4["points"] == 15, str(syi_c4["points"]))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/charity/request", json={"child_id": syila["id"], "points": 1})
+    kid_charity = r.json()["id"]
+    r = c.post(f"/api/charity-requests/{kid_charity}/approve")
+    check("charity: kid blocked from approving", r.status_code == 403, str(r.status_code))
+
+    # =============== REWARD REDEMPTION CANCEL (refund to savings) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_bucket.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {"points": 100, "chiky_save": 60}}))
+    r = c.post("/api/rewards", json={"name": "RefundTest", "cost_points": 20})
+    rf_reward = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/rewards/{rf_reward['id']}/redeem", params={"child_id": syila["id"]})
+    rf_redemption_id = r.json()["id"]
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/redemptions/{rf_redemption_id}/cancel")
+    check("redeem-cancel: ok", r.status_code == 200, r.text[:150])
+    syi_rf = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("redeem-cancel: savings refunded", syi_rf["chiky_save"] == 60, str(syi_rf["chiky_save"]))
+    check("redeem-cancel: points refunded", syi_rf["points"] == 100, str(syi_rf["points"]))
+    r = c.post(f"/api/redemptions/{rf_redemption_id}/cancel")
+    check("redeem-cancel: cannot cancel twice", r.status_code == 400, str(r.status_code))
+
+    # =============== WISHLIST (savings-based progress + days estimate) ===============
+    c.post("/api/config", json={"daily_point_goal": 50, "chiky_save_pct": 40, "chiky_spend_pct": 40, "chiky_share_pct": 20})
+    _aio_bucket.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {"chiky_save": 30}}))
+    r = c.post("/api/rewards", json={"name": "WishGoal", "cost_points": 100})
+    wish_reward = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/wishlist", json={"reward_id": wish_reward["id"]})
+    check("wishlist: added", r.status_code == 200)
+    r = c.get("/api/wishlist")
+    wl = next((x for x in r.json() if x["reward_id"] == wish_reward["id"]), None)
+    check("wishlist: progress from savings not points", wl and wl["current_points"] == 30, str(wl and wl["current_points"]))
+    check("wishlist: percent computed", wl and wl["percent"] == 30, str(wl and wl["percent"]))
+    check("wishlist: remaining computed", wl and wl["remaining"] == 70, str(wl and wl["remaining"]))
+    check("wishlist: days estimate", wl and wl["days_estimate"] == 4, str(wl and wl["days_estimate"]))
+
+    # =============== FLEXIBLE FLOW CONFIG (freeze cards + early bonus) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/config")
+    check("flowcfg: defaults present", r.json().get("early_bonus_pct") == 10 and r.json().get("freeze_cards_per_week") == 3 and r.json().get("freeze_reset_weekday") == 0, str(r.json().get("early_bonus_pct")))
+    r = c.post("/api/config", json={"early_bonus_pct": 25, "freeze_cards_per_week": 5, "freeze_reset_weekday": 6})
+    check("flowcfg: accepted", r.status_code == 200, r.text[:150])
+    r = c.get("/api/config")
+    check("flowcfg: persisted", r.json()["early_bonus_pct"] == 25 and r.json()["freeze_cards_per_week"] == 5 and r.json()["freeze_reset_weekday"] == 6)
+    r = c.post("/api/config", json={"early_bonus_pct": 150})
+    check("flowcfg: early bonus >100 rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"freeze_cards_per_week": 8})
+    check("flowcfg: freeze per week >7 rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"freeze_reset_weekday": 7})
+    check("flowcfg: reset weekday >6 rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"freeze_reset_weekday": -1})
+    check("flowcfg: reset weekday <0 rejected", r.status_code == 422, str(r.status_code))
+
+    # Early bonus OFF (0%) → no bonus even when finished early
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"early_bonus_pct": 0, "freeze_cards_per_week": 3, "freeze_reset_weekday": 0})
+    safe_due = (now_local + _dt.timedelta(minutes=30))
+    if safe_due.strftime("%Y-%m-%d") != today_local:
+        safe_due = now_local.replace(hour=23, minute=59)
+    r = c.post("/api/tasks", json={"title": "NoBonus", "points": 20, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": safe_due.strftime("%H:%M")})
+    nb_task = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{nb_task['id']}/start")
+    c.post(f"/api/tasks/{nb_task['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{nb_task['id']}/approve")
+    nb_after = next((t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json() if t["id"] == nb_task["id"]), None)
+    check("early-bonus: 0% config gives no bonus", nb_after and nb_after.get("early_bonus_awarded", 0) == 0, str(nb_after and nb_after.get("early_bonus_awarded")))
+
+    # Custom early bonus % honored (30% of 20 = 6)
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"early_bonus_pct": 30})
+    r = c.post("/api/tasks", json={"title": "Bonus30", "points": 20, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": safe_due.strftime("%H:%M")})
+    b30 = r.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{b30['id']}/start")
+    c.post(f"/api/tasks/{b30['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{b30['id']}/approve")
+    b30_after = next((t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json() if t["id"] == b30["id"]), None)
+    check("early-bonus: custom 30% honored", b30_after and b30_after.get("early_bonus_awarded", 0) == 6, str(b30_after and b30_after.get("early_bonus_awarded")))
+
+    # Timestamps surfaced for parent honesty analysis
+    check("timestamps: start recorded", b30_after and b30_after.get("timer_started_at"), str(b30_after and b30_after.get("timer_started_at")))
+    check("timestamps: completion recorded", b30_after and b30_after.get("completed_at"), str(b30_after and b30_after.get("completed_at")))
+
+    # Config-driven freeze allotment: set to 1/week, verify only 1 rescue works
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"freeze_cards_per_week": 1, "freeze_reset_weekday": 0})
+    _aio_tg.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {"freeze_cards_available": 1, "freeze_card_week": None}}))
+    past_due = (now_local - _dt.timedelta(minutes=5)).strftime("%H:%M")
+    r1 = c.post("/api/tasks", json={"title": "Stuck1", "points": 5, "date_key": today_local, "target_children": [syila["id"]], "due_time": past_due, "duration_minutes": 10})
+    stuck1 = r1.json()
+    r2 = c.post("/api/tasks", json={"title": "Stuck2", "points": 5, "date_key": today_local, "target_children": [syila["id"]], "due_time": past_due, "duration_minutes": 10})
+    stuck2 = r2.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{stuck1['id']}/free-with-card")
+    check("freezecfg: first rescue ok (1/week)", r.status_code == 200 and r.json()["freeze_cards_available"] == 0, r.text[:120])
+    r = c.post(f"/api/tasks/{stuck2['id']}/free-with-card")
+    check("freezecfg: second rescue blocked (allotment 1)", r.status_code == 400, str(r.status_code))
+    # reset config back to defaults
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"early_bonus_pct": 10, "freeze_cards_per_week": 3, "freeze_reset_weekday": 0})
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

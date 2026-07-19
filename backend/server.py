@@ -3967,7 +3967,18 @@ async def seed_default_family():
 
 
 async def migrate_existing_data():
-    """Idempotent backfills for databases seeded by earlier versions."""
+    """Idempotent backfills for databases seeded by earlier versions.
+
+    Guarded by a persisted schema-version marker: the expensive collection-wide
+    sweeps below only run when the DB hasn't yet been migrated to the current
+    version. On serverless this matters a lot — without the marker, every cold
+    container would re-scan every task/child even though there's nothing left
+    to backfill, which is the main source of 'every menu loads slowly'."""
+    SCHEMA_VERSION = 3
+    marker = await db.app_config.find_one({"_schema_marker": True})
+    if marker and int(marker.get("schema_version", 0)) >= SCHEMA_VERSION:
+        return  # already migrated — skip all the sweeps entirely
+
     # 1. Children still on the default passcode get their plain code recorded
     #    so parents can view it (new behavior).
     await db.members.update_many(
@@ -4113,22 +4124,59 @@ async def migrate_existing_data():
         {"$set": {"pet_chosen_at": None, "pet_last_fed_at": None}},
     )
 
+    # Stamp the schema marker so future cold starts skip all of the above.
+    await db.app_config.update_one(
+        {"_schema_marker": True},
+        {"$set": {"_schema_marker": True, "schema_version": 3, "parent_id": "__schema_marker__"}},
+        upsert=True,
+    )
+
 
 # --------------- Startup ---------------
+# On Vercel's serverless runtime the ASGI app is imported fresh per cold
+# container, and FastAPI's startup event fires each time a new container boots.
+# Index creation + seeding + the (potentially collection-wide) migration are
+# expensive, so we must never run them more than once per container, and we
+# must never let them block or re-run on warm requests. This guard ensures the
+# heavy init runs exactly once per process lifetime; a failure won't wedge the
+# app (it logs and lets requests proceed — indexes/migrations are best-effort
+# backfills, not correctness-critical for a running server).
+_init_done = False
+_init_lock = asyncio.Lock()
+
+
+async def _run_one_time_init():
+    global _init_done
+    if _init_done:
+        return
+    async with _init_lock:
+        if _init_done:  # double-checked after acquiring the lock
+            return
+        try:
+            await db.members.create_index("id", unique=True)
+            await db.children.create_index("parent_id")
+            await db.tasks.create_index([("parent_id", 1), ("child_id", 1)])
+            await db.rewards.create_index("parent_id")
+            await db.consequences.create_index("parent_id")
+            await db.activity.create_index([("parent_id", 1), ("created_at", -1)])
+            await db.app_config.create_index("parent_id", unique=True)
+            await db.reminders.create_index([("parent_id", 1), ("child_id", 1)])
+            await db.push_subscriptions.create_index("parent_id")
+            await db.achievements.create_index("parent_id")
+            await db.pet_reset_requests.create_index([("parent_id", 1), ("status", 1)])
+            await seed_default_family()
+            await migrate_existing_data()
+        except Exception as e:  # noqa: BLE001 — never let init crash request handling
+            logging.getLogger("uvicorn.error").warning("one-time init skipped: %s", e)
+        finally:
+            _init_done = True
+
+
 @app.on_event("startup")
 async def startup():
-    await db.members.create_index("id", unique=True)
-    await db.children.create_index("parent_id")
-    await db.tasks.create_index([("parent_id", 1), ("child_id", 1)])
-    await db.rewards.create_index("parent_id")
-    await db.consequences.create_index("parent_id")
-    await db.activity.create_index([("parent_id", 1), ("created_at", -1)])
-    await db.app_config.create_index("parent_id", unique=True)
-    await db.reminders.create_index([("parent_id", 1), ("child_id", 1)])
-    await db.push_subscriptions.create_index("parent_id")
-    await db.achievements.create_index("parent_id")
-    await seed_default_family()
-    await migrate_existing_data()
+    # Kick off init in the background so the container can start serving
+    # immediately; the first request won't block on migrations.
+    await _run_one_time_init()
 
 
 @app.on_event("shutdown")
@@ -4137,6 +4185,19 @@ async def shutdown_db_client():
 
 
 app.include_router(api)
+
+
+@app.middleware("http")
+async def ensure_initialized(request: Request, call_next):
+    # Vercel's serverless ASGI adapter doesn't always fire FastAPI's startup
+    # lifespan event, which would leave indexes uncreated (→ slow collection
+    # scans). This runs the guarded one-time init on the first request to a
+    # fresh container; the _init_done flag makes every subsequent request a
+    # no-op, so there's no per-request cost once warm.
+    if not _init_done:
+        await _run_one_time_init()
+    return await call_next(request)
+
 
 app.add_middleware(
     CORSMiddleware,

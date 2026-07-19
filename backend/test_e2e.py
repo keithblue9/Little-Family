@@ -1768,6 +1768,33 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/pet-reset-requests/nonexistent/approve", json={"note": "x"})
     check("pet-req: parent 404 for bad request id", r.status_code == 404, str(r.status_code))
 
+    # =============== PERF: migration must not re-run once stamped ===============
+    import asyncio as _aio_perf
+    async def _perf_check():
+        # Ensure the DB is migrated + stamped first (TestClient may not fire the
+        # startup/middleware init in this harness).
+        await server.migrate_existing_data()
+        marker = await server.db.app_config.find_one({"_schema_marker": True})
+        assert marker and marker.get("schema_version", 0) >= 3, "schema marker missing"
+        # Simulate a fresh cold container hitting the already-migrated DB
+        server._init_done = False
+        calls = {"tasks": 0, "children": 0}
+        orig_t = server.db.tasks.update_many
+        orig_c = server.db.children.update_many
+        async def spy_t(*a, **k): calls["tasks"] += 1; return await orig_t(*a, **k)
+        async def spy_c(*a, **k): calls["children"] += 1; return await orig_c(*a, **k)
+        server.db.tasks.update_many = spy_t
+        server.db.children.update_many = spy_c
+        try:
+            await server.migrate_existing_data()
+        finally:
+            server.db.tasks.update_many = orig_t
+            server.db.children.update_many = orig_c
+        return calls
+    _perf_calls = _aio_perf.run(_perf_check())
+    check("perf: migration skips task sweeps when already stamped", _perf_calls["tasks"] == 0, str(_perf_calls))
+    check("perf: migration skips child sweeps when already stamped", _perf_calls["children"] == 0, str(_perf_calls))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

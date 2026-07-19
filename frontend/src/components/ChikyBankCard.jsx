@@ -10,8 +10,8 @@ export default function ChikyBankCard({ child, rate = 100 }) {
   const total = save + spend + share || 1;
 
   const banks = [
-    { key: "save", label: "Tabungan", emoji: "🐔", color: "#3B82F6", pts: save, desc: "Untuk tujuanmu" },
-    { key: "spend", label: "Belanja", emoji: "🐥", color: "#F59E0B", pts: spend, desc: "Boleh dipakai" },
+    { key: "save", label: "Tabungan", emoji: "🐔", color: "#3B82F6", pts: save, desc: "Untuk beli hadiah" },
+    { key: "spend", label: "Belanja", emoji: "🐥", color: "#F59E0B", pts: spend, desc: "Tukar jadi uang" },
     { key: "share", label: "Sedekah", emoji: "🐣", color: "#EC4899", pts: share, desc: "Berbagi kebaikan" },
   ];
 

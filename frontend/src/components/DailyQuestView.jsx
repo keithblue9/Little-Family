@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { motion } from "framer-motion";
-import { Calendar, Target, Sparkles, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer, ChevronUp, ChevronDown } from "lucide-react";
+import { Calendar, Target, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES } from "@/lib/questThemes";
@@ -10,31 +10,6 @@ import { playSoundTheme } from "@/lib/sounds";
 import KidMonthCalendar from "@/components/KidMonthCalendar";
 import MysteryBox from "@/components/MysteryBox";
 import { timeOfDayOverlay, isNightTime } from "@/lib/timeOfDay";
-
-// Bonus mission display order is a small personal-preference feature — kept
-// client-side only (no backend field) since it's just "how this kid likes to
-// see their own optional extras listed today", not something that needs to
-// sync across devices or be visible to parents.
-function bonusOrderKey(childId, dateKey) {
-  return `bonusOrder:${childId}:${dateKey}`;
-}
-function getBonusOrder(childId, dateKey) {
-  if (!childId) return null;
-  try {
-    const raw = localStorage.getItem(bonusOrderKey(childId, dateKey));
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null; // corrupted/unavailable storage — just fall back to default order
-  }
-}
-function saveBonusOrder(childId, dateKey, orderedIds) {
-  if (!childId) return;
-  try {
-    localStorage.setItem(bonusOrderKey(childId, dateKey), JSON.stringify(orderedIds));
-  } catch {
-    // storage unavailable (private browsing, quota) — non-fatal, order just won't persist
-  }
-}
 
 export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [dateKey, setDateKey] = useState(todayKey());
@@ -72,56 +47,48 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
   const theme = QUEST_THEMES[themeKey] || QUEST_THEMES.ocean;
 
-  const { required, bonus, next, done } = useMemo(() => {
+  const { timeline, next, done } = useMemo(() => {
     const tasks = progress?.tasks || [];
     const req = tasks.filter((t) => !t.is_bonus).sort((a, b) => (a.order || 0) - (b.order || 0));
-    let bon = tasks.filter((t) => t.is_bonus);
-    // Apply the kid's own custom display order for bonus missions, if they've
-    // rearranged them — a small personal-preference touch that doesn't need
-    // any backend involvement since it's purely how THEY like to see their
-    // own optional extras listed.
-    const savedOrder = getBonusOrder(child?.id, dateKey);
-    if (savedOrder && savedOrder.length) {
-      const orderIndex = new Map(savedOrder.map((id, i) => [id, i]));
-      bon = [...bon].sort((a, b) => (orderIndex.get(a.id) ?? 999) - (orderIndex.get(b.id) ?? 999));
-    }
+    const bon = tasks.filter((t) => t.is_bonus);
     const openReq = req.filter((t) => t.status === "pending" || t.status === "rejected");
     const first = openReq[0] || null;
     const doneReq = req.filter((t) => t.status === "approved" || t.status === "skipped" || t.status === "completed");
-    return { required: req, bonus: bon, next: first, done: doneReq };
-  }, [progress, child?.id, dateKey]);
 
-  const moveBonusTask = (taskId, direction) => {
-    const ids = bonus.map((t) => t.id);
-    const idx = ids.indexOf(taskId);
-    const swapWith = direction === "up" ? idx - 1 : idx + 1;
-    if (swapWith < 0 || swapWith >= ids.length) return;
-    [ids[idx], ids[swapWith]] = [ids[swapWith], ids[idx]];
-    saveBonusOrder(child?.id, dateKey, ids);
-    // Force a re-render by touching progress reference — cheapest safe way
-    // without adding a whole separate state slice just for display order.
-    setProgress((p) => (p ? { ...p } : p));
-  };
+    // Interleave bonus missions INTO the required sequence by time-of-day, so a
+    // Sunday-morning bonus sits between the morning required missions rather
+    // than in a separate box at the bottom. Sort key: due_time first (missions
+    // with a time slot into their slot; timeless ones sink below by a large
+    // sentinel), then explicit order. Bonuses never affect the required
+    // sequence gate — they're just placed visually.
+    const timeVal = (t) => {
+      if (t.due_time) {
+        const [h, m] = t.due_time.split(":").map(Number);
+        return h * 60 + m;
+      }
+      return 100000 + (t.order || 0); // timeless → after timed ones, stable by order
+    };
+    const merged = [...req, ...bon].sort((a, b) => {
+      const ta = timeVal(a), tb = timeVal(b);
+      if (ta !== tb) return ta - tb;
+      // tie-break: required before bonus at the same slot, then order
+      if (!!a.is_bonus !== !!b.is_bonus) return a.is_bonus ? 1 : -1;
+      return (a.order || 0) - (b.order || 0);
+    });
+
+    return { timeline: merged, next: first, done: doneReq };
+  }, [progress]);
 
   const isToday = dateKey === todayKey();
   const isFuture = isFutureDate(dateKey);
 
   const timeGate = (task) => {
     if (!isToday) return { allowed: false, reason: isFuture ? "future" : "past" };
-    if (!task.due_time) return { allowed: true, reason: null };
-    // Once the timer is running, the due_time window's job is done — it only
-    // exists to gate WHEN a task can be started. Continuing to enforce it
-    // after Start would strand a kid who began right on time but finishes a
-    // minute past due_time with no way to mark it complete. Running-out-of-
-    // time-after-starting is what the separate duration/overdue check is for.
-    if (task.timer_started_at) return { allowed: true, reason: null };
-    const [dh, dm] = task.due_time.split(":").map(Number);
-    const [nh, nm] = nowHHMM.split(":").map(Number);
-    const dueMin = dh * 60 + dm;
-    const nowMin = nh * 60 + nm;
-    const lead = task.duration_minutes && task.duration_minutes > 0 ? task.duration_minutes : 120;
-    if (nowMin < dueMin - lead) return { allowed: false, reason: "early" };
-    if (nowMin > dueMin) return { allowed: false, reason: "late" };
+    // Flexible flow: a task can be started ANY time on its own day (kids may
+    // work ahead of schedule). We no longer block by the due_time window.
+    // Overshooting the due_time without starting turns a required task
+    // time-stuck (handled by isTimeStuck → Kartu Bebas), but that's a finish/
+    // rescue concern, not a start gate.
     return { allowed: true, reason: null };
   };
 
@@ -359,7 +326,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       {/* Treasure Map */}
       {loading ? (
         <div className="text-center text-slate-400 py-8">Memuat…</div>
-      ) : required.length === 0 && bonus.length === 0 ? (
+      ) : timeline.length === 0 ? (
         <div className="rounded-3xl p-8 text-center chunky-shadow-lg" style={{ background: theme.colors.bg, color: theme.colors.text }}>
           <div className="text-5xl mb-3">{theme.goalIcon}</div>
           <div className="font-fun font-bold text-xl">{isToday ? "Belum ada misi hari ini" : "Tidak ada misi di hari ini"}</div>
@@ -367,104 +334,88 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         </div>
       ) : (
         <>
-          {required.length > 0 && (
-            <div className="rounded-3xl overflow-hidden chunky-shadow-lg relative" style={{ background: theme.colors.bg, color: theme.colors.text }}>
-              {/* Time-of-day tint — same theme, but the light shifts with real time */}
-              <div className="absolute inset-0 pointer-events-none transition-all duration-1000" style={{ background: timeOfDayOverlay() }} />
-              {isNightTime() && (
-                <div className="absolute inset-0 pointer-events-none overflow-hidden">
-                  {[...Array(12)].map((_, i) => (
-                    <motion.div
-                      key={`star-${i}`}
-                      className="absolute w-1 h-1 rounded-full bg-white"
-                      style={{ top: `${(i * 17 + 5) % 60}%`, left: `${(i * 29 + 10) % 92}%` }}
-                      animate={{ opacity: [0.2, 0.9, 0.2] }}
-                      transition={{ duration: 2 + (i % 3), repeat: Infinity, delay: i * 0.2 }}
-                    />
-                  ))}
-                </div>
-              )}
-
-              {/* Floating decorations */}
-              {theme.decorEmojis.map((e, i) => (
-                <motion.div key={i} className="absolute select-none pointer-events-none opacity-20"
-                  style={{ top: `${(i * 23 + 5) % 85}%`, left: `${(i * 31 + 8) % 85}%`, fontSize: 16 + (i % 3) * 6 }}
-                  animate={{ y: [0, -10, 0], rotate: [0, 10, -10, 0] }}
-                  transition={{ duration: 3 + i * 0.7, repeat: Infinity, ease: "easeInOut", delay: i * 0.3 }}
-                >{e}</motion.div>
-              ))}
-
-              {/* Header */}
-              <div className="relative z-10 p-4 pb-2 flex items-center justify-between">
-                <div>
-                  <div className="font-fun font-bold text-lg flex items-center gap-2">
-                    <span className="text-2xl">{theme.emoji}</span> {theme.label}
-                  </div>
-                  <div className="text-xs opacity-80" style={{ color: theme.colors.textDim }}>{theme.tagline}</div>
-                </div>
-                <motion.div animate={{ scale: [1, 1.1, 1] }} transition={{ duration: 3, repeat: Infinity }} className="text-4xl">{theme.goalIcon}</motion.div>
+          <div className="rounded-3xl overflow-hidden chunky-shadow-lg relative" style={{ background: theme.colors.bg, color: theme.colors.text }}>
+            {/* Time-of-day tint — same theme, but the light shifts with real time */}
+            <div className="absolute inset-0 pointer-events-none transition-all duration-1000" style={{ background: timeOfDayOverlay() }} />
+            {isNightTime() && (
+              <div className="absolute inset-0 pointer-events-none overflow-hidden">
+                {[...Array(12)].map((_, i) => (
+                  <motion.div
+                    key={`star-${i}`}
+                    className="absolute w-1 h-1 rounded-full bg-white"
+                    style={{ top: `${(i * 17 + 5) % 60}%`, left: `${(i * 29 + 10) % 92}%` }}
+                    animate={{ opacity: [0.2, 0.9, 0.2] }}
+                    transition={{ duration: 2 + (i % 3), repeat: Infinity, delay: i * 0.2 }}
+                  />
+                ))}
               </div>
+            )}
 
-              {/* Quest nodes — clean vertical list */}
-              <div className="relative z-10 px-4">
-                <div className="relative z-10 space-y-2 pb-4">
-                  {required.map((t, idx) => {
-                    const isActive = next?.id === t.id;
-                    const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
-                    const gate = timeGate(t);
-                    const overdue = isDurationExceeded(t);
-                    const timeStuck = isActive && !isDone && isTimeStuck(t);
-                    return (
-                      <QuestNode key={t.id} task={t} idx={idx} total={required.length}
-                        isActive={isActive} isDone={isDone} theme={theme}
-                        busy={busyId === t.id} gate={gate} overdue={overdue} timeStuck={timeStuck}
-                        canStart={isActive && !t.timer_started_at && gate.allowed}
-                        canFinish={isActive && !!t.timer_started_at && gate.allowed && !overdue}
-                        onStart={() => startTimer(t)} onFinish={() => finishTask(t)} onSkip={() => skipTask(t)}
-                        onFreeWithCard={() => freeWithCard(t)}
-                        freezeCardsAvailable={child?.freeze_cards_available ?? 0}
-                      />
-                    );
-                  })}
+            {/* Floating decorations */}
+            {theme.decorEmojis.map((e, i) => (
+              <motion.div key={i} className="absolute select-none pointer-events-none opacity-20"
+                style={{ top: `${(i * 23 + 5) % 85}%`, left: `${(i * 31 + 8) % 85}%`, fontSize: 16 + (i % 3) * 6 }}
+                animate={{ y: [0, -10, 0], rotate: [0, 10, -10, 0] }}
+                transition={{ duration: 3 + i * 0.7, repeat: Infinity, ease: "easeInOut", delay: i * 0.3 }}
+              >{e}</motion.div>
+            ))}
+
+            {/* Header */}
+            <div className="relative z-10 p-4 pb-2 flex items-center justify-between">
+              <div>
+                <div className="font-fun font-bold text-lg flex items-center gap-2">
+                  <span className="text-2xl">{theme.emoji}</span> {theme.label}
                 </div>
+                <div className="text-xs opacity-80" style={{ color: theme.colors.textDim }}>{theme.tagline}</div>
               </div>
-
-              {/* Goal marker */}
-              <div className="relative z-10 flex justify-center pb-5">
-                <motion.div animate={{ scale: [1, 1.12, 1], rotate: [0, 5, -5, 0] }} transition={{ duration: 3, repeat: Infinity }} className="text-5xl select-none">{theme.goalIcon}</motion.div>
-              </div>
+              <motion.div animate={{ scale: [1, 1.1, 1] }} transition={{ duration: 3, repeat: Infinity }} className="text-4xl">{theme.goalIcon}</motion.div>
             </div>
-          )}
 
-          {/* Bonus quests */}
-          {bonus.length > 0 && (
-            <div className="bg-gradient-to-br from-amber-50 to-yellow-50 rounded-3xl p-4 border-2 border-amber-200 chunky-shadow">
-              <div className="flex items-center gap-2 mb-3">
-                <Sparkles className="w-5 h-5 text-amber-500" />
-                <h3 className="font-fun font-bold text-slate-900">Misi Bonus ✨</h3>
-              </div>
-              <div className="space-y-2">
-                {bonus.map((t, bIdx) => {
+            {/* Quest timeline — required + bonus interleaved by time-of-day */}
+            <div className="relative z-10 px-4">
+              <div className="relative z-10 space-y-2 pb-4">
+                {timeline.map((t, idx) => {
                   const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
                   const gate = timeGate(t);
                   const overdue = isDurationExceeded(t);
+                  if (t.is_bonus) {
+                    // Bonus node — never blocked by the required sequence, always
+                    // startable/skippable directly, sits in its time slot.
+                    return (
+                      <QuestNode key={t.id} task={t} idx={idx} total={timeline.length}
+                        isActive={!isDone} isDone={isDone} theme={theme}
+                        busy={busyId === t.id} gate={gate} overdue={overdue}
+                        canStart={!isDone && !t.timer_started_at && gate.allowed}
+                        canFinish={!isDone && !!t.timer_started_at && gate.allowed && !overdue}
+                        onStart={() => startTimer(t)} onFinish={() => finishTask(t)}
+                        onSkip={() => skipTask(t)}
+                        isBonus
+                      />
+                    );
+                  }
+                  // Required node — gated by sequence (only the frontmost open one is active).
+                  const isActive = next?.id === t.id;
+                  const timeStuck = isActive && !isDone && isTimeStuck(t);
                   return (
-                    <QuestNode key={t.id} task={t} idx={0} total={1}
-                      isActive={!isDone} isDone={isDone} theme={theme}
-                      busy={busyId === t.id} gate={gate} overdue={overdue}
-                      canStart={!isDone && !t.timer_started_at && gate.allowed}
-                      canFinish={!isDone && !!t.timer_started_at && gate.allowed && !overdue}
-                      onStart={() => startTimer(t)} onFinish={() => finishTask(t)}
-                      onSkip={() => skipTask(t)}
-                      onMoveUp={!isDone && bIdx > 0 ? () => moveBonusTask(t.id, "up") : null}
-                      onMoveDown={!isDone && bIdx < bonus.length - 1 ? () => moveBonusTask(t.id, "down") : null}
-                      isBonus
+                    <QuestNode key={t.id} task={t} idx={idx} total={timeline.length}
+                      isActive={isActive} isDone={isDone} theme={theme}
+                      busy={busyId === t.id} gate={gate} overdue={overdue} timeStuck={timeStuck}
+                      canStart={isActive && !t.timer_started_at && gate.allowed}
+                      canFinish={isActive && !!t.timer_started_at && gate.allowed && !overdue}
+                      onStart={() => startTimer(t)} onFinish={() => finishTask(t)} onSkip={() => skipTask(t)}
+                      onFreeWithCard={() => freeWithCard(t)}
+                      freezeCardsAvailable={child?.freeze_cards_available ?? 0}
                     />
                   );
                 })}
               </div>
             </div>
-          )}
+
+            {/* Goal marker */}
+            <div className="relative z-10 flex justify-center pb-5">
+              <motion.div animate={{ scale: [1, 1.12, 1], rotate: [0, 5, -5, 0] }} transition={{ duration: 3, repeat: Infinity }} className="text-5xl select-none">{theme.goalIcon}</motion.div>
+            </div>
+          </div>
         </>
       )}
 
@@ -488,7 +439,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 }
 
 /* ======================== QUEST NODE (treasure map stop) ======================== */
-function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, timeStuck, canStart, canFinish, onStart, onFinish, onSkip, onMoveUp, onMoveDown, onFreeWithCard, freezeCardsAvailable, isBonus }) {
+function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, timeStuck, canStart, canFinish, onStart, onFinish, onSkip, onFreeWithCard, freezeCardsAvailable, isBonus }) {
   const c = theme.colors;
   const bg = isDone ? c.nodeDone : isActive ? c.node : c.nodeLocked;
   const started = !!task.timer_started_at;
@@ -551,17 +502,14 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
           {task.together_bonus_enabled && isDone && task.done_together === true && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-pink-500 text-white">🤝 Bersama! +{task.together_bonus_points}</span>}
         </div>
         {started && !isDone && <LiveTimer startedAt={task.timer_started_at} durationMinutes={task.duration_minutes} />}
-        {isActive && !isDone && !started && gateReason === "early" && (
-          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">🔒 Belum waktunya</div>
-        )}
-        {isActive && !isDone && !started && gateReason === "late" && (
-          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-red-100 text-red-600">⌛ Waktu sudah lewat</div>
-        )}
         {!isDone && gateReason === "past" && (
           <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">⌛ Hari ini sudah lewat</div>
         )}
         {!isDone && gateReason === "future" && (
           <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-500">🔮 Belum tiba harinya</div>
+        )}
+        {isDone && task.early_bonus_awarded > 0 && (
+          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-green-500 text-white">⚡ Cepat! +{task.early_bonus_awarded} bonus</div>
         )}
         {isDone && (task.encouragement_message || task.encouragement_voice_url) && (
           <div className="mt-2 bg-pink-50 border border-pink-200 rounded-xl px-2.5 py-1.5">
@@ -607,26 +555,6 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
               <FastForward className="w-3 h-3" /> Lewati
             </button>
           )}
-        </div>
-      )}
-      {(onMoveUp || onMoveDown) && !isDone && (
-        <div className="flex flex-col gap-0.5 shrink-0 ml-1">
-          <button
-            onClick={onMoveUp || undefined}
-            disabled={!onMoveUp}
-            title="Pindah ke atas"
-            className="press-btn p-1 rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-20 disabled:cursor-not-allowed"
-          >
-            <ChevronUp className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={onMoveDown || undefined}
-            disabled={!onMoveDown}
-            title="Pindah ke bawah"
-            className="press-btn p-1 rounded-md text-slate-400 hover:bg-slate-100 disabled:opacity-20 disabled:cursor-not-allowed"
-          >
-            <ChevronDown className="w-3.5 h-3.5" />
-          </button>
         </div>
       )}
       </motion.div>

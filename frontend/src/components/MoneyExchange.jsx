@@ -11,15 +11,27 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
   const [amount, setAmount] = useState("");
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
+  // Charity (sedekah) request
+  const [charityAmount, setCharityAmount] = useState("");
+  const [charityNote, setCharityNote] = useState("");
+  const [charityHistory, setCharityHistory] = useState([]);
+  const [charityLoading, setCharityLoading] = useState(false);
   // Savings goal (BusyKid-inspired)
   const [editingGoal, setEditingGoal] = useState(false);
   const [goalName, setGoalName] = useState("");
   const [goalAmount, setGoalAmount] = useState("");
   const [savingGoal, setSavingGoal] = useState(false);
 
+  // The three buckets fund three different actions:
+  //   Belanja (spend) → cash out to rupiah
+  //   Sedekah (share) → charity request
+  //   Tabungan (save) → spent on rewards (handled in the Toko tab)
+  const spendBal = child?.chiky_spend || 0;
+  const shareBal = child?.chiky_share || 0;
+
   const currentGoalName = child?.savings_goal_name || "";
   const currentGoalAmount = child?.savings_goal_amount || 0;
-  const walletRupiah = (points || 0) * rate;
+  const walletRupiah = spendBal * rate;
   const goalPercent = currentGoalAmount > 0 ? Math.min(100, Math.round((walletRupiah / currentGoalAmount) * 100)) : 0;
 
   const saveGoal = async () => {
@@ -41,12 +53,14 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
 
   const load = useCallback(async () => {
     try {
-      const [cfg, hist] = await Promise.all([
+      const [cfg, hist, charity] = await Promise.all([
         api.get("/config"),
         api.get("/money-redemptions", { params: { child_id: childId } }),
+        api.get("/charity-requests", { params: { child_id: childId } }),
       ]);
       setRate(cfg.data.rupiah_per_point || 100);
       setHistory(hist.data);
+      setCharityHistory(charity.data);
     } catch (e) {
       console.error(e);
     }
@@ -64,14 +78,14 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
       toast.error("Masukkan jumlah poin yang mau ditukar");
       return;
     }
-    if (pts > points) {
-      toast.error("Poin kamu tidak cukup 😅");
+    if (pts > spendBal) {
+      toast.error("Poin belanjamu tidak cukup 😅");
       return;
     }
     setLoading(true);
     try {
       const { data } = await api.post("/points/redeem-money", { child_id: childId, points: pts });
-      toast.success(`Berhasil! ${pts} poin → ${fmtRp(data.rupiah)} 🎉 Tunggu dibayar Abi/Ummi ya`);
+      toast.success(`Berhasil! ${pts} poin belanja → ${fmtRp(data.rupiah)} 🎉 Tunggu dibayar Abi/Ummi ya`);
       setAmount("");
       load();
       onChanged?.();
@@ -79,6 +93,31 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
       toast.error(formatApiError(e));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const charityPts = parseInt(charityAmount || "0", 10);
+  const requestCharity = async () => {
+    if (!charityPts || charityPts < 1) {
+      toast.error("Masukkan jumlah poin sedekah");
+      return;
+    }
+    if (charityPts > shareBal) {
+      toast.error("Poin sedekahmu tidak cukup 😅");
+      return;
+    }
+    setCharityLoading(true);
+    try {
+      const { data } = await api.post("/charity/request", { child_id: childId, points: charityPts, note: charityNote });
+      toast.success(`Permintaan sedekah ${fmtRp(data.rupiah)} terkirim 🤲 Menunggu Abi/Ummi`);
+      setCharityAmount("");
+      setCharityNote("");
+      load();
+      onChanged?.();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setCharityLoading(false);
     }
   };
 
@@ -106,10 +145,10 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
     <div className="space-y-5">
       <div>
         <h3 className="font-fun font-bold text-xl text-slate-900 flex items-center gap-2">
-          <Banknote className="w-6 h-6 text-green-500" /> Tukar Poin Jadi Uang
+          <Banknote className="w-6 h-6 text-green-500" /> Tukar Poin Belanja Jadi Uang
         </h3>
         <p className="text-sm text-slate-500 mt-1">
-          Kurs saat ini: <span className="font-bold text-green-600">1 poin = {fmtRp(rate)}</span>
+          Dari kantong <b className="text-amber-600">Belanja 🐥</b> · Kurs: <span className="font-bold text-green-600">1 poin = {fmtRp(rate)}</span>
         </p>
       </div>
 
@@ -212,7 +251,7 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
 
         <div className="flex items-center justify-between mt-4">
           <div className="text-sm text-slate-500">
-            Poinmu: <span className="font-bold text-slate-700">{points} ⭐</span>
+            Poin belanjamu: <span className="font-bold text-slate-700">{spendBal} 🐥</span>
           </div>
           <button
             onClick={redeem}
@@ -222,6 +261,71 @@ export default function MoneyExchange({ childId, points, child, onChanged }) {
             {loading ? "Memproses…" : "Tukar! 💰"}
           </button>
         </div>
+      </div>
+
+      {/* Sedekah (charity) — request card. Draws from the Sedekah bucket; a
+          parent approves and hands over the cash to donate. */}
+      <div className="bg-gradient-to-br from-pink-50 to-fuchsia-50 border-2 border-pink-100 rounded-3xl p-5">
+        <h4 className="font-fun font-bold text-slate-900 flex items-center gap-2 mb-1">
+          <span className="text-xl">🤲</span> Sedekah
+        </h4>
+        <p className="text-sm text-slate-500 mb-3">
+          Dari kantong <b className="text-pink-600">Sedekah 🐣</b>. Ajukan, nanti Abi/Ummi yang menyalurkan uangnya.
+        </p>
+        <div className="flex items-center gap-2">
+          <div className="flex-1">
+            <div className="flex items-center gap-2 bg-white rounded-2xl border-2 border-pink-200 px-3 py-2">
+              <Coins className="w-5 h-5 text-pink-400 shrink-0" />
+              <input
+                type="text"
+                inputMode="numeric"
+                value={charityAmount}
+                onChange={(e) => setCharityAmount(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                placeholder="0"
+                className="w-full font-fun font-bold text-xl text-slate-900 outline-none bg-transparent"
+              />
+            </div>
+          </div>
+          <div className="text-sm font-bold text-pink-600 shrink-0">= {fmtRp(charityPts * rate)}</div>
+        </div>
+        <input
+          value={charityNote}
+          onChange={(e) => setCharityNote(e.target.value.slice(0, 200))}
+          placeholder="Untuk siapa? (opsional, mis. kotak amal masjid)"
+          className="w-full mt-2 px-3 py-2 rounded-xl border-2 border-pink-200 focus:border-pink-400 focus:outline-none text-sm"
+        />
+        <div className="flex items-center justify-between mt-3">
+          <div className="text-sm text-slate-500">
+            Poin sedekahmu: <span className="font-bold text-slate-700">{shareBal} 🐣</span>
+          </div>
+          <button
+            onClick={requestCharity}
+            disabled={charityLoading || !charityPts}
+            className="press-btn chunky-shadow bg-pink-500 hover:bg-pink-600 text-white font-fun font-bold px-5 py-2.5 rounded-2xl disabled:opacity-40"
+          >
+            {charityLoading ? "Mengirim…" : "Sedekah 🤲"}
+          </button>
+        </div>
+
+        {charityHistory.length > 0 && (
+          <div className="mt-4 space-y-2">
+            {charityHistory.slice(0, 5).map((h) => (
+              <div key={h.id} className="flex items-center justify-between bg-white border-2 border-pink-50 rounded-2xl px-3 py-2">
+                <div className="min-w-0">
+                  <div className="font-fun font-bold text-sm text-slate-800">{h.points} poin → {fmtRp(h.rupiah)}</div>
+                  {h.note && <div className="text-[11px] text-slate-400 truncate">{h.note}</div>}
+                </div>
+                {h.status === "approved" ? (
+                  <span className="inline-flex items-center gap-1 text-xs font-bold text-green-600 bg-green-50 px-2 py-1 rounded-full shrink-0"><CheckCircle2 className="w-3 h-3" /> Disalurkan</span>
+                ) : h.status === "rejected" ? (
+                  <span className="inline-flex items-center gap-1 text-xs font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-full shrink-0"><XCircle className="w-3 h-3" /> Ditolak</span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 text-xs font-bold text-amber-600 bg-amber-50 px-2 py-1 rounded-full shrink-0"><Clock className="w-3 h-3" /> Menunggu</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* History */}

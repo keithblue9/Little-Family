@@ -179,26 +179,6 @@ export default function ParentApp() {
     () => redemptions.filter((r) => r.status === "pending"),
     [redemptions]
   );
-  // "Aktif Hari Ini" count for the Tugas sidebar badge — mirrors TasksView's
-  // own default date filter (exact today) AND its broadcast-collapsing (a
-  // task sent to multiple kids at once is one row in the list, so it must
-  // also count as one here — otherwise the badge and the list disagree).
-  const tasksBadgeCount = useMemo(() => {
-    const todaysPending = tasks.filter(
-      (t) => (t.status === "pending" || t.status === "rejected") && (!t.date_key || t.date_key === todayKey())
-    );
-    const seenBroadcasts = new Set();
-    let count = 0;
-    for (const t of todaysPending) {
-      if (t.broadcast_id) {
-        const key = `${t.broadcast_id}::${t.date_key}::${t.title}`;
-        if (seenBroadcasts.has(key)) continue; // already counted this broadcast group
-        seenBroadcasts.add(key);
-      }
-      count += 1;
-    }
-    return count;
-  }, [tasks]);
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] font-body flex" data-testid={TEST_IDS.parent.dashboard}>
@@ -226,7 +206,6 @@ export default function ParentApp() {
             const lblKey = navLabelKey[n.key];
             const lbl = lblKey ? t(lblKey) : n.label;
             if (lbl === "") return null; // hidden by parent
-            const badgeCount = n.key === "tasks" ? tasksBadgeCount : 0;
             return (
               <button
                 key={n.key}
@@ -241,11 +220,6 @@ export default function ParentApp() {
               >
                 <n.icon className="w-4 h-4 shrink-0" strokeWidth={2.5} />
                 <span className={sidebarCollapsed ? "md:hidden" : ""}>{lbl}</span>
-                {badgeCount > 0 && (
-                  <span className={`ml-auto shrink-0 bg-red-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1 ${sidebarCollapsed ? "md:hidden" : ""}`}>
-                    {badgeCount > 99 ? "99+" : badgeCount}
-                  </span>
-                )}
               </button>
             );
           })}

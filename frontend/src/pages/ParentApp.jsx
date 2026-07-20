@@ -532,7 +532,11 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
     // ever stored the literal strings "today" or "all", not a real date) —
     // anything that isn't "all" or a proper YYYY-MM-DD falls back to today.
     if (stored === "all") return "all";
-    if (stored && /^\d{4}-\d{2}-\d{2}$/.test(stored)) return stored;
+    // Only restore a stored date if it's today or in the future. A stored PAST
+    // date (e.g. yesterday, saved before local midnight rolled over) would
+    // otherwise silently show an old day's tasks — the #1 "why are today's
+    // done tasks under yesterday?" confusion. Past dates snap back to today.
+    if (stored && /^\d{4}-\d{2}-\d{2}$/.test(stored) && stored >= todayKey()) return stored;
     return todayKey();
   });
   const [showCalendar, setShowCalendar] = useState(false);
@@ -567,18 +571,22 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
 
   const grouped = useMemo(() => {
     const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
+    // In date mode, EVERY section (pending, awaiting, done, missed) must be
+    // scoped to the selected day. Previously only `pending` was filtered, so
+    // e.g. today's completed/awaiting tasks leaked into the "Kemarin" view.
+    // Undated tasks (no date_key) always show — there's no day to exclude them by.
+    const inSelectedDay = (t) => !isDateMode || !t.date_key || t.date_key === dateFilter;
+
     let pendingBase = displayTasks.filter((t) => t.status === "pending" || t.status === "rejected");
     const otherDatesCount = isDateMode
       ? pendingBase.filter((t) => t.date_key && t.date_key !== dateFilter).length
       : 0;
-    if (isDateMode) {
-      // Exact-day match; undated tasks still show (no date to exclude them by).
-      pendingBase = pendingBase.filter((t) => !t.date_key || t.date_key === dateFilter);
-    }
+    pendingBase = pendingBase.filter(inSelectedDay);
+
     const pending = pendingBase.sort(byOrder);
-    const awaiting = displayTasks.filter((t) => t.status === "completed").sort(byOrder);
-    const done = displayTasks.filter((t) => t.status === "approved" || t.status === "skipped").sort(byOrder);
-    const missed = displayTasks.filter((t) => t.status === "missed");
+    const awaiting = displayTasks.filter((t) => t.status === "completed" && inSelectedDay(t)).sort(byOrder);
+    const done = displayTasks.filter((t) => (t.status === "approved" || t.status === "skipped") && inSelectedDay(t)).sort(byOrder);
+    const missed = displayTasks.filter((t) => t.status === "missed" && inSelectedDay(t));
     // Sum of a group's own points — a broadcast row collapsed to one
     // representative still only has one `points` value (same for every kid
     // it was sent to), so a plain sum doesn't double-count per sibling.

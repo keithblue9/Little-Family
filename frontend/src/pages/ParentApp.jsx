@@ -180,12 +180,25 @@ export default function ParentApp() {
     [redemptions]
   );
   // "Aktif Hari Ini" count for the Tugas sidebar badge — mirrors TasksView's
-  // own default date filter (exact today) so the number the parent sees
-  // matches what they'll find when they open the tab.
-  const tasksBadgeCount = useMemo(
-    () => tasks.filter((t) => (t.status === "pending" || t.status === "rejected") && (!t.date_key || t.date_key === todayKey())).length,
-    [tasks]
-  );
+  // own default date filter (exact today) AND its broadcast-collapsing (a
+  // task sent to multiple kids at once is one row in the list, so it must
+  // also count as one here — otherwise the badge and the list disagree).
+  const tasksBadgeCount = useMemo(() => {
+    const todaysPending = tasks.filter(
+      (t) => (t.status === "pending" || t.status === "rejected") && (!t.date_key || t.date_key === todayKey())
+    );
+    const seenBroadcasts = new Set();
+    let count = 0;
+    for (const t of todaysPending) {
+      if (t.broadcast_id) {
+        const key = `${t.broadcast_id}::${t.date_key}::${t.title}`;
+        if (seenBroadcasts.has(key)) continue; // already counted this broadcast group
+        seenBroadcasts.add(key);
+      }
+      count += 1;
+    }
+    return count;
+  }, [tasks]);
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] font-body flex" data-testid={TEST_IDS.parent.dashboard}>

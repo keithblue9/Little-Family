@@ -177,10 +177,29 @@ function ChildDayCard({ entry }) {
   );
 }
 
+function fmtClock(iso) {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
+  } catch { return ""; }
+}
+function fmtElapsed(startIso, endIso) {
+  try {
+    const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
+    if (ms < 0) return "";
+    const mins = Math.floor(ms / 60000);
+    const secs = Math.floor((ms % 60000) / 1000);
+    if (mins < 1) return `${secs} dtk`;
+    if (mins < 60) return `${mins} mnt`;
+    return `${Math.floor(mins / 60)} jam ${mins % 60} mnt`;
+  } catch { return ""; }
+}
+
 function TaskRow({ task, bonus }) {
   const s = statusLabel[task.status] || statusLabel.pending;
   const Icon = s.icon;
   const isDone = task.status === "approved" || task.status === "completed" || task.status === "skipped";
+  const hasTimes = task.timer_started_at || task.completed_at;
 
   return (
     <div className={`flex items-center gap-2 p-2 rounded-xl ${isDone ? "bg-slate-50" : "bg-white"} border border-slate-100`}>
@@ -204,7 +223,19 @@ function TaskRow({ task, bonus }) {
           {task.is_coop && <span className="text-teal-600 font-bold">🤝 Bersama</span>}
           {task.due_time && <span>· sblm {task.due_time}</span>}
           {task.duration_minutes && <span>· {task.duration_minutes}m</span>}
+          {task.early_bonus_awarded > 0 && <span className="text-green-600 font-bold">· ⚡ +{task.early_bonus_awarded}</span>}
         </div>
+        {/* Start / finish / actual duration — for spotting instant-tap-through
+            vs. genuinely doing the task. Only shown once there's timing data. */}
+        {hasTimes && (
+          <div className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap mt-0.5">
+            {task.timer_started_at && <span title="Jam mulai">▶️ {fmtClock(task.timer_started_at)}</span>}
+            {task.completed_at && <span title="Jam selesai">✅ {fmtClock(task.completed_at)}</span>}
+            {task.timer_started_at && task.completed_at && (
+              <span className="text-slate-500 font-semibold" title="Lama pengerjaan">⏳ {fmtElapsed(task.timer_started_at, task.completed_at)}</span>
+            )}
+          </div>
+        )}
       </div>
       <div className="flex items-center gap-0.5 text-xs font-bold text-amber-600 shrink-0">
         <Star className="w-3 h-3 fill-amber-500 text-amber-500" />

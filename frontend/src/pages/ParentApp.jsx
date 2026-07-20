@@ -617,25 +617,11 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   });
   const reject = (t) => act(async () => { await api.post(`/tasks/${t.id}/reject`); toast.info("Dikembalikan ke anak"); });
   const miss = (t) => act(async () => { await api.post(`/tasks/${t.id}/miss`); toast(`Ditandai terlewat${t.penalty_points ? ` · -${t.penalty_points} poin` : ""}`); });
-  const undoApproval = (t) => {
-    if (!window.confirm(`Batalkan persetujuan "${t.title}"? Poin akan dikembalikan.`)) return;
-    act(async () => {
-      await api.post(`/tasks/${t.id}/undo-approval`);
-      toast.success("Persetujuan dibatalkan, poin dikembalikan");
-    });
-  };
   const undoMiss = (t) => {
     if (!window.confirm(`Batalkan status "Terlewat" untuk "${t.title}"? Penalti akan dikembalikan dan misi aktif lagi.`)) return;
     act(async () => {
       await api.post(`/tasks/${t.id}/undo-miss`);
       toast.success("Status terlewat dibatalkan, penalti dikembalikan");
-    });
-  };
-  const undoFreeWithCard = (t) => {
-    if (!window.confirm(`Batalkan pembebasan "${t.title}"? Kartu Bebas akan dikembalikan dan misi aktif lagi.`)) return;
-    act(async () => {
-      await api.post(`/tasks/${t.id}/undo-free-with-card`);
-      toast.success("Pembebasan dibatalkan, Kartu Bebas dikembalikan");
     });
   };
   const del = (t) => {
@@ -824,37 +810,9 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
         ))}
       </Section>
 
-      {grouped.done.length > 0 && (
-        <Section title="✅ Selesai" count={grouped.done.length} pointsTotal={grouped.donePoints}>
-          {grouped.done.slice(0, 10).map((t) => (
-            <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
-              {t.freed_with_card ? (
-                <span className="text-xs font-semibold text-sky-600 bg-sky-50 px-2 py-1 rounded-full">🧊 Dibebaskan dgn Kartu</span>
-              ) : (
-                <span className="text-sm text-slate-400">+{t.points} poin</span>
-              )}
-              {t.status === "approved" && (
-                <button
-                  onClick={() => undoApproval(t)}
-                  title="Batalkan persetujuan (dalam 30 menit)"
-                  className="press-btn inline-flex items-center gap-1 bg-white border border-amber-200 text-amber-600 font-semibold px-2.5 py-1 rounded-lg text-xs"
-                >
-                  <Undo2 className="w-3.5 h-3.5" /> Batalkan
-                </button>
-              )}
-              {t.freed_with_card && (
-                <button
-                  onClick={() => undoFreeWithCard(t)}
-                  title="Batalkan pembebasan, kembalikan kartu, misi aktif lagi"
-                  className="press-btn inline-flex items-center gap-1 bg-white border border-sky-200 text-sky-600 font-semibold px-2.5 py-1 rounded-lg text-xs"
-                >
-                  <Undo2 className="w-3.5 h-3.5" /> Batalkan
-                </button>
-              )}
-            </TaskRow>
-          ))}
-        </Section>
-      )}
+      {/* "Selesai" section intentionally removed from the Tugas menu — completed
+          tasks (with start/finish times + duration) live in Monitor Harian to
+          avoid showing the same list in two places. */}
 
       {grouped.missed.length > 0 && (
         <Section title="❌ Terlewat" count={grouped.missed.length}>

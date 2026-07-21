@@ -17,6 +17,11 @@ export function AuthProvider({ children }) {
         // Genuinely not authenticated — clear the stale token and send to login.
         setUser(false);
         localStorage.removeItem("cq_token");
+      } else if (status === 503) {
+        // Maintenance mode locked this session out. This is a deliberate,
+        // long-lived state (not a network hiccup) — surface it immediately
+        // instead of burning retries that can't possibly succeed.
+        setUser({ maintenance: true, message: err?.response?.data?.detail || "Aplikasi sedang nonaktif sementara." });
       } else if (attempt < 5) {
         // Transient error (network hiccup, cold-start 500, timeout). Don't
         // destroy the session over this — retry with backoff instead of
@@ -45,6 +50,15 @@ export function AuthProvider({ children }) {
     fetchMe();
     fetchMembers();
   }, [fetchMe, fetchMembers]);
+
+  useEffect(() => {
+    // Any in-flight request elsewhere in the app hitting a 503 lockout should
+    // flip the whole app to the maintenance screen right away, not just the
+    // next time fetchMe happens to run.
+    const onMaintenance = (e) => setUser({ maintenance: true, message: e.detail?.message });
+    window.addEventListener("app:maintenance", onMaintenance);
+    return () => window.removeEventListener("app:maintenance", onMaintenance);
+  }, []);
 
   const login = async (memberId, passcode) => {
     const { data } = await api.post("/auth/login", { member_id: memberId, passcode });

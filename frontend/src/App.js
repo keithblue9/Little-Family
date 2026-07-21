@@ -30,6 +30,23 @@ function ConnectionErrorScreen() {
   );
 }
 
+function MaintenanceScreen({ message }) {
+  const { refresh } = useAuth();
+  return (
+    <div className="min-h-screen kid-shell flex flex-col items-center justify-center font-parent text-slate-700 gap-4 px-6 text-center">
+      <div className="text-6xl">🛠️</div>
+      <div className="font-bold text-xl">Aplikasi Sedang Nonaktif Sementara</div>
+      <div className="text-sm text-slate-500 max-w-sm">{message}</div>
+      <button
+        onClick={() => refresh()}
+        className="mt-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold px-5 py-2.5 rounded-xl text-sm"
+      >
+        Cek Lagi
+      </button>
+    </div>
+  );
+}
+
 function Protected({ children, role }) {
   const { user } = useAuth();
   if (user === null) {
@@ -40,6 +57,7 @@ function Protected({ children, role }) {
     );
   }
   if (user === "error") return <ConnectionErrorScreen />;
+  if (user && typeof user === "object" && user.maintenance) return <MaintenanceScreen message={user.message} />;
   if (user === false) return <Navigate to="/login" replace />;
   if (role && user.role !== role) {
     return <Navigate to={user.role === "parent" ? "/parent" : `/kid/${user.id}`} replace />;
@@ -57,8 +75,20 @@ function HomeRedirect() {
     );
   }
   if (user === "error") return <ConnectionErrorScreen />;
+  if (user && typeof user === "object" && user.maintenance) return <MaintenanceScreen message={user.message} />;
   if (user === false) return <Navigate to="/login" replace />;
   return <Navigate to={user.role === "parent" ? "/parent" : `/kid/${user.id}`} replace />;
+}
+
+function MaintenanceGate({ children }) {
+  const { user } = useAuth();
+  // Covers every route — including /login — since someone who's blocked
+  // shouldn't be able to sit on the login form retrying forever; they should
+  // see the same clear "app is paused" screen no matter where they land.
+  if (user && typeof user === "object" && user.maintenance) {
+    return <MaintenanceScreen message={user.message} />;
+  }
+  return children;
 }
 
 function App() {
@@ -67,6 +97,7 @@ function App() {
       <AuthProvider>
         <BrowserRouter>
           <LabelProvider>
+          <MaintenanceGate>
           <Routes>
             <Route path="/" element={<HomeRedirect />} />
             <Route path="/login" element={<LoginPage />} />
@@ -97,6 +128,7 @@ function App() {
             />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          </MaintenanceGate>
           </LabelProvider>
         </BrowserRouter>
         <Toaster position="top-center" richColors />

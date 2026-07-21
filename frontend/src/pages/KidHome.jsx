@@ -52,6 +52,7 @@ export default function KidHome() {
   const [petStageNames, setPetStageNames] = useState(null);
   const [petFeedThresholds, setPetFeedThresholds] = useState(null);
   const [feedCostPerMeal, setFeedCostPerMeal] = useState(5);
+  const [rupiahPerPoint, setRupiahPerPoint] = useState(100);
   const [showRecap, setShowRecap] = useState(false);
   const [tab, setTab] = useState("tasks");
   const [celebrate, setCelebrate] = useState(false);
@@ -86,6 +87,7 @@ export default function KidHome() {
       setPetStageNames(cfgRes.data.pet_stage_names);
       setPetFeedThresholds(cfgRes.data.pet_stage_feed_thresholds);
       setFeedCostPerMeal(cfgRes.data.feed_cost_per_meal ?? 5);
+      setRupiahPerPoint(cfgRes.data.rupiah_per_point ?? 100);
     } catch (e) {
       toast.error(formatApiError(e));
     }
@@ -286,7 +288,7 @@ export default function KidHome() {
 
           {tab === "money" && (
             <motion.div key="money" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
-              <ChikyBankCard child={child} />
+              <ChikyBankCard child={child} rate={rupiahPerPoint} />
               <MoneyExchange childId={childId} points={child.points || 0} child={child} onChanged={load} />
 
               {/* Consequences awareness — so kids know what reduces points */}

@@ -30,6 +30,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("no hash leak", all("passcode_hash" not in m and "passcode_plain" not in m for m in members))
 
     abi = next(m for m in members if m["name"] == "Abi")
+    ummi = next(m for m in members if m["name"] == "Ummi")
     adskhan = next(m for m in members if m["name"] == "Adskhan")
     syila = next(m for m in members if m["name"] == "Syila")
 
@@ -2012,6 +2013,95 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # reset config back to defaults
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"early_bonus_pct": 10, "freeze_cards_per_week": 3, "freeze_reset_weekday": 0})
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # =============== MAINTENANCE MODE ===============
+    # Public status check works without any auth
+    r = c.get("/api/maintenance-status")
+    check("maintenance: public status accessible unauth'd", r.status_code == 200 and r.json()["enabled"] is False, r.text[:150])
+
+    # Kid blocked from toggling
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/maintenance/toggle", json={"enabled": True, "message": "test"})
+    check("maintenance: kid blocked from toggling", r.status_code == 403, str(r.status_code))
+
+    # Capture each member's own token WHILE maintenance is still off, so we can
+    # simulate "was already logged in with a valid session" independently of
+    # whichever login the shared cookie jar currently holds.
+    r = c.post("/api/auth/login", json={"member_id": ummi["id"], "passcode": "123456"})
+    ummi_token = r.json()["token"]
+    r = c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    adskhan_token = r.json()["token"]
+    r = c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    syila_token = r.json()["token"]
+
+    # Abi (parent) turns it ON — becomes the exempt account automatically
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/maintenance/toggle", json={"enabled": True, "message": "Lagi maintenance, sabar ya"})
+    check("maintenance: parent can turn on", r.status_code == 200 and r.json()["enabled"] is True, r.text[:150])
+
+    r = c.get("/api/maintenance-status")
+    check("maintenance: public status reflects ON", r.status_code == 200 and r.json()["enabled"] is True and r.json()["message"] == "Lagi maintenance, sabar ya")
+
+    # Abi (the one who enabled it) is NOT blocked — can keep using every endpoint
+    r = c.get("/api/config")
+    check("maintenance: exempt parent (Abi) unaffected", r.status_code == 200, r.text[:150])
+    r = c.get("/api/children")
+    check("maintenance: exempt parent can still list children", r.status_code == 200, r.text[:150])
+
+    # Ummi's PRE-EXISTING session (token captured before the toggle) is locked
+    # out on its very next request — not just blocked at a fresh login.
+    c.cookies.clear()
+    r = c.get("/api/config", headers={"Authorization": f"Bearer {ummi_token}"})
+    check("maintenance: non-exempt parent (Ummi) locked out mid-session", r.status_code == 503, str(r.status_code))
+    # A fresh login attempt for Ummi is also blocked outright
+    r = c.post("/api/auth/login", json={"member_id": ummi["id"], "passcode": "123456"})
+    check("maintenance: non-exempt parent blocked at fresh login too", r.status_code == 503, str(r.status_code))
+
+    # Both kids' pre-existing sessions are locked out too
+    c.cookies.clear()
+    r = c.get("/api/children", headers={"Authorization": f"Bearer {adskhan_token}"})
+    check("maintenance: kid Adskhan locked out mid-session", r.status_code == 503, str(r.status_code))
+    c.cookies.clear()
+    r = c.get("/api/children", headers={"Authorization": f"Bearer {syila_token}"})
+    check("maintenance: kid Syila locked out mid-session", r.status_code == 503, str(r.status_code))
+    r = c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    check("maintenance: kid blocked at fresh login too", r.status_code == 503, str(r.status_code))
+
+    # Abi can still turn it back off
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/maintenance/toggle", json={"enabled": False})
+    check("maintenance: parent can turn off", r.status_code == 200 and r.json()["enabled"] is False, r.text[:150])
+    r = c.get("/api/maintenance-status")
+    check("maintenance: public status reflects OFF", r.json()["enabled"] is False)
+
+    # Everyone regains access once off — including via their OLD tokens.
+    r = c.get("/api/config", headers={"Authorization": f"Bearer {ummi_token}"})
+    check("maintenance: Ummi's old token works again after OFF", r.status_code == 200, r.text[:150])
+    r = c.get("/api/children", headers={"Authorization": f"Bearer {adskhan_token}"})
+    check("maintenance: kid's old token works again after OFF", r.status_code == 200, r.text[:150])
+
+    # If Ummi turns it on next, SHE becomes exempt (not Abi) — confirms the
+    # exemption is "whoever flips the switch", not hardcoded to one name.
+    c.cookies.clear()
+    c.post("/api/auth/login", json={"member_id": ummi["id"], "passcode": "123456"})
+    r = c.post("/api/maintenance/toggle", json={"enabled": True, "message": ""})
+    check("maintenance: Ummi turning it on makes HER exempt", r.status_code == 200)
+    r = c.get("/api/config")
+    check("maintenance: Ummi (new activator) unaffected", r.status_code == 200, r.text[:150])
+    # Abi's session is now the non-exempt one this time
+    c.cookies.clear()
+    r = c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    check("maintenance: Abi now blocked since Ummi is the exempt one this time", r.status_code == 503, str(r.status_code))
+    # Empty message falls back to the default friendly text
+    r = c.get("/api/maintenance-status")
+    check("maintenance: empty message falls back to default text", len(r.json()["message"]) > 0)
+    # Clean up: turn back off (as Ummi, who's exempt) so later tests aren't affected
+    c.cookies.clear()
+    c.post("/api/auth/login", json={"member_id": ummi["id"], "passcode": "123456"})
+    c.post("/api/maintenance/toggle", json={"enabled": False})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

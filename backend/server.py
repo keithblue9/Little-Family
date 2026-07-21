@@ -112,6 +112,21 @@ def validate_due_time(value):
 
 
 # --------------- Auth Dependency ---------------
+async def _enforce_maintenance_mode(member_id: str):
+    """Raise 503 if the app is in maintenance mode and this member isn't the
+    one exempt account (whoever switched it on). Checked centrally in
+    get_current_user so it applies to every protected endpoint immediately —
+    an already-logged-in session gets locked out on its very next request,
+    not just at the next login."""
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    if not config.get("maintenance_mode"):
+        return
+    if member_id == config.get("maintenance_exempt_member_id"):
+        return
+    message = config.get("maintenance_message") or "Aplikasi sedang nonaktif sementara. Hubungi orang tua untuk info lebih lanjut."
+    raise HTTPException(status_code=503, detail=message)
+
+
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
     if not token:
@@ -127,6 +142,7 @@ async def get_current_user(request: Request) -> dict:
         member = await db.members.find_one({"id": payload["sub"]}, {"_id": 0, "passcode_hash": 0, "passcode_plain": 0})
         if not member:
             raise HTTPException(status_code=401, detail="Member not found")
+        await _enforce_maintenance_mode(member["id"])
         return member
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -638,6 +654,7 @@ async def login(payload: MemberLoginInput, response: Response):
         raise HTTPException(status_code=401, detail="Member not found")
     if not verify_password(payload.passcode, member["passcode_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect passcode")
+    await _enforce_maintenance_mode(member["id"])
     token = create_access_token(member["id"], member["role"])
     response.set_cookie(
         key="access_token", value=token, httponly=True, secure=True,
@@ -3115,6 +3132,45 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
     return {"success": True}
 
 
+class MaintenanceToggleInput(BaseModel):
+    enabled: bool
+    message: str = Field(default="", max_length=300)
+
+
+@api.get("/maintenance-status")
+async def maintenance_status():
+    """Public, unauthenticated — lets the frontend show a friendly 'app is
+    paused' screen even for someone who isn't logged in (or whose session just
+    got locked out), without needing a valid token first."""
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    return {
+        "enabled": bool(config.get("maintenance_mode")),
+        "message": config.get("maintenance_message") or "Aplikasi sedang nonaktif sementara. Hubungi orang tua untuk info lebih lanjut.",
+    }
+
+
+@api.post("/maintenance/toggle")
+async def toggle_maintenance(payload: MaintenanceToggleInput, user: dict = Depends(require_parent)):
+    """Turn maintenance mode on/off. Turning it ON locks out every account
+    EXCEPT the parent who just turned it on (recorded automatically) — so
+    whoever flips the switch keeps access, everyone else (other parent, both
+    kids) is blocked from their very next request until it's turned back off."""
+    updates = {"maintenance_mode": payload.enabled, "maintenance_message": payload.message}
+    if payload.enabled:
+        updates["maintenance_exempt_member_id"] = user["id"]
+        updates["maintenance_enabled_by_name"] = user.get("name", "")
+        updates["maintenance_enabled_at"] = now_iso()
+    else:
+        updates["maintenance_exempt_member_id"] = None
+    existing = await db.app_config.find_one({"parent_id": FAMILY_ID})
+    if existing:
+        await db.app_config.update_one({"parent_id": FAMILY_ID}, {"$set": updates})
+    else:
+        await db.app_config.insert_one({"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **updates})
+    await log_activity(FAMILY_ID, None, "maintenance_toggled", {"enabled": payload.enabled, "by": user.get("name")})
+    return {"success": True, "enabled": payload.enabled}
+
+
 @api.get("/config")
 async def get_app_config(user: dict = Depends(get_current_user)):
     config = await db.app_config.find_one({"parent_id": FAMILY_ID})
@@ -3162,6 +3218,10 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "early_bonus_pct": int(config.get("early_bonus_pct", 10)),
         "freeze_cards_per_week": int(config.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK)),
         "freeze_reset_weekday": int(config.get("freeze_reset_weekday", 0)),
+        "maintenance_mode": bool(config.get("maintenance_mode", False)),
+        "maintenance_message": config.get("maintenance_message", ""),
+        "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),
+        "maintenance_enabled_at": config.get("maintenance_enabled_at"),
         "custom_labels": config.get("custom_labels", {}) or {},
         "vacation_mode": bool(config.get("vacation_mode", False)),
         "vacation_note": config.get("vacation_note", ""),

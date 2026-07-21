@@ -22,6 +22,23 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// If ANY request comes back locked out by maintenance mode, broadcast it so
+// the top-level AuthContext can switch the whole app to the maintenance
+// screen immediately — not just when the initial session check happens to
+// run. This is what makes an already-open tab react right away when a parent
+// flips the switch mid-session.
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 503) {
+      window.dispatchEvent(new CustomEvent("app:maintenance", {
+        detail: { message: error.response.data?.detail || "Aplikasi sedang nonaktif sementara." },
+      }));
+    }
+    return Promise.reject(error);
+  }
+);
+
 export default api;
 
 export function formatApiError(err) {

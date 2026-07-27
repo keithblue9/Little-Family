@@ -35,8 +35,11 @@ const PETS = {
   turtle:   { body: "#8FD3A8", belly: "#DFF5E7", accent: "#4CA46C", dark: "#2E7A4C", ear: "none",  tail: "none",    extra: "shell" },
 };
 
+import { useEffect, useState } from "react";
+
 // small helper: cheeks + eyes + smile shared across all non-egg stages.
-// `s` scales feature spacing/size for the growth stage.
+// `s` scales feature spacing/size for the growth stage. Eyes live in their own
+// ".ps-eyes" group so the CSS blink animation can squash them periodically.
 function Face({ cx = 50, cy = 48, s = 1, dark = "#333" }) {
   const eyeDx = 9 * s;
   const eyeY = cy - 2 * s;
@@ -46,12 +49,14 @@ function Face({ cx = 50, cy = 48, s = 1, dark = "#333" }) {
       {/* blush cheeks */}
       <ellipse cx={cx - 14 * s} cy={cy + 5 * s} rx={4.2 * s} ry={2.8 * s} fill="#FF9BB3" opacity="0.55" />
       <ellipse cx={cx + 14 * s} cy={cy + 5 * s} rx={4.2 * s} ry={2.8 * s} fill="#FF9BB3" opacity="0.55" />
-      {/* eyes */}
-      <circle cx={cx - eyeDx} cy={eyeY} r={eyeR} fill={dark} />
-      <circle cx={cx + eyeDx} cy={eyeY} r={eyeR} fill={dark} />
-      {/* eye sparkle */}
-      <circle cx={cx - eyeDx + 1 * s} cy={eyeY - 1 * s} r={0.9 * s} fill="#fff" />
-      <circle cx={cx + eyeDx + 1 * s} cy={eyeY - 1 * s} r={0.9 * s} fill="#fff" />
+      {/* eyes (blink via CSS) */}
+      <g className="ps-eyes">
+        <circle cx={cx - eyeDx} cy={eyeY} r={eyeR} fill={dark} />
+        <circle cx={cx + eyeDx} cy={eyeY} r={eyeR} fill={dark} />
+        {/* eye sparkle */}
+        <circle cx={cx - eyeDx + 1 * s} cy={eyeY - 1 * s} r={0.9 * s} fill="#fff" />
+        <circle cx={cx + eyeDx + 1 * s} cy={eyeY - 1 * s} r={0.9 * s} fill="#fff" />
+      </g>
       {/* smile */}
       <path d={`M ${cx - 4 * s} ${cy + 6 * s} Q ${cx} ${cy + 9.5 * s} ${cx + 4 * s} ${cy + 6 * s}`} stroke={dark} strokeWidth={1.5 * s} fill="none" strokeLinecap="round" />
     </g>
@@ -163,40 +168,50 @@ function Creature({ petKey, stage }) {
       {/* ground shadow */}
       <ellipse cx="50" cy="90" rx={bodyRx + 4} ry="5" fill="#000" opacity="0.08" />
 
-      {/* dragon wings sit behind the body */}
+      {/* dragon wings sit behind the body — gentle flap */}
       {pp.extra === "wing" && stage === 3 && (
-        <g opacity="0.95">
+        <g opacity="0.95" className="ps-wing">
           <path d={`M ${cx - bodyRx} ${bodyCy - 4} q ${-16} ${-10} ${-20} ${4} q ${8} ${-2} ${18} ${6} Z`} fill={pp.belly} stroke={pp.dark} strokeWidth="1.2" strokeLinejoin="round" />
           <path d={`M ${cx + bodyRx} ${bodyCy - 4} q ${16} ${-10} ${20} ${4} q ${-8} ${-2} ${-18} ${6} Z`} fill={pp.belly} stroke={pp.dark} strokeWidth="1.2" strokeLinejoin="round" />
         </g>
       )}
 
-      {/* tail (behind body) */}
-      <Tail p={pp} cx={cx} cy={bodyCy - 6} s={fs} />
+      {/* tail (behind body) — soft wag */}
+      <g className="ps-tail">
+        <Tail p={pp} cx={cx} cy={bodyCy - 6} s={fs} />
+      </g>
 
-      {/* ears (behind head) */}
-      <Ears p={pp} cx={cx} cy={cy} s={fs} />
+      {/* ears (behind head) — occasional twitch */}
+      <g className="ps-ears">
+        <Ears p={pp} cx={cx} cy={cy} s={fs} />
+      </g>
 
-      {/* body */}
-      {pp.extra !== "shell" && (
-        <ellipse cx={cx} cy={bodyCy} rx={bodyRx} ry={bodyRy} fill={pp.body} stroke={pp.dark} strokeWidth="1.4" />
-      )}
-      {/* turtle shell as body */}
-      {pp.extra === "shell" && (
-        <g>
-          <ellipse cx={cx} cy={bodyCy} rx={bodyRx + 3} ry={bodyRy} fill={pp.accent} stroke={pp.dark} strokeWidth="1.4" />
-          <path d={`M ${cx - bodyRx} ${bodyCy} h ${bodyRx * 2}`} stroke={pp.dark} strokeWidth="1" opacity="0.5" />
-          <path d={`M ${cx} ${bodyCy - bodyRy} v ${bodyRy * 2}`} stroke={pp.dark} strokeWidth="1" opacity="0.5" />
-          <ellipse cx={cx} cy={bodyCy} rx={bodyRx - 4} ry={bodyRy - 4} fill="none" stroke={pp.dark} strokeWidth="1" opacity="0.4" />
-        </g>
-      )}
-      {/* belly patch */}
-      {pp.extra !== "shell" && (
-        <ellipse cx={cx} cy={bodyCy + 2} rx={bodyRx * 0.55} ry={bodyRy * 0.65} fill={pp.belly} opacity="0.85" />
-      )}
+      {/* body — breathes (subtle squash from the feet) */}
+      <g className="ps-breath">
+        {pp.extra !== "shell" && (
+          <ellipse cx={cx} cy={bodyCy} rx={bodyRx} ry={bodyRy} fill={pp.body} stroke={pp.dark} strokeWidth="1.4" />
+        )}
+        {/* turtle shell as body */}
+        {pp.extra === "shell" && (
+          <g>
+            <ellipse cx={cx} cy={bodyCy} rx={bodyRx + 3} ry={bodyRy} fill={pp.accent} stroke={pp.dark} strokeWidth="1.4" />
+            <path d={`M ${cx - bodyRx} ${bodyCy} h ${bodyRx * 2}`} stroke={pp.dark} strokeWidth="1" opacity="0.5" />
+            <path d={`M ${cx} ${bodyCy - bodyRy} v ${bodyRy * 2}`} stroke={pp.dark} strokeWidth="1" opacity="0.5" />
+            <ellipse cx={cx} cy={bodyCy} rx={bodyRx - 4} ry={bodyRy - 4} fill="none" stroke={pp.dark} strokeWidth="1" opacity="0.4" />
+          </g>
+        )}
+        {/* belly patch */}
+        {pp.extra !== "shell" && (
+          <ellipse cx={cx} cy={bodyCy + 2} rx={bodyRx * 0.55} ry={bodyRy * 0.65} fill={pp.belly} opacity="0.85" />
+        )}
+        {/* body underside shade — a hint of volume */}
+        <ellipse cx={cx} cy={bodyCy + bodyRy * 0.55} rx={bodyRx * 0.8} ry={bodyRy * 0.4} fill="#000" opacity="0.06" />
+      </g>
 
       {/* head */}
       <circle cx={cx} cy={cy} r={headR} fill={pp.body} stroke={pp.dark} strokeWidth="1.4" />
+      {/* soft top-left highlight — makes the head read as a rounded volume */}
+      <ellipse cx={cx - headR * 0.35} cy={cy - headR * 0.42} rx={headR * 0.42} ry={headR * 0.28} fill="#fff" opacity="0.28" transform={`rotate(-22 ${cx - headR * 0.35} ${cy - headR * 0.42})`} />
 
       {/* panda eye patches */}
       {pp.extra === "pandaface" && (
@@ -250,17 +265,78 @@ function Creature({ petKey, stage }) {
   );
 }
 
+// CSS that makes the creatures feel alive. All transforms use
+// transform-box: fill-box so each group animates around ITS OWN center —
+// supported on iOS Safari 11+ (the family's iPad) and all modern browsers.
+const LIVE_CSS = `
+  .ps-live * { transform-box: fill-box; }
+  .ps-eyes { animation: psBlink 4.2s infinite; transform-origin: center; }
+  .ps-breath { animation: psBreath 2.6s ease-in-out infinite; transform-origin: center bottom; }
+  .ps-tail { animation: psWag 2.2s ease-in-out infinite; transform-origin: left center; }
+  .ps-ears { animation: psTwitch 5.6s ease-in-out infinite; transform-origin: center bottom; }
+  .ps-wing { animation: psFlap 1.8s ease-in-out infinite; transform-origin: center; }
+  .ps-egg { animation: psEggRock 2.8s ease-in-out infinite; transform-origin: center bottom; transform-box: fill-box; }
+  .ps-root { transform-origin: 50px 90px; }
+  .ps-act-hop { animation: psHop 0.9s ease-in-out; }
+  .ps-act-tilt { animation: psTilt 1.1s ease-in-out; }
+  .ps-act-wiggle { animation: psWiggle 0.8s ease-in-out; }
+  @keyframes psBlink { 0%, 92%, 100% { transform: scaleY(1); } 95% { transform: scaleY(0.08); } }
+  @keyframes psBreath { 0%, 100% { transform: scaleY(1); } 50% { transform: scaleY(1.045) scaleX(1.015); } }
+  @keyframes psWag { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(9deg); } }
+  @keyframes psTwitch { 0%, 86%, 100% { transform: rotate(0deg); } 90% { transform: rotate(-5deg); } 94% { transform: rotate(4deg); } }
+  @keyframes psFlap { 0%, 100% { transform: scaleX(1); } 50% { transform: scaleX(1.12); } }
+  @keyframes psEggRock { 0%, 100% { transform: rotate(-4deg); } 50% { transform: rotate(4deg); } }
+  @keyframes psHop { 0%, 100% { transform: translateY(0); } 30% { transform: translateY(-7px) scaleY(1.04); } 55% { transform: translateY(0) scaleY(0.94) scaleX(1.05); } 70% { transform: translateY(-3px); } }
+  @keyframes psTilt { 0%, 100% { transform: rotate(0deg); } 40% { transform: rotate(7deg); } 75% { transform: rotate(-4deg); } }
+  @keyframes psWiggle { 0%, 100% { transform: rotate(0deg); } 20% { transform: rotate(-6deg); } 45% { transform: rotate(6deg); } 70% { transform: rotate(-3deg); } }
+`;
+
+const MICRO_ACTIONS = ["ps-act-hop", "ps-act-tilt", "ps-act-wiggle"];
+
 /**
  * @param {string} petType  one of the 10 pet keys
  * @param {number} stageIndex  0=egg,1=baby,2=teen,3=adult
  * @param {number} size  px width/height (default 64)
+ * @param {boolean} animated  living idle animations (breath/blink/wag + random
+ *   hop/tilt/wiggle). On by default; pass false for static contexts (pickers).
  */
-export default function PetSprite({ petType, stageIndex = 1, size = 64 }) {
+export default function PetSprite({ petType, stageIndex = 1, size = 64, animated = true }) {
   const p = PETS[petType] ? PETS[petType] : PETS.chicken;
   const clean = { ...p, accent: (p.accent || "#999").replace(/\s+/g, "") };
+
+  // Every few seconds the pet does a small random action — a hop, a head
+  // tilt, a happy wiggle — which is what sells "it's alive" far more than any
+  // constant loop. Interval is randomized (4.5–9s) so siblings' pets don't
+  // move in eerie unison.
+  const [action, setAction] = useState("");
+  useEffect(() => {
+    if (!animated || stageIndex === 0) return undefined;
+    let actionTimer = null;
+    let clearTimer = null;
+    let cancelled = false;
+    const schedule = () => {
+      if (cancelled) return;
+      actionTimer = setTimeout(() => {
+        setAction(MICRO_ACTIONS[Math.floor(Math.random() * MICRO_ACTIONS.length)]);
+        clearTimer = setTimeout(() => { setAction(""); schedule(); }, 1200);
+      }, 4500 + Math.random() * 4500);
+    };
+    schedule();
+    return () => { cancelled = true; clearTimeout(actionTimer); clearTimeout(clearTimer); };
+  }, [animated, stageIndex, petType]);
+
   return (
     <svg width={size} height={size} viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" role="img" aria-label={`${petType} stage ${stageIndex}`}>
-      {stageIndex === 0 ? <Egg p={clean} /> : <Creature petKey={petType} stage={stageIndex} />}
+      {animated && <style>{LIVE_CSS}</style>}
+      {stageIndex === 0 ? (
+        <g className={animated ? "ps-egg" : undefined}>
+          <Egg p={clean} />
+        </g>
+      ) : (
+        <g className={animated ? `ps-live ps-root ${action}` : undefined}>
+          <Creature petKey={petType} stage={stageIndex} />
+        </g>
+      )}
     </svg>
   );
 }

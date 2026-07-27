@@ -19,6 +19,12 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [busyId, setBusyId] = useState(null);
   const [nowHHMM, setNowHHMM] = useState(localTimeHHMM());
   const [nowMs, setNowMs] = useState(Date.now()); // ticks every second — precise duration-overrun detection
+  // Late-arrival exception (pengajuan keterlambatan)
+  const [lateModal, setLateModal] = useState(false);
+  const [lateReason, setLateReason] = useState("");
+  const [lateArrival, setLateArrival] = useState("");
+  const [lateSubmitting, setLateSubmitting] = useState(false);
+  const [lateRequests, setLateRequests] = useState([]);
   useEffect(() => {
     const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
     return () => clearInterval(t);
@@ -32,10 +38,12 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     if (!child?.id) return;
     setLoading(true);
     try {
-      const { data } = await api.get(`/children/${child.id}/day-progress`, {
-        params: { date_key: dateKey },
-      });
+      const [{ data }, lateRes] = await Promise.all([
+        api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } }),
+        api.get("/late-exceptions", { params: { date_key: dateKey } }).catch(() => ({ data: [] })),
+      ]);
       setProgress(data);
+      setLateRequests(lateRes.data || []);
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -44,6 +52,31 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   }, [child?.id, dateKey]);
 
   useEffect(() => { load(); }, [load]);
+
+  const submitLateException = async () => {
+    if (!lateReason.trim() || lateReason.trim().length < 3) {
+      toast.error("Ceritakan dulu alasannya ya (min. 3 huruf)");
+      return;
+    }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(lateArrival)) {
+      toast.error("Isi jam sampai rumah dengan benar (mis. 17:15)");
+      return;
+    }
+    setLateSubmitting(true);
+    try {
+      await api.post("/late-exceptions", {
+        child_id: child.id, date_key: dateKey,
+        reason: lateReason.trim(), arrival_time: lateArrival,
+      });
+      toast.success("Pengajuan terkirim! Menunggu dicek Abi/Ummi 🕐");
+      setLateModal(false); setLateReason(""); setLateArrival("");
+      load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setLateSubmitting(false);
+    }
+  };
 
   const theme = QUEST_THEMES[themeKey] || QUEST_THEMES.ocean;
 
@@ -286,6 +319,94 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         </div>
       )}
 
+      {/* Late-arrival report: kid explains why they're late + confirms the time
+          they actually got home. Parent verifies; on approval the rest of the
+          day's schedule reflows automatically from that arrival time. */}
+      {isToday && !progress?.is_off_day && (() => {
+        const pendingLate = lateRequests.find((r) => r.status === "pending");
+        const approvedLate = lateRequests.find((r) => r.status === "approved");
+        if (pendingLate) {
+          return (
+            <div className="bg-amber-50 border-2 border-amber-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-amber-700">
+              <span className="text-xl">🕐</span>
+              <span className="text-sm font-semibold flex-1">
+                Laporan terlambatmu (sampai rumah {pendingLate.arrival_time}) sedang dicek Abi/Ummi…
+              </span>
+            </div>
+          );
+        }
+        if (approvedLate && approvedLate.shift_result?.shifted > 0) {
+          return (
+            <div className="bg-green-50 border-2 border-green-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-green-700">
+              <span className="text-xl">✅</span>
+              <span className="text-sm font-semibold flex-1">
+                Laporanmu disetujui — jadwal hari ini sudah digeser mulai jam {approvedLate.arrival_time}. Semangat!
+              </span>
+            </div>
+          );
+        }
+        return (
+          <button
+            onClick={() => setLateModal(true)}
+            className="press-btn w-full bg-white hover:bg-amber-50 border-2 border-amber-200 rounded-2xl px-4 py-2.5 flex items-center gap-2 text-left"
+          >
+            <span className="text-xl">🕐</span>
+            <span className="flex-1">
+              <span className="block text-sm font-fun font-bold text-slate-800">Terlambat karena ada keperluan?</span>
+              <span className="block text-xs text-slate-500">Lapor di sini — kalau disetujui, jadwalmu digeser otomatis.</span>
+            </span>
+          </button>
+        );
+      })()}
+
+      {/* Late-report modal */}
+      {lateModal && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => !lateSubmitting && setLateModal(false)}>
+          <motion.div
+            initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
+            className="bg-white rounded-3xl p-5 max-w-sm w-full chunky-shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-3xl mb-1">🕐</div>
+            <h3 className="font-fun font-bold text-lg text-slate-900 mb-1">Lapor Terlambat</h3>
+            <p className="text-xs text-slate-500 mb-3">
+              Ceritakan kenapa kamu terlambat (misal: macet, rapat sekolah) dan jam berapa sampai rumah. Abi/Ummi akan mengecek dulu ya.
+            </p>
+            <label className="text-xs font-bold text-slate-500 block mb-1">Alasannya apa?</label>
+            <textarea
+              value={lateReason}
+              onChange={(e) => setLateReason(e.target.value.slice(0, 300))}
+              rows={3}
+              placeholder="Mis. Macet pulang sekolah, ada rapat…"
+              className="w-full px-3 py-2 rounded-xl border-2 border-slate-200 focus:border-amber-400 focus:outline-none text-sm"
+            />
+            <label className="text-xs font-bold text-slate-500 block mb-1 mt-3">Jam berapa sampai rumah?</label>
+            <input
+              type="time"
+              value={lateArrival}
+              onChange={(e) => setLateArrival(e.target.value)}
+              className="w-full px-3 py-2 rounded-xl border-2 border-slate-200 focus:border-amber-400 focus:outline-none text-sm"
+            />
+            <div className="flex gap-2 mt-4">
+              <button
+                onClick={() => setLateModal(false)}
+                disabled={lateSubmitting}
+                className="press-btn flex-1 py-2.5 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600"
+              >
+                Batal
+              </button>
+              <button
+                onClick={submitLateException}
+                disabled={lateSubmitting}
+                className="press-btn flex-1 py-2.5 rounded-xl font-fun font-bold bg-amber-500 hover:bg-amber-600 text-white disabled:opacity-60"
+              >
+                {lateSubmitting ? "Mengirim…" : "Ajukan 🙏"}
+              </button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
       {/* Daily goal progress */}
       {progress && (
         <motion.div
@@ -326,6 +447,20 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       {/* Treasure Map */}
       {loading ? (
         <div className="text-center text-slate-400 py-8">Memuat…</div>
+      ) : progress?.is_off_day ? (
+        <div className="rounded-3xl p-8 text-center chunky-shadow-lg bg-gradient-to-br from-sky-100 to-cyan-50 border-2 border-sky-200">
+          <motion.div
+            animate={{ y: [0, -8, 0], rotate: [0, 6, -6, 0] }}
+            transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
+            className="text-6xl mb-3"
+          >
+            🏖️
+          </motion.div>
+          <div className="font-fun font-bold text-2xl text-sky-800">Hari Libur!</div>
+          <div className="text-sky-600 text-sm mt-1">
+            Tidak ada misi hari ini — nikmati waktunya bersama keluarga! Streak-mu aman kok 😉
+          </div>
+        </div>
       ) : timeline.length === 0 ? (
         <div className="rounded-3xl p-8 text-center chunky-shadow-lg" style={{ background: theme.colors.bg, color: theme.colors.text }}>
           <div className="text-5xl mb-3">{theme.goalIcon}</div>

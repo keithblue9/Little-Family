@@ -2103,6 +2103,179 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/maintenance/toggle", json={"enabled": False})
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # =============== LATE-ARRIVAL EXCEPTION (pengajuan keterlambatan) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.late_exceptions.delete_many({}))
+    # Schedule: 16:00 (30m), 16:45 (15m), 19:00 (no dur), plus one timeless and one done
+    r = c.post("/api/tasks", json={"title": "Mandi sore", "points": 10, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": "16:00", "duration_minutes": 30})
+    t1 = r.json()
+    r = c.post("/api/tasks", json={"title": "Beres tas", "points": 5, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": "16:45", "duration_minutes": 15})
+    t2 = r.json()
+    r = c.post("/api/tasks", json={"title": "Belajar malam", "points": 10, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": "19:00"})
+    t3 = r.json()
+    r = c.post("/api/tasks", json={"title": "Tanpa jam", "points": 5, "date_key": today_local, "target_children": [adskhan["id"]]})
+    t_nodue = r.json()
+
+    # Kid submits: arrived home 17:15
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Macet pulang sekolah, ada rapat", "arrival_time": "17:15"})
+    check("late: kid can submit", r.status_code == 200 and r.json()["status"] == "pending", r.text[:150])
+    late_id = r.json()["id"]
+    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Dobel", "arrival_time": "17:20"})
+    check("late: duplicate pending blocked", r.status_code == 409, str(r.status_code))
+    r = c.post("/api/late-exceptions", json={"child_id": syila["id"], "reason": "Bukan punyaku", "arrival_time": "17:00"})
+    check("late: sibling blocked", r.status_code == 403, str(r.status_code))
+    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "x", "arrival_time": "25:99"})
+    check("late: invalid time rejected", r.status_code == 422, str(r.status_code))
+    r = c.post(f"/api/late-exceptions/{late_id}/approve")
+    check("late: kid can't approve", r.status_code == 403, str(r.status_code))
+    r = c.get("/api/late-exceptions")
+    check("late: kid sees own request", any(x["id"] == late_id for x in r.json()))
+
+    # Parent approves → schedule reflows: first task (16:00, 30m) → due 17:45
+    # (arrival 17:15 + 30m). delta = 105 min. 16:45→18:30, 19:00→20:45.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/late-exceptions")
+    check("late: parent sees request", any(x["id"] == late_id for x in r.json()))
+    r = c.post(f"/api/late-exceptions/{late_id}/approve", json={"note": "Oke, dimaklumi"})
+    check("late: approve ok", r.status_code == 200 and r.json()["status"] == "approved", r.text[:200])
+    check("late: shift result recorded", r.json()["shift_result"]["shifted"] == 3 and r.json()["shift_result"]["delta_minutes"] == 105, str(r.json()["shift_result"]))
+    after = {t["id"]: t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()}
+    check("late: task1 shifted 16:00→17:45", after[t1["id"]]["due_time"] == "17:45", after[t1["id"]]["due_time"])
+    check("late: task2 shifted 16:45→18:30", after[t2["id"]]["due_time"] == "18:30", after[t2["id"]]["due_time"])
+    check("late: task3 shifted 19:00→20:45", after[t3["id"]]["due_time"] == "20:45", after[t3["id"]]["due_time"])
+    check("late: timeless task untouched", not after[t_nodue["id"]].get("due_time"), str(after[t_nodue["id"]].get("due_time")))
+    r = c.post(f"/api/late-exceptions/{late_id}/approve")
+    check("late: cannot re-approve", r.status_code == 400, str(r.status_code))
+
+    # Reject path: no shift happens
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "x", "points": 1})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/tasks", json={"title": "Sore Syila", "points": 5, "date_key": today_local, "target_children": [syila["id"]], "due_time": "16:00", "duration_minutes": 10})
+    sy_task = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/late-exceptions", json={"child_id": syila["id"], "reason": "Latihan menari", "arrival_time": "18:00"})
+    sy_late = r.json()["id"]
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/late-exceptions/{sy_late}/reject", json={"note": "Cek dulu ya"})
+    check("late: reject ok", r.status_code == 200 and r.json()["status"] == "rejected")
+    sy_after = next(t for t in c.get(f"/api/tasks?child_id={syila['id']}&date_key={today_local}").json() if t["id"] == sy_task["id"])
+    check("late: reject leaves schedule untouched", sy_after["due_time"] == "16:00", sy_after["due_time"])
+
+    # Early arrival (before schedule) → approve succeeds but shifts nothing
+    _aio_tg.run(server.db.late_exceptions.delete_many({}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Ternyata pulang cepat", "arrival_time": "10:00"})
+    early_late_id = r.json()["id"]
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/late-exceptions/{early_late_id}/approve")
+    check("late: early arrival shifts nothing", r.status_code == 200 and r.json()["shift_result"]["shifted"] == 0, str(r.json()["shift_result"]))
+
+    # =============== OFF DAYS (hari libur tugas) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    import datetime as _dt_off
+    _off_base = _dt_off.datetime.utcnow() + _dt_off.timedelta(hours=7)
+    off_d1 = (_off_base + _dt_off.timedelta(days=3)).strftime("%Y-%m-%d")
+    off_d2 = (_off_base + _dt_off.timedelta(days=4)).strftime("%Y-%m-%d")
+    after_off = (_off_base + _dt_off.timedelta(days=5)).strftime("%Y-%m-%d")
+
+    r = c.post("/api/tasks", json={"title": "Sabtu bersih2", "points": 10, "date_key": off_d1, "target_children": [adskhan["id"]]})
+    off_task1 = r.json()
+    r = c.post("/api/tasks", json={"title": "Minggu nyapu", "points": 10, "date_key": off_d2, "target_children": [adskhan["id"]]})
+    off_task2 = r.json()
+    r = c.post("/api/tasks", json={"title": "Senin normal", "points": 10, "date_key": after_off, "target_children": [adskhan["id"]]})
+    normal_task = r.json()
+
+    # Kid can't create off days
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/off-days", json={"start_date": off_d1})
+    check("offday: kid blocked", r.status_code == 403, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/off-days", json={"start_date": "banana"})
+    check("offday: invalid date rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/off-days", json={"start_date": off_d2, "end_date": off_d1})
+    check("offday: end<start rejected", r.status_code == 422, str(r.status_code))
+
+    # Range off day covering both days
+    r = c.post("/api/off-days", json={"start_date": off_d1, "end_date": off_d2, "note": "Jalan-jalan keluarga"})
+    check("offday: range created", r.status_code == 200 and r.json()["parked_tasks"] == 2, r.text[:200])
+    off_id = r.json()["id"]
+    r = c.post("/api/off-days", json={"start_date": off_d1, "end_date": off_d2})
+    check("offday: exact duplicate rejected", r.status_code == 409, str(r.status_code))
+
+    tasks_now = {t["id"]: t for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json()}
+    check("offday: task on day1 parked", tasks_now[off_task1["id"]]["status"] == "off", tasks_now[off_task1["id"]]["status"])
+    check("offday: task on day2 parked", tasks_now[off_task2["id"]]["status"] == "off", tasks_now[off_task2["id"]]["status"])
+    check("offday: task outside range untouched", tasks_now[normal_task["id"]]["status"] == "pending", tasks_now[normal_task["id"]]["status"])
+
+    # Kid's day-progress: off tasks hidden + is_off_day flag
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={off_d1}")
+    check("offday: kid sees is_off_day flag", r.json()["is_off_day"] is True)
+    check("offday: parked tasks hidden from quest line", all(t["id"] != off_task1["id"] for t in r.json()["tasks"]))
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={after_off}")
+    check("offday: normal day not flagged", r.json()["is_off_day"] is False)
+
+    # Parked task can't be started
+    r = c.post(f"/api/tasks/{off_task1['id']}/start")
+    check("offday: parked task can't be started", r.status_code in (400, 409), str(r.status_code))
+
+    # Recurrence skips over the off range: approve a daily task dated the day
+    # BEFORE the range → next copy lands AFTER the range, not inside it.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    before_off = (_off_base + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
+    r = c.post("/api/tasks", json={"title": "Harian lompat libur", "points": 5, "date_key": before_off, "target_children": [adskhan["id"]], "recurrence": "daily"})
+    daily_task = r.json()
+    _aio_tg.run(server.db.tasks.update_one({"id": daily_task["id"]}, {"$set": {"status": "completed", "completed_at": server.now_iso()}}))
+    r = c.post(f"/api/tasks/{daily_task['id']}/approve")
+    check("offday: daily approve ok", r.status_code == 200, r.text[:150])
+    spawned = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json() if t["title"] == "Harian lompat libur" and t["status"] == "pending"]
+    check("offday: recurrence skipped off range", len(spawned) == 1 and spawned[0]["date_key"] == after_off, str([s["date_key"] for s in spawned]))
+
+    # Streak bridges across off days: last completion = day before off range,
+    # then approving on the day AFTER the range continues the streak without
+    # burning a freeze card. (Simulate: off range = the 2 days before today.)
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    yest1 = (_off_base - _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    yest2 = (_off_base - _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
+    day_before_off = (_off_base - _dt_off.timedelta(days=3)).strftime("%Y-%m-%d")
+    r = c.post("/api/off-days", json={"start_date": yest2, "end_date": yest1, "note": "Libur kemarin"})
+    check("offday: past range created for streak test", r.status_code == 200)
+    _aio_tg.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {
+        "last_completion_date": day_before_off, "streak_days": 4, "freeze_cards_available": 3, "freeze_card_week": None}}))
+    r = c.post("/api/tasks", json={"title": "Streak jembatan", "points": 5, "date_key": today_local, "target_children": [syila["id"]]})
+    streak_task = r.json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{streak_task['id']}/start")
+    c.post(f"/api/tasks/{streak_task['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{streak_task['id']}/approve")
+    check("offday: streak-bridge approve ok", r.status_code == 200, r.text[:150])
+    syi_streak = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("offday: streak continues across off days", syi_streak["streak_days"] == 5, str(syi_streak["streak_days"]))
+    check("offday: no freeze card burned bridging", syi_streak["freeze_cards_available"] == 3, str(syi_streak["freeze_cards_available"]))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+
+    # Delete off-day restores parked tasks
+    r = c.post("/api/tasks", json={"title": "Restore me", "points": 5, "date_key": off_d1, "target_children": [adskhan["id"]]})
+    restore_task = r.json()
+    r = c.post("/api/off-days", json={"start_date": off_d1})
+    restore_off_id = r.json()["id"]
+    t_parked = next(t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={off_d1}").json() if t["id"] == restore_task["id"])
+    check("offday: parked before delete", t_parked["status"] == "off")
+    r = c.delete(f"/api/off-days/{restore_off_id}")
+    check("offday: delete ok", r.status_code == 200 and r.json()["restored_tasks"] >= 1, r.text[:150])
+    t_restored = next(t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={off_d1}").json() if t["id"] == restore_task["id"])
+    check("offday: task restored to pending", t_restored["status"] == "pending", t_restored["status"])
+    r = c.delete(f"/api/off-days/{restore_off_id}")
+    check("offday: delete missing → 404", r.status_code == 404, str(r.status_code))
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

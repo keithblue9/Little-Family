@@ -502,6 +502,23 @@ class CharityRequestInput(BaseModel):
     note: str = Field(default="", max_length=200)
 
 
+class LateExceptionInput(BaseModel):
+    child_id: str
+    date_key: Optional[str] = None  # defaults to today (family local)
+    reason: str = Field(min_length=3, max_length=300)
+    arrival_time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")  # "HH:MM" jam sampai rumah
+
+
+class LateExceptionReviewInput(BaseModel):
+    note: str = Field(default="", max_length=200)
+
+
+class OffDayInput(BaseModel):
+    start_date: str
+    end_date: Optional[str] = None  # None/empty = single day
+    note: str = Field(default="", max_length=100)
+
+
 class SelfPasscodeInput(BaseModel):
     old_passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
     new_passcode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
@@ -1989,7 +2006,11 @@ async def child_day_progress(
          "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}]},
         {"_id": 0},
     ).to_list(500)
+    # Parked "off" tasks (parent declared this an off day) are invisible to the
+    # quest line — they can't be started, missed, or penalized.
+    tasks = [t for t in tasks if t.get("status") != "off"]
     tasks.sort(key=lambda t: (bool(t.get("is_bonus")), t.get("order") or 0))
+    is_off = await _is_off_day(dk)
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
 
@@ -2042,6 +2063,7 @@ async def child_day_progress(
         "required_done": finished_required,
         "bonus_count": len(bonus),
         "vacation_mode": bool(config.get("vacation_mode", False)),
+        "is_off_day": is_off,
         "perfect_day": perfect_day,
         "perfect_day_claimed": bool(perfect_claim),
         "tasks": tasks,
@@ -2228,6 +2250,181 @@ async def family_day_progress(
     return {"date_key": dk, "children": out}
 
 
+# --------------- Late-arrival exception (pengajuan keterlambatan) ---------------
+def _hhmm_to_min(hhmm: str) -> int:
+    h, m = map(int, hhmm.split(":"))
+    return h * 60 + m
+
+
+async def _shift_remaining_tasks(child_id: str, dk: str, arrival_hhmm: str) -> dict:
+    """Reflow the rest of a child's day after an approved late arrival: every
+    still-open individual task with a due_time gets pushed later by one shared
+    delta, chosen so the EARLIEST remaining task's deadline = arrival time +
+    that task's duration (i.e. the kid starts it the moment they get home and
+    still has its full duration). Original spacing between tasks is preserved.
+    Co-op tasks are left untouched (shifting them would move the sibling's
+    schedule too), as are tasks without a due_time and anything already done."""
+    tasks = await db.tasks.find({
+        "parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk,
+        "status": {"$in": ["pending", "rejected"]},
+        "due_time": {"$nin": [None, ""]},
+        "is_coop": {"$ne": True},
+    }).to_list(500)
+    if not tasks:
+        return {"shifted": 0, "delta_minutes": 0, "changes": []}
+    tasks.sort(key=lambda t: _hhmm_to_min(t["due_time"]))
+    first = tasks[0]
+    first_duration = int(first.get("duration_minutes") or 10)
+    new_first_due = _hhmm_to_min(arrival_hhmm) + first_duration
+    delta = new_first_due - _hhmm_to_min(first["due_time"])
+    if delta <= 0:
+        # Arrived at/before the original schedule — nothing needs to move.
+        return {"shifted": 0, "delta_minutes": 0, "changes": []}
+    changes = []
+    for t in tasks:
+        new_min = min(_hhmm_to_min(t["due_time"]) + delta, 23 * 60 + 59)
+        new_hhmm = f"{new_min // 60:02d}:{new_min % 60:02d}"
+        changes.append({"task_id": t["id"], "title": t["title"], "old_due": t["due_time"], "new_due": new_hhmm})
+        await db.tasks.update_one({"id": t["id"]}, {"$set": {"due_time": new_hhmm}})
+    return {"shifted": len(changes), "delta_minutes": delta, "changes": changes}
+
+
+@api.post("/late-exceptions")
+async def submit_late_exception(payload: LateExceptionInput, user: dict = Depends(get_current_user)):
+    """A kid reports they'll be / were late through no fault of their own
+    (stuck in traffic, school event, ...) with the actual time they got home.
+    Goes to the parent for verification; on approval the remaining schedule
+    for that day reflows automatically from the confirmed arrival time."""
+    if user["role"] == "child" and user["id"] != payload.child_id:
+        raise HTTPException(status_code=403, detail="Kamu hanya bisa mengajukan untuk dirimu sendiri")
+    child = await db.children.find_one({"id": payload.child_id, "parent_id": FAMILY_ID})
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+    dk = validate_date_key(payload.date_key) or _today_key()
+    existing = await db.late_exceptions.find_one({
+        "parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "status": "pending",
+    })
+    if existing:
+        raise HTTPException(status_code=409, detail="Sudah ada pengajuan keterlambatan yang menunggu untuk hari ini")
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": payload.child_id,
+        "child_name": child["name"], "date_key": dk,
+        "reason": payload.reason.strip(), "arrival_time": payload.arrival_time,
+        "status": "pending", "review_note": "", "shift_result": None,
+        "created_at": now_iso(), "reviewed_at": None,
+    }
+    await db.late_exceptions.insert_one(doc)
+    doc.pop("_id", None)
+    await log_activity(FAMILY_ID, payload.child_id, "late_exception_requested", {"date_key": dk, "arrival_time": payload.arrival_time})
+    await send_push_to({"role": "parent"}, title="Pengajuan keterlambatan 🕐", body=f'{child["name"]} lapor terlambat (sampai rumah {payload.arrival_time}): "{payload.reason[:60]}"', url="/parent")
+    return doc
+
+
+@api.get("/late-exceptions")
+async def list_late_exceptions(child_id: Optional[str] = None, date_key: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]
+    elif child_id:
+        query["child_id"] = child_id
+    if date_key:
+        query["date_key"] = date_key
+    items = await db.late_exceptions.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return items
+
+
+@api.post("/late-exceptions/{request_id}/approve")
+async def approve_late_exception(request_id: str, payload: LateExceptionReviewInput = LateExceptionReviewInput(), user: dict = Depends(require_parent)):
+    """Parent confirms the reason is legit → the rest of that day's schedule
+    shifts automatically so it starts from the confirmed arrival time."""
+    req = await db.late_exceptions.find_one({"id": request_id, "parent_id": FAMILY_ID})
+    if not req:
+        raise HTTPException(status_code=404, detail="Pengajuan tidak ditemukan")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Pengajuan ini sudah diproses")
+    shift = await _shift_remaining_tasks(req["child_id"], req["date_key"], req["arrival_time"])
+    await db.late_exceptions.update_one({"id": request_id}, {"$set": {
+        "status": "approved", "reviewed_at": now_iso(), "review_note": payload.note, "shift_result": shift,
+    }})
+    await log_activity(FAMILY_ID, req["child_id"], "late_exception_approved", {"date_key": req["date_key"], "shifted": shift["shifted"], "delta_minutes": shift["delta_minutes"]})
+    await send_push_to({"role": "child", "member_id": req["child_id"]}, title="Pengajuanmu disetujui ✅", body=f"Jadwal misimu digeser mulai jam {req['arrival_time']}. Semangat!", url=f"/kid/{req['child_id']}")
+    return await db.late_exceptions.find_one({"id": request_id}, {"_id": 0})
+
+
+@api.post("/late-exceptions/{request_id}/reject")
+async def reject_late_exception(request_id: str, payload: LateExceptionReviewInput = LateExceptionReviewInput(), user: dict = Depends(require_parent)):
+    req = await db.late_exceptions.find_one({"id": request_id, "parent_id": FAMILY_ID})
+    if not req:
+        raise HTTPException(status_code=404, detail="Pengajuan tidak ditemukan")
+    if req["status"] != "pending":
+        raise HTTPException(status_code=400, detail="Pengajuan ini sudah diproses")
+    await db.late_exceptions.update_one({"id": request_id}, {"$set": {
+        "status": "rejected", "reviewed_at": now_iso(), "review_note": payload.note,
+    }})
+    await log_activity(FAMILY_ID, req["child_id"], "late_exception_rejected", {"date_key": req["date_key"]})
+    return await db.late_exceptions.find_one({"id": request_id}, {"_id": 0})
+
+
+# --------------- Off days (hari libur tugas) ---------------
+@api.post("/off-days")
+async def create_off_day(payload: OffDayInput, user: dict = Depends(require_parent)):
+    """Parent declares one day or a range as task-free (family trip, holiday).
+    Open tasks on those dates are parked as status 'off' (no penalties, hidden
+    from the kids' quest line), recurrence skips over the range when spawning,
+    and streak continuity bridges across it. Deleting the off-day restores the
+    parked tasks."""
+    start = validate_date_key(payload.start_date)
+    if not start:
+        raise HTTPException(status_code=422, detail="Tanggal mulai tidak valid (YYYY-MM-DD)")
+    end = validate_date_key(payload.end_date) if payload.end_date else start
+    if not end:
+        raise HTTPException(status_code=422, detail="Tanggal akhir tidak valid (YYYY-MM-DD)")
+    if end < start:
+        raise HTTPException(status_code=422, detail="Tanggal akhir harus sesudah/sama dengan tanggal mulai")
+    span = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1
+    if span > 31:
+        raise HTTPException(status_code=422, detail="Maksimal 31 hari sekali atur")
+    dup = await db.off_days.find_one({"parent_id": FAMILY_ID, "start_date": start, "end_date": end})
+    if dup:
+        raise HTTPException(status_code=409, detail="Rentang hari libur ini sudah ada")
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "start_date": start, "end_date": end,
+        "note": payload.note, "created_by_name": user.get("name", ""), "created_at": now_iso(),
+    }
+    await db.off_days.insert_one(doc)
+    # Park every open task in the range so it can't be missed/penalized, and
+    # tag it with this off-day's id so deleting the off-day can restore exactly
+    # what it parked (and nothing else).
+    res = await db.tasks.update_many(
+        {"parent_id": FAMILY_ID, "date_key": {"$gte": start, "$lte": end}, "status": {"$in": ["pending", "rejected"]}},
+        {"$set": {"status": "off", "off_day_id": doc["id"]}},
+    )
+    doc.pop("_id", None)
+    await log_activity(FAMILY_ID, None, "off_day_created", {"start": start, "end": end, "parked": res.modified_count})
+    return {**doc, "parked_tasks": res.modified_count}
+
+
+@api.get("/off-days")
+async def list_off_days(user: dict = Depends(get_current_user)):
+    items = await db.off_days.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("start_date", -1).to_list(50)
+    return items
+
+
+@api.delete("/off-days/{off_day_id}")
+async def delete_off_day(off_day_id: str, user: dict = Depends(require_parent)):
+    """Un-declare an off day: parked tasks return to pending, exactly as before."""
+    doc = await db.off_days.find_one({"id": off_day_id, "parent_id": FAMILY_ID})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Hari libur tidak ditemukan")
+    res = await db.tasks.update_many(
+        {"parent_id": FAMILY_ID, "off_day_id": off_day_id, "status": "off"},
+        {"$set": {"status": "pending"}, "$unset": {"off_day_id": ""}},
+    )
+    await db.off_days.delete_one({"id": off_day_id})
+    await log_activity(FAMILY_ID, None, "off_day_deleted", {"start": doc["start_date"], "end": doc["end_date"], "restored": res.modified_count})
+    return {"success": True, "restored_tasks": res.modified_count}
+
+
 async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None) -> Optional[dict]:
     """The lowest-order task still blocking today's quest line for this child.
     Bonus tasks (is_bonus=True) don't block."""
@@ -2241,6 +2438,18 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
 def _now_local():
     """Family wall-clock (GMT+7)."""
     return datetime.now(timezone.utc) + timedelta(hours=7)
+
+
+async def _is_off_day(dk: str) -> bool:
+    """True when the given YYYY-MM-DD falls inside any parent-declared off-day
+    range (family outing, holiday, etc). Off days: existing tasks are parked
+    (status 'off'), recurrence skips over them, and streaks bridge across them."""
+    doc = await db.off_days.find_one({
+        "parent_id": FAMILY_ID,
+        "start_date": {"$lte": dk},
+        "end_date": {"$gte": dk},
+    })
+    return doc is not None
 
 
 FREEZE_CARDS_PER_WEEK = 3  # default "Kartu Bebas" weekly allotment; now overridable per-family via config
@@ -2616,6 +2825,15 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
     child = await db.children.find_one({"id": child_id})
     today = _today_key()
     yesterday = (_now_local() - timedelta(days=1)).strftime("%Y-%m-%d")
+    # An off day shouldn't break a streak: walk "yesterday" back over any
+    # declared off days so a kid who last completed the day BEFORE a family
+    # holiday continues their streak the day after it, without burning a
+    # freeze card. Guard-capped against pathological all-off calendars.
+    effective_yesterday = yesterday
+    for _ in range(60):
+        if not await _is_off_day(effective_yesterday):
+            break
+        effective_yesterday = (datetime.strptime(effective_yesterday, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     last_date = child.get("last_completion_date")
     per_week = int(config.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK))
     reset_weekday = int(config.get("freeze_reset_weekday", 0))
@@ -2631,7 +2849,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
 
     if last_date == today:
         streak = child.get("streak_days", 0)
-    elif last_date == yesterday:
+    elif last_date == yesterday or last_date == effective_yesterday:
         streak = child.get("streak_days", 0) + 1
     else:
         available_now = _refill_freeze_card_if_new_week(child, per_week, reset_weekday)
@@ -2702,6 +2920,16 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
             next_date_key = None
     if not next_date_key:
         next_date_key = (_now_local() + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+
+    # If the next occurrence lands on a declared off day, keep stepping until a
+    # working day: daily tasks slide day by day, weekly ones jump whole weeks
+    # (so a weekly-Saturday task skipped over an off Saturday stays a Saturday
+    # task). Guard-capped so a pathological all-off calendar can't loop forever.
+    step = 1 if task["recurrence"] == "daily" else 7
+    for _ in range(60):
+        if not await _is_off_day(next_date_key):
+            break
+        next_date_key = (datetime.strptime(next_date_key, "%Y-%m-%d") + timedelta(days=step)).strftime("%Y-%m-%d")
 
     next_due = None
     if task.get("due_date"):

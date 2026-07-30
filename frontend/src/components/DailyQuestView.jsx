@@ -312,6 +312,29 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         </motion.div>
       )}
 
+      {/* 🤝 Family combo — everyone finished their required missions today */}
+      {progress?.family_combo && (
+        <motion.div
+          initial={{ opacity: 0, scale: 0.95 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="bg-gradient-to-r from-violet-100 to-fuchsia-100 border-2 border-violet-200 rounded-2xl px-4 py-3 flex items-center gap-3"
+        >
+          <motion.span
+            animate={{ rotate: [0, 12, -12, 0], scale: [1, 1.15, 1] }}
+            transition={{ duration: 2.2, repeat: Infinity }}
+            className="text-2xl"
+          >
+            🤝
+          </motion.span>
+          <div className="min-w-0">
+            <div className="font-fun font-bold text-violet-900 text-sm">Kompak Sekeluarga! 🎉</div>
+            <div className="text-xs text-violet-700">
+              Semua misi wajib selesai bareng — kalian masing-masing dapat +{progress.family_combo.points_per_child} poin bonus!
+            </div>
+          </div>
+        </motion.div>
+      )}
+
       {progress?.vacation_mode && (
         <div className="bg-sky-50 border-2 border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-sky-700">
           <span className="text-xl">🏖️</span>

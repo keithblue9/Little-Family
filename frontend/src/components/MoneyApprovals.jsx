@@ -13,6 +13,7 @@ export default function MoneyApprovals() {
   const [earlyBonus, setEarlyBonus] = useState("");
   const [freezePerWeek, setFreezePerWeek] = useState("");
   const [freezeResetDay, setFreezeResetDay] = useState("0");
+  const [comboBonus, setComboBonus] = useState("");
   const [savingCfg, setSavingCfg] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -28,6 +29,7 @@ export default function MoneyApprovals() {
       setEarlyBonus(String(cfg.data.early_bonus_pct ?? 10));
       setFreezePerWeek(String(cfg.data.freeze_cards_per_week ?? 3));
       setFreezeResetDay(String(cfg.data.freeze_reset_weekday ?? 0));
+      setComboBonus(String(cfg.data.family_combo_bonus_points ?? 10));
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -43,14 +45,17 @@ export default function MoneyApprovals() {
     const eb = parseInt(earlyBonus || "0", 10);
     const fpw = parseInt(freezePerWeek || "0", 10);
     const frd = parseInt(freezeResetDay || "0", 10);
+    const cb = parseInt(comboBonus || "0", 10);
     if (r < 1) { toast.error("Kurs minimal Rp 1 per poin"); return; }
     if (eb < 0 || eb > 100) { toast.error("Bonus cepat harus 0–100%"); return; }
     if (fpw < 0 || fpw > 7) { toast.error("Kartu Bebas per minggu harus 0–7"); return; }
+    if (cb < 0 || cb > 1000) { toast.error("Bonus kompak harus 0–1000 poin"); return; }
     setSavingCfg(true);
     try {
       await api.post("/config", {
         rupiah_per_point: r, skip_cost_points: s,
         early_bonus_pct: eb, freeze_cards_per_week: fpw, freeze_reset_weekday: frd,
+        family_combo_bonus_points: cb,
       });
       toast.success("Pengaturan tersimpan");
       load();
@@ -129,6 +134,15 @@ export default function MoneyApprovals() {
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
             <p className="text-[11px] text-slate-400 mt-1">Jatah untuk menyelamatkan misi macet (0–7).</p>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1">Bonus kompak sekeluarga (poin)</label>
+            <input
+              type="text" inputMode="numeric" value={comboBonus}
+              onChange={(e) => setComboBonus(e.target.value.replace(/\D/g, "").slice(0, 4))}
+              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Diberikan ke semua anak saat semuanya menyelesaikan misi wajib di hari yang sama. 0 = mati.</p>
           </div>
           <div>
             <label className="block text-sm font-semibold text-slate-700 mb-1">Hari reset Kartu Bebas</label>

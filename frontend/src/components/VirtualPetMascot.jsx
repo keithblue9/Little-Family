@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
@@ -29,7 +29,35 @@ function moodFor(child) {
   return { label: "Kangen Banget", face: "🥺", ring: "ring-slate-400", glow: "shadow-slate-200" };
 }
 
+/** Did this child feed their pet today (family local time, GMT+7)? */
+function fedToday(kid) {
+  if (!kid?.pet_last_fed_at) return false;
+  try {
+    const fed = new Date(kid.pet_last_fed_at);
+    const fedLocal = new Date(fed.getTime() + 7 * 3600 * 1000);
+    const nowLocal = new Date(Date.now() + 7 * 3600 * 1000);
+    return fedLocal.toISOString().slice(0, 10) === nowLocal.toISOString().slice(0, 10);
+  } catch {
+    return false;
+  }
+}
+
 export default function VirtualPetMascot({ child, onChanged, levelTitles, petStageNames, petFeedThresholds, feedCostPerMeal }) {
+  // Sibling pets — when BOTH kids have cared for their pet today, the pets
+  // come out to play together. A shared moment that rewards the family being
+  // in sync, rather than one more thing to compete over.
+  const [siblings, setSiblings] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    api.get("/children")
+      .then(({ data }) => {
+        if (cancelled) return;
+        setSiblings(data.filter((k) => k.id !== child?.id && k.pet_type));
+      })
+      .catch(() => { if (!cancelled) setSiblings([]); });
+    return () => { cancelled = true; };
+  }, [child?.id, child?.pet_last_fed_at]);
+  const playmates = fedToday(child) ? siblings.filter(fedToday) : [];
   const [picking, setPicking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [feeding, setFeeding] = useState(false);
@@ -319,6 +347,52 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
           )}
         </div>
       </div>
+
+      {/* 🎪 Playdate — both siblings cared for their pets today, so the pets
+          come out to play together. Purely celebratory, no mechanics attached. */}
+      {playmates.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mt-3 bg-white/50 rounded-2xl px-3 py-2.5 border-2 border-white/60"
+        >
+          <div className="text-xs font-fun font-bold text-slate-700 mb-1.5 flex items-center gap-1">
+            🎪 Peliharaan lagi main bareng!
+          </div>
+          <div className="flex items-end justify-center gap-1">
+            <motion.div
+              animate={{ y: [0, -5, 0], rotate: [0, -6, 0] }}
+              transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
+            >
+              <PetSprite petType={child.pet_type} stageIndex={appearance.stageIndex} size={44} />
+            </motion.div>
+            <motion.span
+              animate={{ scale: [1, 1.25, 1], opacity: [0.7, 1, 0.7] }}
+              transition={{ duration: 1.6, repeat: Infinity }}
+              className="text-base pb-3"
+            >
+              💞
+            </motion.span>
+            {playmates.slice(0, 2).map((mate, i) => (
+              <motion.div
+                key={mate.id}
+                animate={{ y: [0, -5, 0], rotate: [0, 6, 0] }}
+                transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut", delay: 0.35 + i * 0.2 }}
+                title={`Peliharaan ${mate.name}`}
+              >
+                <PetSprite
+                  petType={mate.pet_type}
+                  stageIndex={petAppearanceByFeed(mate.pet_type, mate.pet_feed_count || 0, petFeedThresholds, petStageNames).stageIndex}
+                  size={44}
+                />
+              </motion.div>
+            ))}
+          </div>
+          <div className="text-[10px] text-slate-500 text-center mt-1">
+            Kalian berdua sudah merawat peliharaan hari ini 💛
+          </div>
+        </motion.div>
+      )}
     </div>
   );
 }

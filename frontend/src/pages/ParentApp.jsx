@@ -65,6 +65,7 @@ import PetResetRequestsReview from "@/components/PetResetRequestsReview";
 import MaintenanceModeCard from "@/components/MaintenanceModeCard";
 import LateExceptionsReview from "@/components/LateExceptionsReview";
 import OffDayManager from "@/components/OffDayManager";
+import HonestyInsightCard from "@/components/HonestyInsightCard";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -309,7 +310,14 @@ export default function ParentApp() {
           {view === "overview" && (
             <Overview stats={stats} kids={children} tasks={tasks} pendingRedemptions={pendingRedemptions} onAddChild={() => setChildModal(true)} onNavigate={setView} />
           )}
-          {view === "monitor" && <FamilyDayMonitor />}
+          {view === "monitor" && (
+            <div className="space-y-4">
+              <FamilyDayMonitor />
+              <div className="bg-white rounded-2xl border border-slate-200 p-6">
+                <HonestyInsightCard />
+              </div>
+            </div>
+          )}
           {view === "tasks" && (
             <div className="space-y-4">
               <LateExceptionsReview onChanged={load} />

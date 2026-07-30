@@ -2276,6 +2276,159 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.delete(f"/api/off-days/{restore_off_id}")
     check("offday: delete missing → 404", r.status_code == 404, str(r.status_code))
 
+    # =============== STREAK MILESTONE BONUS CARD (setiap 7 hari) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    c.post("/api/config", json={"freeze_cards_per_week": 3, "freeze_reset_weekday": 0, "family_combo_bonus_points": 0})
+    _yest = (_off_base - _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def _run_one_task(kid, passcode, title):
+        """Create → start → complete → approve one task today for `kid`."""
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        rr = c.post("/api/tasks", json={"title": title, "points": 5, "date_key": today_local, "target_children": [kid["id"]]})
+        tid = rr.json()["id"]
+        c.post("/api/auth/login", json={"member_id": kid["id"], "passcode": passcode})
+        c.post(f"/api/tasks/{tid}/start")
+        c.post(f"/api/tasks/{tid}/complete")
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        return c.post(f"/api/tasks/{tid}/approve")
+
+    # Streak 6 → 7 crosses the milestone: +1 card ON TOP of the allotment
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "streak_days": 6, "last_completion_date": _yest,
+        "freeze_cards_available": 3, "freeze_card_week": server._current_week_key(0)}}))
+    r = _run_one_task(adskhan, "654321", "Streak ke-7")
+    check("streakbonus: approve ok", r.status_code == 200, r.text[:150])
+    ads_sb = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("streakbonus: streak hit 7", ads_sb["streak_days"] == 7, str(ads_sb["streak_days"]))
+    check("streakbonus: +1 card above allotment", ads_sb["freeze_cards_available"] == 4, str(ads_sb["freeze_cards_available"]))
+
+    # Non-milestone day (7 → 8) grants no extra card
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "streak_days": 7, "last_completion_date": _yest, "freeze_cards_available": 4}}))
+    _run_one_task(adskhan, "654321", "Streak ke-8")
+    ads_sb2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("streakbonus: streak 8 no extra card", ads_sb2["streak_days"] == 8 and ads_sb2["freeze_cards_available"] == 4, f'{ads_sb2["streak_days"]}/{ads_sb2["freeze_cards_available"]}')
+
+    # Bonus cards survive (not clamped back down to the weekly allotment)
+    r = c.get("/api/children")
+    check("streakbonus: bonus card not clamped to allotment", next(k for k in r.json() if k["id"] == adskhan["id"])["freeze_cards_available"] == 4)
+
+    # Milestone at 14 also fires
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "streak_days": 13, "last_completion_date": _yest, "freeze_cards_available": 2}}))
+    _run_one_task(adskhan, "654321", "Streak ke-14")
+    ads_sb3 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("streakbonus: milestone 14 grants card", ads_sb3["streak_days"] == 14 and ads_sb3["freeze_cards_available"] == 3, f'{ads_sb3["streak_days"]}/{ads_sb3["freeze_cards_available"]}')
+
+    # =============== FAMILY COMBO (kompak sekeluarga) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.family_combo_awards.delete_many({}))
+    c.post("/api/config", json={"family_combo_bonus_points": 10})
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
+    _aio_tg.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {"points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
+
+    r = _run_one_task(adskhan, "654321", "Combo Adskhan")
+    check("combo: not awarded while sibling still pending", r.json().get("family_combo") is None, str(r.json().get("family_combo")))
+    # Give Syila a task and finish it → combo should fire for BOTH kids
+    r = _run_one_task(syila, "123456", "Combo Syila")
+    combo = r.json().get("family_combo")
+    check("combo: awarded when both finish", combo is not None and combo["points"] == 10, str(combo))
+    check("combo: covers both children", combo and len(combo["child_ids"]) == 2, str(combo and combo["child_ids"]))
+    ads_c = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    syi_c2 = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("combo: Adskhan got bonus points", ads_c["points"] == 15, str(ads_c["points"]))  # 5 task + 10 combo
+    check("combo: Syila got bonus points", syi_c2["points"] == 15, str(syi_c2["points"]))
+    check("combo: split into buckets", ads_c["chiky_save"] + ads_c["chiky_spend"] + ads_c["chiky_share"] == 15, f'{ads_c["chiky_save"]}/{ads_c["chiky_spend"]}/{ads_c["chiky_share"]}')
+
+    # Awarded once only — another approval same day must not double-pay
+    r = _run_one_task(adskhan, "654321", "Combo lagi")
+    check("combo: not awarded twice same day", r.json().get("family_combo") is None, str(r.json().get("family_combo")))
+    ads_c2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("combo: no double bonus", ads_c2["points"] == 20, str(ads_c2["points"]))  # 15 + 5 task only
+
+    # Surfaced in day-progress for the kid banner
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}")
+    check("combo: exposed in day-progress", r.json().get("family_combo") is not None)
+
+    # Config 0 turns it off
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.family_combo_awards.delete_many({}))
+    c.post("/api/config", json={"family_combo_bonus_points": 0})
+    _run_one_task(adskhan, "654321", "Off combo A")
+    r = _run_one_task(syila, "123456", "Off combo B")
+    check("combo: disabled at 0 points", r.json().get("family_combo") is None, str(r.json().get("family_combo")))
+    c.post("/api/config", json={"family_combo_bonus_points": 10})
+
+    # Solo child (only one kid has tasks) is not a combo
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.family_combo_awards.delete_many({}))
+    r = _run_one_task(adskhan, "654321", "Sendirian")
+    check("combo: single-child day is not a combo", r.json().get("family_combo") is None, str(r.json().get("family_combo")))
+
+    # =============== HONESTY INSIGHT ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    import datetime as _dt_hi
+    _t_now = _dt_hi.datetime.now(_dt_hi.timezone.utc)
+    def _seed_timed_task(kid, title, est_min, actual_sec, status="approved"):
+        rr = c.post("/api/tasks", json={"title": title, "points": 5, "date_key": today_local,
+                                        "target_children": [kid["id"]], "duration_minutes": est_min})
+        tid = rr.json()["id"]
+        st = _t_now - _dt_hi.timedelta(seconds=actual_sec)
+        _aio_tg.run(server.db.tasks.update_one({"id": tid}, {"$set": {
+            "status": status, "timer_started_at": st.isoformat(), "completed_at": _t_now.isoformat()}}))
+        return tid
+    _seed_timed_task(adskhan, "Kilat 1", 10, 3)      # 3s vs 10m estimate → flash
+    _seed_timed_task(adskhan, "Kilat 2", 10, 5)      # flash
+    _seed_timed_task(adskhan, "Wajar", 10, 540)      # 9m vs 10m → normal
+    _seed_timed_task(adskhan, "Kelamaan", 10, 1800)  # 30m vs 10m → overrun
+
+    r = c.get("/api/family/honesty-insight?days=14")
+    check("honesty: endpoint ok", r.status_code == 200, r.text[:150])
+    ads_hi = next(x for x in r.json()["children"] if x["child_id"] == adskhan["id"])
+    check("honesty: counts measured tasks", ads_hi["tasks_measured"] == 4, str(ads_hi["tasks_measured"]))
+    check("honesty: detects instant tap-throughs", ads_hi["flash_count"] == 2, str(ads_hi["flash_count"]))
+    check("honesty: detects overruns", ads_hi["overrun_count"] == 1, str(ads_hi["overrun_count"]))
+    check("honesty: reports averages", ads_hi["avg_actual_minutes"] is not None and ads_hi["avg_estimated_minutes"] == 10.0, str(ads_hi["avg_estimated_minutes"]))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.get("/api/family/honesty-insight")
+    check("honesty: kid blocked", r.status_code == 403, str(r.status_code))
+
+    # =============== SMART REMINDERS ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.reminder_log.delete_many({}))
+    _soon = (now_local + _dt.timedelta(minutes=30))
+    _far = (now_local + _dt.timedelta(hours=6))
+    _soon_ok = _soon.strftime("%Y-%m-%d") == today_local
+    if _soon_ok:
+        c.post("/api/tasks", json={"title": "Segera", "points": 5, "date_key": today_local,
+                                   "target_children": [adskhan["id"]], "due_time": _soon.strftime("%H:%M")})
+    if _far.strftime("%Y-%m-%d") == today_local:
+        c.post("/api/tasks", json={"title": "Masih lama", "points": 5, "date_key": today_local,
+                                   "target_children": [adskhan["id"]], "due_time": _far.strftime("%H:%M")})
+    r = c.post("/api/reminders/run")
+    check("reminder: manual sweep ok", r.status_code == 200, r.text[:150])
+    if _soon_ok:
+        check("reminder: nudges only the imminent task", r.json()["task_reminders"] == 1, str(r.json()))
+        r2 = c.post("/api/reminders/run")
+        check("reminder: deduplicated on repeat run", r2.json()["task_reminders"] == 0, str(r2.json()))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/reminders/run")
+    check("reminder: kid blocked from manual sweep", r.status_code == 403, str(r.status_code))
+    r = c.get("/api/cron/reminders?key=wrong")
+    check("reminder: cron rejects bad key", r.status_code == 403, str(r.status_code))
+    r = c.get("/api/cron/reminders")
+    check("reminder: cron rejects empty key", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

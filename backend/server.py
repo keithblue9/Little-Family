@@ -206,6 +206,9 @@ class AppConfigInput(BaseModel):
     # Early-completion bonus: extra % of a task's points awarded when the kid
     # finishes it BEFORE its due_time. 0 = feature off. Configurable per family.
     early_bonus_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    # Family combo: when EVERY kid finishes all their required tasks on the
+    # same day, each gets this bonus. 0 = off.
+    family_combo_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
     # Kartu Bebas (freeze card) economy — how many per week, and which weekday
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     freeze_cards_per_week: Optional[int] = Field(default=None, ge=0, le=7)
@@ -2011,6 +2014,7 @@ async def child_day_progress(
     tasks = [t for t in tasks if t.get("status") != "off"]
     tasks.sort(key=lambda t: (bool(t.get("is_bonus")), t.get("order") or 0))
     is_off = await _is_off_day(dk)
+    combo_award = await db.family_combo_awards.find_one({"parent_id": FAMILY_ID, "date_key": dk}, {"_id": 0})
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
 
@@ -2064,6 +2068,7 @@ async def child_day_progress(
         "bonus_count": len(bonus),
         "vacation_mode": bool(config.get("vacation_mode", False)),
         "is_off_day": is_off,
+        "family_combo": combo_award,
         "perfect_day": perfect_day,
         "perfect_day_claimed": bool(perfect_claim),
         "tasks": tasks,
@@ -2425,6 +2430,144 @@ async def delete_off_day(off_day_id: str, user: dict = Depends(require_parent)):
     return {"success": True, "restored_tasks": res.modified_count}
 
 
+# --------------- Honesty insight (analisa kejujuran, non-accusatory) ---------------
+@api.get("/family/honesty-insight")
+async def honesty_insight(days: int = 14, user: dict = Depends(require_parent)):
+    """Gentle per-child working-pattern stats from the start/finish timestamps
+    over the last N days: average actual duration vs the estimated one, how
+    many finishes look like instant tap-throughs ('kilat'), and how many ran
+    far over the estimate (possible struggle). Meant as conversation-starter
+    signals for the parent — not verdicts."""
+    days = max(1, min(days, 60))
+    since = (_now_local() - timedelta(days=days)).strftime("%Y-%m-%d")
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50)
+    out = []
+    for k in kids:
+        tasks = await db.tasks.find({
+            "parent_id": FAMILY_ID, "child_id": k["id"],
+            "date_key": {"$gte": since},
+            "status": {"$in": ["approved", "completed"]},
+            "timer_started_at": {"$nin": [None, ""]},
+            "completed_at": {"$nin": [None, ""]},
+        }, {"_id": 0}).to_list(1000)
+        total = 0
+        sum_actual = 0.0
+        sum_est = 0.0
+        est_count = 0
+        flash_count = 0     # suspiciously instant (< 20s, or < 15% of the estimate)
+        overrun_count = 0   # > 2x the estimate (possible struggle, not cheating)
+        for t in tasks:
+            try:
+                start = datetime.fromisoformat(t["timer_started_at"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(t["completed_at"].replace("Z", "+00:00"))
+                actual_s = (end - start).total_seconds()
+            except Exception:
+                continue
+            if actual_s < 0:
+                continue
+            total += 1
+            sum_actual += actual_s
+            est_min = t.get("duration_minutes")
+            if est_min:
+                est_s = est_min * 60
+                sum_est += est_s
+                est_count += 1
+                if actual_s < max(20, est_s * 0.15):
+                    flash_count += 1
+                elif actual_s > est_s * 2:
+                    overrun_count += 1
+            elif actual_s < 20:
+                flash_count += 1
+        out.append({
+            "child_id": k["id"], "child_name": k["name"],
+            "avatar_emoji": k.get("avatar_emoji"), "avatar_color": k.get("avatar_color"),
+            "tasks_measured": total,
+            "avg_actual_minutes": round(sum_actual / total / 60, 1) if total else None,
+            "avg_estimated_minutes": round(sum_est / est_count / 60, 1) if est_count else None,
+            "flash_count": flash_count,
+            "overrun_count": overrun_count,
+            "days": days,
+        })
+    return {"since": since, "children": out}
+
+
+# --------------- Smart reminders (cron-triggered push nudges) ---------------
+async def _run_reminder_sweep() -> dict:
+    """Two nudge types, both deduplicated via reminder_log so repeated cron
+    hits never spam:
+      1. Kid: a task due within the next 60 minutes that hasn't been started.
+      2. Parent: pending requests (sedekah / keterlambatan / reset pet /
+         penukaran hadiah & uang) sitting unreviewed for over 2 hours —
+         throttled to at most one nudge per 3-hour block per day."""
+    now = _now_local()
+    today = _today_key()
+    now_min = now.hour * 60 + now.minute
+    sent = {"task_reminders": 0, "parent_nudge": False}
+
+    tasks = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": today,
+        "status": {"$in": ["pending", "rejected"]},
+        "due_time": {"$nin": [None, ""]},
+        "timer_started_at": {"$in": [None, ""]},
+    }).to_list(500)
+    for t in tasks:
+        try:
+            due_min = _hhmm_to_min(t["due_time"])
+        except Exception:
+            continue
+        lead = due_min - now_min
+        if not (0 <= lead <= 60):
+            continue  # only nudge when the deadline is genuinely coming up
+        marker = f"task-reminder:{t['id']}"
+        if await db.reminder_log.find_one({"key": marker}):
+            continue
+        await send_push_to(
+            {"role": "child", "member_id": t["child_id"]},
+            title="Misi sebentar lagi! ⏰",
+            body=f'"{t["title"]}" harus selesai sebelum {t["due_time"]}. Yuk mulai sekarang!',
+            url=f"/kid/{t['child_id']}",
+        )
+        await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
+        sent["task_reminders"] += 1
+
+    two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    pending_total = 0
+    for coll in (db.charity_requests, db.late_exceptions, db.pet_reset_requests):
+        pending_total += len(await coll.find({"status": "pending", "created_at": {"$lt": two_hours_ago}}).to_list(200))
+    pending_total += len(await db.redemptions.find({"status": "pending", "created_at": {"$lt": two_hours_ago}}).to_list(200))
+    pending_total += len(await db.money_redemptions.find({"status": "pending", "created_at": {"$lt": two_hours_ago}}).to_list(200))
+    if pending_total > 0:
+        nudge_marker = f"parent-pending:{today}:{now.hour // 3}"
+        if not await db.reminder_log.find_one({"key": nudge_marker}):
+            await send_push_to(
+                {"role": "parent"},
+                title="Ada yang menunggu persetujuan 📋",
+                body=f"{pending_total} pengajuan anak sudah menunggu lebih dari 2 jam. Cek yuk!",
+                url="/parent",
+            )
+            await db.reminder_log.insert_one({"key": nudge_marker, "sent_at": now_iso()})
+            sent["parent_nudge"] = True
+    return sent
+
+
+@api.get("/cron/reminders")
+async def cron_reminders(key: str = ""):
+    """External-scheduler entry point (e.g. cron-job.org every 10 minutes, or a
+    Vercel cron). Protected by the CRON_SECRET env var — with no secret set,
+    the endpoint refuses everything (safe default). Unauthenticated by design
+    so a dumb HTTP pinger can call it, hence the shared-secret check."""
+    secret = os.environ.get("CRON_SECRET", "")
+    if not secret or key != secret:
+        raise HTTPException(status_code=403, detail="Invalid cron key")
+    return await _run_reminder_sweep()
+
+
+@api.post("/reminders/run")
+async def run_reminders_manual(user: dict = Depends(require_parent)):
+    """Parent-triggered manual sweep (handy for testing the nudges)."""
+    return await _run_reminder_sweep()
+
+
 async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None) -> Optional[dict]:
     """The lowest-order task still blocking today's quest line for this child.
     Bonus tasks (is_bonus=True) don't block."""
@@ -2484,8 +2627,10 @@ def _refill_freeze_card_if_new_week(child: dict, per_week: int = FREEZE_CARDS_PE
     stored_week = child.get("freeze_card_week")
     if stored_week != current_week:
         return per_week  # new cycle — fresh allotment, never carries over unused cards
-    # Clamp to the configured max in case the parent lowered the allotment mid-cycle.
-    return min(int(child.get("freeze_cards_available", per_week)), per_week)
+    # Within the cycle the stored value is authoritative — it may legitimately
+    # EXCEED the weekly allotment thanks to streak-milestone bonus cards, so no
+    # clamping here (bonus cards must survive until used or the next refill).
+    return int(child.get("freeze_cards_available", per_week))
 
 
 def _assert_child_owns_task(user: dict, task: dict):
@@ -2685,6 +2830,8 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     await db.tasks.update_one({"id": task_id}, {"$set": {"status": "skipped", "completed_at": now_iso()}})
     await log_activity(FAMILY_ID, child["id"], "task_skipped", {"task_id": task_id, "title": task["title"], "cost": cost})
     updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    _cfg_combo = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    await _check_family_combo(task.get("date_key"), _cfg_combo)
     return {"task": updated, "points_spent": cost}
 
 
@@ -2737,6 +2884,8 @@ async def free_task_with_card(task_id: str, user: dict = Depends(get_current_use
     )
     await log_activity(FAMILY_ID, child["id"], "task_freed_with_card", {"task_id": task_id, "title": task["title"]})
     updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    _cfg_combo = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    await _check_family_combo(task.get("date_key"), _cfg_combo)
     return {"task": updated, "freeze_cards_available": available - 1}
 
 
@@ -2863,6 +3012,19 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
         else:
             streak = 1
 
+    # 🎁 Streak milestone: every 7 consecutive days earns +1 Kartu Bebas on top
+    # of the weekly allotment — a reward loop for consistency, not just a
+    # safety net for failure. Fires exactly once per milestone (streak only
+    # increments once per day). Careful cycle handling: the bonus must be
+    # stamped onto the CURRENT cycle or the next refill check would wipe it.
+    streak_bonus_card = False
+    if streak > prev_streak and streak > 0 and streak % 7 == 0:
+        cur_cycle = _current_week_key(reset_weekday)
+        base_cards = new_freeze_available if new_freeze_week == cur_cycle else _refill_freeze_card_if_new_week(child, per_week, reset_weekday)
+        new_freeze_available = base_cards + 1
+        new_freeze_week = cur_cycle
+        streak_bonus_card = True
+
     save_pct = int(config.get("chiky_save_pct", 40))
     spend_pct = int(config.get("chiky_spend_pct", 40))
     share_pct = int(config.get("chiky_share_pct", 20))
@@ -2894,6 +3056,9 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
             },
         },
     )
+    if streak_bonus_card:
+        await log_activity(FAMILY_ID, child_id, "streak_bonus_card", {"streak": streak})
+        await send_push_to({"role": "child", "member_id": child_id}, title=f"Streak {streak} hari! 🔥", body="Kamu dapat +1 Kartu Bebas bonus karena konsisten. Keren!", url=f"/kid/{child_id}")
     return {
         "child_id": child_id, "points": points,
         "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
@@ -2902,6 +3067,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
         "prev_freeze_available": prev_freeze_available, "prev_freeze_week": prev_freeze_week,
         "prev_best_streak": prev_best_streak,
         "feed_earned": feed_earned,
+        "streak_bonus_card": streak_bonus_card,
     }
 
 
@@ -3026,7 +3192,8 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                     body=payload.encouragement_message or "Dengarkan pesan suara dari orang tuamu!",
                     url=f"/kid/{cid}",
                 )
-        return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges}
+        combo = await _check_family_combo(task.get("date_key"), config)
+        return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges, "family_combo": combo}
 
     # --- Normal single-child path ---
     child = await db.children.find_one({"id": task["child_id"]})
@@ -3076,7 +3243,56 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
             body=payload.encouragement_message or "Dengarkan pesan suara dari orang tuamu!",
             url=f"/kid/{task['child_id']}",
         )
-    return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges}
+    combo = await _check_family_combo(task.get("date_key"), config)
+    return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges, "family_combo": combo}
+
+
+async def _check_family_combo(date_key: Optional[str], config: dict):
+    """🤝 Family Combo: when EVERY kid who has required tasks on this date has
+    finished ALL of them (approved/skipped), each gets a bonus — encouraging
+    siblings to cheer each other on rather than compete. Needs at least two
+    kids with required tasks that day (one kid alone isn't a 'combo'), awards
+    exactly once per date, and splits into the Chikybank buckets like normal
+    earnings. 0-point config turns the feature off."""
+    bonus = int(config.get("family_combo_bonus_points", 10))
+    if bonus <= 0 or not date_key:
+        return None
+    if await db.family_combo_awards.find_one({"parent_id": FAMILY_ID, "date_key": date_key}):
+        return None  # already awarded for this date
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50)
+    with_tasks = []
+    for k in kids:
+        req = await db.tasks.find({
+            "parent_id": FAMILY_ID, "date_key": date_key, "is_bonus": {"$ne": True},
+            "status": {"$ne": "off"},
+            "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
+        }).to_list(500)
+        if not req:
+            continue
+        all_done = all(t["status"] in ("approved", "skipped") for t in req)
+        with_tasks.append((k, all_done))
+    if len(with_tasks) < 2 or not all(done for _, done in with_tasks):
+        return None
+    save_pct = int(config.get("chiky_save_pct", 40))
+    spend_pct = int(config.get("chiky_spend_pct", 40))
+    share_pct = int(config.get("chiky_share_pct", 20))
+    total_pct = save_pct + spend_pct + share_pct or 100
+    b_save = round(bonus * save_pct / total_pct)
+    b_spend = round(bonus * spend_pct / total_pct)
+    b_share = bonus - b_save - b_spend
+    child_ids = [k["id"] for k, _ in with_tasks]
+    for k, _ in with_tasks:
+        await db.children.update_one({"id": k["id"]}, {"$inc": {
+            "points": bonus, "lifetime_points": bonus,
+            "chiky_save": b_save, "chiky_spend": b_spend, "chiky_share": b_share,
+        }})
+        await send_push_to({"role": "child", "member_id": k["id"]}, title="Kompak sekeluarga! 🤝🎉", body=f"Semua misi wajib selesai bareng — kamu dapat +{bonus} poin bonus!", url=f"/kid/{k['id']}")
+    await db.family_combo_awards.insert_one({
+        "id": new_id(), "parent_id": FAMILY_ID, "date_key": date_key,
+        "points_per_child": bonus, "child_ids": child_ids, "awarded_at": now_iso(),
+    })
+    await log_activity(FAMILY_ID, None, "family_combo_awarded", {"date_key": date_key, "points": bonus, "children": len(child_ids)})
+    return {"points": bonus, "child_ids": child_ids}
 
 
 UNDO_WINDOW_MINUTES = 30
@@ -3338,6 +3554,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "chiky_spend_pct": 40,
             "chiky_share_pct": 20,
             "early_bonus_pct": 10,
+            "family_combo_bonus_points": 10,
             "freeze_cards_per_week": FREEZE_CARDS_PER_WEEK,
             "freeze_reset_weekday": 0,
             "custom_labels": {},
@@ -3416,6 +3633,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "chiky_spend_pct": 40,
             "chiky_share_pct": 20,
             "early_bonus_pct": 10,
+            "family_combo_bonus_points": 10,
             "freeze_cards_per_week": FREEZE_CARDS_PER_WEEK,
             "freeze_reset_weekday": 0,
             "custom_labels": {},
@@ -3444,6 +3662,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "chiky_spend_pct": int(config.get("chiky_spend_pct", 40)),
         "chiky_share_pct": int(config.get("chiky_share_pct", 20)),
         "early_bonus_pct": int(config.get("early_bonus_pct", 10)),
+        "family_combo_bonus_points": int(config.get("family_combo_bonus_points", 10)),
         "freeze_cards_per_week": int(config.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK)),
         "freeze_reset_weekday": int(config.get("freeze_reset_weekday", 0)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),

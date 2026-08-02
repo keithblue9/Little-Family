@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { RotateCcw, RefreshCw, AlertTriangle } from "lucide-react";
+import { useEffect, useState } from "react";
+import { RotateCcw, RefreshCw, AlertTriangle, Undo2 } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
@@ -19,6 +19,30 @@ export default function RestartScheduleCard({ onChanged }) {
   const [resetStreaks, setResetStreaks] = useState(false);
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [archives, setArchives] = useState([]);
+  const [undoing, setUndoing] = useState(false);
+
+  const loadArchives = () => {
+    api.get("/tasks/restart-archives")
+      .then(({ data }) => setArchives(data))
+      .catch(() => setArchives([]));
+  };
+  useEffect(() => { loadArchives(); }, []);
+
+  const undo = async () => {
+    if (!window.confirm("Kembalikan semua misi yang dihapus oleh Mulai Ulang terakhir?")) return;
+    setUndoing(true);
+    try {
+      const { data } = await api.post("/tasks/undo-restart");
+      toast.success(`${data.restored_tasks} misi dikembalikan`);
+      loadArchives();
+      onChanged?.();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setUndoing(false);
+    }
+  };
 
   const refresh = async () => {
     setRefreshing(true);
@@ -57,6 +81,7 @@ export default function RestartScheduleCard({ onChanged }) {
       toast.success(
         `Jadwal dimulai ulang — ${data.deleted_tasks} misi lama dihapus, ${data.upcoming_created} misi baru disiapkan`
       );
+      loadArchives();
       onChanged?.();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -114,6 +139,23 @@ export default function RestartScheduleCard({ onChanged }) {
           <RotateCcw className="w-4 h-4" /> {busy ? "Memproses…" : "Mulai Ulang Sekarang"}
         </button>
       </div>
+
+      {archives.length > 0 && (
+        <div className="mt-4 bg-emerald-50 border-2 border-emerald-200 rounded-2xl p-4 max-w-lg">
+          <div className="text-sm font-bold text-emerald-800 mb-1">Bisa dibatalkan</div>
+          <p className="text-xs text-emerald-700 mb-3">
+            Mulai Ulang terakhir menyimpan {archives[0].task_count} misi. Kalau ada jadwal yang ternyata masih
+            dibutuhkan, kembalikan semuanya di sini.
+          </p>
+          <button
+            onClick={undo}
+            disabled={undoing}
+            className="press-btn inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-4 py-2 rounded-xl text-sm disabled:opacity-60"
+          >
+            <Undo2 className="w-4 h-4" /> {undoing ? "Mengembalikan…" : "Batalkan Mulai Ulang"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

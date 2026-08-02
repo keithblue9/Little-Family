@@ -3114,6 +3114,10 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
     match_query = {
         "title": task["title"], "date_key": next_date_key,
         "recurrence": task["recurrence"], "status": {"$in": ["pending", "rejected"]},
+        # Same title at a DIFFERENT time of day is a different slot, not a
+        # duplicate — without this, a morning task could suppress the evening one.
+        "due_time": task.get("due_time"),
+        "is_bonus": bool(task.get("is_bonus")),
     }
     if task.get("is_coop"):
         match_query["is_coop"] = True
@@ -3147,14 +3151,34 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
 
 
 def _series_key(task: dict) -> tuple:
-    """Identity of a repeating task 'series'. A series is the same title, for
-    the same child (or the same co-op group), on the same cadence — that's what
-    a parent means by 'the Saturday chore'."""
+    """Identity of a repeating task 'series'.
+
+    CRITICAL: this must distinguish every *distinct scheduled slot*, not just
+    the task's name. A family legitimately has the same title on several days
+    ("Piket" every Monday AND every Wednesday) and several times of day
+    ("Sholat" at 05:00 and at 18:00). Keying only on title/cadence/child
+    collapsed those into one series and silently dropped the rest — so the
+    slot's weekday (for weeklies) and its due_time are part of the identity.
+    """
     if task.get("is_coop"):
         who = ("coop", tuple(sorted(task.get("coop_participants") or [])))
     else:
         who = ("child", task.get("child_id"))
-    return (task.get("title"), task.get("recurrence"), who)
+    # Weeklies are anchored to a weekday; dailies repeat regardless of weekday.
+    weekday = None
+    if task.get("recurrence") == "weekly" and task.get("date_key"):
+        try:
+            weekday = datetime.strptime(task["date_key"], "%Y-%m-%d").weekday()
+        except Exception:
+            weekday = None
+    return (
+        task.get("title"),
+        task.get("recurrence"),
+        who,
+        task.get("due_time") or "",
+        bool(task.get("is_bonus")),
+        weekday,
+    )
 
 
 def _clone_series_instance(template: dict, date_key: str) -> dict:
@@ -3270,6 +3294,46 @@ async def _maybe_materialize_recurring():
     return await _materialize_recurring()
 
 
+class BulkTaskImportInput(BaseModel):
+    tasks: List[TaskInput] = Field(min_length=1, max_length=200)
+    skip_existing: bool = True  # don't recreate a slot that's already scheduled
+
+
+@api.post("/tasks/bulk-import")
+async def bulk_import_tasks(payload: BulkTaskImportInput, user: dict = Depends(require_parent)):
+    """Recreate a whole routine in one go — used by 'Pulihkan Jadwal'.
+
+    Each entry goes through the exact same creation path as the normal task
+    form (so weekdays, recurrence, co-op bonuses and broadcasting all behave
+    identically); this just spares a parent from re-entering dozens of rows by
+    hand. Already-scheduled slots are skipped by default, so re-running it is
+    safe and won't double up the calendar.
+    """
+    created = 0
+    skipped = 0
+    errors = []
+    for idx, item in enumerate(payload.tasks):
+        try:
+            if payload.skip_existing:
+                dup_q = {
+                    "parent_id": FAMILY_ID, "title": item.title,
+                    "due_time": item.due_time, "is_bonus": bool(item.is_bonus),
+                    "status": {"$in": ["pending", "rejected"]},
+                }
+                if await db.tasks.find_one(dup_q):
+                    skipped += 1
+                    continue
+            result = await create_task(item, user)
+            made = result.get("tasks") if isinstance(result, dict) else None
+            created += len(made) if isinstance(made, list) else 1
+        except HTTPException as e:
+            errors.append({"index": idx, "title": item.title, "error": str(e.detail)})
+        except Exception as e:  # keep importing the rest rather than aborting everything
+            errors.append({"index": idx, "title": item.title, "error": str(e)})
+    await log_activity(FAMILY_ID, None, "tasks_bulk_imported", {"created": created, "skipped": skipped, "errors": len(errors)})
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
 @api.post("/tasks/materialize-recurring")
 async def materialize_recurring_now(days_ahead: int = 14, user: dict = Depends(require_parent)):
     """Manual 'refresh my schedule' for parents — fills in any missing upcoming
@@ -3313,6 +3377,15 @@ async def restart_schedule(payload: RestartScheduleInput, user: dict = Depends(r
         if key not in templates or t["date_key"] > templates[key]["date_key"]:
             templates[key] = t
 
+    # Archive before deleting so a restart is always reversible. Losing a
+    # carefully built schedule to one button press is not acceptable.
+    batch_id = new_id()
+    doomed = await db.tasks.find({"parent_id": FAMILY_ID, "date_key": {"$lt": start}}, {"_id": 0}).to_list(20000)
+    if doomed:
+        await db.tasks_archive.insert_many([
+            {"archive_batch": batch_id, "archived_at": now_iso(), "parent_id": FAMILY_ID, "task": t}
+            for t in doomed
+        ])
     deleted = await db.tasks.delete_many({"parent_id": FAMILY_ID, "date_key": {"$lt": start}})
 
     if payload.clear_pending_requests:
@@ -3343,10 +3416,18 @@ async def restart_schedule(payload: RestartScheduleInput, user: dict = Depends(r
             cursor += timedelta(days=step)
             guard += 1
         dk = cursor.strftime("%Y-%m-%d")
-        exists = await db.tasks.find_one({
+        dup_q = {
             "parent_id": FAMILY_ID, "title": template["title"],
             "recurrence": template["recurrence"], "date_key": dk,
-        })
+            "due_time": template.get("due_time"),
+            "is_bonus": bool(template.get("is_bonus")),
+        }
+        if template.get("is_coop"):
+            dup_q["is_coop"] = True
+            dup_q["coop_participants"] = template.get("coop_participants")
+        else:
+            dup_q["child_id"] = template.get("child_id")
+        exists = await db.tasks.find_one(dup_q)
         if not exists:
             await db.tasks.insert_one(_clone_series_instance(template, dk))
             seeded += 1
@@ -3360,7 +3441,49 @@ async def restart_schedule(payload: RestartScheduleInput, user: dict = Depends(r
         "success": True, "start_date": start,
         "deleted_tasks": deleted.deleted_count,
         "series_restarted": seeded, "upcoming_created": seeded + filled,
+        "archive_batch": batch_id,
     }
+
+
+@api.get("/tasks/restart-archives")
+async def list_restart_archives(user: dict = Depends(require_parent)):
+    """Restart batches available to undo, newest first."""
+    rows = await db.tasks_archive.find({"parent_id": FAMILY_ID}, {"_id": 0, "archive_batch": 1, "archived_at": 1}).to_list(20000)
+    grouped: dict = {}
+    for r in rows:
+        b = r["archive_batch"]
+        g = grouped.setdefault(b, {"archive_batch": b, "archived_at": r["archived_at"], "task_count": 0})
+        g["task_count"] += 1
+        if r["archived_at"] < g["archived_at"]:
+            g["archived_at"] = r["archived_at"]
+    return sorted(grouped.values(), key=lambda g: g["archived_at"], reverse=True)
+
+
+@api.post("/tasks/undo-restart")
+async def undo_restart(archive_batch: Optional[str] = None, user: dict = Depends(require_parent)):
+    """Put back everything a restart removed. Defaults to the most recent
+    restart. Tasks that already exist again are skipped, so undoing twice or
+    undoing after a partial rebuild can't create duplicates."""
+    query = {"parent_id": FAMILY_ID}
+    if archive_batch:
+        query["archive_batch"] = archive_batch
+    rows = await db.tasks_archive.find(query, {"_id": 0}).to_list(20000)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Tidak ada arsip untuk dikembalikan")
+    if not archive_batch:
+        newest = max(rows, key=lambda r: r["archived_at"])["archive_batch"]
+        rows = [r for r in rows if r["archive_batch"] == newest]
+        archive_batch = newest
+    restored = 0
+    for r in rows:
+        t = r["task"]
+        if await db.tasks.find_one({"id": t["id"]}):
+            continue
+        await db.tasks.insert_one(t)
+        restored += 1
+    await db.tasks_archive.delete_many({"parent_id": FAMILY_ID, "archive_batch": archive_batch})
+    await log_activity(FAMILY_ID, None, "restart_undone", {"batch": archive_batch, "restored": restored})
+    return {"success": True, "restored_tasks": restored, "archive_batch": archive_batch}
 
 
 @api.post("/tasks/{task_id}/approve")

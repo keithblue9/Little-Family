@@ -2565,6 +2565,113 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
           next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["streak_days"] == 6,
           "streak was reset unexpectedly")
 
+    # =============== REGRESSION: DISTINCT SLOTS MUST NEVER COLLAPSE ===============
+    # Bug report: "jadwal Rabu hilang semua, Senin yang pagi hilang juga".
+    # Cause: series identity ignored weekday and time-of-day, so same-titled
+    # tasks on different days/times overwrote each other and vanished.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.tasks_archive.delete_many({}))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    c.post("/api/config", json={"vacation_mode": False})
+
+    # Find a past Monday and the Wednesday of that same week
+    _probe = _base_now - _dt_off.timedelta(days=14)
+    while _probe.weekday() != 0:
+        _probe -= _dt_off.timedelta(days=1)
+    _mon = _probe.strftime("%Y-%m-%d")
+    _wed = (_probe + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
+
+    # Same title, same child, weekly — but on TWO different weekdays
+    c.post("/api/tasks", json={"title": "Piket", "points": 5, "date_key": _mon,
+                               "target_children": [adskhan["id"]], "recurrence": "weekly", "due_time": "06:00"})
+    c.post("/api/tasks", json={"title": "Piket", "points": 5, "date_key": _wed,
+                               "target_children": [adskhan["id"]], "recurrence": "weekly", "due_time": "06:00"})
+    # Same title, same day, DIFFERENT time slots (pagi & sore)
+    c.post("/api/tasks", json={"title": "Sholat", "points": 5, "date_key": _mon,
+                               "target_children": [adskhan["id"]], "recurrence": "daily", "due_time": "05:00"})
+    c.post("/api/tasks", json={"title": "Sholat", "points": 5, "date_key": _mon,
+                               "target_children": [adskhan["id"]], "recurrence": "daily", "due_time": "18:00"})
+
+    c.post("/api/tasks/materialize-recurring?days_ahead=14")
+    fut = [t for t in c.get("/api/tasks").json() if t["date_key"] >= today_local]
+    piket_wd = {_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday()
+                for t in fut if t["title"] == "Piket"}
+    check("slots: Monday weekly survives", 0 in piket_wd, str(sorted(piket_wd)))
+    check("slots: Wednesday weekly survives", 2 in piket_wd, str(sorted(piket_wd)))
+    sholat_times = {t.get("due_time") for t in fut if t["title"] == "Sholat"}
+    check("slots: morning time slot survives", "05:00" in sholat_times, str(sholat_times))
+    check("slots: evening time slot survives", "18:00" in sholat_times, str(sholat_times))
+    # And each slot gets its own instance per day (no silent suppression)
+    _one_day = [t for t in fut if t["title"] == "Sholat" and t["date_key"] == fut[0]["date_key"]]
+    check("slots: both daily slots materialize on the same day",
+          len({t.get("due_time") for t in [t for t in fut if t["title"] == "Sholat" and t["date_key"] == today_local]}) in (0, 2),
+          "only one slot present on a day")
+
+    # Restart must preserve every distinct slot too
+    _tmr = (_base_now + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tmr, "days_ahead": 21})
+    check("slots: restart ok", r.status_code == 200, r.text[:200])
+    after = [t for t in c.get("/api/tasks").json() if t["date_key"] >= _tmr]
+    piket_wd2 = {_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday()
+                 for t in after if t["title"] == "Piket"}
+    check("slots: restart keeps Monday series", 0 in piket_wd2, str(sorted(piket_wd2)))
+    check("slots: restart keeps Wednesday series", 2 in piket_wd2, str(sorted(piket_wd2)))
+    sholat_times2 = {t.get("due_time") for t in after if t["title"] == "Sholat"}
+    check("slots: restart keeps both time slots", sholat_times2 == {"05:00", "18:00"}, str(sholat_times2))
+
+    # =============== UNDO RESTART (jaring pengaman) ===============
+    r = c.get("/api/tasks/restart-archives")
+    check("undo: archive recorded", r.status_code == 200 and len(r.json()) >= 1, r.text[:150])
+    archived_count = r.json()[0]["task_count"]
+    r = c.post("/api/tasks/undo-restart")
+    check("undo: restore ok", r.status_code == 200 and r.json()["restored_tasks"] == archived_count, r.text[:200])
+    restored_past = [t for t in c.get("/api/tasks").json() if t["date_key"] < _tmr]
+    check("undo: old tasks are back", len(restored_past) >= 1, str(len(restored_past)))
+    r = c.post("/api/tasks/undo-restart")
+    check("undo: nothing left to undo", r.status_code == 404, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks/undo-restart")
+    check("undo: kid blocked", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # =============== BULK IMPORT (pulihkan jadwal) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _bulk = {"tasks": [
+        {"title": "Bangun pagi", "due_time": "05:00", "duration_minutes": 10, "points": 5,
+         "task_style": "routine", "weekdays": [0, 1, 2, 3, 4], "recurrence": "weekly",
+         "target_children": [adskhan["id"]]},
+        {"title": "Sholat Subuh", "due_time": "05:15", "duration_minutes": 15, "points": 10,
+         "task_style": "routine", "weekdays": [0, 1, 2, 3, 4], "recurrence": "weekly",
+         "target_children": [adskhan["id"]], "together_bonus_enabled": True, "together_bonus_points": 5},
+        {"title": "Beres kamar", "due_time": "10:00", "duration_minutes": 30, "points": 15,
+         "task_style": "helper", "weekdays": [5], "recurrence": "weekly",
+         "target_children": [syila["id"]]},
+    ]}
+    r = c.post("/api/tasks/bulk-import", json=_bulk)
+    check("bulk: import ok", r.status_code == 200 and r.json()["created"] > 0, r.text[:200])
+    check("bulk: no errors", not r.json()["errors"], str(r.json()["errors"])[:200])
+    made = c.get("/api/tasks").json()
+    check("bulk: weekday task spread over 5 days",
+          len([t for t in made if t["title"] == "Bangun pagi"]) == 5,
+          str(len([t for t in made if t["title"] == "Bangun pagi"])))
+    check("bulk: together bonus preserved",
+          all(t.get("together_bonus_points") == 5 for t in made if t["title"] == "Sholat Subuh"),
+          "bonus missing")
+    check("bulk: saturday-only task lands on Saturday",
+          all(_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday() == 5
+              for t in made if t["title"] == "Beres kamar"),
+          str([t["date_key"] for t in made if t["title"] == "Beres kamar"]))
+    # Re-running skips instead of duplicating
+    r2 = c.post("/api/tasks/bulk-import", json=_bulk)
+    check("bulk: rerun skips existing", r2.json()["created"] == 0 and r2.json()["skipped"] == 3, str(r2.json()))
+    check("bulk: no duplicates after rerun", len(c.get("/api/tasks").json()) == len(made), "count grew")
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks/bulk-import", json=_bulk)
+    check("bulk: kid blocked", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

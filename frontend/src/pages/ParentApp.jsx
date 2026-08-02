@@ -66,6 +66,7 @@ import MaintenanceModeCard from "@/components/MaintenanceModeCard";
 import LateExceptionsReview from "@/components/LateExceptionsReview";
 import OffDayManager from "@/components/OffDayManager";
 import RestartScheduleCard from "@/components/RestartScheduleCard";
+import RestoreWeeklyPlanCard from "@/components/RestoreWeeklyPlanCard";
 import HonestyInsightCard from "@/components/HonestyInsightCard";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
@@ -1296,6 +1297,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <OffDayManager />
+      </div>
+
+      <div className="bg-white rounded-2xl border-2 border-emerald-100 p-6">
+        <RestoreWeeklyPlanCard onChanged={onRefresh} />
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">

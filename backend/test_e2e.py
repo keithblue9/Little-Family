@@ -2429,6 +2429,142 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("reminder: cron rejects empty key", r.status_code == 403, str(r.status_code))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # =============== RECURRENCE SELF-HEALING (tugas berulang tak boleh putus) ===============
+    # Regression: recurrence used to advance ONLY on approval, so one unapproved
+    # day killed a series forever ("tugas mingguan hilang").
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    c.post("/api/config", json={"vacation_mode": False})
+
+    _base_now = _dt_off.datetime.utcnow() + _dt_off.timedelta(hours=7)
+    _past_weekly = (_base_now - _dt_off.timedelta(days=21)).strftime("%Y-%m-%d")
+    _past_daily = (_base_now - _dt_off.timedelta(days=5)).strftime("%Y-%m-%d")
+
+    # A weekly series stranded 3 weeks in the past, never approved
+    r = c.post("/api/tasks", json={"title": "Mingguan terlantar", "points": 10, "date_key": _past_weekly,
+                                   "target_children": [adskhan["id"]], "recurrence": "weekly"})
+    check("recur: stranded weekly created", r.status_code == 200, r.text[:150])
+    # A daily series stranded 5 days back
+    c.post("/api/tasks", json={"title": "Harian terlantar", "points": 5, "date_key": _past_daily,
+                               "target_children": [syila["id"]], "recurrence": "daily"})
+
+    r = c.post("/api/tasks/materialize-recurring?days_ahead=14")
+    check("recur: materialize ok", r.status_code == 200 and r.json()["created"] > 0, r.text[:150])
+
+    all_tasks = c.get("/api/tasks").json()
+    weekly_future = [t for t in all_tasks if t["title"] == "Mingguan terlantar" and t["date_key"] >= today_local]
+    daily_future = [t for t in all_tasks if t["title"] == "Harian terlantar" and t["date_key"] >= today_local]
+    check("recur: stranded weekly revived", len(weekly_future) >= 1, str(len(weekly_future)))
+    check("recur: stranded daily revived", len(daily_future) >= 10, str(len(daily_future)))
+    # Weekly must stay on its original weekday
+    _orig_wd = _dt_off.datetime.strptime(_past_weekly, "%Y-%m-%d").weekday()
+    check("recur: weekly keeps its weekday",
+          all(_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday() == _orig_wd for t in weekly_future),
+          str([t["date_key"] for t in weekly_future]))
+    # Never backfills the past
+    check("recur: no past backfill",
+          not [t for t in all_tasks if t["title"] == "Harian terlantar" and _past_daily < t["date_key"] < today_local],
+          "found backfilled days")
+
+    # Idempotent
+    before_n = len(c.get("/api/tasks").json())
+    r = c.post("/api/tasks/materialize-recurring?days_ahead=14")
+    check("recur: second run creates nothing", r.json()["created"] == 0, str(r.json()))
+    check("recur: no duplicates", len(c.get("/api/tasks").json()) == before_n, "count changed")
+
+    # Off days are skipped
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _skip_day = (_base_now + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
+    c.post("/api/off-days", json={"start_date": _skip_day, "note": "libur tengah"})
+    c.post("/api/tasks", json={"title": "Harian lewat libur", "points": 5, "date_key": _past_daily,
+                               "target_children": [syila["id"]], "recurrence": "daily"})
+    c.post("/api/tasks/materialize-recurring?days_ahead=10")
+    got_days = [t["date_key"] for t in c.get("/api/tasks").json() if t["title"] == "Harian lewat libur"]
+    check("recur: off day skipped by materializer", _skip_day not in got_days, str(got_days))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+
+    # Vacation mode pauses materialization entirely
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"vacation_mode": True})
+    c.post("/api/tasks", json={"title": "Libur panjang", "points": 5, "date_key": _past_daily,
+                               "target_children": [syila["id"]], "recurrence": "daily"})
+    r = c.post("/api/tasks/materialize-recurring?days_ahead=10")
+    check("recur: vacation mode creates nothing", r.json()["created"] == 0, str(r.json()))
+    c.post("/api/config", json={"vacation_mode": False})
+
+    # Kid can't trigger it manually
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks/materialize-recurring")
+    check("recur: kid blocked from manual materialize", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # Lazy self-heal on a plain read (throttled marker cleared first)
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.app_config.update_one({"parent_id": "family-default"},
+                                                {"$unset": {"last_materialize_at": ""}}))
+    c.post("/api/tasks", json={"title": "Auto sembuh", "points": 5, "date_key": _past_daily,
+                               "target_children": [adskhan["id"]], "recurrence": "daily"})
+    healed = [t for t in c.get("/api/tasks").json() if t["title"] == "Auto sembuh" and t["date_key"] >= today_local]
+    check("recur: heals automatically on read", len(healed) >= 1, str(len(healed)))
+
+    # =============== RESTART SCHEDULE (mulai ulang dari tanggal tertentu) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _tomorrow = (_base_now + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 77, "streak_days": 9, "last_completion_date": today_local}}))
+
+    # Old backlog: done + missed + untouched, all in the past
+    for i, st in enumerate(["approved", "missed", "pending"]):
+        rr = c.post("/api/tasks", json={"title": f"Lama {st}", "points": 5,
+                                        "date_key": (_base_now - _dt_off.timedelta(days=i + 2)).strftime("%Y-%m-%d"),
+                                        "target_children": [adskhan["id"]]})
+        _aio_tg.run(server.db.tasks.update_one({"id": rr.json()["id"]}, {"$set": {"status": st}}))
+    # A weekly series that only ever existed in the past
+    c.post("/api/tasks", json={"title": "Mingguan lama", "points": 10, "date_key": _past_weekly,
+                               "target_children": [adskhan["id"]], "recurrence": "weekly"})
+    # Stale pending requests from the old run
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Sisa lama", "arrival_time": "18:00"})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    r = c.post("/api/tasks/restart-schedule", json={"start_date": "bukan-tanggal"})
+    check("restart: invalid date rejected", r.status_code == 422, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tomorrow})
+    check("restart: kid blocked", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tomorrow, "reset_streaks": True, "days_ahead": 14})
+    check("restart: ok", r.status_code == 200, r.text[:200])
+    check("restart: deleted old backlog", r.json()["deleted_tasks"] >= 4, str(r.json()))
+    check("restart: rebuilt upcoming", r.json()["upcoming_created"] >= 1, str(r.json()))
+
+    post_tasks = c.get("/api/tasks").json()
+    check("restart: nothing left before start date",
+          not [t for t in post_tasks if t.get("date_key") and t["date_key"] < _tomorrow], "old tasks remain")
+    check("restart: past-only weekly series revived",
+          any(t["title"] == "Mingguan lama" and t["date_key"] >= _tomorrow for t in post_tasks),
+          str([t["date_key"] for t in post_tasks if t["title"] == "Mingguan lama"]))
+    check("restart: fresh instances are pending",
+          all(t["status"] == "pending" for t in post_tasks if t["title"] == "Mingguan lama"),
+          "non-pending instance found")
+
+    ads_r = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("restart: points untouched", ads_r["points"] == 77, str(ads_r["points"]))
+    check("restart: streak reset when asked", ads_r["streak_days"] == 0, str(ads_r["streak_days"]))
+    r = c.get("/api/late-exceptions")
+    check("restart: stale pending requests cleared",
+          not [x for x in r.json() if x["status"] == "pending"], str(len(r.json())))
+
+    # Streaks preserved when the parent doesn't ask for a reset
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"streak_days": 6}}))
+    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tomorrow, "reset_streaks": False})
+    check("restart: streak kept when not requested",
+          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["streak_days"] == 6,
+          "streak was reset unexpectedly")
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

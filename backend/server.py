@@ -1782,6 +1782,9 @@ async def list_tasks(
     date_key: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
+    # Self-heal the schedule before reading it, so a repeating task always has
+    # its upcoming days on the calendar even if nobody approved the last one.
+    await _maybe_materialize_recurring()
     query = {"parent_id": FAMILY_ID}
     if child_id:
         # Match either "this is their individual task" OR "this is a co-op task
@@ -2003,6 +2006,9 @@ async def child_day_progress(
     Used both by the kid (own progress) and the parent (monitoring)."""
     await get_child_or_404(FAMILY_ID, child_id)
     dk = validate_date_key(date_key) or _today_key()
+    # Keep repeating series alive on the kid's side too — they're often the
+    # first to open the app on a new day.
+    await _maybe_materialize_recurring()
 
     tasks = await db.tasks.find(
         {"parent_id": FAMILY_ID, "date_key": dk,
@@ -3138,6 +3144,223 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
     }
     await db.tasks.insert_one(new_task)
     return spawned_id
+
+
+def _series_key(task: dict) -> tuple:
+    """Identity of a repeating task 'series'. A series is the same title, for
+    the same child (or the same co-op group), on the same cadence — that's what
+    a parent means by 'the Saturday chore'."""
+    if task.get("is_coop"):
+        who = ("coop", tuple(sorted(task.get("coop_participants") or [])))
+    else:
+        who = ("child", task.get("child_id"))
+    return (task.get("title"), task.get("recurrence"), who)
+
+
+def _clone_series_instance(template: dict, date_key: str) -> dict:
+    """A fresh, clean occurrence of a series on a given day. Everything
+    instance-specific (timers, photos, approvals) is reset — only the
+    definition carries over."""
+    return {
+        **{k: v for k, v in template.items() if k != "_id"},
+        "id": new_id(),
+        "date_key": date_key,
+        "status": "pending",
+        "completed_at": None,
+        "approved_at": None,
+        "timer_started_at": None,
+        "timer_completed_at": None,
+        "coop_completed_by": None,
+        "completion_photo_url": None,
+        "done_together": None,
+        "freed_with_card": False,
+        "early_bonus_awarded": 0,
+        "together_bonus_awarded": 0,
+        "off_day_id": None,
+        "due_date": None,
+        "created_at": now_iso(),
+    }
+
+
+async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] = None) -> int:
+    """Make sure every repeating series has its upcoming occurrences on the
+    calendar, WITHOUT waiting for the previous one to be approved.
+
+    This is the fix for 'my weekly chore disappeared': recurrence used to
+    advance only when a parent approved the previous instance, so a single
+    missed or unapproved day silently killed the series forever. Now the
+    schedule is derived from the series definition itself — approval-driven
+    spawning still exists (it keeps same-day chains snappy), but it is no
+    longer the only thing keeping a series alive.
+
+    Idempotent: never creates a duplicate for a day that already has one,
+    never backfills the past, and skips declared off days.
+    """
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    if config.get("vacation_mode"):
+        return 0
+
+    today = _today_key()
+    start = from_date or today
+    if start < today:
+        start = today
+    horizon = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+    recurring = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}},
+        {"_id": 0},
+    ).to_list(5000)
+    if not recurring:
+        return 0
+
+    # Latest instance per series is the most faithful template (it carries any
+    # edits the parent made along the way), and its weekday anchors weeklies.
+    latest: dict = {}
+    existing_days: dict = {}
+    for t in recurring:
+        key = _series_key(t)
+        dk = t.get("date_key")
+        if not dk:
+            continue
+        existing_days.setdefault(key, set()).add(dk)
+        if key not in latest or dk > latest[key].get("date_key", ""):
+            latest[key] = t
+
+    created = 0
+    for key, template in latest.items():
+        step = 1 if template.get("recurrence") == "daily" else 7
+        anchor = template.get("date_key")
+        try:
+            cursor = datetime.strptime(anchor, "%Y-%m-%d")
+        except Exception:
+            continue
+        # Walk the series cadence forward from its own anchor so weeklies keep
+        # landing on their original weekday, then fill from `start` onward.
+        while cursor.strftime("%Y-%m-%d") < start:
+            cursor += timedelta(days=step)
+        have = existing_days.get(key, set())
+        while cursor.strftime("%Y-%m-%d") <= horizon:
+            dk = cursor.strftime("%Y-%m-%d")
+            if dk not in have and not await _is_off_day(dk):
+                await db.tasks.insert_one(_clone_series_instance(template, dk))
+                have.add(dk)
+                created += 1
+            cursor += timedelta(days=step)
+    return created
+
+
+async def _maybe_materialize_recurring():
+    """Cheap throttled wrapper for read paths: at most one sweep every 10
+    minutes family-wide, so the schedule self-heals in the background without
+    every page load paying for a full pass."""
+    now = datetime.now(timezone.utc)
+    marker = await db.app_config.find_one({"parent_id": FAMILY_ID}, {"_id": 0, "last_materialize_at": 1})
+    last = (marker or {}).get("last_materialize_at")
+    if last:
+        try:
+            if (now - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds() < 600:
+                return 0
+        except Exception:
+            pass
+    await db.app_config.update_one(
+        {"parent_id": FAMILY_ID},
+        {"$set": {"last_materialize_at": now.isoformat()}},
+        upsert=True,
+    )
+    return await _materialize_recurring()
+
+
+@api.post("/tasks/materialize-recurring")
+async def materialize_recurring_now(days_ahead: int = 14, user: dict = Depends(require_parent)):
+    """Manual 'refresh my schedule' for parents — fills in any missing upcoming
+    occurrences of every repeating task right now."""
+    created = await _materialize_recurring(days_ahead=max(1, min(days_ahead, 60)))
+    return {"created": created}
+
+
+class RestartScheduleInput(BaseModel):
+    start_date: str                      # fresh start begins on this day (e.g. tomorrow)
+    reset_streaks: bool = False          # also zero streaks so the restart is genuine
+    clear_pending_requests: bool = True  # drop stale approval queues from the old run
+    days_ahead: int = Field(default=14, ge=1, le=60)
+
+
+@api.post("/tasks/restart-schedule")
+async def restart_schedule(payload: RestartScheduleInput, user: dict = Depends(require_parent)):
+    """Wipe the accumulated backlog and start the routine over from a chosen
+    day. Everything dated BEFORE start_date is removed (done, missed, and
+    never-touched alike), then every repeating series is re-seeded from
+    start_date onward so the calendar is clean and populated.
+
+    Points, rewards, and pet progress are deliberately left alone — this
+    restarts the *schedule*, not the child's earnings. Streak reset is opt-in.
+    """
+    start = validate_date_key(payload.start_date)
+    if not start:
+        raise HTTPException(status_code=422, detail="Tanggal mulai tidak valid (YYYY-MM-DD)")
+
+    # Capture series definitions BEFORE deleting, or a series that only ever
+    # existed in the past would be lost with nothing left to rebuild from.
+    recurring = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}},
+        {"_id": 0},
+    ).to_list(5000)
+    templates: dict = {}
+    for t in recurring:
+        if not t.get("date_key"):
+            continue
+        key = _series_key(t)
+        if key not in templates or t["date_key"] > templates[key]["date_key"]:
+            templates[key] = t
+
+    deleted = await db.tasks.delete_many({"parent_id": FAMILY_ID, "date_key": {"$lt": start}})
+
+    if payload.clear_pending_requests:
+        for coll in (db.charity_requests, db.late_exceptions, db.pet_reset_requests):
+            await coll.delete_many({"parent_id": FAMILY_ID, "status": "pending"})
+    await db.family_combo_awards.delete_many({"parent_id": FAMILY_ID, "date_key": {"$lt": start}})
+    await db.reminder_log.delete_many({})
+
+    if payload.reset_streaks:
+        await db.children.update_many(
+            {"parent_id": FAMILY_ID},
+            {"$set": {"streak_days": 0, "last_completion_date": None}},
+        )
+
+    # Re-seed each series at its first valid day on/after start_date, then let
+    # the normal materializer fill the rest of the horizon.
+    seeded = 0
+    for key, template in templates.items():
+        step = 1 if template.get("recurrence") == "daily" else 7
+        try:
+            cursor = datetime.strptime(template["date_key"], "%Y-%m-%d")
+        except Exception:
+            continue
+        while cursor.strftime("%Y-%m-%d") < start:
+            cursor += timedelta(days=step)
+        guard = 0
+        while await _is_off_day(cursor.strftime("%Y-%m-%d")) and guard < 60:
+            cursor += timedelta(days=step)
+            guard += 1
+        dk = cursor.strftime("%Y-%m-%d")
+        exists = await db.tasks.find_one({
+            "parent_id": FAMILY_ID, "title": template["title"],
+            "recurrence": template["recurrence"], "date_key": dk,
+        })
+        if not exists:
+            await db.tasks.insert_one(_clone_series_instance(template, dk))
+            seeded += 1
+
+    filled = await _materialize_recurring(days_ahead=payload.days_ahead, from_date=start)
+    await log_activity(FAMILY_ID, None, "schedule_restarted", {
+        "start_date": start, "deleted": deleted.deleted_count,
+        "seeded": seeded, "filled": filled, "reset_streaks": payload.reset_streaks,
+    })
+    return {
+        "success": True, "start_date": start,
+        "deleted_tasks": deleted.deleted_count,
+        "series_restarted": seeded, "upcoming_created": seeded + filled,
+    }
 
 
 @api.post("/tasks/{task_id}/approve")

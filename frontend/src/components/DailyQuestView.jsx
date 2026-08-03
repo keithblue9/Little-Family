@@ -21,11 +21,6 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [nowHHMM, setNowHHMM] = useState(localTimeHHMM());
   const [nowMs, setNowMs] = useState(Date.now()); // ticks every second — precise duration-overrun detection
   // Late-arrival exception (pengajuan keterlambatan)
-  const [lateModal, setLateModal] = useState(false);
-  const [lateReason, setLateReason] = useState("");
-  const [lateArrival, setLateArrival] = useState("");
-  const [lateSubmitting, setLateSubmitting] = useState(false);
-  const [lateRequests, setLateRequests] = useState([]);
   const [lateTaskModal, setLateTaskModal] = useState(null); // task awaiting a reason pick
   const [lateReasons, setLateReasons] = useState([]);
   const [punishmentBusy, setPunishmentBusy] = useState(false);
@@ -43,12 +38,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     if (!child?.id) return;
     setLoading(true);
     try {
-      const [{ data }, lateRes] = await Promise.all([
-        api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } }),
-        api.get("/late-exceptions", { params: { date_key: dateKey } }).catch(() => ({ data: [] })),
-      ]);
+      const { data } = await api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } });
       setProgress(data);
-      setLateRequests(lateRes.data || []);
       api.get("/config")
         .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); })
         .catch(() => { setLateReasons([]); setDaySegments([]); });
@@ -61,30 +52,6 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
   useEffect(() => { load(); }, [load]);
 
-  const submitLateException = async () => {
-    if (!lateReason.trim() || lateReason.trim().length < 3) {
-      toast.error("Ceritakan dulu alasannya ya (min. 3 huruf)");
-      return;
-    }
-    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(lateArrival)) {
-      toast.error("Isi jam sampai rumah dengan benar (mis. 17:15)");
-      return;
-    }
-    setLateSubmitting(true);
-    try {
-      await api.post("/late-exceptions", {
-        child_id: child.id, date_key: dateKey,
-        reason: lateReason.trim(), arrival_time: lateArrival,
-      });
-      toast.success("Pengajuan terkirim! Menunggu dicek Abi/Ummi 🕐");
-      setLateModal(false); setLateReason(""); setLateArrival("");
-      load();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    } finally {
-      setLateSubmitting(false);
-    }
-  };
 
   const theme = QUEST_THEMES[themeKey] || QUEST_THEMES.ocean;
 
@@ -438,181 +405,6 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         </div>
       )}
 
-      {/* Late-arrival report: kid explains why they're late + confirms the time
-          they actually got home. Parent verifies; on approval the rest of the
-          day's schedule reflows automatically from that arrival time. */}
-      {isToday && !progress?.is_off_day && (() => {
-        const pendingLate = lateRequests.find((r) => r.status === "pending");
-        const approvedLate = lateRequests.find((r) => r.status === "approved");
-        if (pendingLate) {
-          return (
-            <div className="bg-amber-50 border-2 border-amber-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-amber-700">
-              <span className="text-xl">🕐</span>
-              <span className="text-sm font-semibold flex-1">
-                Laporan terlambatmu (sampai rumah {pendingLate.arrival_time}) sedang dicek Abi/Ummi…
-              </span>
-            </div>
-          );
-        }
-        if (approvedLate && approvedLate.shift_result?.shifted > 0) {
-          return (
-            <div className="bg-green-50 border-2 border-green-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-green-700">
-              <span className="text-xl">✅</span>
-              <span className="text-sm font-semibold flex-1">
-                Laporanmu disetujui — jadwal hari ini sudah digeser mulai jam {approvedLate.arrival_time}. Semangat!
-              </span>
-            </div>
-          );
-        }
-        return (
-          <button
-            onClick={() => setLateModal(true)}
-            className="press-btn w-full bg-white hover:bg-amber-50 border-2 border-amber-200 rounded-2xl px-4 py-2.5 flex items-center gap-2 text-left"
-          >
-            <span className="text-xl">🕐</span>
-            <span className="flex-1">
-              <span className="block text-sm font-fun font-bold text-slate-800">Terlambat karena ada keperluan?</span>
-              <span className="block text-xs text-slate-500">Lapor di sini — kalau disetujui, jadwalmu digeser otomatis.</span>
-            </span>
-          </button>
-        );
-      })()}
-
-      {/* Reason picker for a specific missed task ("Terlambat" button) */}
-      {lateTaskModal && (
-        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => setLateTaskModal(null)}>
-          <motion.div
-            initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
-            className="bg-white rounded-3xl p-5 max-w-sm w-full chunky-shadow-lg"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-3xl mb-1">🕐</div>
-            <h3 className="font-fun font-bold text-lg text-slate-900 mb-1">Kenapa terlambat?</h3>
-            <p className="text-xs text-slate-500 mb-3">
-              Misi "<b>{lateTaskModal.title}</b>" sudah lewat waktunya. Pilih alasan yang paling jujur ya —
-              beberapa alasan tidak mengurangi apa pun, tapi kalau memang lalai kamu dapat Kartu Hukuman
-              dan misinya jadi tanpa poin.
-            </p>
-            <div className="space-y-2 max-h-72 overflow-y-auto">
-              {lateReasons.length === 0 && (
-                <div className="text-sm text-slate-400 text-center py-4">Belum ada pilihan alasan. Minta Abi/Ummi mengaturnya dulu.</div>
-              )}
-              {lateReasons.map((r) => (
-                <button
-                  key={r.id}
-                  onClick={() => submitLateReason(r.id)}
-                  disabled={busyId === lateTaskModal.id}
-                  className={`press-btn w-full text-left px-3 py-2.5 rounded-2xl border-2 disabled:opacity-60 ${
-                    r.gives_penalty_card
-                      ? "border-red-200 bg-red-50 hover:bg-red-100"
-                      : "border-emerald-200 bg-emerald-50 hover:bg-emerald-100"
-                  }`}
-                >
-                  <div className="font-fun font-bold text-sm text-slate-800">{r.label}</div>
-                  <div className={`text-[11px] ${r.gives_penalty_card ? "text-red-600" : "text-emerald-700"}`}>
-                    {r.gives_penalty_card ? "Dapat Kartu Hukuman" : "Dimaklumi"}
-                    {" · "}
-                    {r.award_points ? "poin tetap utuh" : "misi lanjut tanpa poin"}
-                  </div>
-                </button>
-              ))}
-            </div>
-            <button
-              onClick={() => setLateTaskModal(null)}
-              className="press-btn w-full mt-3 py-2.5 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600"
-            >
-              Batal
-            </button>
-          </motion.div>
-        </div>
-      )}
-
-      {/* Late-report modal */}
-      {lateModal && (
-        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => !lateSubmitting && setLateModal(false)}>
-          <motion.div
-            initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
-            className="bg-white rounded-3xl p-5 max-w-sm w-full chunky-shadow-lg"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-3xl mb-1">🕐</div>
-            <h3 className="font-fun font-bold text-lg text-slate-900 mb-1">Lapor Terlambat</h3>
-            <p className="text-xs text-slate-500 mb-3">
-              Ceritakan kenapa kamu terlambat (misal: macet, rapat sekolah) dan jam berapa sampai rumah. Abi/Ummi akan mengecek dulu ya.
-            </p>
-            <label className="text-xs font-bold text-slate-500 block mb-1">Alasannya apa?</label>
-            <textarea
-              value={lateReason}
-              onChange={(e) => setLateReason(e.target.value.slice(0, 300))}
-              rows={3}
-              placeholder="Mis. Macet pulang sekolah, ada rapat…"
-              className="w-full px-3 py-2 rounded-xl border-2 border-slate-200 focus:border-amber-400 focus:outline-none text-sm"
-            />
-            <label className="text-xs font-bold text-slate-500 block mb-1 mt-3">Jam berapa sampai rumah?</label>
-            <input
-              type="time"
-              value={lateArrival}
-              onChange={(e) => setLateArrival(e.target.value)}
-              className="w-full px-3 py-2 rounded-xl border-2 border-slate-200 focus:border-amber-400 focus:outline-none text-sm"
-            />
-            <div className="flex gap-2 mt-4">
-              <button
-                onClick={() => setLateModal(false)}
-                disabled={lateSubmitting}
-                className="press-btn flex-1 py-2.5 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600"
-              >
-                Batal
-              </button>
-              <button
-                onClick={submitLateException}
-                disabled={lateSubmitting}
-                className="press-btn flex-1 py-2.5 rounded-xl font-fun font-bold bg-amber-500 hover:bg-amber-600 text-white disabled:opacity-60"
-              >
-                {lateSubmitting ? "Mengirim…" : "Ajukan 🙏"}
-              </button>
-            </div>
-          </motion.div>
-        </div>
-      )}
-
-      {/* Daily goal progress */}
-      {progress && (
-        <motion.div
-          initial={{ opacity: 0, y: 6 }}
-          animate={{ opacity: 1, y: 0 }}
-          className={`rounded-2xl p-4 border-2 ${progress.goal_met ? "bg-gradient-to-br from-green-50 to-emerald-50 border-green-200" : "bg-white border-slate-100"} chunky-shadow`}
-        >
-          <div className="flex items-center gap-3 mb-2">
-            <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${progress.goal_met ? "bg-green-500" : "bg-orange-500"}`}>
-              {progress.goal_met ? <Trophy className="w-5 h-5 text-white" strokeWidth={2.5} /> : <Target className="w-5 h-5 text-white" strokeWidth={2.5} />}
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="font-fun font-bold text-sm text-slate-900">
-                {progress.goal_met ? "Target harian tercapai! 🎉" : "Target Poin Hari Ini"}
-              </div>
-              <div className="text-xs text-slate-500">
-                {progress.total_earned} / {progress.daily_goal} poin
-                {progress.bonus_earned > 0 && ` (+${progress.bonus_earned} bonus)`}
-              </div>
-            </div>
-            <div className="font-fun font-bold text-2xl text-slate-900">{progress.goal_percent}%</div>
-          </div>
-          <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-            <motion.div
-              initial={{ width: 0 }}
-              animate={{ width: `${progress.goal_percent}%` }}
-              transition={{ duration: 0.6, ease: "easeOut" }}
-              className={`h-full rounded-full ${progress.goal_met ? "bg-gradient-to-r from-green-400 to-emerald-500" : "bg-gradient-to-r from-orange-400 to-orange-500"}`}
-            />
-          </div>
-        </motion.div>
-      )}
-
-      {isToday && progress?.perfect_day && !progress?.perfect_day_claimed && (
-        <MysteryBox childId={child?.id} soundTheme={child?.sound_theme} onClaimed={load} />
-      )}
-
-      {/* Treasure Map */}
       {loading ? (
         <div className="text-center text-slate-400 py-8">Memuat…</div>
       ) : progress?.is_off_day ? (

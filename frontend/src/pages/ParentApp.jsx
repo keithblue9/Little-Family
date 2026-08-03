@@ -63,7 +63,6 @@ import LevelConfigEditor from "@/components/LevelConfigEditor";
 import PetConfigEditor from "@/components/PetConfigEditor";
 import PetResetRequestsReview from "@/components/PetResetRequestsReview";
 import MaintenanceModeCard from "@/components/MaintenanceModeCard";
-import LateExceptionsReview from "@/components/LateExceptionsReview";
 import OffDayManager from "@/components/OffDayManager";
 import RestartScheduleCard from "@/components/RestartScheduleCard";
 import RestoreWeeklyPlanCard from "@/components/RestoreWeeklyPlanCard";
@@ -325,7 +324,6 @@ export default function ParentApp() {
           )}
           {view === "tasks" && (
             <div className="space-y-4">
-              <LateExceptionsReview onChanged={load} />
               <TasksView
                 kids={children}
                 tasks={filteredTasks}

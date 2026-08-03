@@ -2683,13 +2683,31 @@ async def run_reminders_manual(user: dict = Depends(require_parent)):
 
 
 async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None) -> Optional[dict]:
-    """The lowest-order task still blocking today's quest line for this child.
-    Bonus tasks (is_bonus=True) don't block."""
-    query = {"child_id": child_id, "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True}}
+    """The task still blocking today's quest line for this child.
+
+    Ordered CHRONOLOGICALLY (due_time, then `order` as tie-breaker), not by raw
+    creation order. The kid's timeline is laid out by the clock, so gating by
+    creation order made the active task jump to the middle of the day while
+    earlier tasks sat greyed out as "menunggu giliran" — the sequence has to
+    agree with what they actually see. Tasks with no due_time sort last, since
+    they can be done whenever. Bonus tasks (is_bonus=True) never block.
+    """
+    query = {
+        "status": {"$in": ["pending", "rejected"]},
+        "is_bonus": {"$ne": True},
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    }
     if date_key:
         query["date_key"] = date_key
-    open_tasks = await db.tasks.find(query).sort("order", 1).to_list(1)
-    return open_tasks[0] if open_tasks else None
+    open_tasks = await db.tasks.find(query).to_list(500)
+    if not open_tasks:
+        return None
+    open_tasks.sort(key=lambda t: (
+        t.get("due_time") in (None, ""),
+        _hhmm_to_min(t["due_time"]) if t.get("due_time") else 0,
+        t.get("order") or 0,
+    ))
+    return open_tasks[0]
 
 
 def _now_local():

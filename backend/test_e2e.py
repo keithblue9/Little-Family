@@ -2844,6 +2844,57 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
 
+    # =============== REGRESSION: QUEST SEQUENCE FOLLOWS THE CLOCK ===============
+    # Bug: gating used raw creation `order`, but the kid's timeline is laid out
+    # by due_time — so the "active" task jumped to the middle of the day while
+    # earlier ones showed "menunggu giliran".
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    # Deliberately CREATE them out of chronological order
+    seq_specs = [("Sore 17:30", "17:30"), ("Pagi 05:30", "05:30"), ("Malam 19:00", "19:00"), ("Siang 12:00", "12:00")]
+    seq_ids = {}
+    for title, due in seq_specs:
+        rr = c.post("/api/tasks", json={"title": title, "points": 5, "date_key": today_local,
+                                        "target_children": [adskhan["id"]], "due_time": due, "duration_minutes": 10})
+        seq_ids[title] = rr.json()["id"]
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    import asyncio as _aseq
+    def _next_title():
+        t = _aseq.run(server.get_next_actionable_task(adskhan["id"], today_local))
+        return t["title"] if t else None
+    check("seq: earliest task is the active one", _next_title() == "Pagi 05:30", str(_next_title()))
+
+    # Only ONE required task may be startable at a time
+    r = c.post(f"/api/tasks/{seq_ids['Malam 19:00']}/start")
+    check("seq: later task cannot start out of turn", r.status_code == 409, str(r.status_code))
+    r = c.post(f"/api/tasks/{seq_ids['Pagi 05:30']}/start")
+    check("seq: earliest task starts fine", r.status_code == 200, r.text[:150])
+    c.post(f"/api/tasks/{seq_ids['Pagi 05:30']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{seq_ids['Pagi 05:30']}/approve")
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    check("seq: advances to the next-earliest, not creation order", _next_title() == "Siang 12:00", str(_next_title()))
+
+    # Timeless tasks sort last — they never steal the turn from a scheduled one
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/tasks", json={"title": "Tanpa jam", "points": 5, "date_key": today_local,
+                               "target_children": [adskhan["id"]]})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    check("seq: timeless task does not jump the queue", _next_title() == "Siang 12:00", str(_next_title()))
+
+    # A bonus task is startable alongside the active required one — by design,
+    # bonuses never block and are never blocked.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    rb = c.post("/api/tasks", json={"title": "Bonus bebas", "points": 10, "date_key": today_local,
+                                    "target_children": [adskhan["id"]], "is_bonus": True})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{rb.json()['id']}/start")
+    check("seq: bonus startable regardless of sequence", r.status_code == 200, r.text[:150])
+    check("seq: bonus never becomes the blocking task", _next_title() == "Siang 12:00", str(_next_title()))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

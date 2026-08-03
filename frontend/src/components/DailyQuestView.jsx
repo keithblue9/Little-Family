@@ -25,6 +25,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [lateArrival, setLateArrival] = useState("");
   const [lateSubmitting, setLateSubmitting] = useState(false);
   const [lateRequests, setLateRequests] = useState([]);
+  const [lateTaskModal, setLateTaskModal] = useState(null); // task awaiting a reason pick
+  const [lateReasons, setLateReasons] = useState([]);
   useEffect(() => {
     const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
     return () => clearInterval(t);
@@ -44,6 +46,9 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       ]);
       setProgress(data);
       setLateRequests(lateRes.data || []);
+      api.get("/config")
+        .then(({ data: cfg }) => setLateReasons(cfg.late_reasons || []))
+        .catch(() => setLateReasons([]));
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -120,7 +125,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     // Flexible flow: a task can be started ANY time on its own day (kids may
     // work ahead of schedule). We no longer block by the due_time window.
     // Overshooting the due_time without starting turns a required task
-    // time-stuck (handled by isTimeStuck → Kartu Bebas), but that's a finish/
+    // time-stuck (handled by isTimeStuck → Terlambat flow), but that's a finish/
     // rescue concern, not a start gate.
     return { allowed: true, reason: null };
   };
@@ -136,9 +141,9 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     return elapsedMin > task.duration_minutes;
   };
 
-  // Mirrors the backend's _task_is_time_stuck check — only show the "Bebaskan
-  // dengan Kartu Bebas" option when a required task is genuinely blocked by
-  // time (duration ran out, or the due_time window closed before it was ever
+  // Mirrors the backend's _task_is_time_stuck check — only offer the
+  // "Terlambat" flow when a required task is genuinely blocked by time
+  // (duration ran out, or the due_time window closed before it was ever
   // started), not just because a kid hasn't gotten around to it yet.
   const isTimeStuck = (task) => {
     if (isDurationExceeded(task)) return true;
@@ -150,11 +155,26 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     return false;
   };
 
-  const freeWithCard = async (task) => {
+  // "Terlambat" flow: the kid owns up to a missed task by picking one of the
+  // parent-configured reasons. Excused reasons keep the points; at-fault ones
+  // cost a Kartu Hukuman and forfeit the points (but the task stays doable).
+  const submitLateReason = async (reasonId) => {
+    const task = lateTaskModal;
+    if (!task) return;
     setBusyId(task.id);
     try {
-      const { data } = await api.post(`/tasks/${task.id}/free-with-card`);
-      toast.success(`Misi dibebaskan dengan Kartu Bebas! Sisa: ${data.freeze_cards_available} kartu minggu ini.`);
+      const { data } = await api.post(`/tasks/${task.id}/late-reason`, { reason_id: reasonId });
+      if (data.gives_penalty_card) {
+        toast(
+          data.threshold_hit
+            ? `Kamu dapat Kartu Hukuman (total ${data.penalty_cards}). Sudah mencapai batas — ngobrol sama Abi/Ummi ya.`
+            : `Kamu dapat 1 Kartu Hukuman (total ${data.penalty_cards}). Misi tetap bisa dikerjakan, tapi tanpa poin.`,
+          { icon: "⚠️" }
+        );
+      } else {
+        toast.success("Oke, alasanmu dicatat. Misi bisa dilanjutkan dan poinnya tetap utuh!");
+      }
+      setLateTaskModal(null);
       await load();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -382,6 +402,55 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         );
       })()}
 
+      {/* Reason picker for a specific missed task ("Terlambat" button) */}
+      {lateTaskModal && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => setLateTaskModal(null)}>
+          <motion.div
+            initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
+            className="bg-white rounded-3xl p-5 max-w-sm w-full chunky-shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-3xl mb-1">🕐</div>
+            <h3 className="font-fun font-bold text-lg text-slate-900 mb-1">Kenapa terlambat?</h3>
+            <p className="text-xs text-slate-500 mb-3">
+              Misi "<b>{lateTaskModal.title}</b>" sudah lewat waktunya. Pilih alasan yang paling jujur ya —
+              beberapa alasan tidak mengurangi apa pun, tapi kalau memang lalai kamu dapat Kartu Hukuman
+              dan misinya jadi tanpa poin.
+            </p>
+            <div className="space-y-2 max-h-72 overflow-y-auto">
+              {lateReasons.length === 0 && (
+                <div className="text-sm text-slate-400 text-center py-4">Belum ada pilihan alasan. Minta Abi/Ummi mengaturnya dulu.</div>
+              )}
+              {lateReasons.map((r) => (
+                <button
+                  key={r.id}
+                  onClick={() => submitLateReason(r.id)}
+                  disabled={busyId === lateTaskModal.id}
+                  className={`press-btn w-full text-left px-3 py-2.5 rounded-2xl border-2 disabled:opacity-60 ${
+                    r.gives_penalty_card
+                      ? "border-red-200 bg-red-50 hover:bg-red-100"
+                      : "border-emerald-200 bg-emerald-50 hover:bg-emerald-100"
+                  }`}
+                >
+                  <div className="font-fun font-bold text-sm text-slate-800">{r.label}</div>
+                  <div className={`text-[11px] ${r.gives_penalty_card ? "text-red-600" : "text-emerald-700"}`}>
+                    {r.gives_penalty_card ? "Dapat Kartu Hukuman" : "Dimaklumi"}
+                    {" · "}
+                    {r.award_points ? "poin tetap utuh" : "misi lanjut tanpa poin"}
+                  </div>
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setLateTaskModal(null)}
+              className="press-btn w-full mt-3 py-2.5 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600"
+            >
+              Batal
+            </button>
+          </motion.div>
+        </div>
+      )}
+
       {/* Late-report modal */}
       {lateModal && (
         <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => !lateSubmitting && setLateModal(false)}>
@@ -561,8 +630,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       canStart={isActive && !t.timer_started_at && gate.allowed}
                       canFinish={isActive && !!t.timer_started_at && gate.allowed && !overdue}
                       onStart={() => startTimer(t)} onFinish={() => finishTask(t)} onSkip={() => skipTask(t)}
-                      onFreeWithCard={() => freeWithCard(t)}
-                      freezeCardsAvailable={child?.freeze_cards_available ?? 0}
+                      onReportLate={() => setLateTaskModal(t)}
                     />
                   );
                 })}
@@ -597,7 +665,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 }
 
 /* ======================== QUEST NODE (treasure map stop) ======================== */
-function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, timeStuck, canStart, canFinish, onStart, onFinish, onSkip, onFreeWithCard, freezeCardsAvailable, isBonus }) {
+function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, timeStuck, canStart, canFinish, onStart, onFinish, onSkip, onReportLate, isBonus }) {
   const c = theme.colors;
   const bg = isDone ? c.nodeDone : isActive ? c.node : c.nodeLocked;
   const started = !!task.timer_started_at;
@@ -698,15 +766,23 @@ function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, over
               <Square className="w-3.5 h-3.5" strokeWidth={2.5} /> Waktu Habis
             </button>
           )}
-          {timeStuck && onFreeWithCard && (
+          {timeStuck && onReportLate && !task.late_ack && (
             <button
-              onClick={onFreeWithCard}
-              disabled={busy || freezeCardsAvailable < 1}
-              title={freezeCardsAvailable < 1 ? "Kartu Bebas minggu ini sudah habis" : "Bebaskan misi ini tanpa poin, pakai 1 Kartu Bebas"}
-              className="press-btn bg-sky-100 hover:bg-sky-200 text-sky-700 font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+              onClick={onReportLate}
+              disabled={busy}
+              title="Ceritakan kenapa kamu terlambat"
+              className="press-btn bg-amber-100 hover:bg-amber-200 text-amber-800 font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 disabled:opacity-50"
             >
-              🧊 Pakai Kartu Bebas {freezeCardsAvailable > 0 ? `(${freezeCardsAvailable})` : ""}
+              🕐 Terlambat
             </button>
+          )}
+          {task.late_ack && (
+            <span
+              className={`font-fun font-bold px-2.5 py-1 rounded-xl text-[10px] flex items-center gap-1 ${task.late_no_points ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"}`}
+              title={task.late_reason_label || ""}
+            >
+              {task.late_no_points ? "⚠️ Tanpa poin" : "✅ Dimaklumi"}
+            </span>
           )}
           {onSkip && (canStart || canFinish || overdue) && (
             <button onClick={onSkip} disabled={busy} className="press-btn bg-slate-100 hover:bg-slate-200 text-slate-600 font-fun font-semibold px-3 py-1 rounded-xl text-[10px] flex items-center gap-1 disabled:opacity-60">

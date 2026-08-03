@@ -225,9 +225,9 @@ export default function KidHome() {
             <span className="inline-flex items-center gap-1 bg-white/15 rounded-full px-2.5 py-1 text-xs font-semibold">
               ✅ {child.tasks_completed || 0} misi
             </span>
-            {(child.freeze_cards_available ?? 0) > 0 && (
-              <span className="inline-flex items-center gap-1 bg-white/15 rounded-full px-2.5 py-1 text-xs font-semibold" title="Kartu Bebas — melindungi streak-mu kalau kelewat 1 hari">
-                🧊 {child.freeze_cards_available} Kartu Bebas
+            {(child.penalty_cards ?? 0) > 0 && (
+              <span className="inline-flex items-center gap-1 bg-red-500/25 rounded-full px-2.5 py-1 text-xs font-semibold" title="Kartu Hukuman — didapat saat terlambat karena lalai">
+                ⚠️ {child.penalty_cards} Kartu Hukuman
               </span>
             )}
           </div>

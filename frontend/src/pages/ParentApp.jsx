@@ -67,6 +67,7 @@ import LateExceptionsReview from "@/components/LateExceptionsReview";
 import OffDayManager from "@/components/OffDayManager";
 import RestartScheduleCard from "@/components/RestartScheduleCard";
 import RestoreWeeklyPlanCard from "@/components/RestoreWeeklyPlanCard";
+import LateReasonsConfig from "@/components/LateReasonsConfig";
 import HonestyInsightCard from "@/components/HonestyInsightCard";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
@@ -266,7 +267,7 @@ export default function ParentApp() {
       {/* Main */}
       <main className="flex-1 min-w-0">
         {/* Topbar */}
-        <div className="sticky top-0 z-20 bg-white/80 backdrop-blur border-b border-slate-200 px-4 md:px-8 py-4 flex items-center gap-4">
+        <div className="sticky top-0 z-20 bg-white/80 backdrop-blur border-b border-slate-200 px-4 md:px-8 py-4 flex items-center gap-4" style={{ paddingTop: "calc(1rem + env(safe-area-inset-top))" }}>
           <button className="md:hidden p-2" onClick={() => setMobileNavOpen(true)}>
             <Menu className="w-5 h-5" />
           </button>
@@ -1293,6 +1294,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <PushNotificationManager />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <LateReasonsConfig kids={kids} onChanged={onRefresh} />
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">

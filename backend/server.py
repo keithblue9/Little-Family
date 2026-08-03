@@ -75,6 +75,30 @@ DEFAULT_LATE_REASONS = [
 ]
 DEFAULT_PENALTY_CARD_THRESHOLD = 3
 
+# When the Kartu Hukuman threshold is reached the child owes a real-world
+# consequence. "choice" lets them pick which one (ownership beats being
+# sentenced); "auto" assigns one for them. Either way it must be served by
+# `punishment_deadline_weekday` (default Sunday) or the overdue action lands.
+DEFAULT_PUNISHMENT_OPTIONS = [
+    {"id": "no_tv", "label": "Tidak nonton TV", "description": "Tidak menonton TV selama satu hari penuh."},
+    {"id": "no_gadget", "label": "Tidak main gadget", "description": "Tidak memakai HP/tablet untuk main selama satu hari."},
+    {"id": "extra_chore", "label": "Tugas rumah tambahan", "description": "Mengerjakan satu tugas rumah ekstra yang dipilih Abi/Ummi."},
+    {"id": "early_bed", "label": "Tidur lebih awal", "description": "Tidur satu jam lebih awal dari biasanya."},
+]
+DEFAULT_PUNISHMENT_MODE = "choice"
+DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY = 6  # Sunday
+DEFAULT_PUNISHMENT_OVERDUE_ACTION = "reset_points"
+
+# Timeline sections for the kid's day. Tasks are bucketed by due_time; a task
+# with no due_time lands in a trailing "kapan saja" group so nothing is ever
+# invisible. Ranges may not overlap and must cover a contiguous stretch.
+DEFAULT_DAY_SEGMENTS = [
+    {"id": "pagi", "label": "Pagi", "emoji": "🌅", "start_time": "00:00", "end_time": "09:59"},
+    {"id": "siang", "label": "Siang", "emoji": "☀️", "start_time": "10:00", "end_time": "14:59"},
+    {"id": "sore", "label": "Sore", "emoji": "🌇", "start_time": "15:00", "end_time": "17:59"},
+    {"id": "malam", "label": "Malam", "emoji": "🌙", "start_time": "18:00", "end_time": "23:59"},
+]
+
 
 def get_jwt_secret() -> str:
     return os.environ["JWT_SECRET"]
@@ -205,6 +229,24 @@ class LateReasonOption(BaseModel):
     award_points: bool = True          # False → kid may continue but earns 0 points
 
 
+class DaySegment(BaseModel):
+    id: Optional[str] = None
+    label: str = Field(min_length=1, max_length=40)
+    emoji: str = Field(default="", max_length=8)
+    start_time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    end_time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+class PunishmentOption(BaseModel):
+    id: Optional[str] = None
+    label: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=300)
+
+
+class PunishmentChooseInput(BaseModel):
+    option_id: str
+
+
 class PenaltyCardsSetInput(BaseModel):
     penalty_cards: int = Field(ge=0, le=999)
 
@@ -234,6 +276,14 @@ class AppConfigInput(BaseModel):
     # trigger a real-world consequence. Unlimited number of options.
     late_reasons: Optional[List[LateReasonOption]] = None
     penalty_card_threshold: Optional[int] = Field(default=None, ge=1, le=50)
+    # What happens once the Kartu Hukuman threshold is reached.
+    punishment_mode: Optional[Literal["auto", "choice"]] = None
+    punishment_options: Optional[List[PunishmentOption]] = None
+    punishment_deadline_weekday: Optional[int] = Field(default=None, ge=0, le=6)
+    punishment_overdue_action: Optional[Literal["reset_points", "pet_dies", "none"]] = None
+    # Kid timeline sections (Pagi/Siang/Sore/Malam...). Fully editable: rename,
+    # re-time, add or remove as many as the family wants.
+    day_segments: Optional[List[DaySegment]] = None
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -1560,6 +1610,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "last_completion_date": None,
         "tasks_completed": 0,
         "penalty_cards": 0,
+        "pet_force_dead": False,
 
         "pet_type": None,  # kid picks on first visit to the pet feature
         "pet_chosen_at": None,
@@ -1633,6 +1684,7 @@ async def reset_child_points(child_id: str, user: dict = Depends(require_parent)
             "last_completion_date": None,
             "tasks_completed": 0,
         "penalty_cards": 0,
+        "pet_force_dead": False,
             "feed_balance": 0,
             "feed_lifetime": 0,
         }},
@@ -2045,6 +2097,11 @@ async def child_day_progress(
     tasks.sort(key=lambda t: (bool(t.get("is_bonus")), t.get("order") or 0))
     is_off = await _is_off_day(dk)
     combo_award = await db.family_combo_awards.find_one({"parent_id": FAMILY_ID, "date_key": dk}, {"_id": 0})
+    await _sweep_overdue_punishments()
+    active_punishment = await db.punishments.find_one({
+        "parent_id": FAMILY_ID, "child_id": child_id,
+        "status": {"$in": ["pending_choice", "assigned"]},
+    }, {"_id": 0})
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
 
@@ -2099,6 +2156,7 @@ async def child_day_progress(
         "vacation_mode": bool(config.get("vacation_mode", False)),
         "is_off_day": is_off,
         "family_combo": combo_award,
+        "active_punishment": active_punishment,
         "perfect_day": perfect_day,
         "perfect_day_claimed": bool(perfect_claim),
         "tasks": tasks,
@@ -2150,6 +2208,9 @@ def _pet_is_dead(child: dict, config: dict) -> bool:
     is not considered 'dead' (there's simply nothing to mourn yet)."""
     if not child.get("pet_type"):
         return False
+    if child.get("pet_force_dead"):
+        # Killed deliberately as an overdue-punishment consequence, not by neglect.
+        return True
     last_interaction = child.get("pet_last_fed_at") or child.get("pet_chosen_at")
     if not last_interaction:
         return False  # legacy data from before these timestamps existed — don't retroactively kill it
@@ -2286,6 +2347,26 @@ async def family_day_progress(
 
 
 # --------------- Late-arrival exception (pengajuan keterlambatan) ---------------
+def _validate_day_segments(segments: list):
+    """Segments must be sane before they're stored: each range forward-going,
+    no two overlapping. Overlap would make a task's section ambiguous, which
+    silently duplicates or hides it in the kid's timeline."""
+    if not segments:
+        raise HTTPException(status_code=422, detail="Minimal harus ada satu bagian waktu")
+    for seg in segments:
+        if not seg.get("id"):
+            seg["id"] = new_id()[:8]
+        if _hhmm_to_min(seg["start_time"]) > _hhmm_to_min(seg["end_time"]):
+            raise HTTPException(status_code=422, detail=f'Bagian "{seg.get("label")}": jam mulai harus sebelum jam selesai')
+    ordered = sorted(segments, key=lambda x: _hhmm_to_min(x["start_time"]))
+    for a, b in zip(ordered, ordered[1:]):
+        if _hhmm_to_min(b["start_time"]) <= _hhmm_to_min(a["end_time"]):
+            raise HTTPException(
+                status_code=422,
+                detail=f'Bagian "{a.get("label")}" dan "{b.get("label")}" waktunya bertabrakan',
+            )
+
+
 def _hhmm_to_min(hhmm: str) -> int:
     h, m = map(int, hhmm.split(":"))
     return h * 60 + m
@@ -2559,6 +2640,9 @@ async def _run_reminder_sweep() -> dict:
         )
         await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
         sent["task_reminders"] += 1
+
+    expired = await _sweep_overdue_punishments()
+    sent["punishments_expired"] = expired
 
     two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     pending_total = 0
@@ -2908,6 +2992,8 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
         await db.children.update_one({"id": child_id}, {"$set": {"penalty_cards": penalty_cards}})
         threshold = int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD))
         threshold_hit = penalty_cards >= threshold
+        if threshold_hit:
+            await _issue_punishment({**(child or {}), "id": child_id}, config, penalty_cards)
         kid_name = (child or {}).get("name", "Anak")
         if threshold_hit:
             await send_push_to({"role": "parent"}, title="Kartu Hukuman penuh ⚠️",
@@ -2928,6 +3014,204 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
         "penalty_cards": penalty_cards,
         "threshold_hit": threshold_hit,
     }
+
+
+def _next_deadline_date(deadline_weekday: int) -> str:
+    """The upcoming deadline day (default Sunday), inclusive of today. A
+    punishment issued ON the deadline day is still due that same day — the kid
+    has until end of that day, which is the honest reading of 'paling telat
+    hari Minggu'."""
+    now = _now_local()
+    delta = (deadline_weekday - now.weekday()) % 7
+    return (now + timedelta(days=delta)).strftime("%Y-%m-%d")
+
+
+async def _issue_punishment(child: dict, config: dict, cards: int) -> Optional[dict]:
+    """Create the consequence owed once a child hits the Kartu Hukuman
+    threshold. Only ever one active punishment per child at a time — cards keep
+    accruing, but we don't stack sentences on top of each other."""
+    active = await db.punishments.find_one({
+        "parent_id": FAMILY_ID, "child_id": child["id"],
+        "status": {"$in": ["pending_choice", "assigned"]},
+    })
+    if active:
+        return None
+    options = config.get("punishment_options") or DEFAULT_PUNISHMENT_OPTIONS
+    if not options:
+        return None
+    mode = config.get("punishment_mode", DEFAULT_PUNISHMENT_MODE)
+    deadline_wd = int(config.get("punishment_deadline_weekday", DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY))
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID,
+        "child_id": child["id"], "child_name": child.get("name", ""),
+        "cards_at_issue": cards,
+        "threshold": int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD)),
+        "mode": mode,
+        "deadline_date": _next_deadline_date(deadline_wd),
+        "overdue_action": config.get("punishment_overdue_action", DEFAULT_PUNISHMENT_OVERDUE_ACTION),
+        "options_snapshot": options,   # frozen so later config edits can't change a live sentence
+        "option_id": None, "option_label": None, "option_description": None,
+        "status": "pending_choice" if mode == "choice" else "assigned",
+        "issued_at": now_iso(), "issued_date_key": _today_key(),
+        "served_at": None, "expired_at": None, "penalty_applied": None,
+    }
+    if mode == "auto":
+        picked = random.choice(options)
+        doc.update({
+            "option_id": picked.get("id"), "option_label": picked.get("label"),
+            "option_description": picked.get("description", ""),
+        })
+    await db.punishments.insert_one(doc)
+    doc.pop("_id", None)
+    body = (
+        f'Pilih hukumanmu sebelum {_weekday_name_id(doc["deadline_date"])} ya.'
+        if mode == "choice" else
+        f'Hukumanmu: {doc["option_label"]}. Selesaikan sebelum {_weekday_name_id(doc["deadline_date"])}.'
+    )
+    await send_push_to({"role": "child", "member_id": child["id"]},
+                       title="Kartu Hukuman penuh ⚠️", body=body, url=f"/kid/{child['id']}")
+    await send_push_to({"role": "parent"}, title="Hukuman diterbitkan",
+                       body=f'{child.get("name", "Anak")} mencapai {cards} Kartu Hukuman.', url="/parent")
+    await log_activity(FAMILY_ID, child["id"], "punishment_issued",
+                       {"mode": mode, "cards": cards, "deadline": doc["deadline_date"]})
+    return doc
+
+
+def _weekday_name_id(date_key: str) -> str:
+    names = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+    try:
+        return f'{names[datetime.strptime(date_key, "%Y-%m-%d").weekday()]} ({date_key})'
+    except Exception:
+        return date_key
+
+
+async def _apply_overdue_punishment(p: dict) -> str:
+    """The teeth behind the deadline. Runs exactly once per punishment."""
+    action = p.get("overdue_action") or DEFAULT_PUNISHMENT_OVERDUE_ACTION
+    child_id = p["child_id"]
+    if action == "reset_points":
+        # Spendable balance and buckets go to zero. Lifetime points (and so
+        # level/XP) are deliberately preserved — we're clearing the wallet, not
+        # erasing everything the child has ever achieved.
+        await db.children.update_one({"id": child_id}, {"$set": {
+            "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0,
+        }})
+    elif action == "pet_dies":
+        await db.children.update_one({"id": child_id}, {"$set": {"pet_force_dead": True}})
+    await db.punishments.update_one({"id": p["id"]}, {"$set": {
+        "status": "expired", "expired_at": now_iso(), "penalty_applied": action,
+    }})
+    # The sentence has been enforced; start the card count over so the child
+    # isn't instantly re-sentenced for the same offences.
+    await db.children.update_one({"id": child_id}, {"$set": {"penalty_cards": 0}})
+    label = {"reset_points": "poinmu direset ke 0", "pet_dies": "peliharaanmu tidak selamat",
+             "none": "tercatat"}.get(action, action)
+    await send_push_to({"role": "child", "member_id": child_id},
+                       title="Batas hukuman terlewat 💔",
+                       body=f"Hukuman belum dijalani sampai batas waktu — {label}.",
+                       url=f"/kid/{child_id}")
+    await send_push_to({"role": "parent"}, title="Hukuman kedaluwarsa",
+                       body=f'{p.get("child_name", "Anak")}: {label}.', url="/parent")
+    await log_activity(FAMILY_ID, child_id, "punishment_expired", {"action": action})
+    return action
+
+
+async def _sweep_overdue_punishments() -> int:
+    """Expire any punishment whose deadline day has fully passed. Idempotent
+    and safe to call from any read path or the cron sweep."""
+    today = _today_key()
+    overdue = await db.punishments.find({
+        "parent_id": FAMILY_ID,
+        "status": {"$in": ["pending_choice", "assigned"]},
+        "deadline_date": {"$lt": today},
+    }, {"_id": 0}).to_list(200)
+    for p in overdue:
+        await _apply_overdue_punishment(p)
+    return len(overdue)
+
+
+@api.get("/punishments")
+async def list_punishments(child_id: Optional[str] = None, active_only: bool = False, user: dict = Depends(get_current_user)):
+    await _sweep_overdue_punishments()
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]
+    elif child_id:
+        query["child_id"] = child_id
+    if active_only:
+        query["status"] = {"$in": ["pending_choice", "assigned"]}
+    return await db.punishments.find(query, {"_id": 0}).sort("issued_at", -1).to_list(100)
+
+
+@api.post("/punishments/{punishment_id}/choose")
+async def choose_punishment(punishment_id: str, payload: PunishmentChooseInput, user: dict = Depends(get_current_user)):
+    """Kid picks which consequence to take (choice mode). Picking is required —
+    ignoring it until the deadline triggers the overdue action instead."""
+    await _sweep_overdue_punishments()
+    p = await db.punishments.find_one({"id": punishment_id, "parent_id": FAMILY_ID})
+    if not p:
+        raise HTTPException(status_code=404, detail="Hukuman tidak ditemukan")
+    if user["role"] == "child" and user["id"] != p["child_id"]:
+        raise HTTPException(status_code=403, detail="Ini bukan hukumanmu")
+    if p["status"] != "pending_choice":
+        raise HTTPException(status_code=400, detail="Hukuman ini tidak sedang menunggu pilihan")
+    opt = next((o for o in (p.get("options_snapshot") or []) if o.get("id") == payload.option_id), None)
+    if not opt:
+        raise HTTPException(status_code=404, detail="Pilihan hukuman tidak ditemukan")
+    await db.punishments.update_one({"id": punishment_id}, {"$set": {
+        "status": "assigned", "option_id": opt.get("id"),
+        "option_label": opt.get("label"), "option_description": opt.get("description", ""),
+        "chosen_at": now_iso(),
+    }})
+    await send_push_to({"role": "parent"}, title="Anak memilih hukumannya",
+                       body=f'{p.get("child_name", "Anak")} memilih: {opt.get("label")}', url="/parent")
+    await log_activity(FAMILY_ID, p["child_id"], "punishment_chosen", {"option": opt.get("label")})
+    return await db.punishments.find_one({"id": punishment_id}, {"_id": 0})
+
+
+@api.post("/punishments/{punishment_id}/serve")
+async def serve_punishment(punishment_id: str, user: dict = Depends(require_parent)):
+    """Parent confirms the consequence was actually carried out. This clears
+    the child's Kartu Hukuman back to zero — a clean slate for doing the hard
+    thing."""
+    p = await db.punishments.find_one({"id": punishment_id, "parent_id": FAMILY_ID})
+    if not p:
+        raise HTTPException(status_code=404, detail="Hukuman tidak ditemukan")
+    if p["status"] != "assigned":
+        raise HTTPException(status_code=400, detail="Hanya hukuman yang sudah ditentukan yang bisa ditandai selesai")
+    await db.punishments.update_one({"id": punishment_id}, {"$set": {"status": "served", "served_at": now_iso()}})
+    await db.children.update_one({"id": p["child_id"]}, {"$set": {"penalty_cards": 0}})
+    await send_push_to({"role": "child", "member_id": p["child_id"]},
+                       title="Hukuman selesai ✅",
+                       body="Kartu Hukumanmu kembali ke 0. Mulai lagi dari bersih ya!",
+                       url=f"/kid/{p['child_id']}")
+    await log_activity(FAMILY_ID, p["child_id"], "punishment_served", {"option": p.get("option_label")})
+    return await db.punishments.find_one({"id": punishment_id}, {"_id": 0})
+
+
+@api.post("/punishments/{punishment_id}/cancel")
+async def cancel_punishment(punishment_id: str, user: dict = Depends(require_parent)):
+    """Parent withdraws a punishment (issued by mistake, or forgiven). Cards
+    are cleared too, since the slate is being wiped deliberately."""
+    p = await db.punishments.find_one({"id": punishment_id, "parent_id": FAMILY_ID})
+    if not p:
+        raise HTTPException(status_code=404, detail="Hukuman tidak ditemukan")
+    if p["status"] not in ("pending_choice", "assigned"):
+        raise HTTPException(status_code=400, detail="Hukuman ini sudah selesai atau kedaluwarsa")
+    await db.punishments.update_one({"id": punishment_id}, {"$set": {"status": "cancelled", "cancelled_at": now_iso()}})
+    await db.children.update_one({"id": p["child_id"]}, {"$set": {"penalty_cards": 0}})
+    await log_activity(FAMILY_ID, p["child_id"], "punishment_cancelled", {})
+    return await db.punishments.find_one({"id": punishment_id}, {"_id": 0})
+
+
+@api.post("/children/{child_id}/revive-pet")
+async def revive_pet(child_id: str, user: dict = Depends(require_parent)):
+    """Undo a punishment-caused pet death (a second chance is the parent's to
+    give). Also refreshes the feed timestamp so neglect doesn't re-kill it."""
+    await get_child_or_404(FAMILY_ID, child_id)
+    await db.children.update_one({"id": child_id}, {"$set": {"pet_force_dead": False, "pet_last_fed_at": now_iso()}})
+    await log_activity(FAMILY_ID, child_id, "pet_revived", {})
+    return {"success": True}
 
 
 @api.post("/children/{child_id}/penalty-cards")
@@ -3850,6 +4134,12 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             for opt in update_data["late_reasons"]:
                 if not opt.get("id"):
                     opt["id"] = new_id()[:8]
+        if update_data.get("punishment_options") is not None:
+            for opt in update_data["punishment_options"]:
+                if not opt.get("id"):
+                    opt["id"] = new_id()[:8]
+        if update_data.get("day_segments") is not None:
+            _validate_day_segments(update_data["day_segments"])
         # Merge dict-typed fields so partial updates don't wipe existing keys.
         for dict_field in ("custom_labels", "weekday_goals"):
             if dict_field in update_data:
@@ -3883,6 +4173,11 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "family_combo_bonus_points": 10,
             "late_reasons": DEFAULT_LATE_REASONS,
             "penalty_card_threshold": DEFAULT_PENALTY_CARD_THRESHOLD,
+            "punishment_mode": DEFAULT_PUNISHMENT_MODE,
+            "punishment_options": DEFAULT_PUNISHMENT_OPTIONS,
+            "punishment_deadline_weekday": DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY,
+            "punishment_overdue_action": DEFAULT_PUNISHMENT_OVERDUE_ACTION,
+            "day_segments": DEFAULT_DAY_SEGMENTS,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -3901,6 +4196,12 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             for opt in incoming["late_reasons"]:
                 if not opt.get("id"):
                     opt["id"] = new_id()[:8]
+        if incoming.get("punishment_options") is not None:
+            for opt in incoming["punishment_options"]:
+                if not opt.get("id"):
+                    opt["id"] = new_id()[:8]
+        if incoming.get("day_segments") is not None:
+            _validate_day_segments(incoming["day_segments"])
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
         await db.app_config.insert_one(config)
     await log_activity(FAMILY_ID, None, "config_updated", {"changes": payload.model_dump()})
@@ -3966,6 +4267,11 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "family_combo_bonus_points": 10,
             "late_reasons": DEFAULT_LATE_REASONS,
             "penalty_card_threshold": DEFAULT_PENALTY_CARD_THRESHOLD,
+            "punishment_mode": DEFAULT_PUNISHMENT_MODE,
+            "punishment_options": DEFAULT_PUNISHMENT_OPTIONS,
+            "punishment_deadline_weekday": DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY,
+            "punishment_overdue_action": DEFAULT_PUNISHMENT_OVERDUE_ACTION,
+            "day_segments": DEFAULT_DAY_SEGMENTS,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -3995,6 +4301,11 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "family_combo_bonus_points": int(config.get("family_combo_bonus_points", 10)),
         "late_reasons": config.get("late_reasons") or DEFAULT_LATE_REASONS,
         "penalty_card_threshold": int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD)),
+        "punishment_mode": config.get("punishment_mode", DEFAULT_PUNISHMENT_MODE),
+        "punishment_options": config.get("punishment_options") or DEFAULT_PUNISHMENT_OPTIONS,
+        "punishment_deadline_weekday": int(config.get("punishment_deadline_weekday", DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY)),
+        "punishment_overdue_action": config.get("punishment_overdue_action", DEFAULT_PUNISHMENT_OVERDUE_ACTION),
+        "day_segments": config.get("day_segments") or DEFAULT_DAY_SEGMENTS,
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),
@@ -4985,6 +5296,7 @@ async def seed_default_family():
             "last_completion_date": None,
             "tasks_completed": 0,
         "penalty_cards": 0,
+        "pet_force_dead": False,
             "pet_type": None,
             "pet_chosen_at": None,
             "pet_last_fed_at": None,
@@ -5116,7 +5428,11 @@ async def migrate_existing_data():
     #    relying entirely on .get()-with-default everywhere.
     await db.children.update_many(
         {"penalty_cards": {"$exists": False}},
-        {"$set": {"penalty_cards": 0}},
+        {"$set": {"penalty_cards": 0, "pet_force_dead": False}},
+    )
+    await db.children.update_many(
+        {"pet_force_dead": {"$exists": False}},
+        {"$set": {"pet_force_dead": False}},
     )
     # Kartu Bebas was replaced by the Terlambat + Kartu Hukuman system; drop its
     # leftover per-child state so old values can't confuse anything later.

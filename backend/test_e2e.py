@@ -2621,6 +2621,229 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("late2: kid can't set cards", r.status_code == 403, str(r.status_code))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # =============== HUKUMAN OTOMATIS (punishment system) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.punishments.delete_many({}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "penalty_cards": 0, "points": 500, "chiky_save": 200, "chiky_spend": 200, "chiky_share": 100,
+        "lifetime_points": 900, "pet_type": "dragon", "pet_force_dead": False,
+        "pet_last_fed_at": server.now_iso()}}))
+
+    r = c.get("/api/config")
+    check("pun: defaults present", len(r.json()["punishment_options"]) >= 3
+          and r.json()["punishment_mode"] == "choice"
+          and r.json()["punishment_deadline_weekday"] == 6
+          and r.json()["punishment_overdue_action"] == "reset_points", str(r.json().get("punishment_mode")))
+
+    # Parent config: unlimited custom options
+    pun_opts = [
+        {"label": "Tidak nonton TV", "description": "Sehari penuh"},
+        {"label": "Tidak main gadget", "description": "Sehari penuh"},
+        {"label": "Cuci piring 3 hari", "description": "Setelah makan malam"},
+        {"label": "Tidur lebih awal", "description": "1 jam lebih cepat"},
+        {"label": "Bantu bersihkan halaman", "description": "Sabtu pagi"},
+    ]
+    r = c.post("/api/config", json={"punishment_options": pun_opts, "punishment_mode": "choice",
+                                    "penalty_card_threshold": 2, "punishment_overdue_action": "reset_points"})
+    check("pun: custom options saved", r.status_code == 200, r.text[:150])
+    cfgp = c.get("/api/config").json()
+    check("pun: five options round-trip", len(cfgp["punishment_options"]) == 5, str(len(cfgp["punishment_options"])))
+    check("pun: option ids auto-assigned", all(o.get("id") for o in cfgp["punishment_options"]))
+    r = c.post("/api/config", json={"punishment_mode": "banana"})
+    check("pun: invalid mode rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"punishment_overdue_action": "explode"})
+    check("pun: invalid overdue action rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"punishment_deadline_weekday": 9})
+    check("pun: invalid deadline weekday rejected", r.status_code == 422, str(r.status_code))
+
+    lr = [{"label": "Terlambat bangun", "gives_penalty_card": True, "award_points": False}]
+    c.post("/api/config", json={"late_reasons": lr})
+    fault2 = c.get("/api/config").json()["late_reasons"][0]["id"]
+
+    def _earn_card(kid, passcode, title):
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        rr = c.post("/api/tasks", json={"title": title, "points": 10, "date_key": today_local,
+                                        "target_children": [kid["id"]], "due_time": "00:01", "duration_minutes": 10})
+        c.post("/api/auth/login", json={"member_id": kid["id"], "passcode": passcode})
+        return c.post(f"/api/tasks/{rr.json()['id']}/late-reason", json={"reason_id": fault2})
+
+    # 1st card: below threshold(2) → no punishment yet
+    _earn_card(adskhan, "654321", "Telat A")
+    r = c.get("/api/punishments")
+    check("pun: none issued below threshold", len(r.json()) == 0, str(len(r.json())))
+
+    # 2nd card: threshold reached → punishment issued awaiting the kid's choice
+    r = _earn_card(adskhan, "654321", "Telat B")
+    check("pun: threshold reported", r.json()["threshold_hit"] is True, str(r.json()))
+    pl = c.get("/api/punishments").json()
+    check("pun: punishment issued at threshold", len(pl) == 1, str(len(pl)))
+    pun = pl[0]
+    check("pun: choice mode awaits pick", pun["status"] == "pending_choice" and pun["option_id"] is None, pun["status"])
+    check("pun: options frozen onto the sentence", len(pun["options_snapshot"]) == 5, str(len(pun["options_snapshot"])))
+    check("pun: deadline is a Sunday", _dt_off.datetime.strptime(pun["deadline_date"], "%Y-%m-%d").weekday() == 6, pun["deadline_date"])
+    check("pun: surfaced in day-progress", c.get(f"/api/children/{adskhan['id']}/day-progress").json().get("active_punishment") is not None)
+
+    # Earning more cards must not stack a second sentence
+    _earn_card(adskhan, "654321", "Telat C")
+    check("pun: no duplicate sentence stacked", len(c.get("/api/punishments").json()) == 1)
+
+    # Kid picks one
+    r = c.post(f"/api/punishments/{pun['id']}/choose", json={"option_id": "nope"})
+    check("pun: unknown option rejected", r.status_code == 404, str(r.status_code))
+    pick = pun["options_snapshot"][2]
+    r = c.post(f"/api/punishments/{pun['id']}/choose", json={"option_id": pick["id"]})
+    check("pun: kid can choose", r.status_code == 200 and r.json()["status"] == "assigned", r.text[:180])
+    check("pun: chosen label recorded", r.json()["option_label"] == pick["label"], str(r.json().get("option_label")))
+    r = c.post(f"/api/punishments/{pun['id']}/choose", json={"option_id": pick["id"]})
+    check("pun: cannot choose twice", r.status_code == 400, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/punishments/{pun['id']}/choose", json={"option_id": pick["id"]})
+    check("pun: sibling blocked from choosing", r.status_code in (400, 403), str(r.status_code))
+
+    # Kid can't mark it served themselves
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/punishments/{pun['id']}/serve")
+    check("pun: kid cannot self-serve", r.status_code == 403, str(r.status_code))
+
+    # Parent confirms → cards wiped, points untouched
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/punishments/{pun['id']}/serve")
+    check("pun: parent confirms served", r.status_code == 200 and r.json()["status"] == "served", r.text[:150])
+    ads_p = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pun: cards cleared after serving", ads_p["penalty_cards"] == 0, str(ads_p["penalty_cards"]))
+    check("pun: points untouched by serving", ads_p["points"] == 500, str(ads_p["points"]))
+    r = c.post(f"/api/punishments/{pun['id']}/serve")
+    check("pun: cannot serve twice", r.status_code == 400, str(r.status_code))
+
+    # --- Overdue: reset_points ---
+    _aio_tg.run(server.db.punishments.delete_many({}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "penalty_cards": 0, "points": 500, "chiky_save": 200, "chiky_spend": 200, "chiky_share": 100, "lifetime_points": 900}}))
+    _earn_card(adskhan, "654321", "Telat D")
+    _earn_card(adskhan, "654321", "Telat E")
+    pun2 = c.get("/api/punishments").json()[0]
+    _past = (_off_base - _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
+    _aio_tg.run(server.db.punishments.update_one({"id": pun2["id"]}, {"$set": {"deadline_date": _past}}))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/punishments")
+    expired = next(x for x in r.json() if x["id"] == pun2["id"])
+    check("pun: overdue auto-expires", expired["status"] == "expired", expired["status"])
+    check("pun: overdue action recorded", expired["penalty_applied"] == "reset_points", str(expired.get("penalty_applied")))
+    ads_e = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pun: points reset to zero", ads_e["points"] == 0, str(ads_e["points"]))
+    check("pun: buckets zeroed too", ads_e["chiky_save"] == 0 and ads_e["chiky_spend"] == 0 and ads_e["chiky_share"] == 0)
+    check("pun: lifetime points preserved", ads_e["lifetime_points"] == 900, str(ads_e["lifetime_points"]))
+    check("pun: cards cleared after expiry", ads_e["penalty_cards"] == 0, str(ads_e["penalty_cards"]))
+    before_n = len(c.get("/api/punishments").json())
+    c.get("/api/punishments")
+    check("pun: expiry applied only once", len(c.get("/api/punishments").json()) == before_n
+          and next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 0)
+
+    # --- Overdue: pet_dies + auto mode ---
+    _aio_tg.run(server.db.punishments.delete_many({}))
+    c.post("/api/config", json={"punishment_overdue_action": "pet_dies", "punishment_mode": "auto"})
+    _aio_tg.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {
+        "penalty_cards": 0, "pet_type": "cat", "pet_force_dead": False, "pet_last_fed_at": server.now_iso()}}))
+    _earn_card(syila, "123456", "Telat Syila 1")
+    _earn_card(syila, "123456", "Telat Syila 2")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    pun3 = c.get(f"/api/punishments?child_id={syila['id']}").json()[0]
+    check("pun: auto mode assigns immediately", pun3["status"] == "assigned" and pun3["option_id"], str(pun3.get("option_id")))
+    syi_alive = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("pun: pet alive before deadline", syi_alive["pet_is_dead"] is False, str(syi_alive["pet_is_dead"]))
+    _aio_tg.run(server.db.punishments.update_one({"id": pun3["id"]}, {"$set": {"deadline_date": _past}}))
+    c.get("/api/punishments")
+    syi_dead = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("pun: pet dies when overdue", syi_dead["pet_is_dead"] is True, str(syi_dead["pet_is_dead"]))
+    r = c.post(f"/api/children/{syila['id']}/revive-pet")
+    check("pun: parent can revive pet", r.status_code == 200, r.text[:150])
+    syi_revived = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("pun: pet alive again after revive", syi_revived["pet_is_dead"] is False, str(syi_revived["pet_is_dead"]))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/children/{syila['id']}/revive-pet")
+    check("pun: kid cannot revive pet", r.status_code == 403, str(r.status_code))
+
+    # --- Cancel path ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.punishments.delete_many({}))
+    c.post("/api/config", json={"punishment_mode": "choice", "punishment_overdue_action": "reset_points"})
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"penalty_cards": 0, "points": 300}}))
+    _earn_card(adskhan, "654321", "Telat F")
+    _earn_card(adskhan, "654321", "Telat G")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    pun4 = c.get(f"/api/punishments?child_id={adskhan['id']}&active_only=true").json()[0]
+    r = c.post(f"/api/punishments/{pun4['id']}/cancel")
+    check("pun: parent can cancel", r.status_code == 200 and r.json()["status"] == "cancelled", r.text[:150])
+    ads_c2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pun: cancel clears cards", ads_c2["penalty_cards"] == 0, str(ads_c2["penalty_cards"]))
+    check("pun: cancel leaves points alone", ads_c2["points"] == 300, str(ads_c2["points"]))
+    r = c.post(f"/api/punishments/{pun4['id']}/cancel")
+    check("pun: cannot cancel twice", r.status_code == 400, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/punishments/{pun4['id']}/cancel")
+    check("pun: kid cannot cancel", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # Kid only ever sees their own sentences
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    check("pun: kid sees only own punishments",
+          all(x["child_id"] == syila["id"] for x in c.get("/api/punishments").json()))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # =============== DAY SEGMENTS (bagian timeline anak) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/config")
+    check("seg: defaults present", len(r.json()["day_segments"]) == 4
+          and r.json()["day_segments"][0]["label"] == "Pagi", str(r.json().get("day_segments"))[:120])
+
+    segs = [
+        {"label": "Subuh", "emoji": "🌄", "start_time": "00:00", "end_time": "06:59"},
+        {"label": "Pagi", "emoji": "🌅", "start_time": "07:00", "end_time": "11:59"},
+        {"label": "Siang", "emoji": "☀️", "start_time": "12:00", "end_time": "15:59"},
+        {"label": "Sore", "emoji": "🌇", "start_time": "16:00", "end_time": "18:29"},
+        {"label": "Malam", "emoji": "🌙", "start_time": "18:30", "end_time": "23:59"},
+    ]
+    r = c.post("/api/config", json={"day_segments": segs})
+    check("seg: five custom segments saved", r.status_code == 200, r.text[:200])
+    got = c.get("/api/config").json()["day_segments"]
+    check("seg: round-trip keeps all five", len(got) == 5, str(len(got)))
+    check("seg: ids auto-assigned", all(x.get("id") for x in got))
+    check("seg: emoji preserved", got[0]["emoji"] == "🌄", str(got[0]))
+
+    # Overlap must be rejected — an ambiguous section would duplicate/hide tasks
+    bad = [
+        {"label": "A", "start_time": "06:00", "end_time": "12:00"},
+        {"label": "B", "start_time": "11:00", "end_time": "18:00"},
+    ]
+    r = c.post("/api/config", json={"day_segments": bad})
+    check("seg: overlapping ranges rejected", r.status_code == 422, str(r.status_code))
+    check("seg: overlap message names both", "bertabrakan" in r.text, r.text[:150])
+
+    # Touching boundaries are fine (end 09:59 → next start 10:00)
+    ok_adj = [
+        {"label": "X", "start_time": "00:00", "end_time": "09:59"},
+        {"label": "Y", "start_time": "10:00", "end_time": "23:59"},
+    ]
+    r = c.post("/api/config", json={"day_segments": ok_adj})
+    check("seg: adjacent (non-overlapping) ranges accepted", r.status_code == 200, r.text[:150])
+
+    r = c.post("/api/config", json={"day_segments": [{"label": "Z", "start_time": "18:00", "end_time": "06:00"}]})
+    check("seg: reversed range rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"day_segments": []})
+    check("seg: empty list rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"day_segments": [{"label": "Bad", "start_time": "25:00", "end_time": "26:00"}]})
+    check("seg: malformed time rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"day_segments": [{"label": "", "start_time": "01:00", "end_time": "02:00"}]})
+    check("seg: empty label rejected", r.status_code == 422, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/config", json={"day_segments": segs})
+    check("seg: kid cannot edit segments", r.status_code == 403, str(r.status_code))
+    r = c.get("/api/config")
+    check("seg: kid can read segments", r.status_code == 200 and len(r.json()["day_segments"]) >= 1)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

@@ -64,6 +64,16 @@ JWT_ACCESS_MINUTES = 60 * 24 * 30  # 30 days, shared family device
 FAMILY_ID = "family-default"
 
 DEFAULT_PASSCODE = "123456"  # seeded members start with this; must be changed
+# Default "Terlambat" reason options — parents can add/remove/edit freely, no
+# cap on how many. Excused reasons (not the kid's fault) cost nothing; at-fault
+# reasons earn a Kartu Hukuman and forfeit the task's points.
+DEFAULT_LATE_REASONS = [
+    {"id": "macet", "label": "Kena macet / urusan di luar rumah", "gives_penalty_card": False, "award_points": True},
+    {"id": "acara", "label": "Ada acara sekolah / keluarga", "gives_penalty_card": False, "award_points": True},
+    {"id": "bangun", "label": "Terlambat bangun", "gives_penalty_card": True, "award_points": False},
+    {"id": "lupa", "label": "Lupa / keasyikan main", "gives_penalty_card": True, "award_points": False},
+]
+DEFAULT_PENALTY_CARD_THRESHOLD = 3
 
 
 def get_jwt_secret() -> str:
@@ -188,6 +198,17 @@ class LevelTierInput(BaseModel):
     min_xp: int = Field(ge=0, le=1000000)
 
 
+class LateReasonOption(BaseModel):
+    id: Optional[str] = None
+    label: str = Field(min_length=1, max_length=120)
+    gives_penalty_card: bool = False   # True → picking this earns a Kartu Hukuman
+    award_points: bool = True          # False → kid may continue but earns 0 points
+
+
+class PenaltyCardsSetInput(BaseModel):
+    penalty_cards: int = Field(ge=0, le=999)
+
+
 class AppConfigInput(BaseModel):
     app_name: Optional[str] = None
     default_theme: Optional[Literal["clean", "candy", "mermaid", "cyber", "galaxy"]] = None
@@ -209,10 +230,11 @@ class AppConfigInput(BaseModel):
     # Family combo: when EVERY kid finishes all their required tasks on the
     # same day, each gets this bonus. 0 = off.
     family_combo_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
-    # Kartu Bebas (freeze card) economy — how many per week, and which weekday
+    # "Terlambat" system: configurable reason options + how many Kartu Hukuman
+    # trigger a real-world consequence. Unlimited number of options.
+    late_reasons: Optional[List[LateReasonOption]] = None
+    penalty_card_threshold: Optional[int] = Field(default=None, ge=1, le=50)
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
-    freeze_cards_per_week: Optional[int] = Field(default=None, ge=0, le=7)
-    freeze_reset_weekday: Optional[int] = Field(default=None, ge=0, le=6)
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
     # Vacation/pause mode: while on, recurring (daily/weekly) tasks don't spawn
@@ -1537,8 +1559,8 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "best_streak_days": 0,
         "last_completion_date": None,
         "tasks_completed": 0,
-        "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
-        "freeze_card_week": None,
+        "penalty_cards": 0,
+
         "pet_type": None,  # kid picks on first visit to the pet feature
         "pet_chosen_at": None,
         "pet_last_fed_at": None,
@@ -1596,7 +1618,7 @@ async def update_child(child_id: str, payload: ChildUpdate, user: dict = Depends
 async def reset_child_points(child_id: str, user: dict = Depends(require_parent)):
     """Wipe a child's scoreboard back to zero — for clearing out test data or
     starting a fresh season. Resets current & lifetime points, streaks, tasks
-    completed, pet-feed currency, and the freeze-card allotment; also clears
+    completed, pet-feed currency, and penalty cards; also clears
     that child's redemption and applied-consequence history so the Leaderboard
     and Uang & Poin pages start clean. Does NOT delete the child, their tasks,
     passcode, avatar, pet choice, or theme — only the earned/spent scoreboard."""
@@ -1610,10 +1632,9 @@ async def reset_child_points(child_id: str, user: dict = Depends(require_parent)
             "best_streak_days": 0,
             "last_completion_date": None,
             "tasks_completed": 0,
+        "penalty_cards": 0,
             "feed_balance": 0,
             "feed_lifetime": 0,
-            "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
-            "freeze_card_week": None,
         }},
     )
     # Clear scoreboard-affecting history so the numbers genuinely start from 0.
@@ -1634,8 +1655,8 @@ async def reset_all_children_points(user: dict = Depends(require_parent)):
             {"$set": {
                 "points": 0, "lifetime_points": 0, "streak_days": 0,
                 "best_streak_days": 0, "last_completion_date": None,
-                "tasks_completed": 0, "feed_balance": 0, "feed_lifetime": 0,
-                "freeze_cards_available": FREEZE_CARDS_PER_WEEK, "freeze_card_week": None,
+                "tasks_completed": 0,
+        "penalty_cards": 0, "feed_balance": 0, "feed_lifetime": 0,
             }},
         )
         await db.redemptions.delete_many({"child_id": k["id"]})
@@ -1798,7 +1819,6 @@ async def list_tasks(
     _UNDO_FIELDS = {
         "_undo_prev_streak": 0, "_undo_prev_last_completion": 0, "_undo_points_awarded": 0,
         "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
-        "_undo_used_freeze_card": 0, "_undo_prev_freeze_available": 0, "_undo_prev_freeze_week": 0,
         "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0, "_undo_feed_earned": 0, "_undo_miss_penalty": 0,
         "_undo_free_prev_available": 0, "_undo_free_prev_week": 0,
     }
@@ -1872,7 +1892,11 @@ async def _build_task_doc(
         "together_bonus_enabled": payload.together_bonus_enabled,
         "together_bonus_points": payload.together_bonus_points,
         "done_together": None,  # kid's self-reported answer once they complete the task
-        "freed_with_card": False,  # true if unblocked via Kartu Bebas instead of actually finishing
+        "late_ack": False,          # kid explained a missed deadline via the Terlambat flow
+        "late_reason_id": None,
+        "late_reason_label": None,
+        "late_no_points": False,    # at-fault lateness → task still doable, but worth 0
+        "late_penalized": False,    # this task earned the kid a Kartu Hukuman
         "timer_started_at": None,
         "timer_completed_at": None,
         "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
@@ -2122,7 +2146,7 @@ def _pet_is_dead(child: dict, config: dict) -> bool:
     """A pet 'passes away' from neglect if it hasn't been fed in
     `pet_neglect_days` (parent-configurable). Purely a lazy/derived check —
     computed fresh on every read rather than needing a background job, the
-    same pattern as the weekly freeze-card refill. A child with no pet at all
+    same weekly-cycle pattern. A child with no pet at all
     is not considered 'dead' (there's simply nothing to mourn yet)."""
     if not child.get("pet_type"):
         return False
@@ -2601,11 +2625,10 @@ async def _is_off_day(dk: str) -> bool:
     return doc is not None
 
 
-FREEZE_CARDS_PER_WEEK = 3  # default "Kartu Bebas" weekly allotment; now overridable per-family via config
 
 
 def _current_week_key(reset_weekday: int = 0) -> str:
-    """Identifier for the current freeze-card cycle. The cycle is a 7-day
+    """Identifier for the current weekly cycle. The cycle is a 7-day
     window that rolls over on `reset_weekday` (0=Mon..6=Sun). We compute it as
     the date of the most recent reset weekday, so changing the reset day shifts
     the boundary cleanly without cards ever accumulating."""
@@ -2614,29 +2637,6 @@ def _current_week_key(reset_weekday: int = 0) -> str:
     delta = (now.weekday() - reset_weekday) % 7
     cycle_start = (now - timedelta(days=delta)).strftime("%Y-%m-%d")
     return f"cycle:{cycle_start}"
-
-
-async def _freeze_config() -> tuple:
-    """(per_week, reset_weekday) from app config, with sane fallbacks."""
-    cfg = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
-    per_week = int(cfg.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK))
-    reset_weekday = int(cfg.get("freeze_reset_weekday", 0))
-    return per_week, reset_weekday
-
-
-def _refill_freeze_card_if_new_week(child: dict, per_week: int = FREEZE_CARDS_PER_WEEK, reset_weekday: int = 0) -> int:
-    """How many 'Kartu Bebas' this child has available RIGHT NOW, accounting
-    for the weekly refill. Does not write to the DB — the caller folds the
-    (possibly refilled, possibly about-to-be-consumed) count into its own
-    $set. Config-driven allotment + reset day."""
-    current_week = _current_week_key(reset_weekday)
-    stored_week = child.get("freeze_card_week")
-    if stored_week != current_week:
-        return per_week  # new cycle — fresh allotment, never carries over unused cards
-    # Within the cycle the stored value is authoritative — it may legitimately
-    # EXCEED the weekly allotment thanks to streak-milestone bonus cards, so no
-    # clamping here (bonus cards must survive until used or the next refill).
-    return int(child.get("freeze_cards_available", per_week))
 
 
 def _assert_child_owns_task(user: dict, task: dict):
@@ -2658,7 +2658,7 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
     started any time on its OWN day, as long as it's the next one in sequence
     (bonuses can be started any time and never block the sequence). We no longer
     gate on the due_time 'window' — kids may work ahead of schedule. Overshooting
-    the due_time turns the task time-stuck (rescued via Kartu Bebas / skip),
+    the due_time turns the task time-stuck (owned via the Terlambat flow / skip),
     handled separately at finish time."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
@@ -2779,9 +2779,13 @@ def _task_is_time_stuck(task: dict) -> bool:
     """True when a REQUIRED task is blocked purely by time running out — either
     (a) the kid started it but the duration elapsed before they could finish,
     or (b) they never started it and the due_time window has already closed.
-    This is exactly the situation 'Kartu Bebas' (Freeze Card) exists to rescue
-    — as opposed to a kid simply not wanting to do a task that's still well
-    within its window, which is what the points-cost Skip is for."""
+    This is exactly the situation the 'Terlambat' flow exists for — as opposed
+    to a kid simply not wanting to do a task that's still well within its
+    window, which is what the points-cost Skip is for."""
+    if task.get("late_ack"):
+        # The lateness was already explained via the "Terlambat" flow — the
+        # task is unblocked (points behavior decided by the chosen reason).
+        return False
     started = task.get("timer_started_at")
     duration = task.get("duration_minutes")
     if started and duration:
@@ -2841,85 +2845,99 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     return {"task": updated, "points_spent": cost}
 
 
-@api.post("/tasks/{task_id}/free-with-card")
-async def free_task_with_card(task_id: str, user: dict = Depends(get_current_user)):
-    """'Kartu Bebas' as a stuck-task rescue: when a required task's Finish
-    button is disabled because time ran out (either mid-timer or the window
-    closed before it was ever started), this unblocks the sequence for free —
-    spending a weekly freeze card instead of the usual points-cost Skip. Only
-    usable when the task is genuinely time-stuck, not as a free shortcut
-    around a task the kid simply hasn't gotten to yet."""
+class LateReasonPickInput(BaseModel):
+    reason_id: str
+
+
+@api.post("/tasks/{task_id}/late-reason")
+async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user: dict = Depends(get_current_user)):
+    """The "Terlambat" flow: an overdue, never-started task shows a Terlambat
+    button; the kid picks one of the parent-configured reasons.
+
+      • Excused reason (not the kid's fault, e.g. stuck in traffic) → task is
+        unblocked, full points still available.
+      • At-fault reason (e.g. overslept) → +1 Kartu Hukuman for the kid, and
+        the task is unblocked but worth 0 points ("lanjutkan tapi tanpa poin").
+        Reaching the configured threshold notifies the parents that a real
+        consequence is due.
+
+    Honest self-reporting is the point: the parent sees which reason was picked
+    on the approval card either way."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    _assert_child_owns_task(user, task)
-    if task["status"] not in ("pending", "rejected"):
-        raise HTTPException(status_code=400, detail="Hanya misi yang masih aktif yang bisa dibebaskan")
-    if task.get("is_bonus"):
-        raise HTTPException(status_code=422, detail="Misi bonus tidak menghalangi urutan — tidak perlu kartu bebas")
+    kid_ids = task.get("coop_participants") or [task.get("child_id")]
+    if user["role"] == "child" and user["id"] not in kid_ids:
+        raise HTTPException(status_code=403, detail="Bukan misi kamu")
+    if task.get("status") not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail="Misi ini sudah diproses")
+    if task.get("late_ack"):
+        raise HTTPException(status_code=400, detail="Alasan keterlambatan sudah dipilih untuk misi ini")
+    if task.get("timer_started_at"):
+        raise HTTPException(status_code=400, detail="Misi ini sudah dimulai, tidak perlu lapor terlambat")
+    # Must actually be overdue: past date, or today with its due_time passed.
+    today = _today_key()
+    overdue = False
+    if task.get("date_key") and task["date_key"] < today:
+        overdue = True
+    elif task.get("date_key") == today and task.get("due_time"):
+        overdue = _hhmm_to_min(task["due_time"]) < (_now_local().hour * 60 + _now_local().minute)
+    if not overdue:
+        raise HTTPException(status_code=400, detail="Misi ini belum terlewat")
 
-    nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-    if nxt and nxt["id"] != task_id:
-        raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dibebaskan")
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    reasons = config.get("late_reasons") or DEFAULT_LATE_REASONS
+    reason = next((r for r in reasons if r.get("id") == payload.reason_id), None)
+    if not reason:
+        raise HTTPException(status_code=404, detail="Pilihan alasan tidak ditemukan")
 
-    if not _task_is_time_stuck(task):
-        raise HTTPException(status_code=422, detail="Misi ini belum macet karena waktu — masih bisa dikerjakan atau dilewati dengan poin")
+    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "late_ack": True,
+        "late_reason_id": reason["id"],
+        "late_reason_label": reason.get("label", ""),
+        "late_no_points": not reason.get("award_points", True),
+        "late_penalized": bool(reason.get("gives_penalty_card")),
+    }})
 
-    child = await db.children.find_one({"id": task["child_id"]})
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
+    penalty_cards = None
+    threshold_hit = False
+    if reason.get("gives_penalty_card") and child_id:
+        child = await db.children.find_one({"id": child_id})
+        penalty_cards = int((child or {}).get("penalty_cards", 0)) + 1
+        await db.children.update_one({"id": child_id}, {"$set": {"penalty_cards": penalty_cards}})
+        threshold = int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD))
+        threshold_hit = penalty_cards >= threshold
+        kid_name = (child or {}).get("name", "Anak")
+        if threshold_hit:
+            await send_push_to({"role": "parent"}, title="Kartu Hukuman penuh ⚠️",
+                               body=f"{kid_name} sudah mengumpulkan {penalty_cards} Kartu Hukuman (batas {threshold}). Saatnya konsekuensi & reset kartunya.",
+                               url="/parent")
+        else:
+            await send_push_to({"role": "parent"}, title="Kartu Hukuman +1",
+                               body=f'{kid_name} terlambat ("{reason.get("label", "")}") — total {penalty_cards} kartu.',
+                               url="/parent")
+    await log_activity(FAMILY_ID, child_id, "task_late_reason", {
+        "task_id": task_id, "title": task.get("title"), "reason": reason.get("label"),
+        "penalized": bool(reason.get("gives_penalty_card")),
+    })
+    return {
+        "task": await db.tasks.find_one({"id": task_id}, {"_id": 0}),
+        "gives_penalty_card": bool(reason.get("gives_penalty_card")),
+        "award_points": bool(reason.get("award_points", True)),
+        "penalty_cards": penalty_cards,
+        "threshold_hit": threshold_hit,
+    }
 
-    per_week, reset_weekday = await _freeze_config()
-    available = _refill_freeze_card_if_new_week(child, per_week, reset_weekday)
-    if available < 1:
-        raise HTTPException(status_code=400, detail="Kartu Bebas minggu ini sudah habis")
 
-    current_week = _current_week_key(reset_weekday)
-    prev_available = int(child.get("freeze_cards_available", per_week))
-    prev_week = child.get("freeze_card_week")
-    await db.children.update_one(
-        {"id": child["id"]},
-        {"$set": {"freeze_cards_available": available - 1, "freeze_card_week": current_week}},
-    )
-    await db.tasks.update_one(
-        {"id": task_id},
-        {"$set": {
-            "status": "skipped", "completed_at": now_iso(), "freed_with_card": True,
-            "_undo_free_prev_available": prev_available, "_undo_free_prev_week": prev_week,
-        }},
-    )
-    await log_activity(FAMILY_ID, child["id"], "task_freed_with_card", {"task_id": task_id, "title": task["title"]})
-    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
-    _cfg_combo = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
-    await _check_family_combo(task.get("date_key"), _cfg_combo)
-    return {"task": updated, "freeze_cards_available": available - 1}
-
-
-@api.post("/tasks/{task_id}/undo-free-with-card")
-async def undo_free_task_with_card(task_id: str, user: dict = Depends(require_parent)):
-    """Reverses a mistaken 'bebaskan dengan kartu' tap — refunds the card and
-    returns the task to pending. Parent-only, matching the other undo actions."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if not task.get("freed_with_card"):
-        raise HTTPException(status_code=400, detail="Misi ini tidak dibebaskan dengan kartu bebas")
-
-    prev_available = task.get("_undo_free_prev_available", FREEZE_CARDS_PER_WEEK)
-    prev_week = task.get("_undo_free_prev_week")
-    await db.children.update_one(
-        {"id": task["child_id"]},
-        {"$set": {"freeze_cards_available": prev_available, "freeze_card_week": prev_week}},
-    )
-    await db.tasks.update_one(
-        {"id": task_id},
-        {
-            "$set": {"status": "pending", "completed_at": None, "freed_with_card": False},
-            "$unset": {"_undo_free_prev_available": "", "_undo_free_prev_week": ""},
-        },
-    )
-    await log_activity(FAMILY_ID, task["child_id"], "task_freed_with_card_undone", {"task_id": task_id})
-    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+@api.post("/children/{child_id}/penalty-cards")
+async def set_penalty_cards(child_id: str, payload: PenaltyCardsSetInput, user: dict = Depends(require_parent)):
+    """Parent adjusts/resets a kid's Kartu Hukuman count — typically back to 0
+    after the real-world consequence has been served."""
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    await db.children.update_one({"id": child_id}, {"$set": {"penalty_cards": payload.penalty_cards}})
+    await log_activity(FAMILY_ID, child_id, "penalty_cards_set", {"from": int(child.get("penalty_cards", 0)), "to": payload.penalty_cards})
+    return {"success": True, "penalty_cards": payload.penalty_cards}
 
 
 def _child_share_of_task(task: dict, child_id: str) -> int:
@@ -2939,217 +2957,6 @@ def _child_share_of_task(task: dict, child_id: str) -> int:
     return base_share + (1 if idx < remainder else 0)
 
 
-def _early_completion_bonus(task: dict, base_points: int, config: dict) -> int:
-    """Extra points for finishing a task BEFORE its due_time. Returns the bonus
-    (rounded, at least 1 if the pct would round to 0 but is configured > 0), or
-    0 when there's no due_time, no completion timestamp, it wasn't actually
-    early, or the feature is turned off (early_bonus_pct == 0)."""
-    pct = int(config.get("early_bonus_pct", 10))
-    if pct <= 0:
-        return 0
-    due_time = task.get("due_time")
-    completed_at = task.get("completed_at")
-    date_key = task.get("date_key")
-    if not due_time or not completed_at:
-        return 0
-    try:
-        # completed_at is a UTC ISO string; convert to family local (GMT+7),
-        # then compare against the due_time on the task's own local day.
-        comp_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-        if comp_dt.tzinfo:
-            comp_local = comp_dt.astimezone(timezone.utc).replace(tzinfo=None) + timedelta(hours=7)
-        else:
-            comp_local = comp_dt + timedelta(hours=7)
-        dh, dm = map(int, due_time.split(":"))
-        base_date = date_key or comp_local.strftime("%Y-%m-%d")
-        y, mo, d = map(int, base_date.split("-"))
-        due_dt = comp_local.replace(year=y, month=mo, day=d, hour=dh, minute=dm, second=0, microsecond=0)
-        if comp_local < due_dt:
-            bonus = round(base_points * pct / 100)
-            return max(bonus, 1) if base_points > 0 else 0
-    except Exception:
-        return 0
-    return 0
-
-
-async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> dict:
-    """Applies streak/freeze-card/Chikybank updates for ONE child earning
-    `points` from an approval. Returns a snapshot describing exactly what
-    changed, so a later undo can reverse precisely this — used for both the
-    normal single-child path and, once per participant, for co-op tasks."""
-    child = await db.children.find_one({"id": child_id})
-    today = _today_key()
-    yesterday = (_now_local() - timedelta(days=1)).strftime("%Y-%m-%d")
-    # An off day shouldn't break a streak: walk "yesterday" back over any
-    # declared off days so a kid who last completed the day BEFORE a family
-    # holiday continues their streak the day after it, without burning a
-    # freeze card. Guard-capped against pathological all-off calendars.
-    effective_yesterday = yesterday
-    for _ in range(60):
-        if not await _is_off_day(effective_yesterday):
-            break
-        effective_yesterday = (datetime.strptime(effective_yesterday, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    last_date = child.get("last_completion_date")
-    per_week = int(config.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK))
-    reset_weekday = int(config.get("freeze_reset_weekday", 0))
-    current_week = _current_week_key(reset_weekday)
-    prev_freeze_week = child.get("freeze_card_week")
-    prev_freeze_available = int(child.get("freeze_cards_available", per_week))
-    prev_streak = child.get("streak_days", 0)
-    prev_last_completion = last_date
-
-    used_freeze_card = False
-    new_freeze_available = prev_freeze_available
-    new_freeze_week = prev_freeze_week
-
-    if last_date == today:
-        streak = child.get("streak_days", 0)
-    elif last_date == yesterday or last_date == effective_yesterday:
-        streak = child.get("streak_days", 0) + 1
-    else:
-        available_now = _refill_freeze_card_if_new_week(child, per_week, reset_weekday)
-        if prev_freeze_week != current_week:
-            new_freeze_week = current_week
-            new_freeze_available = available_now
-        if available_now > 0:
-            streak = child.get("streak_days", 0) + 1
-            used_freeze_card = True
-            new_freeze_available = available_now - 1
-        else:
-            streak = 1
-
-    # 🎁 Streak milestone: every 7 consecutive days earns +1 Kartu Bebas on top
-    # of the weekly allotment — a reward loop for consistency, not just a
-    # safety net for failure. Fires exactly once per milestone (streak only
-    # increments once per day). Careful cycle handling: the bonus must be
-    # stamped onto the CURRENT cycle or the next refill check would wipe it.
-    streak_bonus_card = False
-    if streak > prev_streak and streak > 0 and streak % 7 == 0:
-        cur_cycle = _current_week_key(reset_weekday)
-        base_cards = new_freeze_available if new_freeze_week == cur_cycle else _refill_freeze_card_if_new_week(child, per_week, reset_weekday)
-        new_freeze_available = base_cards + 1
-        new_freeze_week = cur_cycle
-        streak_bonus_card = True
-
-    save_pct = int(config.get("chiky_save_pct", 40))
-    spend_pct = int(config.get("chiky_spend_pct", 40))
-    share_pct = int(config.get("chiky_share_pct", 20))
-    total_pct = save_pct + spend_pct + share_pct or 100
-    p_save = round(points * save_pct / total_pct)
-    p_spend = round(points * spend_pct / total_pct)
-    p_share = points - p_save - p_spend  # remainder goes to share to avoid rounding loss
-
-    prev_best_streak = int(child.get("best_streak_days", 0))
-    new_best_streak = max(prev_best_streak, streak)
-
-    # Virtual pet "feed" currency — earned alongside points at the family's
-    # configured rate (default 1:1), separate from the spendable points
-    # economy (feeding never touches points).
-    feed_earned = round(points * float(config.get("feed_per_point", 1)))
-
-    await db.children.update_one(
-        {"id": child_id},
-        {
-            "$inc": {
-                "points": points, "lifetime_points": points, "tasks_completed": 1,
-                "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
-                "feed_balance": feed_earned, "feed_lifetime": feed_earned,
-            },
-            "$set": {
-                "last_completion_date": today, "streak_days": streak,
-                "freeze_cards_available": new_freeze_available, "freeze_card_week": new_freeze_week,
-                "best_streak_days": new_best_streak,
-            },
-        },
-    )
-    if streak_bonus_card:
-        await log_activity(FAMILY_ID, child_id, "streak_bonus_card", {"streak": streak})
-        await send_push_to({"role": "child", "member_id": child_id}, title=f"Streak {streak} hari! 🔥", body="Kamu dapat +1 Kartu Bebas bonus karena konsisten. Keren!", url=f"/kid/{child_id}")
-    return {
-        "child_id": child_id, "points": points,
-        "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
-        "prev_streak": prev_streak, "prev_last_completion": prev_last_completion,
-        "used_freeze_card": used_freeze_card,
-        "prev_freeze_available": prev_freeze_available, "prev_freeze_week": prev_freeze_week,
-        "prev_best_streak": prev_best_streak,
-        "feed_earned": feed_earned,
-        "streak_bonus_card": streak_bonus_card,
-    }
-
-
-async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
-    """Shared recurrence-spawn logic (used by both normal and co-op approval
-    paths). Returns the new task's id, or None if nothing was spawned."""
-    if task["recurrence"] not in ("daily", "weekly") or config.get("vacation_mode"):
-        return None
-    delta_days = 1 if task["recurrence"] == "daily" else 7
-    next_date_key = None
-    if task.get("date_key"):
-        try:
-            base_day = datetime.strptime(task["date_key"], "%Y-%m-%d")
-            next_date_key = (base_day + timedelta(days=delta_days)).strftime("%Y-%m-%d")
-        except Exception:
-            next_date_key = None
-    if not next_date_key:
-        next_date_key = (_now_local() + timedelta(days=delta_days)).strftime("%Y-%m-%d")
-
-    # If the next occurrence lands on a declared off day, keep stepping until a
-    # working day: daily tasks slide day by day, weekly ones jump whole weeks
-    # (so a weekly-Saturday task skipped over an off Saturday stays a Saturday
-    # task). Guard-capped so a pathological all-off calendar can't loop forever.
-    step = 1 if task["recurrence"] == "daily" else 7
-    for _ in range(60):
-        if not await _is_off_day(next_date_key):
-            break
-        next_date_key = (datetime.strptime(next_date_key, "%Y-%m-%d") + timedelta(days=step)).strftime("%Y-%m-%d")
-
-    next_due = None
-    if task.get("due_date"):
-        try:
-            base = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
-            next_due = (base + timedelta(days=delta_days)).isoformat()
-        except Exception:
-            next_due = None
-
-    match_query = {
-        "title": task["title"], "date_key": next_date_key,
-        "recurrence": task["recurrence"], "status": {"$in": ["pending", "rejected"]},
-        # Same title at a DIFFERENT time of day is a different slot, not a
-        # duplicate — without this, a morning task could suppress the evening one.
-        "due_time": task.get("due_time"),
-        "is_bonus": bool(task.get("is_bonus")),
-    }
-    if task.get("is_coop"):
-        match_query["is_coop"] = True
-        match_query["coop_participants"] = task.get("coop_participants")
-    else:
-        match_query["child_id"] = task["child_id"]
-
-    existing = await db.tasks.find_one(match_query)
-    if existing:
-        return None
-
-    spawned_id = new_id()
-    new_task = {
-        **{k: v for k, v in task.items() if k != "_id"},
-        "id": spawned_id,
-        "status": "pending",
-        "completed_at": None,
-        "approved_at": None,
-        "due_date": next_due,
-        "date_key": next_date_key,
-        "timer_started_at": None,
-        "timer_completed_at": None,
-        "coop_completed_by": None,
-        "completion_photo_url": None,  # was previously carried over from the just-approved instance — a fresh day shouldn't start with yesterday's photo already attached
-        "done_together": None,  # same bug: a fresh day's "was this done together?" answer must start unset, not inherit yesterday's
-        "freed_with_card": False,  # same reasoning — a fresh day hasn't been freed by anything yet
-        "created_at": now_iso(),
-    }
-    await db.tasks.insert_one(new_task)
-    return spawned_id
-
-
 def _series_key(task: dict) -> tuple:
     """Identity of a repeating task 'series'.
 
@@ -3164,7 +2971,6 @@ def _series_key(task: dict) -> tuple:
         who = ("coop", tuple(sorted(task.get("coop_participants") or [])))
     else:
         who = ("child", task.get("child_id"))
-    # Weeklies are anchored to a weekday; dailies repeat regardless of weekday.
     weekday = None
     if task.get("recurrence") == "weekly" and task.get("date_key"):
         try:
@@ -3183,7 +2989,7 @@ def _series_key(task: dict) -> tuple:
 
 def _clone_series_instance(template: dict, date_key: str) -> dict:
     """A fresh, clean occurrence of a series on a given day. Everything
-    instance-specific (timers, photos, approvals) is reset — only the
+    instance-specific (timers, photos, approvals, lateness) is reset — only the
     definition carries over."""
     return {
         **{k: v for k, v in template.items() if k != "_id"},
@@ -3197,11 +3003,15 @@ def _clone_series_instance(template: dict, date_key: str) -> dict:
         "coop_completed_by": None,
         "completion_photo_url": None,
         "done_together": None,
-        "freed_with_card": False,
         "early_bonus_awarded": 0,
         "together_bonus_awarded": 0,
         "off_day_id": None,
         "due_date": None,
+        "late_ack": False,
+        "late_reason_id": None,
+        "late_reason_label": None,
+        "late_no_points": False,
+        "late_penalized": False,
         "created_at": now_iso(),
     }
 
@@ -3212,10 +3022,7 @@ async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] 
 
     This is the fix for 'my weekly chore disappeared': recurrence used to
     advance only when a parent approved the previous instance, so a single
-    missed or unapproved day silently killed the series forever. Now the
-    schedule is derived from the series definition itself — approval-driven
-    spawning still exists (it keeps same-day chains snappy), but it is no
-    longer the only thing keeping a series alive.
+    missed or unapproved day silently killed the series forever.
 
     Idempotent: never creates a duplicate for a day that already has one,
     never backfills the past, and skips declared off days.
@@ -3237,8 +3044,6 @@ async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] 
     if not recurring:
         return 0
 
-    # Latest instance per series is the most faithful template (it carries any
-    # edits the parent made along the way), and its weekday anchors weeklies.
     latest: dict = {}
     existing_days: dict = {}
     for t in recurring:
@@ -3253,13 +3058,10 @@ async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] 
     created = 0
     for key, template in latest.items():
         step = 1 if template.get("recurrence") == "daily" else 7
-        anchor = template.get("date_key")
         try:
-            cursor = datetime.strptime(anchor, "%Y-%m-%d")
+            cursor = datetime.strptime(template.get("date_key"), "%Y-%m-%d")
         except Exception:
             continue
-        # Walk the series cadence forward from its own anchor so weeklies keep
-        # landing on their original weekday, then fill from `start` onward.
         while cursor.strftime("%Y-%m-%d") < start:
             cursor += timedelta(days=step)
         have = existing_days.get(key, set())
@@ -3486,6 +3288,181 @@ async def undo_restart(archive_batch: Optional[str] = None, user: dict = Depends
     return {"success": True, "restored_tasks": restored, "archive_batch": archive_batch}
 
 
+def _early_completion_bonus(task: dict, base_points: int, config: dict) -> int:
+    """Extra points for finishing a task BEFORE its due_time. Returns the bonus
+    (rounded, at least 1 if the pct would round to 0 but is configured > 0), or
+    0 when there's no due_time, no completion timestamp, it wasn't actually
+    early, or the feature is turned off (early_bonus_pct == 0)."""
+    pct = int(config.get("early_bonus_pct", 10))
+    if pct <= 0:
+        return 0
+    due_time = task.get("due_time")
+    completed_at = task.get("completed_at")
+    date_key = task.get("date_key")
+    if not due_time or not completed_at:
+        return 0
+    try:
+        # completed_at is a UTC ISO string; convert to family local (GMT+7),
+        # then compare against the due_time on the task's own local day.
+        comp_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        if comp_dt.tzinfo:
+            comp_local = comp_dt.astimezone(timezone.utc).replace(tzinfo=None) + timedelta(hours=7)
+        else:
+            comp_local = comp_dt + timedelta(hours=7)
+        dh, dm = map(int, due_time.split(":"))
+        base_date = date_key or comp_local.strftime("%Y-%m-%d")
+        y, mo, d = map(int, base_date.split("-"))
+        due_dt = comp_local.replace(year=y, month=mo, day=d, hour=dh, minute=dm, second=0, microsecond=0)
+        if comp_local < due_dt:
+            bonus = round(base_points * pct / 100)
+            return max(bonus, 1) if base_points > 0 else 0
+    except Exception:
+        return 0
+    return 0
+
+
+async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> dict:
+    """Applies streak/Chikybank updates for ONE child earning
+    `points` from an approval. Returns a snapshot describing exactly what
+    changed, so a later undo can reverse precisely this — used for both the
+    normal single-child path and, once per participant, for co-op tasks."""
+    child = await db.children.find_one({"id": child_id})
+    today = _today_key()
+    yesterday = (_now_local() - timedelta(days=1)).strftime("%Y-%m-%d")
+    # An off day shouldn't break a streak: walk "yesterday" back over any
+    # declared off days so a kid who last completed the day BEFORE a family
+    # holiday continues their streak the day after it, without burning a
+    # Guard-capped against pathological all-off calendars.
+    effective_yesterday = yesterday
+    for _ in range(60):
+        if not await _is_off_day(effective_yesterday):
+            break
+        effective_yesterday = (datetime.strptime(effective_yesterday, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    last_date = child.get("last_completion_date")
+    prev_streak = child.get("streak_days", 0)
+    prev_last_completion = last_date
+
+    if last_date == today:
+        streak = child.get("streak_days", 0)
+    elif last_date == yesterday or last_date == effective_yesterday:
+        streak = child.get("streak_days", 0) + 1
+    else:
+        # A real gap resets the streak. There is no Kartu Bebas to spend here
+        # any more — lateness is owned via the Terlambat flow instead.
+        streak = 1
+
+    save_pct = int(config.get("chiky_save_pct", 40))
+    spend_pct = int(config.get("chiky_spend_pct", 40))
+    share_pct = int(config.get("chiky_share_pct", 20))
+    total_pct = save_pct + spend_pct + share_pct or 100
+    p_save = round(points * save_pct / total_pct)
+    p_spend = round(points * spend_pct / total_pct)
+    p_share = points - p_save - p_spend  # remainder goes to share to avoid rounding loss
+
+    prev_best_streak = int(child.get("best_streak_days", 0))
+    new_best_streak = max(prev_best_streak, streak)
+
+    # Virtual pet "feed" currency — earned alongside points at the family's
+    # configured rate (default 1:1), separate from the spendable points
+    # economy (feeding never touches points).
+    feed_earned = round(points * float(config.get("feed_per_point", 1)))
+
+    await db.children.update_one(
+        {"id": child_id},
+        {
+            "$inc": {
+                "points": points, "lifetime_points": points, "tasks_completed": 1,
+                "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
+                "feed_balance": feed_earned, "feed_lifetime": feed_earned,
+            },
+            "$set": {
+                "last_completion_date": today, "streak_days": streak,
+                "best_streak_days": new_best_streak,
+            },
+        },
+    )
+    return {
+        "child_id": child_id, "points": points,
+        "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
+        "prev_streak": prev_streak, "prev_last_completion": prev_last_completion,
+        "prev_best_streak": prev_best_streak,
+        "feed_earned": feed_earned,
+    }
+
+
+async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
+    """Shared recurrence-spawn logic (used by both normal and co-op approval
+    paths). Returns the new task's id, or None if nothing was spawned."""
+    if task["recurrence"] not in ("daily", "weekly") or config.get("vacation_mode"):
+        return None
+    delta_days = 1 if task["recurrence"] == "daily" else 7
+    next_date_key = None
+    if task.get("date_key"):
+        try:
+            base_day = datetime.strptime(task["date_key"], "%Y-%m-%d")
+            next_date_key = (base_day + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+        except Exception:
+            next_date_key = None
+    if not next_date_key:
+        next_date_key = (_now_local() + timedelta(days=delta_days)).strftime("%Y-%m-%d")
+
+    # If the next occurrence lands on a declared off day, keep stepping until a
+    # working day: daily tasks slide day by day, weekly ones jump whole weeks
+    # (so a weekly-Saturday task skipped over an off Saturday stays a Saturday
+    # task). Guard-capped so a pathological all-off calendar can't loop forever.
+    step = 1 if task["recurrence"] == "daily" else 7
+    for _ in range(60):
+        if not await _is_off_day(next_date_key):
+            break
+        next_date_key = (datetime.strptime(next_date_key, "%Y-%m-%d") + timedelta(days=step)).strftime("%Y-%m-%d")
+
+    next_due = None
+    if task.get("due_date"):
+        try:
+            base = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
+            next_due = (base + timedelta(days=delta_days)).isoformat()
+        except Exception:
+            next_due = None
+
+    match_query = {
+        "title": task["title"], "date_key": next_date_key,
+        "recurrence": task["recurrence"], "status": {"$in": ["pending", "rejected"]},
+        # Same title at a DIFFERENT time of day is a different slot, not a
+        # duplicate — without this, a morning task could suppress the evening one.
+        "due_time": task.get("due_time"),
+        "is_bonus": bool(task.get("is_bonus")),
+    }
+    if task.get("is_coop"):
+        match_query["is_coop"] = True
+        match_query["coop_participants"] = task.get("coop_participants")
+    else:
+        match_query["child_id"] = task["child_id"]
+
+    existing = await db.tasks.find_one(match_query)
+    if existing:
+        return None
+
+    spawned_id = new_id()
+    new_task = {
+        **{k: v for k, v in task.items() if k != "_id"},
+        "id": spawned_id,
+        "status": "pending",
+        "completed_at": None,
+        "approved_at": None,
+        "due_date": next_due,
+        "date_key": next_date_key,
+        "timer_started_at": None,
+        "timer_completed_at": None,
+        "coop_completed_by": None,
+        "completion_photo_url": None,  # was previously carried over from the just-approved instance — a fresh day shouldn't start with yesterday's photo already attached
+        "done_together": None,  # same bug: a fresh day's "was this done together?" answer must start unset, not inherit yesterday's
+        "freed_with_card": False,  # same reasoning — a fresh day hasn't been freed by anything yet
+        "created_at": now_iso(),
+    }
+    await db.tasks.insert_one(new_task)
+    return spawned_id
+
+
 @api.post("/tasks/{task_id}/approve")
 async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInput(), user: dict = Depends(require_parent)):
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
@@ -3551,6 +3528,13 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         together_bonus_awarded = task.get("together_bonus_points") or 0
     early_bonus_awarded = _early_completion_bonus(task, task["points"], config)
     points = task["points"] + together_bonus_awarded + early_bonus_awarded
+    if task.get("late_no_points"):
+        # At-fault lateness: the kid chose to continue anyway, which is the
+        # honest thing to do — but the reward is gone. No base points and no
+        # bonuses of any kind.
+        points = 0
+        early_bonus_awarded = 0
+        together_bonus_awarded = 0
     snap = await _apply_approval_rewards(task["child_id"], points, config)
     spawned_next_id = await _spawn_recurrence_if_due(task, config)
 
@@ -3570,9 +3554,6 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                 "_undo_chiky_spend": snap["chiky_spend"],
                 "_undo_chiky_share": snap["chiky_share"],
                 "_undo_spawned_next_id": spawned_next_id,
-                "_undo_used_freeze_card": snap["used_freeze_card"],
-                "_undo_prev_freeze_available": snap["prev_freeze_available"],
-                "_undo_prev_freeze_week": snap["prev_freeze_week"],
                 "_undo_prev_best_streak": snap["prev_best_streak"],
                 "_undo_feed_earned": snap["feed_earned"],
                 "encouragement_message": payload.encouragement_message,
@@ -3678,8 +3659,6 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                     "$set": {
                         "streak_days": snap["prev_streak"],
                         "last_completion_date": snap["prev_last_completion"],
-                        "freeze_cards_available": snap["prev_freeze_available"],
-                        "freeze_card_week": snap["prev_freeze_week"],
                         "best_streak_days": snap.get("prev_best_streak", 0),
                     },
                 },
@@ -3724,8 +3703,6 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
             "$set": {
                 "streak_days": task.get("_undo_prev_streak", 0),
                 "last_completion_date": task.get("_undo_prev_last_completion"),
-                "freeze_cards_available": task.get("_undo_prev_freeze_available", 1),
-                "freeze_card_week": task.get("_undo_prev_freeze_week"),
                 "best_streak_days": task.get("_undo_prev_best_streak", 0),
             },
         },
@@ -3748,7 +3725,6 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 "_undo_prev_streak": "", "_undo_prev_last_completion": "",
                 "_undo_points_awarded": "", "_undo_chiky_save": "", "_undo_chiky_spend": "",
                 "_undo_chiky_share": "", "_undo_spawned_next_id": "",
-                "_undo_used_freeze_card": "", "_undo_prev_freeze_available": "", "_undo_prev_freeze_week": "",
                 "_undo_prev_best_streak": "",
                 "_undo_feed_earned": "",
                 "encouragement_message": "", "encouragement_voice_url": "",
@@ -3791,7 +3767,7 @@ async def mark_task_missed(task_id: str, user: dict = Depends(require_parent)):
 async def undo_task_missed(task_id: str, user: dict = Depends(require_parent)):
     """Reverses a mistaken 'Terlewat' tap: refunds the penalty and returns the
     task to pending so it's actionable again. No time window — unlike undoing
-    an approval (which affects streak/freeze-card state that only makes sense
+    an approval (which affects streak state that only makes sense
     to unwind quickly), a missed-task correction is safe to make anytime."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
@@ -3870,6 +3846,10 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
     config_doc = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if config_doc:
         update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if update_data.get("late_reasons") is not None:
+            for opt in update_data["late_reasons"]:
+                if not opt.get("id"):
+                    opt["id"] = new_id()[:8]
         # Merge dict-typed fields so partial updates don't wipe existing keys.
         for dict_field in ("custom_labels", "weekday_goals"):
             if dict_field in update_data:
@@ -3901,8 +3881,8 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "chiky_share_pct": 20,
             "early_bonus_pct": 10,
             "family_combo_bonus_points": 10,
-            "freeze_cards_per_week": FREEZE_CARDS_PER_WEEK,
-            "freeze_reset_weekday": 0,
+            "late_reasons": DEFAULT_LATE_REASONS,
+            "penalty_card_threshold": DEFAULT_PENALTY_CARD_THRESHOLD,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -3917,6 +3897,10 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "pet_stage_feed_thresholds": _DEFAULT_PET_FEED_THRESHOLDS,
         }
         incoming = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if incoming.get("late_reasons") is not None:
+            for opt in incoming["late_reasons"]:
+                if not opt.get("id"):
+                    opt["id"] = new_id()[:8]
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
         await db.app_config.insert_one(config)
     await log_activity(FAMILY_ID, None, "config_updated", {"changes": payload.model_dump()})
@@ -3980,8 +3964,8 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "chiky_share_pct": 20,
             "early_bonus_pct": 10,
             "family_combo_bonus_points": 10,
-            "freeze_cards_per_week": FREEZE_CARDS_PER_WEEK,
-            "freeze_reset_weekday": 0,
+            "late_reasons": DEFAULT_LATE_REASONS,
+            "penalty_card_threshold": DEFAULT_PENALTY_CARD_THRESHOLD,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4009,8 +3993,8 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "chiky_share_pct": int(config.get("chiky_share_pct", 20)),
         "early_bonus_pct": int(config.get("early_bonus_pct", 10)),
         "family_combo_bonus_points": int(config.get("family_combo_bonus_points", 10)),
-        "freeze_cards_per_week": int(config.get("freeze_cards_per_week", FREEZE_CARDS_PER_WEEK)),
-        "freeze_reset_weekday": int(config.get("freeze_reset_weekday", 0)),
+        "late_reasons": config.get("late_reasons") or DEFAULT_LATE_REASONS,
+        "penalty_card_threshold": int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),
@@ -5000,8 +4984,7 @@ async def seed_default_family():
             "best_streak_days": 0,
             "last_completion_date": None,
             "tasks_completed": 0,
-            "freeze_cards_available": FREEZE_CARDS_PER_WEEK,
-            "freeze_card_week": None,
+        "penalty_cards": 0,
             "pet_type": None,
             "pet_chosen_at": None,
             "pet_last_fed_at": None,
@@ -5128,21 +5111,18 @@ async def migrate_existing_data():
             {"$set": {"best_streak_days": int(child.get("streak_days", 0))}},
         )
 
-    # 7. Freeze cards + virtual pet: any child doc predating these features
-    #    (including the originally-seeded family, which built its children
-    #    mirror by hand before these fields existed) gets sane defaults so
-    #    `"field" in child` checks and raw API responses are complete rather
-    #    than relying entirely on .get()-with-default everywhere.
+    # 7. Penalty cards + virtual pet: any child doc predating these features
+    #    gets sane defaults so raw API responses are complete rather than
+    #    relying entirely on .get()-with-default everywhere.
     await db.children.update_many(
-        {"freeze_cards_available": {"$exists": False}},
-        {"$set": {"freeze_cards_available": FREEZE_CARDS_PER_WEEK, "freeze_card_week": None}},
+        {"penalty_cards": {"$exists": False}},
+        {"$set": {"penalty_cards": 0}},
     )
-    # The freeze-card cycle key format changed (ISO-week → reset-weekday cycle).
-    # Clear the stored week marker so everyone gets a clean, correctly-formatted
-    # refill on their next check rather than trying to match an old-format key.
+    # Kartu Bebas was replaced by the Terlambat + Kartu Hukuman system; drop its
+    # leftover per-child state so old values can't confuse anything later.
     await db.children.update_many(
-        {"freeze_card_week": {"$not": {"$regex": "^cycle:"}}},
-        {"$set": {"freeze_card_week": None}},
+        {"freeze_cards_available": {"$exists": True}},
+        {"$unset": {"freeze_cards_available": "", "freeze_card_week": ""}},
     )
     await db.children.update_many(
         {"pet_type": {"$exists": False}},

@@ -150,7 +150,7 @@ function Track({ segment, tasks, helpers }) {
   const doneCount = tasks.filter((t) => ["approved", "completed", "skipped"].includes(t.status)).length;
 
   return (
-    <div className="rounded-3xl border-2 border-slate-200 bg-white/70 p-3 sm:p-4">
+    <div className="rounded-3xl border border-slate-200 bg-white p-3 sm:p-4 shadow-sm">
       <div className="flex items-baseline gap-2 mb-1">
         <span className="text-lg">{segment.emoji || "•"}</span>
         <span className="font-fun font-bold text-slate-800">{segment.label}</span>
@@ -165,10 +165,11 @@ function Track({ segment, tasks, helpers }) {
       </div>
 
       <div ref={scroller} className="overflow-x-auto pb-1 -mx-1 px-1">
-        <div className="relative inline-flex items-stretch min-w-full">
-          {/* the spine */}
-          <div className="absolute left-0 right-0 top-1/2 h-[3px] bg-slate-200 rounded-full" />
-          <div className="relative flex items-center gap-4">
+        {/* Width hugs the cards so a short section doesn't leave a long empty
+            stretch of spine trailing off to the right. */}
+        <div className="relative inline-flex items-stretch w-max">
+          <div className="absolute left-4 right-4 top-1/2 h-[3px] bg-slate-200 rounded-full" />
+          <div className="relative flex items-center gap-3">
             {tasks.map((t, i) => {
               const st = STATUS_STYLE[t.status] || STATUS_STYLE.pending;
               const isActive = helpers.activeId === t.id;

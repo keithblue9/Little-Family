@@ -90,7 +90,20 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
   const { timeline, next, done } = useMemo(() => {
     const tasks = progress?.tasks || [];
-    const req = tasks.filter((t) => !t.is_bonus).sort((a, b) => (a.order || 0) - (b.order || 0));
+    // The quest line is CHRONOLOGICAL, matching the timeline the kid actually
+    // looks at. Sorting by creation `order` here (as this used to) made the
+    // active task land in the middle of the day while earlier ones showed
+    // "menunggu giliran" — the backend gate uses the same clock order.
+    const seqVal = (t) => {
+      if (t.due_time) {
+        const [h, m] = t.due_time.split(":").map(Number);
+        return h * 60 + m;
+      }
+      return 100000 + (t.order || 0); // timeless tasks queue after scheduled ones
+    };
+    const req = tasks
+      .filter((t) => !t.is_bonus)
+      .sort((a, b) => seqVal(a) - seqVal(b) || (a.order || 0) - (b.order || 0));
     const bon = tasks.filter((t) => t.is_bonus);
     const openReq = req.filter((t) => t.status === "pending" || t.status === "rejected");
     const first = openReq[0] || null;
@@ -663,7 +676,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
             {/* Horizontal timeline — sections come from parent config; required
                 and bonus tasks share one chronological spine. */}
-            <div className="relative z-10 px-3 pb-4">
+            <div className="relative z-10 px-3 pb-4 bg-slate-50/95 rounded-t-3xl pt-4 mt-2">
               <TimelineQuestView
                 tasks={timeline}
                 segments={daySegments}

@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { Calendar, Target, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
+import TimelineQuestView from "@/components/TimelineQuestView";
 import { QUEST_THEMES } from "@/lib/questThemes";
 import { styleMeta } from "@/lib/personality";
 import { todayKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
@@ -27,6 +28,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [lateRequests, setLateRequests] = useState([]);
   const [lateTaskModal, setLateTaskModal] = useState(null); // task awaiting a reason pick
   const [lateReasons, setLateReasons] = useState([]);
+  const [punishmentBusy, setPunishmentBusy] = useState(false);
+  const [daySegments, setDaySegments] = useState([]);
   useEffect(() => {
     const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
     return () => clearInterval(t);
@@ -47,8 +50,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       setProgress(data);
       setLateRequests(lateRes.data || []);
       api.get("/config")
-        .then(({ data: cfg }) => setLateReasons(cfg.late_reasons || []))
-        .catch(() => setLateReasons([]));
+        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); })
+        .catch(() => { setLateReasons([]); setDaySegments([]); });
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -153,6 +156,19 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       return nh * 60 + nm > dh * 60 + dm;
     }
     return false;
+  };
+
+  const choosePunishment = async (optionId) => {
+    const p = progress?.active_punishment;
+    if (!p) return;
+    setPunishmentBusy(true);
+    try {
+      await api.post(`/punishments/${p.id}/choose`, { option_id: optionId });
+      toast.success("Hukuman dipilih. Selesaikan sebelum batas waktunya ya!");
+      await load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally { setPunishmentBusy(false); }
   };
 
   // "Terlambat" flow: the kid owns up to a missed task by picking one of the
@@ -330,6 +346,53 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}>
           <KidMonthCalendar childId={child?.id} selectedDateKey={dateKey} onSelectDate={(d) => { setDateKey(d); setShowCalendar(false); }} />
         </motion.div>
+      )}
+
+      {/* ⚖️ Active punishment — the child either picks one or sees the one
+          assigned to them, always with the deadline and what happens if it's
+          missed. Shown before everything else because it's time-critical. */}
+      {progress?.active_punishment && (
+        <div className="bg-red-50 border-2 border-red-200 rounded-2xl p-4">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-xl">⚖️</span>
+            <span className="font-fun font-bold text-red-800 text-sm">
+              {progress.active_punishment.status === "pending_choice" ? "Pilih Hukumanmu" : "Hukumanmu"}
+            </span>
+          </div>
+          <p className="text-xs text-red-700 mb-2">
+            Kartu Hukumanmu sudah penuh ({progress.active_punishment.cards_at_issue} kartu). Harus dijalani paling
+            lambat <b>{progress.active_punishment.deadline_date}</b>
+            {progress.active_punishment.overdue_action === "pet_dies"
+              ? " — kalau lewat, peliharaanmu tidak selamat."
+              : progress.active_punishment.overdue_action === "reset_points"
+              ? " — kalau lewat, poinmu direset ke 0."
+              : "."}
+          </p>
+
+          {progress.active_punishment.status === "pending_choice" ? (
+            <div className="space-y-2">
+              {(progress.active_punishment.options_snapshot || []).map((o) => (
+                <button
+                  key={o.id}
+                  onClick={() => choosePunishment(o.id)}
+                  disabled={punishmentBusy}
+                  className="press-btn w-full text-left px-3 py-2 rounded-2xl border-2 border-red-200 bg-white hover:bg-red-100 disabled:opacity-60"
+                >
+                  <div className="font-fun font-bold text-sm text-slate-800">{o.label}</div>
+                  {o.description && <div className="text-[11px] text-slate-500">{o.description}</div>}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="bg-white rounded-2xl border-2 border-red-200 px-3 py-2">
+              <div className="font-fun font-bold text-sm text-slate-800">{progress.active_punishment.option_label}</div>
+              {progress.active_punishment.option_description && (
+                <div className="text-[11px] text-slate-500">{progress.active_punishment.option_description}</div>
+              )}
+              <div className="text-[11px] text-red-600 mt-1">Kalau sudah dijalani, minta Abi/Ummi menandainya selesai.</div>
+            </div>
+          )}
+        </div>
       )}
 
       {/* 🤝 Family combo — everyone finished their required missions today */}
@@ -598,43 +661,35 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
               <motion.div animate={{ scale: [1, 1.1, 1] }} transition={{ duration: 3, repeat: Infinity }} className="text-4xl">{theme.goalIcon}</motion.div>
             </div>
 
-            {/* Quest timeline — required + bonus interleaved by time-of-day */}
-            <div className="relative z-10 px-4">
-              <div className="relative z-10 space-y-2 pb-4">
-                {timeline.map((t, idx) => {
-                  const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
-                  const gate = timeGate(t);
-                  const overdue = isDurationExceeded(t);
-                  if (t.is_bonus) {
-                    // Bonus node — never blocked by the required sequence, always
-                    // startable/skippable directly, sits in its time slot.
-                    return (
-                      <QuestNode key={t.id} task={t} idx={idx} total={timeline.length}
-                        isActive={!isDone} isDone={isDone} theme={theme}
-                        busy={busyId === t.id} gate={gate} overdue={overdue}
-                        canStart={!isDone && !t.timer_started_at && gate.allowed}
-                        canFinish={!isDone && !!t.timer_started_at && gate.allowed && !overdue}
-                        onStart={() => startTimer(t)} onFinish={() => finishTask(t)}
-                        onSkip={() => skipTask(t)}
-                        isBonus
-                      />
-                    );
-                  }
-                  // Required node — gated by sequence (only the frontmost open one is active).
-                  const isActive = next?.id === t.id;
-                  const timeStuck = isActive && !isDone && isTimeStuck(t);
-                  return (
-                    <QuestNode key={t.id} task={t} idx={idx} total={timeline.length}
-                      isActive={isActive} isDone={isDone} theme={theme}
-                      busy={busyId === t.id} gate={gate} overdue={overdue} timeStuck={timeStuck}
-                      canStart={isActive && !t.timer_started_at && gate.allowed}
-                      canFinish={isActive && !!t.timer_started_at && gate.allowed && !overdue}
-                      onStart={() => startTimer(t)} onFinish={() => finishTask(t)} onSkip={() => skipTask(t)}
-                      onReportLate={() => setLateTaskModal(t)}
-                    />
-                  );
-                })}
-              </div>
+            {/* Horizontal timeline — sections come from parent config; required
+                and bonus tasks share one chronological spine. */}
+            <div className="relative z-10 px-3 pb-4">
+              <TimelineQuestView
+                tasks={timeline}
+                segments={daySegments}
+                activeId={next?.id}
+                helpers={{
+                  forTask: (t) => {
+                    const isDone = t.status === "approved" || t.status === "skipped" || t.status === "completed";
+                    const gate = timeGate(t);
+                    const overdue = isDurationExceeded(t);
+                    // Bonus tasks bypass the required sequence entirely; required
+                    // ones are only actionable when they're the frontmost open task.
+                    const isActive = t.is_bonus ? !isDone : next?.id === t.id;
+                    const timeStuck = isActive && !isDone && isTimeStuck(t);
+                    return {
+                      busy: busyId === t.id,
+                      canStart: isActive && !t.timer_started_at && gate.allowed,
+                      canFinish: isActive && !!t.timer_started_at && gate.allowed && !overdue,
+                      timeStuck,
+                      onStart: () => startTimer(t),
+                      onFinish: () => finishTask(t),
+                      onSkip: () => skipTask(t),
+                      onReportLate: t.is_bonus ? null : () => setLateTaskModal(t),
+                    };
+                  },
+                }}
+              />
             </div>
 
             {/* Goal marker */}
@@ -663,140 +718,6 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     </div>
   );
 }
-
-/* ======================== QUEST NODE (treasure map stop) ======================== */
-function QuestNode({ task, idx, total, isActive, isDone, theme, busy, gate, overdue, timeStuck, canStart, canFinish, onStart, onFinish, onSkip, onReportLate, isBonus }) {
-  const c = theme.colors;
-  const bg = isDone ? c.nodeDone : isActive ? c.node : c.nodeLocked;
-  const started = !!task.timer_started_at;
-  const gateReason = gate?.reason;
-
-  // Node connector line (clean vertical, not zigzag)
-  const showConnector = !isBonus && idx > 0;
-
-  return (
-    <div className="relative">
-      {showConnector && (
-        <div className="absolute left-6 md:left-7 -top-2 h-2 w-0.5" style={{ background: theme.colors.path, opacity: 0.4 }} />
-      )}
-      <motion.div
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: idx * 0.06 }}
-        className={`rounded-2xl p-3 flex items-center gap-3 border-2 ${isActive && !isDone ? "ring-2 ring-white/60" : ""}`}
-        style={{
-          background: isDone ? "rgba(255,255,255,0.85)" : isActive ? "rgba(255,255,255,0.96)" : "rgba(255,255,255,0.55)",
-          borderColor: bg,
-          color: "#1E293B",
-        }}
-      >
-      {/* Node circle with animated glow for active */}
-      <motion.div
-        animate={isActive && !isDone && started ? { scale: [1, 1.08, 1], boxShadow: [`0 0 0px ${bg}`, `0 0 20px ${bg}`, `0 0 0px ${bg}`] } : {}}
-        transition={isActive && started ? { duration: 1.5, repeat: Infinity } : {}}
-        className="w-12 h-12 md:w-14 md:h-14 rounded-full flex items-center justify-center text-xl md:text-2xl shrink-0"
-        style={{ background: bg, color: "white", boxShadow: isActive ? `0 4px 16px ${bg}80` : "0 2px 6px rgba(0,0,0,0.15)" }}
-      >
-        {isDone ? <CheckCircle2 className="w-7 h-7 text-white" strokeWidth={2.5} /> :
-         isActive ? <span>{theme.activeIcon}</span> :
-         <Lock className="w-5 h-5 text-white opacity-60" strokeWidth={2.5} />}
-      </motion.div>
-
-      {/* Info */}
-      <div className="flex-1 min-w-0">
-        <div className={`font-fun font-bold text-sm ${isDone ? "line-through text-slate-500" : "text-slate-900"} truncate`}>
-          {task.title}
-        </div>
-        {task.description && isActive && <div className="text-xs text-slate-600 truncate">{task.description}</div>}
-        <div className="flex items-center gap-1.5 mt-1 flex-wrap">
-          <span className="inline-flex items-center gap-0.5 text-xs font-bold text-amber-600">
-            <Star className="w-3 h-3 fill-amber-500 text-amber-500" /> +{task.points}
-          </span>
-          {isBonus && !task.is_coop && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-amber-500 text-white">✨ Bonus</span>}
-          {task.is_coop && (
-            <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-teal-500 text-white">🤝 Bersama</span>
-          )}
-          {task.recurrence && task.recurrence !== "none" && (
-            <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700">
-              🔁 {task.recurrence === "daily" ? "Harian" : "Mingguan"}
-            </span>
-          )}
-          {task.due_time && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700">🕒 {task.due_time}</span>}
-          {task.duration_minutes && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-700">⏱️ {task.duration_minutes}m</span>}
-          {task.photo_required && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-fuchsia-100 text-fuchsia-700">📷 butuh foto</span>}
-          {task.together_bonus_enabled && !isDone && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-pink-100 text-pink-700">🎁 bonus jika bersama</span>}
-          {task.together_bonus_enabled && isDone && task.done_together === true && <span className="text-xs font-bold px-1.5 py-0.5 rounded-full bg-pink-500 text-white">🤝 Bersama! +{task.together_bonus_points}</span>}
-        </div>
-        {started && !isDone && <LiveTimer startedAt={task.timer_started_at} durationMinutes={task.duration_minutes} />}
-        {!isDone && gateReason === "past" && (
-          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">⌛ Hari ini sudah lewat</div>
-        )}
-        {!isDone && gateReason === "future" && (
-          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-500">🔮 Belum tiba harinya</div>
-        )}
-        {isDone && task.early_bonus_awarded > 0 && (
-          <div className="mt-1 inline-flex items-center gap-1 text-xs font-bold px-2 py-0.5 rounded-full bg-green-500 text-white">⚡ Cepat! +{task.early_bonus_awarded} bonus</div>
-        )}
-        {isDone && (task.encouragement_message || task.encouragement_voice_url) && (
-          <div className="mt-2 bg-pink-50 border border-pink-200 rounded-xl px-2.5 py-1.5">
-            <div className="text-[10px] font-bold text-pink-500 mb-0.5">💌 Pesan dari orang tuamu</div>
-            {task.encouragement_message && <div className="text-xs text-pink-700">{task.encouragement_message}</div>}
-            {task.encouragement_voice_url && (
-              <audio controls src={task.encouragement_voice_url} className="h-8 w-full mt-1" />
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Actions */}
-      {isActive && !isDone && (
-        <div className="flex flex-col gap-1.5 shrink-0">
-          {canStart && (
-            <button onClick={onStart} disabled={busy} className="press-btn chunky-shadow bg-blue-500 hover:bg-blue-600 text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 disabled:opacity-60">
-              <Play className="w-3.5 h-3.5" strokeWidth={2.5} /> Mulai
-            </button>
-          )}
-          {canFinish && (
-            <button onClick={onFinish} disabled={busy} className="press-btn chunky-shadow bg-[#34D399] hover:bg-[#2bbf88] text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 disabled:opacity-60">
-              <Square className="w-3.5 h-3.5" strokeWidth={2.5} /> Selesai!
-            </button>
-          )}
-          {overdue && !!task.timer_started_at && (
-            <button disabled className="press-btn bg-slate-200 text-slate-400 font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 cursor-not-allowed" title="Waktu sudah habis — lewati misi ini untuk lanjut">
-              <Square className="w-3.5 h-3.5" strokeWidth={2.5} /> Waktu Habis
-            </button>
-          )}
-          {timeStuck && onReportLate && !task.late_ack && (
-            <button
-              onClick={onReportLate}
-              disabled={busy}
-              title="Ceritakan kenapa kamu terlambat"
-              className="press-btn bg-amber-100 hover:bg-amber-200 text-amber-800 font-fun font-bold px-3 py-1.5 rounded-xl text-xs flex items-center gap-1 disabled:opacity-50"
-            >
-              🕐 Terlambat
-            </button>
-          )}
-          {task.late_ack && (
-            <span
-              className={`font-fun font-bold px-2.5 py-1 rounded-xl text-[10px] flex items-center gap-1 ${task.late_no_points ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"}`}
-              title={task.late_reason_label || ""}
-            >
-              {task.late_no_points ? "⚠️ Tanpa poin" : "✅ Dimaklumi"}
-            </span>
-          )}
-          {onSkip && (canStart || canFinish || overdue) && (
-            <button onClick={onSkip} disabled={busy} className="press-btn bg-slate-100 hover:bg-slate-200 text-slate-600 font-fun font-semibold px-3 py-1 rounded-xl text-[10px] flex items-center gap-1 disabled:opacity-60">
-              <FastForward className="w-3 h-3" /> Lewati
-            </button>
-          )}
-        </div>
-      )}
-      </motion.div>
-    </div>
-  );
-}
-
-/* ======================== LIVE TIMER ======================== */
 function LiveTimer({ startedAt, durationMinutes }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {

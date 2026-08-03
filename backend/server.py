@@ -2994,13 +2994,25 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
         raise HTTPException(status_code=404, detail="Pilihan alasan tidak ditemukan")
 
     child_id = user["id"] if user["role"] == "child" else task.get("child_id")
-    await db.tasks.update_one({"id": task_id}, {"$set": {
+    # Reschedule the slot to start now: the child gets the FULL original
+    # duration from this moment, and the card stops showing a deadline that has
+    # already passed. The duration itself is never changed — only when the
+    # window sits on the clock. Clamped to end-of-day so a late-night
+    # acknowledgement can't roll the deadline past midnight.
+    updates = {
         "late_ack": True,
         "late_reason_id": reason["id"],
         "late_reason_label": reason.get("label", ""),
         "late_no_points": not reason.get("award_points", True),
         "late_penalized": bool(reason.get("gives_penalty_card")),
-    }})
+    }
+    if task.get("due_time"):
+        now_min = _now_local().hour * 60 + _now_local().minute
+        new_due = min(now_min + int(task.get("duration_minutes") or 10), 23 * 60 + 59)
+        updates["due_time_original"] = task.get("due_time_original") or task["due_time"]
+        updates["due_time"] = f"{new_due // 60:02d}:{new_due % 60:02d}"
+        updates["late_rescheduled"] = True
+    await db.tasks.update_one({"id": task_id}, {"$set": updates})
 
     penalty_cards = None
     threshold_hit = False
@@ -3595,6 +3607,11 @@ def _early_completion_bonus(task: dict, base_points: int, config: dict) -> int:
     (rounded, at least 1 if the pct would round to 0 but is configured > 0), or
     0 when there's no due_time, no completion timestamp, it wasn't actually
     early, or the feature is turned off (early_bonus_pct == 0)."""
+    if task.get("late_ack"):
+        # You can't be "early" on a task you already reported late — the window
+        # was moved to accommodate the lateness, so beating the new deadline
+        # isn't an achievement worth paying for.
+        return 0
     pct = int(config.get("early_bonus_pct", 10))
     if pct <= 0:
         return 0

@@ -2895,6 +2895,52 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("seq: bonus never becomes the blocking task", _next_title() == "Siang 12:00", str(_next_title()))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # =============== LATE ACK RESCHEDULES THE SLOT (durasi tetap) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"late_reasons": [
+        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
+        {"label": "Terlambat bangun", "gives_penalty_card": True, "award_points": False},
+    ]})
+    _lr = c.get("/api/config").json()["late_reasons"]
+    _ex_id, _ft_id = _lr[0]["id"], _lr[1]["id"]
+
+    rr = c.post("/api/tasks", json={"title": "Geser jadwal", "points": 10, "date_key": today_local,
+                                    "target_children": [adskhan["id"]], "due_time": "00:05", "duration_minutes": 25})
+    resched = rr.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{resched['id']}/late-reason", json={"reason_id": _ex_id})
+    check("resched: ack ok", r.status_code == 200, r.text[:150])
+    t_after = r.json()["task"]
+    check("resched: original time remembered", t_after.get("due_time_original") == "00:05", str(t_after.get("due_time_original")))
+    check("resched: flagged as rescheduled", t_after.get("late_rescheduled") is True, str(t_after.get("late_rescheduled")))
+    check("resched: duration untouched", t_after["duration_minutes"] == 25, str(t_after["duration_minutes"]))
+    _now_m = server._now_local().hour * 60 + server._now_local().minute
+    _new_m = server._hhmm_to_min(t_after["due_time"])
+    check("resched: new deadline gives the full duration from now",
+          _new_m >= min(_now_m + 24, 23 * 60 + 59), f'{t_after["due_time"]} vs now {_now_m}')
+    check("resched: deadline never rolls past midnight", _new_m <= 23 * 60 + 59, t_after["due_time"])
+
+    # The task must now actually be doable end-to-end
+    r = c.post(f"/api/tasks/{resched['id']}/start")
+    check("resched: startable after ack", r.status_code == 200, r.text[:150])
+    r = c.post(f"/api/tasks/{resched['id']}/complete")
+    check("resched: completable after ack", r.status_code == 200, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{resched['id']}/approve")
+    check("resched: approvable after ack", r.status_code == 200, r.text[:150])
+
+    # A timeless task has no slot to move — ack must still work, nothing shifts
+    rr = c.post("/api/tasks", json={"title": "Tanpa jam telat", "points": 5, "date_key": (_off_base - _dt_off.timedelta(days=1)).strftime("%Y-%m-%d"),
+                                    "target_children": [adskhan["id"]]})
+    no_time = rr.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{no_time['id']}/late-reason", json={"reason_id": _ft_id})
+    check("resched: timeless task ack ok", r.status_code == 200, r.text[:150])
+    check("resched: timeless task gains no due_time", not r.json()["task"].get("due_time"), str(r.json()["task"].get("due_time")))
+    check("resched: at-fault still forfeits points", r.json()["task"]["late_no_points"] is True)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

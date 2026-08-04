@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
   Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2, Copy,
-  Pencil, RotateCcw, PawPrint, ImagePlus,
+  Pencil, RotateCcw, PawPrint, ImagePlus, GripVertical,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
@@ -518,6 +518,81 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
 
 // ─────────────────────────────────────────────────────────
 function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild }) {
+  // Drag-and-drop reordering of the active list. We keep a local copy while
+  // dragging so the row follows the cursor instantly, then persist the whole
+  // visible slice in one call. If the save fails we reload from the server
+  // rather than leaving the screen showing an order that isn't real.
+  const [dragId, setDragId] = useState(null);
+  const [overId, setOverId] = useState(null);
+  const [localOrder, setLocalOrder] = useState(null);
+  const [savingOrder, setSavingOrder] = useState(false);
+
+  // Reordering uses POINTER events, not HTML5 drag-and-drop: the latter simply
+  // never fires on touch screens, so on an iPad the list looked draggable but
+  // wasn't. Pointer events cover mouse, pen and touch with one code path.
+  // Dragging is bound to an explicit grip handle so ordinary scrolling and
+  // button taps inside a row keep working normally.
+  const dragState = useRef(null);
+
+  const commitOrder = async (list) => {
+    const original = grouped.pending.map((x) => x.id).join(",");
+    if (list.map((x) => x.id).join(",") === original) { setLocalOrder(null); return; }
+    setSavingOrder(true);
+    try {
+      await api.post("/tasks/reorder", { task_ids: list.map((x) => x.id) });
+      toast.success("Urutan disimpan");
+      setLocalOrder(null);
+      onRefresh();
+    } catch (e) {
+      toast.error(formatApiError(e));
+      setLocalOrder(null); // fall back to the server's truth
+      onRefresh();
+    } finally { setSavingOrder(false); }
+  };
+
+  const beginDrag = (e, task) => {
+    if (savingOrder) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const startList = localOrder || grouped.pending;
+    dragState.current = { id: task.id, list: [...startList] };
+    setDragId(task.id);
+    setLocalOrder([...startList]);
+
+    const move = (ev) => {
+      const st = dragState.current;
+      if (!st) return;
+      const point = ev.touches ? ev.touches[0] : ev;
+      const el = document.elementFromPoint(point.clientX, point.clientY);
+      const row = el && el.closest("[data-task-row]");
+      if (!row) return;
+      const overTaskId = row.getAttribute("data-task-row");
+      if (!overTaskId || overTaskId === st.id) return;
+      setOverId(overTaskId);
+      const list = [...st.list];
+      const from = list.findIndex((x) => x.id === st.id);
+      const to = list.findIndex((x) => x.id === overTaskId);
+      if (from === -1 || to === -1 || from === to) return;
+      list.splice(to, 0, list.splice(from, 1)[0]);
+      st.list = list;
+      setLocalOrder(list);
+    };
+
+    const end = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      const st = dragState.current;
+      dragState.current = null;
+      setDragId(null);
+      setOverId(null);
+      if (st) commitOrder(st.list);
+    };
+
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  };
   // When viewing "Semua" (selectedChildId === null), collapse broadcast siblings
   // (same broadcast_id) into a single representative row that lists all the kids
   // it was assigned to — e.g. "Adskhan & Syila". Editing/duplicating still targets
@@ -798,8 +873,28 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
           <div className="text-sm text-slate-400 py-3">
             {isDateMode ? `Tidak ada tugas aktif untuk ${humanDateKey(dateFilter)}.` : "Tidak ada tugas aktif."}
           </div>
-        ) : grouped.pending.map((t) => (
-          <TaskRow key={t.id} task={t} childName={rowName(t)} currentDateFilter={dateFilter}>
+        ) : (<>
+        <div className="text-[11px] text-slate-400 px-1 pb-1 flex items-center gap-1">
+          ⠿ Tahan ikon titik-titik lalu geser untuk mengubah urutan misi{savingOrder ? " · menyimpan…" : ""}
+        </div>
+        {(localOrder || grouped.pending).map((t) => (
+          <div
+            key={t.id}
+            data-task-row={t.id}
+            className={`rounded-2xl transition-all ${dragId === t.id ? "opacity-50 scale-[0.99]" : ""} ${
+              overId === t.id && dragId !== t.id ? "ring-2 ring-indigo-300" : ""
+            } ${savingOrder ? "pointer-events-none" : ""}`}
+          >
+          <TaskRow task={t} childName={rowName(t)} currentDateFilter={dateFilter}>
+            <button
+              onPointerDown={(e) => beginDrag(e, t)}
+              className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 cursor-grab active:cursor-grabbing select-none"
+              style={{ touchAction: "none" }}
+              title="Tahan dan geser untuk mengubah urutan"
+              aria-label="Ubah urutan"
+            >
+              <GripVertical className="w-4 h-4" strokeWidth={2.5} />
+            </button>
             {editBtn(t)}
             <button onClick={() => miss(t)} data-testid={`${TEST_IDS.parent.missTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-red-50 text-red-500" title="Tandai terlewat">
               <AlertTriangle className="w-4 h-4" strokeWidth={2.5} />
@@ -811,7 +906,9 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
               <Trash2 className="w-4 h-4" strokeWidth={2.5} />
             </button>
           </TaskRow>
+          </div>
         ))}
+        </>)}
       </Section>
 
       {/* "Selesai" section intentionally removed from the Tugas menu — completed
@@ -1431,7 +1528,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [dateKey, setDateKey] = useState(todayKey());
   const [scheduleMode, setScheduleMode] = useState("weekdays"); // "weekdays" default | "date"
   const [weekdays, setWeekdays] = useState([new Date().getDay() === 0 ? 6 : new Date().getDay() - 1]); // default = today's weekday (Mon=0..Sun=6)
-  const [dueTime, setDueTime] = useState("");
+  const [segmentId, setSegmentId] = useState("");
+  const [segments, setSegments] = useState([]);
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
   const [photoRequired, setPhotoRequired] = useState(false);
@@ -1449,6 +1547,15 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   );
   const [saving, setSaving] = useState(false);
 
+  // Sections carry the clock now, so the form offers "which part of the day"
+  // instead of a per-task time.
+  useEffect(() => {
+    if (!open) return;
+    api.get("/config")
+      .then(({ data }) => setSegments(data.day_segments || []))
+      .catch(() => setSegments([]));
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
     if (editTask && !isDuplicate) {
@@ -1460,7 +1567,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setDateKey(editTask.date_key || todayKey());
       setScheduleMode("date"); // editing is always a single existing date
       setWeekdays([]);
-      setDueTime(editTask.due_time || "");
+      setSegmentId(editTask.segment_id || "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
@@ -1481,7 +1588,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setScheduleMode("weekdays");
       const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
       setWeekdays([todayWd]);
-      setDueTime(editTask.due_time || "");
+      setSegmentId(editTask.segment_id || "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
@@ -1498,7 +1605,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setScheduleMode("weekdays");
       const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
       setWeekdays([todayWd]);
-      setDueTime(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
+      setSegmentId(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
       setTogetherBonusEnabled(false); setTogetherBonusPoints(10);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
@@ -1519,9 +1626,6 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
 
   const submit = async () => {
     if (!title.trim()) return toast.error("Judul tugas wajib diisi");
-    if (dueTime && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(dueTime)) {
-      return toast.error("Format jam harus HH:MM (contoh 18:00)");
-    }
     if (!isEdit && scheduleMode === "weekdays" && weekdays.length === 0) {
       return toast.error("Pilih minimal satu hari");
     }
@@ -1541,7 +1645,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         penalty_points: Number(penalty) || 0,
         date_key: useWeekdays ? null : (dateKey || null),
         weekdays: useWeekdays ? weekdays : null,
-        due_time: dueTime || null,
+        segment_id: segmentId || null,
         duration_minutes: duration ? Number(duration) : null,
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
@@ -1920,13 +2024,22 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
             <p className="text-xs text-slate-400 mt-1">Berapa lama tugas dikerjakan.</p>
           </div>
           <div>
-            <label className={labelClass}>🕒 Harus sebelum jam (opsional)</label>
-            <input
-              type="time" value={dueTime}
-              onChange={(e) => setDueTime(e.target.value)}
+            <label className={labelClass}>🕒 Bagian hari</label>
+            <select
+              value={segmentId}
+              onChange={(e) => setSegmentId(e.target.value)}
               className={inputClass}
-            />
-            <p className="text-xs text-slate-400 mt-1">Batas waktu dalam sehari, mis. 18:00.</p>
+            >
+              <option value="">Kapan saja (tanpa bagian)</option>
+              {segments.map((sg) => (
+                <option key={sg.id} value={sg.id}>
+                  {sg.emoji ? `${sg.emoji} ` : ""}{sg.label} ({sg.start_time}–{sg.end_time})
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-slate-400 mt-1">
+              Jam diambil dari bagiannya — tugas cukup diatur urutannya di dalam bagian itu.
+            </p>
           </div>
         </div>
 

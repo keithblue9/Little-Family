@@ -61,12 +61,18 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     // looks at. Sorting by creation `order` here (as this used to) made the
     // active task land in the middle of the day while earlier ones showed
     // "menunggu giliran" — the backend gate uses the same clock order.
+    // Sequence anchor = the task's SECTION start time (sections carry the
+    // clock), falling back to a legacy per-task due_time. Must mirror the
+    // backend's ordering exactly, or the gate and the display disagree.
+    const toMin = (t) => {
+      const [h, m] = t.split(":").map(Number);
+      return h * 60 + m;
+    };
     const seqVal = (t) => {
-      if (t.due_time) {
-        const [h, m] = t.due_time.split(":").map(Number);
-        return h * 60 + m;
-      }
-      return 100000 + (t.order || 0); // timeless tasks queue after scheduled ones
+      const seg = t.segment_id ? daySegments.find((x) => x.id === t.segment_id) : null;
+      if (seg) return toMin(seg.start_time);
+      if (t.due_time) return toMin(t.due_time);
+      return 100000; // no section, no time → do whenever, queue last
     };
     const req = tasks
       .filter((t) => !t.is_bonus)
@@ -98,7 +104,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     });
 
     return { timeline: merged, next: first, done: doneReq };
-  }, [progress]);
+  }, [progress, daySegments]);
 
   const isToday = dateKey === todayKey();
   const isFuture = isFutureDate(dateKey);
@@ -484,7 +490,11 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     const timeStuck = isActive && !isDone && isTimeStuck(t);
                     return {
                       busy: busyId === t.id,
-                      canStart: isActive && !t.timer_started_at && gate.allowed,
+                      // An overdue task offers ONLY the Terlambat button — the
+                      // child owns the lateness first, which reschedules the
+                      // slot; Mulai reappears after that. Mirrors the backend
+                      // guard, so the UI can't offer an action that would fail.
+                      canStart: isActive && !t.timer_started_at && gate.allowed && !timeStuck,
                       canFinish: isActive && !!t.timer_started_at && gate.allowed && !overdue,
                       timeStuck,
                       onStart: () => startTimer(t),

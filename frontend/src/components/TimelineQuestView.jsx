@@ -24,6 +24,12 @@ const hhmmToMin = (t) => {
 };
 
 function segmentOf(task, segments) {
+  // A task states its own section now. Older tasks (made before sections
+  // existed) only carry a due_time, so fall back to whichever section covers
+  // that time — nothing from the old data model gets orphaned.
+  if (task.segment_id) {
+    return segments.some((s) => s.id === task.segment_id) ? task.segment_id : "__anytime__";
+  }
   const mins = hhmmToMin(task.due_time);
   if (mins === null) return "__anytime__";
   const hit = segments.find(
@@ -60,7 +66,7 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, onStar
         </div>
 
         <div className="flex items-center gap-1.5 mt-1 text-[10px] text-slate-500">
-          {task.due_time && <span>🕐 {task.due_time}</span>}
+          {task.due_time ? <span>🕐 {task.due_time}</span> : null}
           {task.duration_minutes ? <span>⏱ {task.duration_minutes}m</span> : null}
         </div>
 
@@ -109,6 +115,11 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, onStar
               >
                 <Clock className="w-3 h-3" strokeWidth={3} /> Terlambat
               </button>
+            )}
+            {timeStuck && task.late_ack && !canStart && !canFinish && (
+              <span className="text-[9px] text-amber-600 flex items-center gap-1 px-1 py-1">
+                <Clock className="w-3 h-3" /> Waktunya sudah digeser
+              </span>
             )}
             {!canStart && !canFinish && !timeStuck && (
               <span className="text-[9px] text-slate-400 flex items-center gap-1 px-1 py-1">
@@ -217,10 +228,16 @@ export default function TimelineQuestView({ tasks, segments, activeId, helpers }
     for (const list of buckets.values()) {
       // Bonus tasks are interleaved by time, not exiled to the end — the day
       // should read chronologically. Timeless ones trail their group.
+      // Inside a section the sequence is the task's own order — the section
+      // supplies the clock. Legacy tasks that still carry a time fall back to
+      // it so mixed data stays sensible.
       list.sort((a, b) => {
+        const ao = a.order || 0;
+        const bo = b.order || 0;
+        if (ao !== bo) return ao - bo;
         const am = hhmmToMin(a.due_time);
         const bm = hhmmToMin(b.due_time);
-        if (am === null && bm === null) return (a.order || 0) - (b.order || 0);
+        if (am === null && bm === null) return 0;
         if (am === null) return 1;
         if (bm === null) return -1;
         return am - bm;

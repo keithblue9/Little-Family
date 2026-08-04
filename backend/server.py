@@ -518,6 +518,11 @@ class TaskInput(BaseModel):
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
     date_key: Optional[str] = None       # "YYYY-MM-DD" — which daily slot this belongs to
     weekdays: Optional[List[int]] = None  # [0-6] Mon-Sun; create one copy per upcoming matching day
+    # Which part of the day this belongs to (Pagi/Siang/Sore/Malam…). This is
+    # the new anchor: only the SEGMENT carries a clock time, individual tasks
+    # just hold their position within it. due_time stays supported for older
+    # tasks that were created before segments existed.
+    segment_id: Optional[str] = None
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
@@ -1930,6 +1935,7 @@ async def _build_task_doc(
         "is_bonus": payload.is_bonus,
         "due_date": payload.due_date,
         "due_time": validate_due_time(payload.due_time),
+        "segment_id": payload.segment_id,
         "duration_minutes": payload.duration_minutes,
         "date_key": date_key,
         "recurrence": payload.recurrence,
@@ -2097,6 +2103,7 @@ async def child_day_progress(
     tasks.sort(key=lambda t: (bool(t.get("is_bonus")), t.get("order") or 0))
     is_off = await _is_off_day(dk)
     combo_award = await db.family_combo_awards.find_one({"parent_id": FAMILY_ID, "date_key": dk}, {"_id": 0})
+    await _refresh_segments_cache()
     await _sweep_overdue_punishments()
     active_punishment = await db.punishments.find_one({
         "parent_id": FAMILY_ID, "child_id": child_id,
@@ -2347,6 +2354,51 @@ async def family_day_progress(
 
 
 # --------------- Late-arrival exception (pengajuan keterlambatan) ---------------
+async def _get_day_segments() -> list:
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    return config.get("day_segments") or DEFAULT_DAY_SEGMENTS
+
+
+def _segment_for_task(task: dict, segments: list) -> Optional[dict]:
+    """The section a task lives in. Prefers an explicit segment_id; falls back
+    to matching a legacy due_time into whichever section covers it, so tasks
+    made before segments existed keep behaving sensibly."""
+    sid = task.get("segment_id")
+    if sid:
+        return next((s for s in segments if s.get("id") == sid), None)
+    if task.get("due_time"):
+        m = _hhmm_to_min(task["due_time"])
+        return next(
+            (s for s in segments if _hhmm_to_min(s["start_time"]) <= m <= _hhmm_to_min(s["end_time"])),
+            None,
+        )
+    return None
+
+
+def _task_sort_anchor(task: dict, segments: list) -> int:
+    """Minutes-into-the-day used to order the quest line. Tasks are sequenced by
+    their SECTION's start time and then by their own order within it — the
+    individual task no longer needs a clock of its own. Anything with no
+    section and no time sorts last (do-whenever)."""
+    seg = _segment_for_task(task, segments)
+    if seg:
+        return _hhmm_to_min(seg["start_time"])
+    if task.get("due_time"):
+        return _hhmm_to_min(task["due_time"])
+    return 24 * 60 + 1
+
+
+def _task_window_end(task: dict, segments: list) -> Optional[int]:
+    """When this task's opportunity closes: the end of its section. Legacy
+    tasks without a section fall back to their own due_time."""
+    seg = _segment_for_task(task, segments)
+    if seg:
+        return _hhmm_to_min(seg["end_time"])
+    if task.get("due_time"):
+        return _hhmm_to_min(task["due_time"])
+    return None
+
+
 def _validate_day_segments(segments: list):
     """Segments must be sane before they're stored: each range forward-going,
     no two overlapping. Overlap would make a task's section ambiguous, which
@@ -2702,11 +2754,8 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
     open_tasks = await db.tasks.find(query).to_list(500)
     if not open_tasks:
         return None
-    open_tasks.sort(key=lambda t: (
-        t.get("due_time") in (None, ""),
-        _hhmm_to_min(t["due_time"]) if t.get("due_time") else 0,
-        t.get("order") or 0,
-    ))
+    segments = await _get_day_segments()
+    open_tasks.sort(key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
     return open_tasks[0]
 
 
@@ -2785,6 +2834,18 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
             raise HTTPException(
                 status_code=409,
                 detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
+            )
+        # A required task whose window has already closed can't just be started
+        # as if nothing happened — the child owns the lateness first via the
+        # Terlambat button, which reschedules the slot and (for at-fault
+        # reasons) drops its points. Without this, a stale morning task stayed
+        # freely startable all evening and sat "active" alongside the current
+        # one, which is exactly the double-active confusion.
+        await _refresh_segments_cache()
+        if _task_is_time_stuck(task):
+            raise HTTPException(
+                status_code=409,
+                detail="Misi ini sudah lewat waktunya — tekan tombol Terlambat dulu untuk memilih alasannya.",
             )
 
     await db.tasks.update_one({"id": task_id}, {"$set": {"timer_started_at": now_iso()}})
@@ -2899,16 +2960,30 @@ def _task_is_time_stuck(task: dict) -> bool:
                 return True
         except Exception:
             pass
-    due_time = task.get("due_time")
-    if due_time and not started:
-        try:
+    # Never started and the task's SECTION has already closed → the chance for
+    # it has passed. Section-based rather than per-task, because tasks no longer
+    # carry their own clock: everything in "Pagi" is late once Pagi is over.
+    if not started:
+        end = _segment_window_end_cached(task)
+        if end is not None:
             now_local = _now_local()
-            dh, dm = map(int, due_time.split(":"))
-            if now_local.hour * 60 + now_local.minute > dh * 60 + dm:
+            if now_local.hour * 60 + now_local.minute > end:
                 return True
-        except Exception:
-            pass
     return False
+
+
+# _task_is_time_stuck is called from sync contexts, so the segment list is
+# refreshed by the async callers and stashed here rather than awaited inline.
+_SEGMENTS_CACHE: dict = {"segments": None}
+
+
+def _segment_window_end_cached(task: dict) -> Optional[int]:
+    segments = _SEGMENTS_CACHE.get("segments") or DEFAULT_DAY_SEGMENTS
+    return _task_window_end(task, segments)
+
+
+async def _refresh_segments_cache():
+    _SEGMENTS_CACHE["segments"] = await _get_day_segments()
 
 
 @api.post("/tasks/{task_id}/skip")
@@ -2977,13 +3052,17 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
         raise HTTPException(status_code=400, detail="Alasan keterlambatan sudah dipilih untuk misi ini")
     if task.get("timer_started_at"):
         raise HTTPException(status_code=400, detail="Misi ini sudah dimulai, tidak perlu lapor terlambat")
-    # Must actually be overdue: past date, or today with its due_time passed.
+    # Must actually be overdue: a past day, or today with the task's SECTION
+    # already closed (sections carry the clock now, not individual tasks).
     today = _today_key()
+    segments = await _get_day_segments()
     overdue = False
     if task.get("date_key") and task["date_key"] < today:
         overdue = True
-    elif task.get("date_key") == today and task.get("due_time"):
-        overdue = _hhmm_to_min(task["due_time"]) < (_now_local().hour * 60 + _now_local().minute)
+    elif task.get("date_key") == today:
+        end = _task_window_end(task, segments)
+        if end is not None:
+            overdue = end < (_now_local().hour * 60 + _now_local().minute)
     if not overdue:
         raise HTTPException(status_code=400, detail="Misi ini belum terlewat")
 
@@ -3413,6 +3492,32 @@ async def _maybe_materialize_recurring():
 class BulkTaskImportInput(BaseModel):
     tasks: List[TaskInput] = Field(min_length=1, max_length=200)
     skip_existing: bool = True  # don't recreate a slot that's already scheduled
+
+
+class TaskReorderInput(BaseModel):
+    task_ids: List[str] = Field(min_length=1, max_length=200)
+
+
+@api.post("/tasks/reorder")
+async def reorder_tasks(payload: TaskReorderInput, user: dict = Depends(require_parent)):
+    """Persist a drag-and-drop reordering: the given ids are numbered 1..n in
+    the order supplied. Applies to whatever slice the parent is looking at (one
+    child, one day, one section), so it never disturbs tasks outside that view.
+
+    Unknown ids are rejected outright rather than silently skipped — a partial
+    apply would leave the list in a state the parent didn't ask for.
+    """
+    found = await db.tasks.find({"parent_id": FAMILY_ID, "id": {"$in": payload.task_ids}}, {"_id": 0, "id": 1}).to_list(500)
+    known = {t["id"] for t in found}
+    missing = [tid for tid in payload.task_ids if tid not in known]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"{len(missing)} misi tidak ditemukan")
+    if len(set(payload.task_ids)) != len(payload.task_ids):
+        raise HTTPException(status_code=422, detail="Ada misi yang tercantum lebih dari sekali")
+    for idx, tid in enumerate(payload.task_ids, start=1):
+        await db.tasks.update_one({"id": tid}, {"$set": {"order": idx}})
+    await log_activity(FAMILY_ID, None, "tasks_reordered", {"count": len(payload.task_ids)})
+    return {"success": True, "reordered": len(payload.task_ids)}
 
 
 @api.post("/tasks/bulk-import")

@@ -2868,11 +2868,11 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # Only ONE required task may be startable at a time
     r = c.post(f"/api/tasks/{seq_ids['Malam 19:00']}/start")
     check("seq: later task cannot start out of turn", r.status_code == 409, str(r.status_code))
-    r = c.post(f"/api/tasks/{seq_ids['Pagi 05:30']}/start")
-    check("seq: earliest task starts fine", r.status_code == 200, r.text[:150])
-    c.post(f"/api/tasks/{seq_ids['Pagi 05:30']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{seq_ids['Pagi 05:30']}/approve")
+    # Advance the queue without depending on the wall clock (these fixed times
+    # may already be in the past, which is now correctly refused by the start
+    # guard — that behaviour is covered on its own further down).
+    _aio_tg.run(server.db.tasks.update_one({"id": seq_ids["Pagi 05:30"]},
+                                           {"$set": {"status": "approved"}}))
 
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
     check("seq: advances to the next-earliest, not creation order", _next_title() == "Siang 12:00", str(_next_title()))
@@ -2940,6 +2940,260 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("resched: timeless task gains no due_time", not r.json()["task"].get("due_time"), str(r.json()["task"].get("due_time")))
     check("resched: at-fault still forfeits points", r.json()["task"]["late_no_points"] is True)
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # =============== OVERDUE TASKS MUST GO THROUGH "TERLAMBAT" FIRST ===============
+    # Bug: a morning task whose window had closed stayed freely startable all
+    # evening, so it sat "active" at the same time as the current task.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"late_reasons": [
+        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
+        {"label": "Terlambat bangun", "gives_penalty_card": True, "award_points": False},
+    ]})
+    _lr2 = c.get("/api/config").json()["late_reasons"]
+    _ex2, _ft2 = _lr2[0]["id"], _lr2[1]["id"]
+
+    rr = c.post("/api/tasks", json={"title": "Pagi kelewat", "points": 10, "date_key": today_local,
+                                    "target_children": [adskhan["id"]], "due_time": "00:01", "duration_minutes": 10})
+    stale = rr.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{stale['id']}/start")
+    check("overdue: expired window cannot be started", r.status_code == 409, str(r.status_code))
+    check("overdue: refusal points at the Terlambat button", "Terlambat" in r.text, r.text[:160])
+
+    # After owning the lateness it becomes startable again (window moved to now)
+    r = c.post(f"/api/tasks/{stale['id']}/late-reason", json={"reason_id": _ex2})
+    check("overdue: ack ok", r.status_code == 200, r.text[:150])
+    r = c.post(f"/api/tasks/{stale['id']}/start")
+    check("overdue: startable after acknowledging", r.status_code == 200, r.text[:150])
+    r = c.post(f"/api/tasks/{stale['id']}/complete")
+    check("overdue: completable after acknowledging", r.status_code == 200, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{stale['id']}/approve")
+    check("overdue: approvable after acknowledging", r.status_code == 200, r.text[:150])
+
+    # A task still inside its window starts normally — the guard must not
+    # over-block tasks that are merely scheduled for later today.
+    _future_m = min(server._now_local().hour * 60 + server._now_local().minute + 90, 23 * 60 + 58)
+    _future = f"{_future_m // 60:02d}:{_future_m % 60:02d}"
+    rr = c.post("/api/tasks", json={"title": "Masih berlaku", "points": 5, "date_key": today_local,
+                                    "target_children": [adskhan["id"]], "due_time": _future, "duration_minutes": 30})
+    fresh = rr.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{fresh['id']}/start")
+    check("overdue: in-window task still starts freely", r.status_code == 200, r.text[:150])
+
+    # A bonus task with a past time is NOT sequence-gated, but the same
+    # lateness rule should not trap it either — bonuses stay free.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    rr = c.post("/api/tasks", json={"title": "Bonus lewat", "points": 10, "date_key": today_local,
+                                    "target_children": [adskhan["id"]], "due_time": "00:02",
+                                    "duration_minutes": 10, "is_bonus": True})
+    lateb = rr.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{lateb['id']}/start")
+    check("overdue: bonus stays startable despite past time", r.status_code == 200, r.text[:150])
+
+    # Timeless required tasks have no window to expire → never blocked by this
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    rr = c.post("/api/tasks", json={"title": "Tanpa jam bebas", "points": 5, "date_key": today_local,
+                                    "target_children": [adskhan["id"]]})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{rr.json()['id']}/start")
+    check("overdue: timeless task unaffected by the guard", r.status_code == 200, r.text[:150])
+
+    # At-fault ack also unblocks (kid may continue), but without points
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0, "penalty_cards": 0}}))
+    rr = c.post("/api/tasks", json={"title": "Telat salah sendiri", "points": 20, "date_key": today_local,
+                                    "target_children": [adskhan["id"]], "due_time": "00:01", "duration_minutes": 10})
+    fault_task = rr.json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{fault_task['id']}/late-reason", json={"reason_id": _ft2})
+    r = c.post(f"/api/tasks/{fault_task['id']}/start")
+    check("overdue: at-fault ack still unblocks the task", r.status_code == 200, r.text[:150])
+    c.post(f"/api/tasks/{fault_task['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{fault_task['id']}/approve")
+    ads_ov = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("overdue: at-fault path awards zero points", ads_ov["points"] == 0, str(ads_ov["points"]))
+
+    # =============== SEGMENT-ANCHORED TASKS (tanpa jam per tugas) ===============
+    # New concept: a task belongs to a SECTION (Pagi/Siang/…); only the section
+    # carries a clock. Order inside the section decides the sequence.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    seg_cfg = [
+        {"label": "Pagi", "emoji": "🌅", "start_time": "04:45", "end_time": "09:59"},
+        {"label": "Siang", "emoji": "☀️", "start_time": "10:00", "end_time": "14:59"},
+        {"label": "Malam", "emoji": "🌙", "start_time": "18:00", "end_time": "23:59"},
+    ]
+    c.post("/api/config", json={"day_segments": seg_cfg})
+    live_segs = c.get("/api/config").json()["day_segments"]
+    S_PAGI, S_SIANG, S_MALAM = [x["id"] for x in live_segs]
+
+    # Created deliberately out of section order, and with NO due_time at all
+    mk = lambda title, seg, order: c.post("/api/tasks", json={
+        "title": title, "points": 5, "date_key": today_local, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": seg, "order": order}).json()
+    t_m2 = mk("Malam kedua", S_MALAM, 2)
+    t_p1 = mk("Pagi pertama", S_PAGI, 1)
+    t_p2 = mk("Pagi kedua", S_PAGI, 2)
+    t_s1 = mk("Siang pertama", S_SIANG, 1)
+
+    check("segtask: segment stored on the task", c.get(f"/api/tasks?child_id={adskhan['id']}").json()[0].get("segment_id") is not None)
+    check("segtask: no per-task time needed", all(not t.get("due_time") for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json()))
+
+    import asyncio as _asg
+    def _nxt():
+        t = _asg.run(server.get_next_actionable_task(adskhan["id"], today_local))
+        return t["title"] if t else None
+
+    check("segtask: earliest section comes first", _nxt() == "Pagi pertama", str(_nxt()))
+    _asg.run(server.db.tasks.update_one({"id": t_p1["id"]}, {"$set": {"status": "approved"}}))
+    check("segtask: order within a section is respected", _nxt() == "Pagi kedua", str(_nxt()))
+    _asg.run(server.db.tasks.update_one({"id": t_p2["id"]}, {"$set": {"status": "approved"}}))
+    check("segtask: moves to the next section by its start time", _nxt() == "Siang pertama", str(_nxt()))
+    _asg.run(server.db.tasks.update_one({"id": t_s1["id"]}, {"$set": {"status": "approved"}}))
+    check("segtask: later section last despite being created first", _nxt() == "Malam kedua", str(_nxt()))
+
+    # Lateness is section-based: a task in a section that has already closed
+    # is time-stuck even though it has no time of its own.
+    _asg.run(server._refresh_segments_cache())
+    past_seg = [{"label": "Sudah lewat", "start_time": "00:00", "end_time": "00:01"},
+                {"label": "Nanti", "start_time": "23:58", "end_time": "23:59"}]
+    c.post("/api/config", json={"day_segments": past_seg})
+    ps = c.get("/api/config").json()["day_segments"]
+    _asg.run(server._refresh_segments_cache())
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    closed = mk("Di sesi yang sudah lewat", ps[0]["id"], 1)
+    future = mk("Di sesi nanti malam", ps[1]["id"], 1)
+    check("segtask: closed section marks task stuck",
+          server._task_is_time_stuck(_asg.run(server.db.tasks.find_one({"id": closed["id"]}))) is True)
+    check("segtask: open section does not",
+          server._task_is_time_stuck(_asg.run(server.db.tasks.find_one({"id": future["id"]}))) is False)
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{closed['id']}/start")
+    check("segtask: closed-section task blocked from starting", r.status_code == 409, str(r.status_code))
+    check("segtask: refusal mentions Terlambat", "Terlambat" in r.text, r.text[:150])
+
+    # Weekday tagging (no explicit date) still creates the right slots
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    r = c.post("/api/tasks", json={"title": "Tiap Senin & Rabu", "points": 5, "duration_minutes": 10,
+                                   "target_children": [adskhan["id"]], "segment_id": ps[0]["id"],
+                                   "weekdays": [0, 2], "recurrence": "weekly"})
+    check("segtask: weekday tagging accepted without a date", r.status_code == 200, r.text[:200])
+    made = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json() if t["title"] == "Tiap Senin & Rabu"]
+    check("segtask: one copy per tagged weekday", len(made) == 2, str(len(made)))
+    check("segtask: copies land on Mon and Wed",
+          sorted(_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday() for t in made) == [0, 2],
+          str([t["date_key"] for t in made]))
+    check("segtask: weekday copies keep the section", all(t.get("segment_id") == ps[0]["id"] for t in made))
+    check("segtask: weekday copies are weekly-recurring", all(t["recurrence"] == "weekly" for t in made))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    _asg.run(server._refresh_segments_cache())
+
+    # =============== DRAG & DROP REORDER ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    ro = []
+    for i, t in enumerate(["Ro A", "Ro B", "Ro C"], start=1):
+        ro.append(c.post("/api/tasks", json={"title": t, "points": 5, "date_key": today_local,
+                                             "target_children": [adskhan["id"]], "order": i}).json())
+    ids = [x["id"] for x in ro]
+    check("reorder: initial order 1,2,3",
+          [t["order"] for t in sorted(c.get(f"/api/tasks?child_id={adskhan['id']}").json(), key=lambda x: x["order"])] == [1, 2, 3])
+
+    # Reverse them
+    r = c.post("/api/tasks/reorder", json={"task_ids": list(reversed(ids))})
+    check("reorder: ok", r.status_code == 200 and r.json()["reordered"] == 3, r.text[:150])
+    after = {t["id"]: t["order"] for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json()}
+    check("reorder: positions applied in the given sequence",
+          after[ids[2]] == 1 and after[ids[1]] == 2 and after[ids[0]] == 3, str(after))
+
+    # Sequencing follows the new order
+    import asyncio as _aro
+    nxt = _aro.run(server.get_next_actionable_task(adskhan["id"], today_local))
+    check("reorder: quest sequence follows the new order", nxt["title"] == "Ro C", str(nxt["title"]))
+
+    # Guards
+    r = c.post("/api/tasks/reorder", json={"task_ids": ids + ["ghost-id"]})
+    check("reorder: unknown id rejected wholesale", r.status_code == 404, str(r.status_code))
+    unchanged = {t["id"]: t["order"] for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json()}
+    check("reorder: nothing applied on a failed batch", unchanged == after, "partial write happened")
+    r = c.post("/api/tasks/reorder", json={"task_ids": [ids[0], ids[0], ids[1]]})
+    check("reorder: duplicate ids rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/tasks/reorder", json={"task_ids": []})
+    check("reorder: empty list rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/tasks/reorder", json={"task_ids": [ids[1]]})
+    check("reorder: single-item reorder works", r.status_code == 200, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks/reorder", json={"task_ids": ids})
+    check("reorder: kid blocked", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # =============== REORDER (drag & drop) UNDER THE SEGMENT MODEL ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    ro_segs = [{"label": "Pagi", "start_time": "04:45", "end_time": "09:59"},
+               {"label": "Malam", "start_time": "18:00", "end_time": "23:59"}]
+    c.post("/api/config", json={"day_segments": ro_segs})
+    RS = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    _asg2 = __import__("asyncio")
+
+    mk2 = lambda title, seg, order: c.post("/api/tasks", json={
+        "title": title, "points": 5, "date_key": today_local, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": seg, "order": order}).json()
+    a = mk2("A pagi", RS[0], 1)
+    b = mk2("B pagi", RS[0], 2)
+    cc = mk2("C malam", RS[1], 3)
+
+    def _seq_titles():
+        rows = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
+        segs = c.get("/api/config").json()["day_segments"]
+        def key(t):
+            sg = next((x for x in segs if x["id"] == t.get("segment_id")), None)
+            base = server._hhmm_to_min(sg["start_time"]) if sg else 99999
+            return (base, t.get("order") or 0)
+        return [t["title"] for t in sorted(rows, key=key)]
+
+    check("reorder: initial sequence", _seq_titles() == ["A pagi", "B pagi", "C malam"], str(_seq_titles()))
+
+    # Drag B above A
+    r = c.post("/api/tasks/reorder", json={"task_ids": [b["id"], a["id"], cc["id"]]})
+    check("reorder: endpoint ok", r.status_code == 200 and r.json()["reordered"] == 3, r.text[:150])
+    check("reorder: new order persisted", _seq_titles() == ["B pagi", "A pagi", "C malam"], str(_seq_titles()))
+
+    # The quest gate must follow the new order too
+    def _nx():
+        t = _asg2.run(server.get_next_actionable_task(adskhan["id"], today_local))
+        return t["title"] if t else None
+    check("reorder: active task follows the new order", _nx() == "B pagi", str(_nx()))
+
+    # Reordering never moves a task between sections
+    rows = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
+    check("reorder: sections untouched",
+          {t["title"]: t["segment_id"] for t in rows} ==
+          {"A pagi": RS[0], "B pagi": RS[0], "C malam": RS[1]}, "a section changed")
+
+    r = c.post("/api/tasks/reorder", json={"task_ids": []})
+    check("reorder: empty list rejected", r.status_code in (400, 422), str(r.status_code))
+    r = c.post("/api/tasks/reorder", json={"task_ids": [a["id"], "tidak-ada"]})
+    check("reorder: unknown id handled without corrupting order", r.status_code in (200, 404, 422), str(r.status_code))
+    check("reorder: real tasks still intact after bad id",
+          len(c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()) == 3)
+
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks/reorder", json={"task_ids": [a["id"], b["id"]]})
+    check("reorder: kid blocked", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

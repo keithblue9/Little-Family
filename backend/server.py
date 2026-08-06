@@ -2380,12 +2380,43 @@ def _task_sort_anchor(task: dict, segments: list) -> int:
     their SECTION's start time and then by their own order within it — the
     individual task no longer needs a clock of its own. Anything with no
     section and no time sorts last (do-whenever)."""
-    seg = _segment_for_task(task, segments)
-    if seg:
-        return _hhmm_to_min(seg["start_time"])
+    # An explicit section wins; otherwise a legacy per-task time still orders
+    # correctly on its own (mapping it onto a section would flatten several
+    # distinct times into one anchor and lose their relative order).
+    sid = task.get("segment_id")
+    if sid:
+        seg = next((x for x in segments if x.get("id") == sid), None)
+        if seg:
+            return _hhmm_to_min(seg["start_time"])
     if task.get("due_time"):
         return _hhmm_to_min(task["due_time"])
     return 24 * 60 + 1
+
+
+def _task_availability(task: dict, segments: list) -> str:
+    """Is this task doable RIGHT NOW? Three states:
+
+      "open"   — its section is running now (or it has no section, or the child
+                 already owned the lateness via Terlambat).
+      "future" — its section hasn't started yet; nothing to do but wait.
+      "closed" — its section has already ended and the lateness wasn't
+                 acknowledged; it needs the Terlambat flow.
+
+    A closed task must NOT block the rest of the day: a missed morning chore
+    shouldn't freeze the afternoon. That's why the sequence skips over them
+    rather than stopping there.
+    """
+    if task.get("late_ack"):
+        return "open"
+    seg = _segment_for_task(task, segments)
+    if not seg:
+        return "open"  # no section = do it whenever
+    now_min = _now_local().hour * 60 + _now_local().minute
+    if now_min < _hhmm_to_min(seg["start_time"]):
+        return "future"
+    if now_min > _hhmm_to_min(seg["end_time"]):
+        return "closed"
+    return "open"
 
 
 def _task_window_end(task: dict, segments: list) -> Optional[int]:
@@ -2756,7 +2787,11 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
         return None
     segments = await _get_day_segments()
     open_tasks.sort(key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
-    return open_tasks[0]
+    # Only sections that are actually running can hold the turn. Overdue ones
+    # are handled through Terlambat and future ones simply aren't due yet —
+    # neither should stall everything behind them.
+    actionable = [t for t in open_tasks if _task_availability(t, segments) == "open"]
+    return actionable[0] if actionable else None
 
 
 def _now_local():
@@ -2827,25 +2862,31 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
         if date_key > today:
             raise HTTPException(status_code=409, detail="Misi ini belum waktunya (hari yang akan datang)")
 
-    # Required tasks must be the next in line; bonuses are free to start anytime.
+    # Required tasks must be inside their section's window AND next in line.
     if not task.get("is_bonus"):
+        # The TIME WINDOW is checked first on purpose: "belum waktunya" and
+        # "sudah lewat, pakai Terlambat" tell the child exactly what to do,
+        # whereas the generic "finish the previous mission first" would be
+        # technically true but useless for a task that simply isn't due yet.
+        await _refresh_segments_cache()
+        _segs_now = await _get_day_segments()
+        _avail = _task_availability(task, _segs_now)
+        if _avail == "future":
+            _sg = _segment_for_task(task, _segs_now)
+            raise HTTPException(
+                status_code=409,
+                detail=f'Belum waktunya — bagian "{_sg["label"]}" mulai jam {_sg["start_time"]}.',
+            )
+        if _avail == "closed":
+            raise HTTPException(
+                status_code=409,
+                detail="Misi ini sudah lewat waktunya — tekan tombol Terlambat dulu untuk memilih alasannya.",
+            )
         nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
         if nxt and nxt["id"] != task_id:
             raise HTTPException(
                 status_code=409,
                 detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
-            )
-        # A required task whose window has already closed can't just be started
-        # as if nothing happened — the child owns the lateness first via the
-        # Terlambat button, which reschedules the slot and (for at-fault
-        # reasons) drops its points. Without this, a stale morning task stayed
-        # freely startable all evening and sat "active" alongside the current
-        # one, which is exactly the double-active confusion.
-        await _refresh_segments_cache()
-        if _task_is_time_stuck(task):
-            raise HTTPException(
-                status_code=409,
-                detail="Misi ini sudah lewat waktunya — tekan tombol Terlambat dulu untuk memilih alasannya.",
             )
 
     await db.tasks.update_one({"id": task_id}, {"$set": {"timer_started_at": now_iso()}})
@@ -3518,6 +3559,26 @@ async def reorder_tasks(payload: TaskReorderInput, user: dict = Depends(require_
         await db.tasks.update_one({"id": tid}, {"$set": {"order": idx}})
     await log_activity(FAMILY_ID, None, "tasks_reordered", {"count": len(payload.task_ids)})
     return {"success": True, "reordered": len(payload.task_ids)}
+
+
+class BulkDeleteInput(BaseModel):
+    task_ids: List[str] = Field(min_length=1, max_length=500)
+
+
+@api.post("/tasks/bulk-delete")
+async def bulk_delete_tasks(payload: BulkDeleteInput, user: dict = Depends(require_parent)):
+    """Delete many tasks at once. Cleaning up after a bad import one row at a
+    time is miserable, so the parent can tick a batch and remove it in one go.
+    Unknown ids are simply skipped rather than failing the whole request."""
+    existing = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "id": {"$in": payload.task_ids}}, {"_id": 0, "id": 1}
+    ).to_list(500)
+    ids = [t["id"] for t in existing]
+    if not ids:
+        raise HTTPException(status_code=404, detail="Tidak ada tugas yang cocok untuk dihapus")
+    res = await db.tasks.delete_many({"parent_id": FAMILY_ID, "id": {"$in": ids}})
+    await log_activity(FAMILY_ID, None, "tasks_bulk_deleted", {"count": res.deleted_count})
+    return {"success": True, "deleted": res.deleted_count, "skipped": len(payload.task_ids) - len(ids)}
 
 
 @api.post("/tasks/bulk-import")

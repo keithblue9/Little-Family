@@ -526,6 +526,29 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
   const [overId, setOverId] = useState(null);
   const [localOrder, setLocalOrder] = useState(null);
   const [savingOrder, setSavingOrder] = useState(false);
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
+  const toggleSelected = (id) =>
+    setSelectedIds((ids) => (ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]));
+
+  const bulkDelete = async () => {
+    if (selectedIds.length === 0) return;
+    if (!window.confirm(
+      `Hapus ${selectedIds.length} tugas terpilih?\n\nTindakan ini permanen.`
+    )) return;
+    setBulkDeleting(true);
+    try {
+      const { data } = await api.post("/tasks/bulk-delete", { task_ids: selectedIds });
+      toast.success(`${data.deleted} tugas dihapus`);
+      setSelectedIds([]);
+      onRefresh();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
 
   // Reordering uses POINTER events, not HTML5 drag-and-drop: the latter simply
   // never fires on touch screens, so on an iPad the list looked draggable but
@@ -877,6 +900,41 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
         <div className="text-[11px] text-slate-400 px-1 pb-1 flex items-center gap-1">
           ⠿ Tahan ikon titik-titik lalu geser untuk mengubah urutan misi{savingOrder ? " · menyimpan…" : ""}
         </div>
+        <div className="flex flex-wrap items-center gap-2 px-1 pb-2">
+          <label className="flex items-center gap-2 cursor-pointer select-none text-xs font-semibold text-slate-600">
+            <input
+              type="checkbox"
+              className="w-4 h-4 accent-indigo-600"
+              checked={selectedIds.length > 0 && selectedIds.length === (localOrder || grouped.pending).length}
+              // Indeterminate is the honest state for a partial selection —
+              // without it a half-ticked list looks fully unselected.
+              ref={(el) => { if (el) el.indeterminate = selectedIds.length > 0 && selectedIds.length < (localOrder || grouped.pending).length; }}
+              onChange={(e) =>
+                setSelectedIds(e.target.checked ? (localOrder || grouped.pending).map((x) => x.id) : [])
+              }
+            />
+            Pilih semua
+          </label>
+          {selectedIds.length > 0 && (
+            <>
+              <span className="text-xs text-slate-500">{selectedIds.length} dipilih</span>
+              <button
+                onClick={bulkDelete}
+                disabled={bulkDeleting}
+                className="press-btn inline-flex items-center gap-1 bg-red-500 hover:bg-red-600 text-white font-semibold px-3 py-1.5 rounded-lg text-xs disabled:opacity-60"
+              >
+                <Trash2 className="w-3.5 h-3.5" strokeWidth={2.5} />
+                {bulkDeleting ? "Menghapus…" : `Hapus ${selectedIds.length} tugas`}
+              </button>
+              <button
+                onClick={() => setSelectedIds([])}
+                className="press-btn text-xs text-slate-500 underline px-1"
+              >
+                Batal pilih
+              </button>
+            </>
+          )}
+        </div>
         {(localOrder || grouped.pending).map((t) => (
           <div
             key={t.id}
@@ -886,6 +944,14 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
             } ${savingOrder ? "pointer-events-none" : ""}`}
           >
           <TaskRow task={t} childName={rowName(t)} currentDateFilter={dateFilter}>
+            <input
+              type="checkbox"
+              checked={selectedIds.includes(t.id)}
+              onChange={() => toggleSelected(t.id)}
+              onClick={(e) => e.stopPropagation()}
+              className="w-4 h-4 accent-indigo-600 mr-0.5"
+              title="Pilih untuk dihapus massal"
+            />
             <button
               onPointerDown={(e) => beginDrag(e, t)}
               className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 cursor-grab active:cursor-grabbing select-none"

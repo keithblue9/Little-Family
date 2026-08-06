@@ -486,6 +486,12 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     const overdue = isDurationExceeded(t);
                     // Bonus tasks bypass the required sequence entirely; required
                     // ones are only actionable when they're the frontmost open task.
+                    // Mirrors the backend window rule so the UI never offers
+                    // an action the server would refuse.
+                    const seg = t.segment_id ? daySegments.find((x) => x.id === t.segment_id) : null;
+                    const nowM = (() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); })();
+                    const toM = (v) => { const [h, m] = v.split(":").map(Number); return h * 60 + m; };
+                    const notYet = !t.is_bonus && !t.late_ack && seg && nowM < toM(seg.start_time);
                     const isActive = t.is_bonus ? !isDone : next?.id === t.id;
                     const timeStuck = isActive && !isDone && isTimeStuck(t);
                     return {
@@ -494,7 +500,9 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // child owns the lateness first, which reschedules the
                       // slot; Mulai reappears after that. Mirrors the backend
                       // guard, so the UI can't offer an action that would fail.
-                      canStart: isActive && !t.timer_started_at && gate.allowed && !timeStuck,
+                      canStart: isActive && !t.timer_started_at && gate.allowed && !timeStuck && !notYet,
+                      notYet,
+                      notYetLabel: notYet ? `Mulai ${seg.start_time}` : null,
                       canFinish: isActive && !!t.timer_started_at && gate.allowed && !overdue,
                       timeStuck,
                       onStart: () => startTimer(t),

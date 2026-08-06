@@ -47,7 +47,7 @@ const STATUS_STYLE = {
   pending: { ring: "border-slate-200", dot: "bg-slate-300", chip: "bg-slate-100 text-slate-500", label: "Belum" },
 };
 
-function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, onStart, onFinish, onSkip, onReportLate, below }) {
+function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet, notYetLabel, onStart, onFinish, onSkip, onReportLate, below }) {
   const st = STATUS_STYLE[task.status] || STATUS_STYLE.pending;
   const done = ["approved", "completed", "skipped"].includes(task.status);
 
@@ -121,7 +121,12 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, onStar
                 <Clock className="w-3 h-3" /> Waktunya sudah digeser
               </span>
             )}
-            {!canStart && !canFinish && !timeStuck && (
+            {notYet && (
+              <span className="text-[9px] text-sky-600 flex items-center gap-1 px-1 py-1">
+                <Clock className="w-3 h-3" /> {notYetLabel || "Belum waktunya"}
+              </span>
+            )}
+            {!canStart && !canFinish && !timeStuck && !notYet && (
               <span className="text-[9px] text-slate-400 flex items-center gap-1 px-1 py-1">
                 <Lock className="w-3 h-3" /> Menunggu giliran
               </span>

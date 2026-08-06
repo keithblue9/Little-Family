@@ -12,6 +12,10 @@ export default function MoneyApprovals() {
   const [skipCost, setSkipCost] = useState("");
   const [earlyBonus, setEarlyBonus] = useState("");
   const [penaltyThreshold, setPenaltyThreshold] = useState("3");
+  const [minGap, setMinGap] = useState("60");
+  const [flashPct, setFlashPct] = useState("15");
+  const [pacingBonus, setPacingBonus] = useState("2");
+  const [notifyStart, setNotifyStart] = useState(true);
   const [comboBonus, setComboBonus] = useState("");
   const [savingCfg, setSavingCfg] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -27,6 +31,10 @@ export default function MoneyApprovals() {
       setSkipCost(String(cfg.data.skip_cost_points ?? 20));
       setEarlyBonus(String(cfg.data.early_bonus_pct ?? 10));
       setPenaltyThreshold(String(cfg.data.penalty_card_threshold ?? 3));
+      setMinGap(String(cfg.data.min_gap_seconds ?? 60));
+      setFlashPct(String(cfg.data.flash_threshold_pct ?? 15));
+      setPacingBonus(String(cfg.data.pacing_bonus_points ?? 2));
+      setNotifyStart(cfg.data.notify_parent_on_start !== false);
       setComboBonus(String(cfg.data.family_combo_bonus_points ?? 10));
     } catch (e) {
       toast.error(formatApiError(e));
@@ -42,16 +50,24 @@ export default function MoneyApprovals() {
     const s = parseInt(skipCost || "0", 10);
     const eb = parseInt(earlyBonus || "0", 10);
     const pct = parseInt(penaltyThreshold || "3", 10);
+    const mg = parseInt(minGap || "0", 10);
+    const fp = parseInt(flashPct || "0", 10);
+    const pbp = parseInt(pacingBonus || "0", 10);
     const cb = parseInt(comboBonus || "0", 10);
     if (r < 1) { toast.error("Kurs minimal Rp 1 per poin"); return; }
     if (eb < 0 || eb > 100) { toast.error("Bonus cepat harus 0–100%"); return; }
     if (pct < 1 || pct > 50) { toast.error("Batas Kartu Hukuman harus 1–50"); return; }
+    if (mg < 0 || mg > 1800) { toast.error("Jeda antar misi harus 0–1800 detik"); return; }
+    if (fp < 0 || fp > 100) { toast.error("Ambang kilat harus 0–100%"); return; }
+    if (pbp < 0 || pbp > 100) { toast.error("Bonus ritme harus 0–100 poin"); return; }
     if (cb < 0 || cb > 1000) { toast.error("Bonus kompak harus 0–1000 poin"); return; }
     setSavingCfg(true);
     try {
       await api.post("/config", {
         rupiah_per_point: r, skip_cost_points: s,
         early_bonus_pct: eb, penalty_card_threshold: pct,
+        min_gap_seconds: mg, flash_threshold_pct: fp,
+        pacing_bonus_points: pbp, notify_parent_on_start: notifyStart,
         family_combo_bonus_points: cb,
       });
       toast.success("Pengaturan tersimpan");
@@ -122,6 +138,40 @@ export default function MoneyApprovals() {
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
             <p className="text-[11px] text-slate-400 mt-1">Ekstra poin jika misi selesai sebelum jam-nya. 0 = mati.</p>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1">Jeda antar misi (detik)</label>
+            <input
+              type="text" inputMode="numeric" value={minGap}
+              onChange={(e) => setMinGap(e.target.value.replace(/\D/g, "").slice(0, 4))}
+              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Cegah misi "dirapel" sekaligus. 0 = mati. Misi bonus tidak terkena.</p>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1">Ambang "kilat" (%)</label>
+            <input
+              type="text" inputMode="numeric" value={flashPct}
+              onChange={(e) => setFlashPct(e.target.value.replace(/\D/g, "").slice(0, 3))}
+              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Selesai di bawah % durasi ini → anak diminta konfirmasi, dan ditandai untukmu.</p>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1">Bonus ritme sehat (poin)</label>
+            <input
+              type="text" inputMode="numeric" value={pacingBonus}
+              onChange={(e) => setPacingBonus(e.target.value.replace(/\D/g, "").slice(0, 3))}
+              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Diberikan saat jeda wajar & durasi masuk akal. 0 = mati.</p>
+          </div>
+          <div className="sm:col-span-2">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input type="checkbox" checked={notifyStart} onChange={(e) => setNotifyStart(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
+              <span className="text-sm font-semibold text-slate-700">Beri tahu saya saat anak menekan Mulai</span>
+            </label>
+            <p className="text-[11px] text-slate-400 mt-1">Berguna untuk sesekali mengecek, tapi bisa cukup sering — matikan kalau terasa ramai.</p>
           </div>
           <div>
             <label className="block text-sm font-semibold text-slate-700 mb-1">Batas Kartu Hukuman</label>

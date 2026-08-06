@@ -66,7 +66,7 @@ export default function HonestyInsightCard() {
                   <div className="font-semibold text-slate-800 text-sm">{c.child_name}</div>
                   <div className="text-xs text-slate-400 ml-auto">{c.tasks_measured} misi terukur</div>
                 </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-center">
                   <div className="bg-white rounded-xl py-2 border border-slate-100">
                     <div className="text-[10px] text-slate-400">Rata-rata asli</div>
                     <div className="font-bold text-slate-800 text-sm">{c.avg_actual_minutes ?? "—"} mnt</div>
@@ -83,11 +83,22 @@ export default function HonestyInsightCard() {
                     <div className="text-[10px] text-slate-400">Kelamaan 🐢</div>
                     <div className={`font-bold text-sm ${c.overrun_count > 0 ? "text-sky-600" : "text-slate-800"}`}>{c.overrun_count}</div>
                   </div>
+                  <div className="bg-white rounded-xl py-2 border border-slate-100">
+                    <div className="text-[10px] text-slate-400">Beruntun ⚡</div>
+                    <div className={`font-bold text-sm ${(c.burst_count || 0) > 2 ? "text-amber-600" : "text-slate-800"}`}>{c.burst_count || 0}</div>
+                  </div>
                 </div>
                 {flashRatio >= 0.4 && (
                   <div className="text-xs text-amber-700 mt-2">
                     💡 Cukup sering selesai sangat cepat. Mungkin bagus diobrolkan santai — apa misinya terlalu mudah,
                     atau ada yang perlu dibantu?
+                  </div>
+                )}
+                {(c.burst_count || 0) > 2 && (
+                  <div className="text-xs text-amber-700 mt-2">
+                    💡 Ada {c.burst_count} misi yang dimulai kurang dari 2 menit setelah misi sebelumnya selesai.
+                    Bisa jadi memang lancar berurutan — tapi kalau totalnya mestinya makan waktu lama, mungkin
+                    dikerjakan sekaligus di akhir. Cocok diobrolkan santai.
                   </div>
                 )}
                 {c.overrun_count > 0 && flashRatio < 0.4 && (

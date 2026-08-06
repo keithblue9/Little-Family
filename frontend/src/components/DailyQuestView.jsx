@@ -25,6 +25,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [lateReasons, setLateReasons] = useState([]);
   const [punishmentBusy, setPunishmentBusy] = useState(false);
   const [daySegments, setDaySegments] = useState([]);
+  const [flashPct, setFlashPct] = useState(15);
   useEffect(() => {
     const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
     return () => clearInterval(t);
@@ -41,7 +42,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       const { data } = await api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } });
       setProgress(data);
       api.get("/config")
-        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); })
+        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); })
         .catch(() => { setLateReasons([]); setDaySegments([]); });
     } catch (e) {
       toast.error(formatApiError(e));
@@ -197,7 +198,26 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [pendingPhotoTask, setPendingPhotoTask] = useState(null);
   const [pendingTogetherTask, setPendingTogetherTask] = useState(null);
 
+  // Friction, not a wall: finishing far below the estimate asks for a quick
+  // confirmation. A genuinely fast child just taps OK; a reflexive tapper is
+  // made to pause. The finish itself is never blocked.
+  const confirmIfFlash = (task) => {
+    const started = task.timer_started_at ? new Date(task.timer_started_at).getTime() : null;
+    if (!started) return true;
+    const secs = (Date.now() - started) / 1000;
+    const estSecs = (task.duration_minutes || 0) * 60;
+    const floor = estSecs ? Math.max(20, estSecs * ((flashPct ?? 15) / 100)) : 20;
+    if (secs >= floor) return true;
+    const shown = secs < 60 ? `${Math.round(secs)} detik` : `${Math.round(secs / 60)} menit`;
+    return window.confirm(
+      `Yakin "${task.title}" sudah selesai?\n\nBaru ${shown} sejak kamu menekan Mulai` +
+      (task.duration_minutes ? ` (perkiraannya ${task.duration_minutes} menit).` : ".") +
+      `\n\nKalau memang sudah beres, lanjut saja 🙂`
+    );
+  };
+
   const finishTask = async (task, photoUrl, doneTogether) => {
+    if (!confirmIfFlash(task)) return;
     if (task.photo_required && !photoUrl) {
       // Need a photo first — open the camera/file picker, then re-invoke this
       // same function with the captured image once it's read.

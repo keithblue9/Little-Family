@@ -284,6 +284,17 @@ class AppConfigInput(BaseModel):
     # Kid timeline sections (Pagi/Siang/Sore/Malam...). Fully editable: rename,
     # re-time, add or remove as many as the family wants.
     day_segments: Optional[List[DaySegment]] = None
+    # --- Pacing & honesty guards -------------------------------------------
+    # Cooldown between finishing one mission and being able to start the next.
+    # Stops a whole morning being "rapel"-clicked in one burst. 0 = off.
+    min_gap_seconds: Optional[int] = Field(default=None, ge=0, le=1800)
+    # Finishing below this % of the estimated duration is flagged as "kilat".
+    # Never blocks — the child confirms, and the parent sees the flag.
+    flash_threshold_pct: Optional[int] = Field(default=None, ge=0, le=100)
+    # Reward for a healthy rhythm (sensible gap + not rushed). 0 = off.
+    pacing_bonus_points: Optional[int] = Field(default=None, ge=0, le=100)
+    # Ping the parent the moment a mission is started.
+    notify_parent_on_start: Optional[bool] = None
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -2393,6 +2404,82 @@ def _task_sort_anchor(task: dict, segments: list) -> int:
     return 24 * 60 + 1
 
 
+async def _last_finish_dt(child_id: str, date_key: str, exclude_task_id: Optional[str] = None):
+    """When this child most recently finished a mission today. Used both for the
+    anti-rapel cooldown and for measuring the gap between missions."""
+    q = {
+        "parent_id": FAMILY_ID, "date_key": date_key,
+        "completed_at": {"$nin": [None, ""]},
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    }
+    if exclude_task_id:
+        q["id"] = {"$ne": exclude_task_id}
+    rows = await db.tasks.find(q, {"_id": 0, "completed_at": 1}).to_list(500)
+    stamps = []
+    for r in rows:
+        try:
+            d = datetime.fromisoformat(r["completed_at"].replace("Z", "+00:00"))
+            stamps.append(d if d.tzinfo else d.replace(tzinfo=timezone.utc))
+        except Exception:
+            continue
+    return max(stamps) if stamps else None
+
+
+def _elapsed_seconds(task: dict) -> Optional[float]:
+    """How long the child actually spent, from Mulai to Selesai."""
+    st, en = task.get("timer_started_at"), task.get("completed_at")
+    if not st or not en:
+        return None
+    try:
+        a = datetime.fromisoformat(st.replace("Z", "+00:00"))
+        b = datetime.fromisoformat(en.replace("Z", "+00:00"))
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=timezone.utc)
+        if b.tzinfo is None:
+            b = b.replace(tzinfo=timezone.utc)
+        return max(0.0, (b - a).total_seconds())
+    except Exception:
+        return None
+
+
+def _pacing_bonus(task: dict, config: dict) -> int:
+    """Small reward for a HEALTHY rhythm rather than raw speed.
+
+    Earned when the child left a sensible gap after the previous mission AND
+    actually spent a believable amount of time on this one. The point is to
+    make honest pacing pay, so doing the day properly beats batching it — a
+    carrot next to the cooldown's stick.
+    """
+    pts = int(config.get("pacing_bonus_points", 2))
+    if pts <= 0 or task.get("is_bonus") or task.get("late_ack"):
+        return 0
+    if task.get("flash_flag"):
+        return 0  # rushed finishes never count as good pacing
+    est_min = task.get("duration_minutes")
+    secs = task.get("actual_seconds")
+    if est_min and secs is not None and secs < est_min * 60 * 0.5:
+        return 0  # far quicker than planned — not a healthy rhythm
+    gap = task.get("gap_from_prev_seconds")
+    min_gap = int(config.get("min_gap_seconds", 60)) or 60
+    # The very first mission of the day has no previous gap to judge; give it
+    # the benefit of the doubt rather than silently withholding the bonus.
+    if gap is not None and gap < min_gap:
+        return 0
+    return pts
+
+
+def _is_flash_finish(task: dict, threshold_pct: int) -> bool:
+    """A finish so fast it probably wasn't really done. Deliberately advisory:
+    it flags, it never blocks — a genuinely quick child shouldn't be punished."""
+    secs = _elapsed_seconds(task)
+    if secs is None:
+        return False
+    est_min = task.get("duration_minutes")
+    if est_min:
+        return secs < max(20, est_min * 60 * (threshold_pct / 100.0))
+    return secs < 20
+
+
 def _task_availability(task: dict, segments: list) -> str:
     """Is this task doable RIGHT NOW? Three states:
 
@@ -2672,8 +2759,21 @@ async def honesty_insight(days: int = 14, user: dict = Depends(require_parent)):
                     overrun_count += 1
             elif actual_s < 20:
                 flash_count += 1
+        # "Rapel" detection: missions started almost immediately after the
+        # previous one finished, repeatedly. One quick hand-off is normal; a
+        # run of them across a morning that should have taken an hour is the
+        # signature of batch-clicking. Reported as a signal, never a verdict.
+        burst_count = 0
+        for t in tasks:
+            gap = t.get("gap_from_prev_seconds")
+            if gap is not None and gap < 120:
+                burst_count += 1
+        flagged_flash = len([t for t in tasks if t.get("flash_flag")])
+
         out.append({
             "child_id": k["id"], "child_name": k["name"],
+            "burst_count": burst_count,
+            "flagged_flash_count": flagged_flash,
             "avatar_emoji": k.get("avatar_emoji"), "avatar_color": k.get("avatar_color"),
             "tasks_measured": total,
             "avg_actual_minutes": round(sum_actual / total / 60, 1) if total else None,
@@ -2889,7 +2989,34 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
                 detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
             )
 
-    await db.tasks.update_one({"id": task_id}, {"$set": {"timer_started_at": now_iso()}})
+    cfg_start = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    gap_seconds = None
+    prev_finish = await _last_finish_dt(task["child_id"], task.get("date_key") or _today_key(), task_id)
+    if prev_finish:
+        gap_seconds = (datetime.now(timezone.utc) - prev_finish).total_seconds()
+        # Anti-"rapel": a whole morning can't be clicked through in one burst.
+        # Bonus missions are exempt — they're meant to be opportunistic.
+        min_gap = int(cfg_start.get("min_gap_seconds", 60))
+        if min_gap > 0 and not task.get("is_bonus") and gap_seconds < min_gap:
+            wait = int(min_gap - gap_seconds) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Sabar sebentar ya — tunggu {wait} detik lagi sebelum mulai misi berikutnya.",
+            )
+
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "timer_started_at": now_iso(),
+        "gap_from_prev_seconds": gap_seconds,
+    }})
+
+    if cfg_start.get("notify_parent_on_start", True):
+        _kid = await db.children.find_one({"id": task["child_id"]})
+        await send_push_to(
+            {"role": "parent"},
+            title=f'{(_kid or {}).get("name", "Anak")} mulai misi ▶️',
+            body=f'"{task["title"]}" dimulai sekarang.',
+            url="/parent",
+        )
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
@@ -2961,6 +3088,11 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
         {"$set": {
             "status": "completed", "completed_at": now_iso(), "timer_completed_at": now_iso(),
             "completion_photo_url": payload.photo_url,
+            "actual_seconds": _elapsed_seconds({**task, "completed_at": now_iso()}),
+            "flash_flag": _is_flash_finish(
+                {**task, "completed_at": now_iso()},
+                int((await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}).get("flash_threshold_pct", 15)),
+            ),
             "coop_completed_by": user["id"] if task.get("is_coop") else task.get("coop_completed_by"),
             "done_together": payload.done_together if task.get("together_bonus_enabled") else None,
         }},
@@ -4012,7 +4144,8 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
     if task.get("together_bonus_enabled") and task.get("done_together") is True:
         together_bonus_awarded = task.get("together_bonus_points") or 0
     early_bonus_awarded = _early_completion_bonus(task, task["points"], config)
-    points = task["points"] + together_bonus_awarded + early_bonus_awarded
+    pacing_bonus_awarded = _pacing_bonus(task, config)
+    points = task["points"] + together_bonus_awarded + early_bonus_awarded + pacing_bonus_awarded
     if task.get("late_no_points"):
         # At-fault lateness: the kid chose to continue anyway, which is the
         # honest thing to do — but the reward is gone. No base points and no
@@ -4020,6 +4153,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         points = 0
         early_bonus_awarded = 0
         together_bonus_awarded = 0
+        pacing_bonus_awarded = 0
     snap = await _apply_approval_rewards(task["child_id"], points, config)
     spawned_next_id = await _spawn_recurrence_if_due(task, config)
 
@@ -4035,6 +4169,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                 "_undo_points_awarded": points,
                 "early_bonus_awarded": early_bonus_awarded,
                 "together_bonus_awarded": together_bonus_awarded,
+                "pacing_bonus_awarded": pacing_bonus_awarded,
                 "_undo_chiky_save": snap["chiky_save"],
                 "_undo_chiky_spend": snap["chiky_spend"],
                 "_undo_chiky_share": snap["chiky_share"],
@@ -4379,6 +4514,10 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "punishment_deadline_weekday": DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY,
             "punishment_overdue_action": DEFAULT_PUNISHMENT_OVERDUE_ACTION,
             "day_segments": DEFAULT_DAY_SEGMENTS,
+            "min_gap_seconds": 60,
+            "flash_threshold_pct": 15,
+            "pacing_bonus_points": 2,
+            "notify_parent_on_start": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4473,6 +4612,10 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "punishment_deadline_weekday": DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY,
             "punishment_overdue_action": DEFAULT_PUNISHMENT_OVERDUE_ACTION,
             "day_segments": DEFAULT_DAY_SEGMENTS,
+            "min_gap_seconds": 60,
+            "flash_threshold_pct": 15,
+            "pacing_bonus_points": 2,
+            "notify_parent_on_start": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4507,6 +4650,10 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "punishment_deadline_weekday": int(config.get("punishment_deadline_weekday", DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY)),
         "punishment_overdue_action": config.get("punishment_overdue_action", DEFAULT_PUNISHMENT_OVERDUE_ACTION),
         "day_segments": config.get("day_segments") or DEFAULT_DAY_SEGMENTS,
+        "min_gap_seconds": int(config.get("min_gap_seconds", 60)),
+        "flash_threshold_pct": int(config.get("flash_threshold_pct", 15)),
+        "pacing_bonus_points": int(config.get("pacing_bonus_points", 2)),
+        "notify_parent_on_start": bool(config.get("notify_parent_on_start", True)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

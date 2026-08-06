@@ -50,6 +50,10 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("orders 1,2,3", [x["order"] for x in t] == [1, 2, 3], str([x.get("order") for x in t]))
 
     # ---- 4. Parent config: rate & skip cost ----
+    # The anti-rapel cooldown is exercised in its own block below; everywhere
+    # else it would just make unrelated tests race the clock, so keep it off.
+    c.post("/api/config", json={"min_gap_seconds": 0, "notify_parent_on_start": False,
+                                "pacing_bonus_points": 0})
     r = c.post("/api/config", json={"rupiah_per_point": 500, "skip_cost_points": 5})
     check("set config", r.status_code == 200, r.text[:120])
     r = c.get("/api/config")
@@ -824,6 +828,11 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("regression: vacation_mode set on fresh config doc", r.json()["vacation_mode"] is True, str(r.json().get("vacation_mode")))
     check("regression: other defaults still sane", r.json()["daily_point_goal"] == 50 and r.json()["chiky_save_pct"] == 40, str(r.json()))
     c.post("/api/config", json={"vacation_mode": False})  # reset — leaving this on would silently break every later test that expects recurrence to spawn
+    # The wipe above restored factory defaults, which re-enable the pacing
+    # cooldown/bonus. Re-apply the suite-wide overrides so later tests keep
+    # measuring what they intend to.
+    c.post("/api/config", json={"min_gap_seconds": 0, "notify_parent_on_start": False,
+                                "pacing_bonus_points": 0})
 
     # ================= 43. REGRESSION: /auth/me must include all self-editable profile fields =================
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
@@ -2972,6 +2981,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # Bug: a morning task whose window had closed stayed freely startable all
     # evening, so it sat "active" at the same time as the current task.
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"min_gap_seconds": 0})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
     c.post("/api/config", json={"late_reasons": [
         {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
@@ -3235,6 +3245,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     def _hhmm(m):
         m = max(0, min(m, 23 * 60 + 59))
         return f"{m // 60:02d}:{m % 60:02d}"
+    c.post("/api/config", json={"min_gap_seconds": 0})
     win_segs = [
         {"label": "Lewat", "start_time": "00:00", "end_time": _hhmm(max(1, _nm - 30))},
         {"label": "Sekarang", "start_time": _hhmm(max(2, _nm - 29)), "end_time": _hhmm(min(_nm + 30, 23 * 60 + 58))},
@@ -3296,6 +3307,145 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("bulkdel: kid's blocked attempt deleted nothing",
           len(c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()) == 1)
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== PACING & ANTI-RAPEL GUARDS ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
+    c.post("/api/config", json={"day_segments": [{"label": "Sehari penuh", "start_time": "00:00", "end_time": "23:59"}]})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    r = c.get("/api/config")
+    check("pacing: defaults exposed", r.json()["min_gap_seconds"] == 0
+          and "flash_threshold_pct" in r.json() and "pacing_bonus_points" in r.json(), str(r.json().get("flash_threshold_pct")))
+    r = c.post("/api/config", json={"min_gap_seconds": 2000})
+    check("pacing: absurd cooldown rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"flash_threshold_pct": 150})
+    check("pacing: flash pct >100 rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"pacing_bonus_points": -1})
+    check("pacing: negative bonus rejected", r.status_code == 422, str(r.status_code))
+
+    mkp = lambda title, dur=10, bonus=False: c.post("/api/tasks", json={
+        "title": title, "points": 10, "date_key": today_local, "duration_minutes": dur,
+        "target_children": [adskhan["id"]], "is_bonus": bonus}).json()
+
+    # --- Cooldown blocks a rapid second start ---
+    c.post("/api/config", json={"min_gap_seconds": 60, "pacing_bonus_points": 0})
+    p1, p2 = mkp("Pacing satu"), mkp("Pacing dua")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{p1['id']}/start")
+    check("pacing: first mission of the day starts freely", r.status_code == 200, r.text[:150])
+    c.post(f"/api/tasks/{p1['id']}/complete")
+    r = c.post(f"/api/tasks/{p2['id']}/start")
+    check("pacing: rapid next start blocked", r.status_code == 429, str(r.status_code))
+    check("pacing: block tells the child how long to wait", "detik" in r.text, r.text[:150])
+
+    # Bonus missions are exempt from the cooldown
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    pb = mkp("Pacing bonus", bonus=True)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{pb['id']}/start")
+    check("pacing: bonus mission ignores the cooldown", r.status_code == 200, r.text[:150])
+
+    # Cooldown honours its config: 0 disables it entirely
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"min_gap_seconds": 0})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{p2['id']}/start")
+    check("pacing: cooldown of 0 disables the guard", r.status_code == 200, r.text[:150])
+
+    # --- Flash flag: fast finish is recorded, never blocked ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"flash_threshold_pct": 15})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{p2['id']}/complete")
+    check("pacing: instant finish still allowed", r.status_code == 200, r.text[:150])
+    p2_after = _aio_tg.run(server.db.tasks.find_one({"id": p2["id"]}, {"_id": 0}))
+    check("pacing: instant finish flagged as kilat", p2_after.get("flash_flag") is True, str(p2_after.get("flash_flag")))
+    check("pacing: actual duration recorded", p2_after.get("actual_seconds") is not None, str(p2_after.get("actual_seconds")))
+
+    # A believable finish is NOT flagged
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    slow = mkp("Dikerjakan wajar", dur=1)
+    _aio_tg.run(server.db.tasks.update_one({"id": slow["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=50)).isoformat()}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{slow['id']}/complete")
+    slow_after = _aio_tg.run(server.db.tasks.find_one({"id": slow["id"]}, {"_id": 0}))
+    check("pacing: believable finish not flagged", not slow_after.get("flash_flag"), str(slow_after.get("flash_flag")))
+
+    # --- Pacing bonus: healthy rhythm pays, rushing doesn't ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"pacing_bonus_points": 3, "min_gap_seconds": 60, "early_bonus_pct": 0})
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
+    good = mkp("Ritme sehat", dur=1)
+    _aio_tg.run(server.db.tasks.update_one({"id": good["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=55)).isoformat(),
+        "gap_from_prev_seconds": 300}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{good['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{good['id']}/approve")
+    ads_pb = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pacing: healthy rhythm earns the bonus", ads_pb["points"] == 13, str(ads_pb["points"]))
+    good_after = next(t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json() if t["id"] == good["id"])
+    check("pacing: bonus recorded on the task", good_after.get("pacing_bonus_awarded") == 3, str(good_after.get("pacing_bonus_awarded")))
+
+    # Rushed finish earns no pacing bonus
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+    rush = mkp("Buru-buru", dur=10)
+    _aio_tg.run(server.db.tasks.update_one({"id": rush["id"]}, {"$set": {
+        "timer_started_at": _dt_off.datetime.now(_dt_off.timezone.utc).isoformat(),
+        "gap_from_prev_seconds": 600}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{rush['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{rush['id']}/approve")
+    ads_rush = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pacing: rushed finish earns no bonus", ads_rush["points"] == 10, str(ads_rush["points"]))
+
+    # Batched (tiny gap) finish earns no pacing bonus either
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+    batched = mkp("Dirapel", dur=1)
+    _aio_tg.run(server.db.tasks.update_one({"id": batched["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=55)).isoformat(),
+        "gap_from_prev_seconds": 5}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{batched['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{batched['id']}/approve")
+    ads_b = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("pacing: batched start earns no bonus", ads_b["points"] == 10, str(ads_b["points"]))
+
+    # Bonus of 0 turns the whole reward off
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+    c.post("/api/config", json={"pacing_bonus_points": 0})
+    off = mkp("Bonus mati", dur=1)
+    _aio_tg.run(server.db.tasks.update_one({"id": off["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=55)).isoformat(),
+        "gap_from_prev_seconds": 300}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{off['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{off['id']}/approve")
+    check("pacing: bonus of 0 disables the reward",
+          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 10)
+
+    # --- Rapel signal surfaces in the honesty insight ---
+    r = c.get("/api/family/honesty-insight?days=14")
+    ins = next(x for x in r.json()["children"] if x["child_id"] == adskhan["id"])
+    check("pacing: insight reports burst count", ins.get("burst_count", 0) >= 1, str(ins.get("burst_count")))
+    check("pacing: insight reports flagged kilat finishes", ins.get("flagged_flash_count", 0) >= 1, str(ins.get("flagged_flash_count")))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.get("/api/family/honesty-insight")
+    check("pacing: insight stays parent-only", r.status_code == 403, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"min_gap_seconds": 0, "pacing_bonus_points": 0, "early_bonus_pct": 10,
+                                "day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
 print("\n" + "=" * 50)

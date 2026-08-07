@@ -3755,6 +3755,69 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "snooze_options_minutes": [5, 10, 15, 20]})
     _asn.run(server._refresh_segments_cache())
 
+    # =============== BATAS TUNDA PER TUGAS ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"snooze_options_minutes": [5, 10, 15, 20],
+                                "day_segments": [{"label": "Sesi Cap", "start_time": "00:00", "end_time": "23:59"}],
+                                "min_gap_seconds": 0, "auto_start_next": True})
+    CSID = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    mkcap = lambda title, order, cap=None: c.post("/api/tasks", json={
+        "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": CSID, "order": order,
+        **({"max_snooze_minutes": cap} if cap is not None else {})}).json()
+
+    r = c.post("/api/tasks", json={"title": "Cap invalid", "points": 5, "date_key": today_local,
+                                   "target_children": [adskhan["id"]], "max_snooze_minutes": 999})
+    check("cap: absurd cap rejected", r.status_code == 422, str(r.status_code))
+
+    normal = mkcap("Beres-beres", 1)
+    sholat = mkcap("Sholat Maghrib", 2, cap=10)
+    never = mkcap("Tidak boleh ditunda", 3, cap=1)
+    check("cap: stored on the task", sholat.get("max_snooze_minutes") == 10, str(sholat.get("max_snooze_minutes")))
+    check("cap: absent when not set", not normal.get("max_snooze_minutes"), str(normal.get("max_snooze_minutes")))
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    # Uncapped mission still accepts the family's longest option
+    r = c.post(f"/api/tasks/{normal['id']}/snooze", json={"minutes": 20})
+    check("cap: uncapped mission allows the longest snooze", r.status_code == 200, r.text[:150])
+
+    # Capped mission refuses anything beyond its own limit...
+    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 20})
+    check("cap: capped mission refuses a longer snooze", r.status_code == 422, str(r.status_code))
+    check("cap: refusal states the mission's own limit", "10 menit" in r.text, r.text[:180])
+    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 15})
+    check("cap: still refuses just above the cap", r.status_code == 422, str(r.status_code))
+    # ...but accepts anything within it
+    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 10})
+    check("cap: accepts a snooze at exactly the cap", r.status_code == 200, r.text[:150])
+    _aio_tg.run(server.db.tasks.update_one({"id": sholat["id"]}, {"$unset": {"snooze_until": ""}}))
+    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 5})
+    check("cap: accepts a snooze below the cap", r.status_code == 200, r.text[:150])
+
+    # A cap below every option means the mission simply can't be put off
+    r = c.post(f"/api/tasks/{never['id']}/snooze", json={"minutes": 5})
+    check("cap: a cap below all options blocks snoozing entirely", r.status_code == 400, str(r.status_code))
+    check("cap: block says so plainly", "tidak boleh ditunda" in r.text.lower(), r.text[:170])
+
+    # The hand-off popup only advertises options the mission actually allows
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    h1 = mkcap("Pembuka", 1)
+    mkcap("Sholat Isya", 2, cap=10)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{h1['id']}/start")
+    r = c.post(f"/api/tasks/{h1['id']}/complete")
+    nxt_cap = r.json().get("auto_next")
+    check("cap: hand-off carries the trimmed options",
+          nxt_cap and nxt_cap.get("snooze_options") == [5, 10], str(nxt_cap and nxt_cap.get("snooze_options")))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

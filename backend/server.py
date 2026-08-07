@@ -556,6 +556,10 @@ class TaskInput(BaseModel):
     # just hold their position within it. due_time stays supported for older
     # tasks that were created before segments existed.
     segment_id: Optional[str] = None
+    # Cap on how long THIS mission may be snoozed, overriding the family-wide
+    # options. Some things genuinely can't wait as long as others — prayer
+    # shouldn't be postponable as far as tidying up. None/0 = use the default.
+    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
@@ -1969,6 +1973,7 @@ async def _build_task_doc(
         "due_date": payload.due_date,
         "due_time": validate_due_time(payload.due_time),
         "segment_id": payload.segment_id,
+        "max_snooze_minutes": payload.max_snooze_minutes,
         "duration_minutes": payload.duration_minutes,
         "date_key": date_key,
         "recurrence": payload.recurrence,
@@ -3271,6 +3276,7 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
                         "duration_minutes": nxt.get("duration_minutes"),
                         "segment_label": nxt_seg.get("label"),
                         "wait_seconds": int(config_for_notify.get("min_gap_seconds", 60)),
+                        "snooze_options": _snooze_options_for(nxt, config_for_notify),
                     }
     return {**updated_task, "auto_next": auto_next}
 
@@ -3365,6 +3371,18 @@ class LateReasonPickInput(BaseModel):
     reason_id: str
 
 
+def _snooze_options_for(task: dict, config: dict) -> list:
+    """Snooze choices valid for THIS mission: the family list, trimmed by the
+    mission's own cap when it has one. A cap below the smallest option leaves
+    no choices at all, which is the honest way to express "this one can't
+    really be put off"."""
+    base = config.get("snooze_options_minutes") or [5, 10, 15, 20]
+    cap = task.get("max_snooze_minutes")
+    if not cap:
+        return sorted(base)
+    return sorted([m for m in base if m <= int(cap)])
+
+
 class SnoozeInput(BaseModel):
     minutes: int = Field(ge=1, le=240)
 
@@ -3392,9 +3410,14 @@ async def snooze_task(task_id: str, payload: SnoozeInput, user: dict = Depends(g
         raise HTTPException(status_code=400, detail="Misi ini sudah dimulai")
 
     config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
-    allowed = config.get("snooze_options_minutes") or [5, 10, 15, 20]
+    allowed = _snooze_options_for(task, config)
+    if not allowed:
+        raise HTTPException(status_code=400, detail="Misi ini tidak boleh ditunda")
     if payload.minutes not in allowed:
-        raise HTTPException(status_code=422, detail=f"Pilihan tunda harus salah satu dari: {allowed} menit")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Misi ini paling lama ditunda {max(allowed)} menit (pilihan: {allowed})",
+        )
 
     until = datetime.now(timezone.utc) + timedelta(minutes=payload.minutes)
     await db.tasks.update_one({"id": task_id}, {"$set": {

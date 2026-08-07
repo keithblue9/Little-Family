@@ -18,6 +18,7 @@ export default function MoneyApprovals() {
   const [notifyStart, setNotifyStart] = useState(true);
   const [graceMin, setGraceMin] = useState("10");
   const [autoNext, setAutoNext] = useState(true);
+  const [snoozeOpts, setSnoozeOpts] = useState("5, 10, 15, 20");
   const [comboBonus, setComboBonus] = useState("");
   const [savingCfg, setSavingCfg] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -39,6 +40,7 @@ export default function MoneyApprovals() {
       setNotifyStart(cfg.data.notify_parent_on_start !== false);
       setGraceMin(String(cfg.data.segment_late_grace_minutes ?? 10));
       setAutoNext(cfg.data.auto_start_next !== false);
+      setSnoozeOpts((cfg.data.snooze_options_minutes || [5, 10, 15, 20]).join(", "));
       setComboBonus(String(cfg.data.family_combo_bonus_points ?? 10));
     } catch (e) {
       toast.error(formatApiError(e));
@@ -58,6 +60,7 @@ export default function MoneyApprovals() {
     const fp = parseInt(flashPct || "0", 10);
     const pbp = parseInt(pacingBonus || "0", 10);
     const gm = parseInt(graceMin || "0", 10);
+    const snz = [...new Set(snoozeOpts.split(",").map((x) => parseInt(x.trim(), 10)).filter((x) => x > 0))].sort((a, b) => a - b);
     const cb = parseInt(comboBonus || "0", 10);
     if (r < 1) { toast.error("Kurs minimal Rp 1 per poin"); return; }
     if (eb < 0 || eb > 100) { toast.error("Bonus cepat harus 0–100%"); return; }
@@ -66,6 +69,9 @@ export default function MoneyApprovals() {
     if (fp < 0 || fp > 100) { toast.error("Ambang kilat harus 0–100%"); return; }
     if (pbp < 0 || pbp > 100) { toast.error("Bonus ritme harus 0–100 poin"); return; }
     if (gm < 0 || gm > 180) { toast.error("Toleransi telat harus 0–180 menit"); return; }
+    if (snz.length === 0 || snz.length > 6 || snz[snz.length - 1] > 240) {
+      toast.error("Pilihan tunda harus 1–6 angka, masing-masing 1–240 menit"); return;
+    }
     if (cb < 0 || cb > 1000) { toast.error("Bonus kompak harus 0–1000 poin"); return; }
     setSavingCfg(true);
     try {
@@ -75,6 +81,7 @@ export default function MoneyApprovals() {
         min_gap_seconds: mg, flash_threshold_pct: fp,
         pacing_bonus_points: pbp, notify_parent_on_start: notifyStart,
         segment_late_grace_minutes: gm, auto_start_next: autoNext,
+        snooze_options_minutes: snz,
         family_combo_bonus_points: cb,
       });
       toast.success("Pengaturan tersimpan");
@@ -181,6 +188,16 @@ export default function MoneyApprovals() {
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
             <p className="text-[11px] text-slate-400 mt-1">Berlaku pada misi pembuka tiap bagian, dan hanya bila jam mulai personal anak sudah diatur.</p>
+          </div>
+          <div className="sm:col-span-2">
+            <label className="block text-sm font-semibold text-slate-700 mb-1">Pilihan tunda (menit)</label>
+            <input
+              type="text" value={snoozeOpts}
+              onChange={(e) => setSnoozeOpts(e.target.value)}
+              placeholder="5, 10, 15, 20"
+              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Tombol yang muncul saat anak menunda misi berikutnya. Pisahkan dengan koma, maks. 6 pilihan.</p>
           </div>
           <div className="sm:col-span-2">
             <label className="flex items-center gap-2 cursor-pointer select-none">

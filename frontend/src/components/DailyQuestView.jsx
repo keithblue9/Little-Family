@@ -26,6 +26,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [punishmentBusy, setPunishmentBusy] = useState(false);
   const [daySegments, setDaySegments] = useState([]);
   const [flashPct, setFlashPct] = useState(15);
+  const [snoozeOptions, setSnoozeOptions] = useState([5, 10, 15, 20]);
   // Hand-off popup: offers the next mission in the same section with a
   // countdown, then starts it. The countdown only runs while the child is
   // actually here — one ticking away with the app closed would silently eat
@@ -47,7 +48,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       const { data } = await api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } });
       setProgress(data);
       api.get("/config")
-        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); })
+        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); setSnoozeOptions(cfg.snooze_options_minutes || [5, 10, 15, 20]); })
         .catch(() => { setLateReasons([]); setDaySegments([]); });
     } catch (e) {
       toast.error(formatApiError(e));
@@ -218,6 +219,19 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   }, [handoff]);
 
   const handoffFiring = useRef(false);
+
+  const snoozeHandoff = async (minutes) => {
+    const h = handoff;
+    if (!h) return;
+    try {
+      await api.post(`/tasks/${h.task.id}/snooze`, { minutes });
+      toast.success(`Oke, ditunda ${minutes} menit. Kalau sudah siap, tinggal tekan Mulai ya 🙂`);
+      setHandoff(null);
+      await load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
+  };
 
   const startHandoff = async () => {
     const h = handoff;
@@ -438,12 +452,23 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
               </button>
             )}
 
-            <button
-              onClick={() => setHandoff(null)}
-              className="press-btn w-full py-2 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600 text-sm"
-            >
-              Tunda dulu
-            </button>
+            <div className="border-t border-slate-100 pt-3 mt-1">
+              <div className="text-[11px] text-slate-500 mb-1.5">Belum sempat? Tunda dulu:</div>
+              <div className="flex flex-wrap gap-1.5 justify-center">
+                {snoozeOptions.map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => snoozeHandoff(m)}
+                    className="press-btn px-3 py-1.5 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600 text-xs hover:bg-slate-50"
+                  >
+                    {m} menit
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] text-slate-400 mt-2">
+                Boleh mulai lebih cepat kapan saja. Kalau lewat dari waktu tunda, kamu tinggal jelaskan alasannya lewat tombol Terlambat.
+              </p>
+            </div>
           </motion.div>
         </div>
       )}

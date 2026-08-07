@@ -15,7 +15,7 @@ import logging
 import bcrypt
 import jwt
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status, Query
 from starlette.middleware.cors import CORSMiddleware
@@ -237,6 +237,19 @@ class DaySegment(BaseModel):
     end_time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 
 
+class SegmentStartOverrideInput(BaseModel):
+    """Per-child, per-weekday start time for a section.
+
+    Kids don't share one clock: one gets home from an activity at 18:50 while a
+    sibling starts at 18:00, and it differs by weekday. Only the START moves —
+    the section's END stays shared, since "when the day is over" is a household
+    rule rather than a personal one.
+    Shape: {segment_id: {"0".."6": "HH:MM"}}; a missing weekday falls back to
+    the section's global start time.
+    """
+    starts: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+
+
 class PunishmentOption(BaseModel):
     id: Optional[str] = None
     label: str = Field(min_length=1, max_length=120)
@@ -295,6 +308,12 @@ class AppConfigInput(BaseModel):
     pacing_bonus_points: Optional[int] = Field(default=None, ge=0, le=100)
     # Ping the parent the moment a mission is started.
     notify_parent_on_start: Optional[bool] = None
+    # How long after a section's (personal) start time a child may still begin
+    # the first mission without it counting as late.
+    segment_late_grace_minutes: Optional[int] = Field(default=None, ge=0, le=180)
+    # Offer the next mission automatically after finishing one (same section
+    # only), with a countdown. Set False to keep it quiet.
+    auto_start_next: Optional[bool] = None
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -2480,7 +2499,35 @@ def _is_flash_finish(task: dict, threshold_pct: int) -> bool:
     return secs < 20
 
 
-def _task_availability(task: dict, segments: list) -> str:
+def _effective_segment_start(segment: dict, child: Optional[dict], date_key: Optional[str]) -> int:
+    """Minutes-into-day when THIS child's section begins on THIS date.
+
+    Falls back to the section's shared start whenever the child has no override
+    for that weekday, so partial configuration is always safe.
+    """
+    base = _hhmm_to_min(segment["start_time"])
+    if not child or not date_key:
+        return base
+    overrides = (child.get("segment_starts") or {}).get(segment.get("id")) or {}
+    try:
+        wd = str(datetime.strptime(date_key, "%Y-%m-%d").weekday())
+    except Exception:
+        return base
+    val = overrides.get(wd)
+    if not val:
+        return base
+    try:
+        return _hhmm_to_min(val)
+    except Exception:
+        return base
+
+
+def _fmt_min(m: int) -> str:
+    m = max(0, min(int(m), 23 * 60 + 59))
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _task_availability(task: dict, segments: list, child: Optional[dict] = None, is_segment_first: bool = False, grace_minutes: int = 10) -> str:
     """Is this task doable RIGHT NOW? Three states:
 
       "open"   — its section is running now (or it has no section, or the child
@@ -2499,11 +2546,34 @@ def _task_availability(task: dict, segments: list) -> str:
     if not seg:
         return "open"  # no section = do it whenever
     now_min = _now_local().hour * 60 + _now_local().minute
-    if now_min < _hhmm_to_min(seg["start_time"]):
+    start_min = _effective_segment_start(seg, child, task.get("date_key"))
+    if now_min < start_min:
         return "future"
     if now_min > _hhmm_to_min(seg["end_time"]):
         return "closed"
+    # The FIRST mission of a section carries the "did you start on time?"
+    # question. Past its personal start + grace it needs the Terlambat flow,
+    # so beginning the evening an hour late is acknowledged rather than
+    # silently accepted. Later missions in the section aren't judged this way —
+    # they're paced by the auto-start flow instead.
+    # ...and only where a personal start time was actually configured. Judging
+    # punctuality against a broad section start (e.g. "Pagi 00:00–09:59") would
+    # brand a 05:00 start as late, which is nonsense — the expectation only
+    # exists once a parent sets one.
+    if is_segment_first and _has_start_override(seg, child, task.get("date_key")):
+        if now_min > start_min + max(0, grace_minutes):
+            return "closed"
     return "open"
+
+
+def _has_start_override(segment: dict, child: Optional[dict], date_key: Optional[str]) -> bool:
+    if not child or not date_key:
+        return False
+    overrides = (child.get("segment_starts") or {}).get(segment.get("id")) or {}
+    try:
+        return bool(overrides.get(str(datetime.strptime(date_key, "%Y-%m-%d").weekday())))
+    except Exception:
+        return False
 
 
 def _task_window_end(task: dict, segments: list) -> Optional[int]:
@@ -2887,11 +2957,45 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
         return None
     segments = await _get_day_segments()
     open_tasks.sort(key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
-    # Only sections that are actually running can hold the turn. Overdue ones
-    # are handled through Terlambat and future ones simply aren't due yet —
-    # neither should stall everything behind them.
-    actionable = [t for t in open_tasks if _task_availability(t, segments) == "open"]
+    child = await db.children.find_one({"id": child_id})
+    cfg = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    grace = int(cfg.get("segment_late_grace_minutes", 10))
+    all_today = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": date_key,
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    }).to_list(500) if date_key else open_tasks
+    firsts = _segment_first_ids(open_tasks, segments, all_today)
+    actionable = [
+        t for t in open_tasks
+        if _task_availability(t, segments, child, t["id"] in firsts, grace) == "open"
+    ]
     return actionable[0] if actionable else None
+
+
+def _segment_first_ids(open_tasks: list, segments: list, all_tasks: Optional[list] = None) -> set:
+    """Ids of missions whose START TIME should be judged for punctuality.
+
+    Only the mission that OPENS a section counts, and only while the child
+    hasn't begun that section at all. Once they've started anything in it, the
+    "did you begin on time?" question has already been answered — judging every
+    subsequent mission against the same section start would keep flagging them
+    as late for the rest of the evening.
+    """
+    entered = set()
+    for t in (all_tasks or []):
+        if t.get("timer_started_at") or t.get("status") in ("completed", "approved", "skipped"):
+            seg = _segment_for_task(t, segments)
+            if seg:
+                entered.add(seg.get("id"))
+    seen: dict = {}
+    for t in sorted(open_tasks, key=lambda x: (_task_sort_anchor(x, segments), x.get("order") or 0)):
+        seg = _segment_for_task(t, segments)
+        key = seg.get("id") if seg else "__none__"
+        if key in entered:
+            continue
+        if key not in seen:
+            seen[key] = t["id"]
+    return set(seen.values())
 
 
 def _now_local():
@@ -2970,12 +3074,26 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
         # technically true but useless for a task that simply isn't due yet.
         await _refresh_segments_cache()
         _segs_now = await _get_day_segments()
-        _avail = _task_availability(task, _segs_now)
+        _cfg_now = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+        _grace = int(_cfg_now.get("segment_late_grace_minutes", 10))
+        _kid_doc = await db.children.find_one({"id": task["child_id"]})
+        _open_now = await db.tasks.find({
+            "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
+            "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True},
+            "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
+        }).to_list(500)
+        _all_now = await db.tasks.find({
+            "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
+            "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
+        }).to_list(500)
+        _is_first = task_id in _segment_first_ids(_open_now, _segs_now, _all_now)
+        _avail = _task_availability(task, _segs_now, _kid_doc, _is_first, _grace)
         if _avail == "future":
             _sg = _segment_for_task(task, _segs_now)
+            _st = _fmt_min(_effective_segment_start(_sg, _kid_doc, task.get("date_key")))
             raise HTTPException(
                 status_code=409,
-                detail=f'Belum waktunya — bagian "{_sg["label"]}" mulai jam {_sg["start_time"]}.',
+                detail=f'Belum waktunya — bagian "{_sg["label"]}" mulai jam {_st}.',
             )
         if _avail == "closed":
             raise HTTPException(
@@ -3108,7 +3226,31 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
             body=f'"{task["title"]}" menunggu untuk dicek dan disetujui.',
             url="/parent",
         )
-    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+    # Hand-off to the next mission IN THE SAME SECTION. Offering it right away
+    # (with a countdown) keeps the child moving through their routine instead
+    # of drifting off and batch-clicking everything later. Deliberately limited:
+    # never across sections, never for co-op (needs both kids ready) or bonus
+    # missions (those are meant to be free choice).
+    updated_task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    auto_next = None
+    if config_for_notify.get("auto_start_next", True) and not task.get("is_coop"):
+        segs = await _get_day_segments()
+        this_seg = _segment_for_task(task, segs)
+        if this_seg:
+            nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
+            if nxt and not nxt.get("is_coop") and not nxt.get("is_bonus"):
+                nxt_seg = _segment_for_task(nxt, segs)
+                if nxt_seg and nxt_seg.get("id") == this_seg.get("id"):
+                    auto_next = {
+                        "id": nxt["id"],
+                        "title": nxt["title"],
+                        "points": nxt.get("points"),
+                        "duration_minutes": nxt.get("duration_minutes"),
+                        "segment_label": nxt_seg.get("label"),
+                        "wait_seconds": int(config_for_notify.get("min_gap_seconds", 60)),
+                    }
+    return {**updated_task, "auto_next": auto_next}
 
 
 def _task_is_time_stuck(task: dict) -> bool:
@@ -3494,6 +3636,51 @@ async def revive_pet(child_id: str, user: dict = Depends(require_parent)):
     await db.children.update_one({"id": child_id}, {"$set": {"pet_force_dead": False, "pet_last_fed_at": now_iso()}})
     await log_activity(FAMILY_ID, child_id, "pet_revived", {})
     return {"success": True}
+
+
+@api.put("/children/{child_id}/segment-starts")
+async def set_segment_starts(child_id: str, payload: SegmentStartOverrideInput, user: dict = Depends(require_parent)):
+    """Set a child's personal start time per section per weekday.
+
+    Validated against the real sections so a stale id can't silently create an
+    override that never applies, and each time must sit inside its section's
+    window — a personal start after the section already ends would make the
+    mission impossible.
+    """
+    await get_child_or_404(FAMILY_ID, child_id)
+    segments = await _get_day_segments()
+    seg_by_id = {s["id"]: s for s in segments}
+    cleaned: dict = {}
+    for seg_id, per_day in (payload.starts or {}).items():
+        seg = seg_by_id.get(seg_id)
+        if not seg:
+            raise HTTPException(status_code=404, detail=f"Bagian waktu tidak ditemukan: {seg_id}")
+        day_map = {}
+        for wd, hhmm in (per_day or {}).items():
+            if not hhmm:
+                continue  # empty = "use the shared start"
+            if str(wd) not in {"0", "1", "2", "3", "4", "5", "6"}:
+                raise HTTPException(status_code=422, detail=f"Hari tidak valid: {wd}")
+            if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", hhmm):
+                raise HTTPException(status_code=422, detail=f"Jam tidak valid: {hhmm}")
+            m = _hhmm_to_min(hhmm)
+            if m < _hhmm_to_min(seg["start_time"]) or m > _hhmm_to_min(seg["end_time"]):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f'Jam {hhmm} di luar rentang bagian "{seg["label"]}" ({seg["start_time"]}–{seg["end_time"]})',
+                )
+            day_map[str(wd)] = hhmm
+        if day_map:
+            cleaned[seg_id] = day_map
+    await db.children.update_one({"id": child_id}, {"$set": {"segment_starts": cleaned}})
+    await log_activity(FAMILY_ID, child_id, "segment_starts_updated", {"sections": len(cleaned)})
+    return {"success": True, "segment_starts": cleaned}
+
+
+@api.get("/children/{child_id}/segment-starts")
+async def get_segment_starts(child_id: str, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    return {"segment_starts": child.get("segment_starts") or {}}
 
 
 @api.post("/children/{child_id}/penalty-cards")
@@ -4518,6 +4705,8 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "flash_threshold_pct": 15,
             "pacing_bonus_points": 2,
             "notify_parent_on_start": True,
+            "segment_late_grace_minutes": 10,
+            "auto_start_next": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4616,6 +4805,8 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "flash_threshold_pct": 15,
             "pacing_bonus_points": 2,
             "notify_parent_on_start": True,
+            "segment_late_grace_minutes": 10,
+            "auto_start_next": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4654,6 +4845,8 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "flash_threshold_pct": int(config.get("flash_threshold_pct", 15)),
         "pacing_bonus_points": int(config.get("pacing_bonus_points", 2)),
         "notify_parent_on_start": bool(config.get("notify_parent_on_start", True)),
+        "segment_late_grace_minutes": int(config.get("segment_late_grace_minutes", 10)),
+        "auto_start_next": bool(config.get("auto_start_next", True)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

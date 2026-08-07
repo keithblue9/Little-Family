@@ -3448,6 +3448,192 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
                                 "day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== JAM MULAI PER ANAK PER HARI + AUTO-START ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    _asx = __import__("asyncio")
+    _nl = server._now_local()
+    _nmin = _nl.hour * 60 + _nl.minute
+    def _fm(m):
+        m = max(0, min(m, 23 * 60 + 59))
+        return f"{m // 60:02d}:{m % 60:02d}"
+    # One wide section that is definitely open right now
+    wide = [{"label": "Sesi Uji", "start_time": "00:00", "end_time": "23:59"}]
+    c.post("/api/config", json={"day_segments": wide, "segment_late_grace_minutes": 10,
+                                "auto_start_next": True, "min_gap_seconds": 0})
+    SID = c.get("/api/config").json()["day_segments"][0]["id"]
+    _asx.run(server._refresh_segments_cache())
+    _today_wd = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
+
+    r = c.get("/api/config")
+    check("segstart: grace + auto-start defaults exposed",
+          r.json()["segment_late_grace_minutes"] == 10 and r.json()["auto_start_next"] is True, r.text[:120])
+
+    # --- validation ---
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts",
+              json={"starts": {"tidak-ada": {"0": "18:00"}}})
+    check("segstart: unknown section rejected", r.status_code == 404, str(r.status_code))
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {"9": "18:00"}}})
+    check("segstart: invalid weekday rejected", r.status_code == 422, str(r.status_code))
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {"0": "25:99"}}})
+    check("segstart: malformed time rejected", r.status_code == 422, str(r.status_code))
+    c.post("/api/config", json={"day_segments": [{"label": "Sempit", "start_time": "18:00", "end_time": "20:00"}]})
+    NSID = c.get("/api/config").json()["day_segments"][0]["id"]
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {NSID: {"0": "21:30"}}})
+    check("segstart: time outside its section rejected", r.status_code == 422, str(r.status_code))
+    check("segstart: rejection explains the range", "di luar rentang" in r.text, r.text[:160])
+    c.post("/api/config", json={"day_segments": wide})
+    SID = c.get("/api/config").json()["day_segments"][0]["id"]
+    _asx.run(server._refresh_segments_cache())
+
+    # --- per-child, per-weekday storage ---
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts",
+              json={"starts": {SID: {"0": "18:50", "2": "19:15"}}})
+    check("segstart: saved for two weekdays", r.status_code == 200, r.text[:200])
+    r = c.put(f"/api/children/{syila['id']}/segment-starts", json={"starts": {SID: {"0": "18:00"}}})
+    check("segstart: sibling stored separately", r.status_code == 200, r.text[:150])
+    ads_ss = c.get(f"/api/children/{adskhan['id']}/segment-starts").json()["segment_starts"]
+    syi_ss = c.get(f"/api/children/{syila['id']}/segment-starts").json()["segment_starts"]
+    check("segstart: Adskhan keeps his own times", ads_ss[SID] == {"0": "18:50", "2": "19:15"}, str(ads_ss))
+    check("segstart: Syila unaffected by Adskhan's", syi_ss[SID] == {"0": "18:00"}, str(syi_ss))
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {"0": ""}}})
+    check("segstart: blank clears back to the shared start",
+          c.get(f"/api/children/{adskhan['id']}/segment-starts").json()["segment_starts"] == {}, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {"0": "18:00"}}})
+    check("segstart: kid cannot set start times", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # --- "not yet" uses the personal start ---
+    mkseg = lambda title, order: c.post("/api/tasks", json={
+        "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": SID, "order": order}).json()
+    later = _fm(min(_nmin + 90, 23 * 60 + 59))
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {_today_wd: later}}})
+    t_ns = mkseg("Belum mulai personal", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{t_ns['id']}/start")
+    check("segstart: personal start blocks an early start", r.status_code == 409, str(r.status_code))
+    check("segstart: message quotes the personal time", later in r.text, r.text[:180])
+
+    # Sibling with no override is NOT blocked by Adskhan's personal time
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    t_syi = c.post("/api/tasks", json={"title": "Syila bebas", "points": 10, "date_key": today_local,
+                                       "duration_minutes": 10, "target_children": [syila["id"]],
+                                       "segment_id": SID, "order": 1}).json()
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{t_syi['id']}/start")
+    check("segstart: sibling unaffected by the other's personal start", r.status_code == 200, r.text[:150])
+
+    # --- lateness vs grace on the FIRST mission of a section ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    within = _fm(max(0, _nmin - 5))     # started 5 min ago → inside 10-min grace
+    beyond = _fm(max(0, _nmin - 40))    # 40 min ago → past grace
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {_today_wd: within}}})
+    t_grace = mkseg("Masih dalam toleransi", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{t_grace['id']}/start")
+    check("segstart: inside the grace window still starts", r.status_code == 200, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {_today_wd: beyond}}})
+    t_late = mkseg("Lewat toleransi", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{t_late['id']}/start")
+    check("segstart: past grace demands the Terlambat flow",
+          r.status_code == 409 and "Terlambat" in r.text, r.text[:180])
+    # Widening the grace makes it acceptable again — config really is in charge
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"segment_late_grace_minutes": 120})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{t_late['id']}/start")
+    check("segstart: a wider grace accepts the same start", r.status_code == 200, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"segment_late_grace_minutes": 10})
+
+    # Only the FIRST mission is judged on punctuality
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    f1, f2 = mkseg("Pertama", 1), mkseg("Kedua", 2)
+    _aio_tg.run(server.db.tasks.update_one({"id": f1["id"]}, {"$set": {"status": "approved"}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{f2['id']}/start")
+    check("segstart: later missions aren't judged on punctuality", r.status_code == 200, r.text[:150])
+
+    # --- auto-start hand-off ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={"min_gap_seconds": 45, "auto_start_next": True})
+    a1, a2 = mkseg("Rantai satu", 1), mkseg("Rantai dua", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{a1['id']}/start")
+    r = c.post(f"/api/tasks/{a1['id']}/complete")
+    nx = r.json().get("auto_next")
+    check("autostart: next mission offered on finish", nx and nx["id"] == a2["id"], str(nx))
+    check("autostart: popup carries title, points and duration",
+          nx and nx["title"] == "Rantai dua" and nx["points"] == 10 and nx["duration_minutes"] == 10, str(nx))
+    check("autostart: countdown matches the cooldown", nx and nx["wait_seconds"] == 45, str(nx))
+
+    # Last mission of a section hands off to nothing
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.update_one({"id": a2["id"]}, {"$set": {"gap_from_prev_seconds": 999}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{a2['id']}/start")
+    r = c.post(f"/api/tasks/{a2['id']}/complete")
+    check("autostart: no hand-off after the last mission", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
+
+    # Never hands off across sections
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    two_segs = [{"label": "Sesi A", "start_time": "00:00", "end_time": "23:58"},
+                {"label": "Sesi B", "start_time": "23:59", "end_time": "23:59"}]
+    c.post("/api/config", json={"day_segments": two_segs})
+    SA, SB = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    _asx.run(server._refresh_segments_cache())
+    x1 = c.post("/api/tasks", json={"title": "Akhir sesi A", "points": 5, "date_key": today_local,
+                                    "duration_minutes": 5, "target_children": [adskhan["id"]],
+                                    "segment_id": SA, "order": 1}).json()
+    c.post("/api/tasks", json={"title": "Awal sesi B", "points": 5, "date_key": today_local,
+                               "duration_minutes": 5, "target_children": [adskhan["id"]],
+                               "segment_id": SB, "order": 2})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{x1['id']}/start")
+    r = c.post(f"/api/tasks/{x1['id']}/complete")
+    check("autostart: never hands off across sections", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
+
+    # Bonus missions are never auto-offered, and the toggle silences it
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": wide})
+    SID = c.get("/api/config").json()["day_segments"][0]["id"]
+    _asx.run(server._refresh_segments_cache())
+    b1 = mkseg("Wajib satu", 1)
+    c.post("/api/tasks", json={"title": "Bonus jangan ditawarkan", "points": 5, "date_key": today_local,
+                               "duration_minutes": 5, "target_children": [adskhan["id"]],
+                               "segment_id": SID, "is_bonus": True, "order": 2})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{b1['id']}/start")
+    r = c.post(f"/api/tasks/{b1['id']}/complete")
+    check("autostart: bonus missions are never auto-offered", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"auto_start_next": False})
+    d1, d2 = mkseg("Diam satu", 1), mkseg("Diam dua", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{d1['id']}/start")
+    r = c.post(f"/api/tasks/{d1['id']}/complete")
+    check("autostart: toggle off silences the hand-off", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"auto_start_next": True, "min_gap_seconds": 0,
+                                "day_segments": server.DEFAULT_DAY_SEGMENTS})
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    _asx.run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

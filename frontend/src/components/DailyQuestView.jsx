@@ -26,6 +26,11 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [punishmentBusy, setPunishmentBusy] = useState(false);
   const [daySegments, setDaySegments] = useState([]);
   const [flashPct, setFlashPct] = useState(15);
+  // Hand-off popup: offers the next mission in the same section with a
+  // countdown, then starts it. The countdown only runs while the child is
+  // actually here — one ticking away with the app closed would silently eat
+  // into their working time.
+  const [handoff, setHandoff] = useState(null); // { task, secondsLeft }
   useEffect(() => {
     const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
     return () => clearInterval(t);
@@ -201,6 +206,36 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   // Friction, not a wall: finishing far below the estimate asks for a quick
   // confirmation. A genuinely fast child just taps OK; a reflexive tapper is
   // made to pause. The finish itself is never blocked.
+  // Tick the hand-off countdown. Using an interval (rather than a deadline
+  // computed once) means a backgrounded tab simply stops counting instead of
+  // "catching up" — which is exactly the fairness property we want.
+  useEffect(() => {
+    if (!handoff || handoff.secondsLeft <= 0) return undefined;
+    const id = setInterval(() => {
+      setHandoff((h) => (h && h.secondsLeft > 0 ? { ...h, secondsLeft: h.secondsLeft - 1 } : h));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [handoff]);
+
+  const handoffFiring = useRef(false);
+
+  const startHandoff = async () => {
+    const h = handoff;
+    if (!h || handoffFiring.current) return;
+    handoffFiring.current = true;
+    setBusyId(h.task.id);
+    try {
+      await api.post(`/tasks/${h.task.id}/start`);
+      toast.success(`"${h.task.title}" dimulai. Semangat! 💪`);
+      setHandoff(null);
+      await load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+      setHandoff(null);
+      await load();
+    } finally { setBusyId(null); }
+  };
+
   const confirmIfFlash = (task) => {
     const started = task.timer_started_at ? new Date(task.timer_started_at).getTime() : null;
     if (!started) return true;
@@ -236,7 +271,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       const body = {};
       if (photoUrl) body.photo_url = photoUrl;
       if (task.together_bonus_enabled) body.done_together = !!doneTogether;
-      await api.post(`/tasks/${task.id}/complete`, body);
+      const { data: finishData } = await api.post(`/tasks/${task.id}/complete`, body);
       playSoundTheme(child?.sound_theme || "ding");
       onCelebrate?.();
       toast.success(
@@ -245,6 +280,9 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
           : "Misi selesai! Menunggu dicek Abi/Ummi ⭐"
       );
       await load();
+      if (finishData?.auto_next) {
+        setHandoff({ task: finishData.auto_next, secondsLeft: finishData.auto_next.wait_seconds ?? 0 });
+      }
     } catch (e) {
       toast.error(formatApiError(e));
     } finally { setBusyId(null); }
@@ -352,6 +390,62 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}>
           <KidMonthCalendar childId={child?.id} selectedDateKey={dateKey} onSelectDate={(d) => { setDateKey(d); setShowCalendar(false); }} />
         </motion.div>
+      )}
+
+      {/* ▶️ Hand-off to the next mission in the same section */}
+      {handoff && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+          <motion.div
+            initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
+            className="bg-white rounded-3xl p-5 max-w-sm w-full chunky-shadow-lg text-center"
+          >
+            <div className="text-4xl mb-1">🎉</div>
+            <h3 className="font-fun font-bold text-lg text-slate-900">Keren, satu misi beres!</h3>
+            <p className="text-xs text-slate-500 mb-3">Lanjut ke misi berikutnya yuk — kamu lagi jalan bagus.</p>
+
+            <div className="bg-indigo-50 border-2 border-indigo-100 rounded-2xl p-3 mb-3 text-left">
+              <div className="text-[10px] font-bold text-indigo-500 uppercase tracking-wide">
+                {handoff.task.segment_label || "Berikutnya"}
+              </div>
+              <div className="font-fun font-bold text-slate-800 text-sm">{handoff.task.title}</div>
+              <div className="flex items-center gap-2 mt-1 text-[11px] text-slate-500">
+                {handoff.task.duration_minutes ? <span>⏱ {handoff.task.duration_minutes} menit</span> : null}
+                <span className="font-bold text-indigo-600">+{handoff.task.points} poin</span>
+              </div>
+            </div>
+
+            {handoff.secondsLeft > 0 ? (
+              <>
+                <div className="text-xs text-slate-500 mb-1">
+                  Ambil napas dulu — mulai otomatis dalam <b>{handoff.secondsLeft} detik</b>
+                </div>
+                <div className="h-2 rounded-full bg-slate-100 overflow-hidden mb-3">
+                  <div
+                    className="h-full bg-indigo-500 transition-all duration-1000"
+                    style={{
+                      width: `${100 - (handoff.secondsLeft / Math.max(1, handoff.task.wait_seconds || 1)) * 100}%`,
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <button
+                onClick={startHandoff}
+                disabled={busyId === handoff.task.id}
+                className="press-btn w-full py-2.5 rounded-xl font-fun font-bold bg-indigo-600 hover:bg-indigo-700 text-white mb-2 disabled:opacity-60"
+              >
+                Mulai Sekarang ▶️
+              </button>
+            )}
+
+            <button
+              onClick={() => setHandoff(null)}
+              className="press-btn w-full py-2 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600 text-sm"
+            >
+              Tunda dulu
+            </button>
+          </motion.div>
+        </div>
       )}
 
       {/* ⚖️ Active punishment — the child either picks one or sees the one

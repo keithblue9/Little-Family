@@ -3634,6 +3634,127 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
     _asx.run(server._refresh_segments_cache())
 
+    # =============== TUNDA (snooze) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    _asn = __import__("asyncio")
+    c.post("/api/config", json={"day_segments": [{"label": "Sesi Tunda", "start_time": "00:00", "end_time": "23:59"}],
+                                "min_gap_seconds": 0, "auto_start_next": True})
+    TSID = c.get("/api/config").json()["day_segments"][0]["id"]
+    _asn.run(server._refresh_segments_cache())
+
+    r = c.get("/api/config")
+    check("snooze: default options exposed", r.json()["snooze_options_minutes"] == [5, 10, 15, 20], str(r.json().get("snooze_options_minutes")))
+
+    # --- config validation ---
+    r = c.post("/api/config", json={"snooze_options_minutes": [3, 7, 12]})
+    check("snooze: custom options accepted", r.status_code == 200, r.text[:150])
+    check("snooze: options stored sorted", c.get("/api/config").json()["snooze_options_minutes"] == [3, 7, 12])
+    r = c.post("/api/config", json={"snooze_options_minutes": []})
+    check("snooze: empty options rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"snooze_options_minutes": [1, 2, 3, 4, 5, 6, 7]})
+    check("snooze: too many options rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"snooze_options_minutes": [5, 999]})
+    check("snooze: absurd duration rejected", r.status_code == 422, str(r.status_code))
+    c.post("/api/config", json={"snooze_options_minutes": [5, 10, 15, 20]})
+
+    mksn = lambda title, order: c.post("/api/tasks", json={
+        "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": TSID, "order": order}).json()
+    s1, s2 = mksn("Tunda satu", 1), mksn("Tunda dua", 2)
+
+    # --- snoozing a task ---
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{s2['id']}/snooze", json={"minutes": 7})
+    check("snooze: value outside the configured options rejected", r.status_code == 422, str(r.status_code))
+    r = c.post(f"/api/tasks/{s2['id']}/snooze", json={"minutes": 10})
+    check("snooze: accepted option works", r.status_code == 200 and r.json()["minutes"] == 10, r.text[:180])
+    check("snooze: deadline is a real timestamp", bool(r.json().get("snooze_until")), r.text[:150])
+    s2_doc = _aio_tg.run(server.db.tasks.find_one({"id": s2["id"]}, {"_id": 0}))
+    check("snooze: counted for the parent to see", s2_doc.get("snooze_count") == 1, str(s2_doc.get("snooze_count")))
+
+    # Coming back EARLY is always fine — still startable during the snooze
+    r = c.post(f"/api/tasks/{s1['id']}/start")
+    check("snooze: unrelated task unaffected", r.status_code == 200, r.text[:150])
+    c.post(f"/api/tasks/{s1['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{s1['id']}/approve")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{s2['id']}/start")
+    check("snooze: starting before the deadline is allowed", r.status_code == 200, r.text[:150])
+    s2_started = _aio_tg.run(server.db.tasks.find_one({"id": s2["id"]}, {"_id": 0}))
+    check("snooze: deadline cleared once started", not s2_started.get("snooze_until"), str(s2_started.get("snooze_until")))
+
+    # --- an EXPIRED snooze routes through Terlambat, it does not fail ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"late_reasons": [
+        {"label": "Ke kamar mandi", "gives_penalty_card": False, "award_points": True},
+        {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
+    _snr = c.get("/api/config").json()["late_reasons"]
+    _sn_ok, _sn_bad = _snr[0]["id"], _snr[1]["id"]
+    s3 = mksn("Tunda kelewat", 1)
+    _aio_tg.run(server.db.tasks.update_one({"id": s3["id"]}, {"$set": {
+        "snooze_until": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=5)).isoformat(),
+        "snooze_count": 1}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{s3['id']}/start")
+    check("snooze: expired snooze blocks a plain start", r.status_code == 409, str(r.status_code))
+    check("snooze: refusal points to Terlambat", "Terlambat" in r.text, r.text[:170])
+    r = c.post(f"/api/tasks/{s3['id']}/late-reason", json={"reason_id": _sn_ok})
+    check("snooze: expired snooze can be owned via Terlambat", r.status_code == 200, r.text[:150])
+    r = c.post(f"/api/tasks/{s3['id']}/start")
+    check("snooze: startable again after acknowledging", r.status_code == 200, r.text[:150])
+    c.post(f"/api/tasks/{s3['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{s3['id']}/approve")
+    check("snooze: excused overrun keeps full points", r.status_code == 200, r.text[:150])
+
+    # At-fault overrun still costs the points
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0, "penalty_cards": 0}}))
+    s4 = mksn("Tunda kelewat salah sendiri", 1)
+    _aio_tg.run(server.db.tasks.update_one({"id": s4["id"]}, {"$set": {
+        "snooze_until": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=30)).isoformat()}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{s4['id']}/late-reason", json={"reason_id": _sn_bad})
+    c.post(f"/api/tasks/{s4['id']}/start")
+    c.post(f"/api/tasks/{s4['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{s4['id']}/approve")
+    ads_sn = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("snooze: at-fault overrun earns no points", ads_sn["points"] == 0, str(ads_sn["points"]))
+    check("snooze: at-fault overrun still costs a card", ads_sn["penalty_cards"] >= 1, str(ads_sn["penalty_cards"]))
+
+    # --- guards ---
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    s5 = mksn("Guard tunda", 1)
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{s5['id']}/snooze", json={"minutes": 5})
+    check("snooze: sibling cannot snooze someone else's mission", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{s5['id']}/start")
+    r = c.post(f"/api/tasks/{s5['id']}/snooze", json={"minutes": 5})
+    check("snooze: an already-started mission cannot be snoozed", r.status_code == 400, str(r.status_code))
+    c.post(f"/api/tasks/{s5['id']}/complete")
+    r = c.post(f"/api/tasks/{s5['id']}/snooze", json={"minutes": 5})
+    check("snooze: a finished mission cannot be snoozed", r.status_code == 400, str(r.status_code))
+    r = c.post("/api/tasks/tidak-ada/snooze", json={"minutes": 5})
+    check("snooze: unknown mission → 404", r.status_code == 404, str(r.status_code))
+
+    # --- parent visibility ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get(f"/api/activity?child_id={adskhan['id']}&limit=50")
+    check("snooze: logged for parent monitoring",
+          any(x["action"] == "task_snoozed" for x in r.json()), str([x["action"] for x in r.json()][:8]))
+    snoozed_log = next(x for x in r.json() if x["action"] == "task_snoozed")
+    check("snooze: log records which mission and how long",
+          snoozed_log["details"].get("minutes") and snoozed_log["details"].get("title"), str(snoozed_log.get("details")))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "snooze_options_minutes": [5, 10, 15, 20]})
+    _asn.run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

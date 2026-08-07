@@ -314,6 +314,9 @@ class AppConfigInput(BaseModel):
     # Offer the next mission automatically after finishing one (same section
     # only), with a countdown. Set False to keep it quiet.
     auto_start_next: Optional[bool] = None
+    # Choices offered on the "Tunda dulu" button, in minutes. Fully editable —
+    # every family's idea of "just a moment" is different.
+    snooze_options_minutes: Optional[List[int]] = None
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -2542,6 +2545,12 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     """
     if task.get("late_ack"):
         return "open"
+    # An expired snooze behaves exactly like any other missed start: not a
+    # failure, but it has to be owned via Terlambat before continuing. While
+    # the snooze is still running the child may start whenever they're ready —
+    # coming back early is always fine.
+    if _snooze_expired(task):
+        return "closed"
     seg = _segment_for_task(task, segments)
     if not seg:
         return "open"  # no section = do it whenever
@@ -2564,6 +2573,19 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
         if now_min > start_min + max(0, grace_minutes):
             return "closed"
     return "open"
+
+
+def _snooze_expired(task: dict) -> bool:
+    until = task.get("snooze_until")
+    if not until or task.get("timer_started_at"):
+        return False
+    try:
+        dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) > dt
+    except Exception:
+        return False
 
 
 def _has_start_override(segment: dict, child: Optional[dict], date_key: Optional[str]) -> bool:
@@ -3125,7 +3147,7 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
     await db.tasks.update_one({"id": task_id}, {"$set": {
         "timer_started_at": now_iso(),
         "gap_from_prev_seconds": gap_seconds,
-    }})
+    }, "$unset": {"snooze_until": ""}})
 
     if cfg_start.get("notify_parent_on_start", True):
         _kid = await db.children.find_one({"id": task["child_id"]})
@@ -3278,6 +3300,8 @@ def _task_is_time_stuck(task: dict) -> bool:
     # Never started and the task's SECTION has already closed → the chance for
     # it has passed. Section-based rather than per-task, because tasks no longer
     # carry their own clock: everything in "Pagi" is late once Pagi is over.
+    if not started and _snooze_expired(task):
+        return True
     if not started:
         end = _segment_window_end_cached(task)
         if end is not None:
@@ -3341,6 +3365,53 @@ class LateReasonPickInput(BaseModel):
     reason_id: str
 
 
+class SnoozeInput(BaseModel):
+    minutes: int = Field(ge=1, le=240)
+
+
+@api.post("/tasks/{task_id}/snooze")
+async def snooze_task(task_id: str, payload: SnoozeInput, user: dict = Depends(get_current_user)):
+    """"Tunda dulu" on the hand-off popup.
+
+    The deadline is stored as a real wall-clock timestamp rather than a ticking
+    client countdown: a timer that paused whenever the app was closed would be
+    trivially gamed. Coming back EARLY is fine — the child can start whenever
+    they like before the deadline. Coming back late doesn't fail the mission,
+    it just routes them through the ordinary Terlambat flow so the delay is
+    acknowledged out loud.
+    """
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    kid_ids = task.get("coop_participants") or [task.get("child_id")]
+    if user["role"] == "child" and user["id"] not in kid_ids:
+        raise HTTPException(status_code=403, detail="Bukan misi kamu")
+    if task.get("status") not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail="Misi ini sudah diproses")
+    if task.get("timer_started_at"):
+        raise HTTPException(status_code=400, detail="Misi ini sudah dimulai")
+
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    allowed = config.get("snooze_options_minutes") or [5, 10, 15, 20]
+    if payload.minutes not in allowed:
+        raise HTTPException(status_code=422, detail=f"Pilihan tunda harus salah satu dari: {allowed} menit")
+
+    until = datetime.now(timezone.utc) + timedelta(minutes=payload.minutes)
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "snooze_until": until.isoformat(),
+        "snooze_minutes": payload.minutes,
+    }, "$inc": {"snooze_count": 1}})
+    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
+    await log_activity(FAMILY_ID, child_id, "task_snoozed", {
+        "task_id": task_id, "title": task.get("title"), "minutes": payload.minutes,
+    })
+    return {
+        "task": await db.tasks.find_one({"id": task_id}, {"_id": 0}),
+        "snooze_until": until.isoformat(),
+        "minutes": payload.minutes,
+    }
+
+
 @api.post("/tasks/{task_id}/late-reason")
 async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user: dict = Depends(get_current_user)):
     """The "Terlambat" flow: an overdue, never-started task shows a Terlambat
@@ -3371,13 +3442,15 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     # already closed (sections carry the clock now, not individual tasks).
     today = _today_key()
     segments = await _get_day_segments()
-    overdue = False
+    overdue = _snooze_expired(task)
     if task.get("date_key") and task["date_key"] < today:
         overdue = True
     elif task.get("date_key") == today:
         end = _task_window_end(task, segments)
         if end is not None:
-            overdue = end < (_now_local().hour * 60 + _now_local().minute)
+            # OR, not assignment: an expired snooze already made this overdue,
+            # and a still-open section must not erase that.
+            overdue = overdue or end < (_now_local().hour * 60 + _now_local().minute)
     if not overdue:
         raise HTTPException(status_code=400, detail="Misi ini belum terlewat")
 
@@ -4663,6 +4736,11 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
                     opt["id"] = new_id()[:8]
         if update_data.get("day_segments") is not None:
             _validate_day_segments(update_data["day_segments"])
+        if update_data.get("snooze_options_minutes") is not None:
+            opts = sorted({int(x) for x in update_data["snooze_options_minutes"] if int(x) > 0})
+            if not opts or len(opts) > 6 or opts[-1] > 240:
+                raise HTTPException(status_code=422, detail="Pilihan tunda harus 1–6 opsi, masing-masing 1–240 menit")
+            update_data["snooze_options_minutes"] = opts
         # Merge dict-typed fields so partial updates don't wipe existing keys.
         for dict_field in ("custom_labels", "weekday_goals"):
             if dict_field in update_data:
@@ -4707,6 +4785,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "notify_parent_on_start": True,
             "segment_late_grace_minutes": 10,
             "auto_start_next": True,
+            "snooze_options_minutes": [5, 10, 15, 20],
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4731,6 +4810,11 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
                     opt["id"] = new_id()[:8]
         if incoming.get("day_segments") is not None:
             _validate_day_segments(incoming["day_segments"])
+        if incoming.get("snooze_options_minutes") is not None:
+            opts = sorted({int(x) for x in incoming["snooze_options_minutes"] if int(x) > 0})
+            if not opts or len(opts) > 6 or opts[-1] > 240:
+                raise HTTPException(status_code=422, detail="Pilihan tunda harus 1–6 opsi, masing-masing 1–240 menit")
+            incoming["snooze_options_minutes"] = opts
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
         await db.app_config.insert_one(config)
     await log_activity(FAMILY_ID, None, "config_updated", {"changes": payload.model_dump()})
@@ -4807,6 +4891,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "notify_parent_on_start": True,
             "segment_late_grace_minutes": 10,
             "auto_start_next": True,
+            "snooze_options_minutes": [5, 10, 15, 20],
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4847,6 +4932,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "notify_parent_on_start": bool(config.get("notify_parent_on_start", True)),
         "segment_late_grace_minutes": int(config.get("segment_late_grace_minutes", 10)),
         "auto_start_next": bool(config.get("auto_start_next", True)),
+        "snooze_options_minutes": config.get("snooze_options_minutes") or [5, 10, 15, 20],
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

@@ -71,6 +71,7 @@ import PunishmentConfig from "@/components/PunishmentConfig";
 import DaySegmentsConfig from "@/components/DaySegmentsConfig";
 import SegmentStartsConfig from "@/components/SegmentStartsConfig";
 import HonestyInsightCard from "@/components/HonestyInsightCard";
+import ActivityLogCard from "@/components/ActivityLogCard";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -320,6 +321,9 @@ export default function ParentApp() {
               <FamilyDayMonitor />
               <div className="bg-white rounded-2xl border border-slate-200 p-6">
                 <HonestyInsightCard />
+              </div>
+              <div className="bg-white rounded-2xl border border-slate-200 p-6">
+                <ActivityLogCard kids={children} />
               </div>
             </div>
           )}

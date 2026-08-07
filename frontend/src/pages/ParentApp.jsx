@@ -1604,6 +1604,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [scheduleMode, setScheduleMode] = useState("weekdays"); // "weekdays" default | "date"
   const [weekdays, setWeekdays] = useState([new Date().getDay() === 0 ? 6 : new Date().getDay() - 1]); // default = today's weekday (Mon=0..Sun=6)
   const [segmentId, setSegmentId] = useState("");
+  const [maxSnooze, setMaxSnooze] = useState("");
   const [segments, setSegments] = useState([]);
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
@@ -1643,6 +1644,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setScheduleMode("date"); // editing is always a single existing date
       setWeekdays([]);
       setSegmentId(editTask.segment_id || "");
+      setMaxSnooze(editTask.max_snooze_minutes ? String(editTask.max_snooze_minutes) : "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
@@ -1680,7 +1682,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setScheduleMode("weekdays");
       const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
       setWeekdays([todayWd]);
-      setSegmentId(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
+      setSegmentId("");
+      setMaxSnooze(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
       setTogetherBonusEnabled(false); setTogetherBonusPoints(10);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
@@ -1721,6 +1724,7 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         date_key: useWeekdays ? null : (dateKey || null),
         weekdays: useWeekdays ? weekdays : null,
         segment_id: segmentId || null,
+        max_snooze_minutes: maxSnooze ? parseInt(maxSnooze, 10) : null,
         duration_minutes: duration ? Number(duration) : null,
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
@@ -2097,6 +2101,19 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
               placeholder="mis. 15"
             />
             <p className="text-xs text-slate-400 mt-1">Berapa lama tugas dikerjakan.</p>
+          </div>
+          <div>
+            <label className={labelClass}>⏰ Batas tunda (menit, opsional)</label>
+            <input
+              type="text" inputMode="numeric" value={maxSnooze}
+              onChange={(e) => setMaxSnooze(e.target.value.replace(/\D/g, "").slice(0, 3))}
+              placeholder="kosong = ikut aturan umum"
+              className={inputClass}
+            />
+            <p className="text-xs text-slate-400 mt-1">
+              Batasi berapa lama misi ini boleh ditunda anak. Mis. isi 10 untuk sholat. Isi angka lebih kecil dari
+              pilihan tunda terkecil kalau misi ini tidak boleh ditunda sama sekali.
+            </p>
           </div>
           <div>
             <label className={labelClass}>🕒 Bagian hari</label>

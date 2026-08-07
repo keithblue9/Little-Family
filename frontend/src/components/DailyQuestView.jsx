@@ -453,9 +453,15 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
             )}
 
             <div className="border-t border-slate-100 pt-3 mt-1">
+              {(handoff.task.snooze_options || snoozeOptions).length === 0 ? (
+                <p className="text-[11px] text-slate-500">
+                  Misi ini sebaiknya tidak ditunda. Kalau memang ada halangan, nanti bisa dijelaskan lewat tombol Terlambat.
+                </p>
+              ) : (
+              <>
               <div className="text-[11px] text-slate-500 mb-1.5">Belum sempat? Tunda dulu:</div>
               <div className="flex flex-wrap gap-1.5 justify-center">
-                {snoozeOptions.map((m) => (
+                {(handoff.task.snooze_options || snoozeOptions).map((m) => (
                   <button
                     key={m}
                     onClick={() => snoozeHandoff(m)}
@@ -468,6 +474,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
               <p className="text-[10px] text-slate-400 mt-2">
                 Boleh mulai lebih cepat kapan saja. Kalau lewat dari waktu tunda, kamu tinggal jelaskan alasannya lewat tombol Terlambat.
               </p>
+              </>
+              )}
             </div>
           </motion.div>
         </div>

@@ -609,6 +609,10 @@ class TaskUpdate(BaseModel):
     photo_required: Optional[bool] = None
     together_bonus_enabled: Optional[bool] = None
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
+    # These were missing, so editing a task silently discarded them and the
+    # task snapped back to "Kapan Saja" (no section) on every save.
+    segment_id: Optional[str] = None
+    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
 
 
 class RedeemMoneyInput(BaseModel):
@@ -2087,7 +2091,10 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Fields the parent is allowed to explicitly clear (set back to empty).
-    clearable = {"due_date", "due_time", "duration_minutes", "task_style"}
+    # Sending null for these means "clear it" (back to Kapan Saja / the family
+    # default), as opposed to "leave it alone" — which is what omitting does.
+    clearable = {"due_date", "due_time", "duration_minutes", "task_style",
+                 "segment_id", "max_snooze_minutes"}
     raw = payload.model_dump(exclude_unset=True)
 
     updates = {}

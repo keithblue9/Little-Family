@@ -3896,6 +3896,57 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== REGRESI: EDIT TUGAS HARUS MENYIMPAN SEGMEN ===============
+    # Bug: TaskUpdate had no segment_id/max_snooze_minutes, so every edit
+    # silently dropped them and the task snapped back to "Kapan Saja".
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Pagi", "start_time": "04:30", "end_time": "11:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    ES = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    et = c.post("/api/tasks", json={"title": "Awalnya kapan saja", "points": 10,
+                                    "date_key": today_local, "duration_minutes": 10,
+                                    "target_children": [adskhan["id"]]}).json()
+    check("editseg: starts with no section", not et.get("segment_id"), str(et.get("segment_id")))
+
+    r = c.patch(f"/api/tasks/{et['id']}", json={"segment_id": ES[1]})
+    check("editseg: edit accepts a section", r.status_code == 200, r.text[:150])
+    after = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("editseg: section actually persisted", after.get("segment_id") == ES[1], str(after.get("segment_id")))
+
+    # Editing something else must not wipe the section
+    r = c.patch(f"/api/tasks/{et['id']}", json={"points": 25})
+    after2 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("editseg: unrelated edit keeps the section", after2.get("segment_id") == ES[1], str(after2.get("segment_id")))
+    check("editseg: unrelated edit applied", after2["points"] == 25, str(after2["points"]))
+
+    # Moving between sections works
+    c.patch(f"/api/tasks/{et['id']}", json={"segment_id": ES[0]})
+    after3 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("editseg: can be moved to another section", after3.get("segment_id") == ES[0], str(after3.get("segment_id")))
+
+    # Explicit null clears it back to "Kapan Saja"
+    c.patch(f"/api/tasks/{et['id']}", json={"segment_id": None})
+    after4 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("editseg: null clears back to Kapan Saja", not after4.get("segment_id"), str(after4.get("segment_id")))
+
+    # Same story for the per-task snooze cap
+    c.patch(f"/api/tasks/{et['id']}", json={"max_snooze_minutes": 10})
+    after5 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("editseg: snooze cap persists through edit", after5.get("max_snooze_minutes") == 10, str(after5.get("max_snooze_minutes")))
+    c.patch(f"/api/tasks/{et['id']}", json={"title": "Ganti judul saja"})
+    after6 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("editseg: snooze cap survives an unrelated edit", after6.get("max_snooze_minutes") == 10, str(after6.get("max_snooze_minutes")))
+    c.patch(f"/api/tasks/{et['id']}", json={"max_snooze_minutes": None})
+    after7 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("editseg: snooze cap can be cleared", not after7.get("max_snooze_minutes"), str(after7.get("max_snooze_minutes")))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

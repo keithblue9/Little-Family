@@ -7,7 +7,7 @@ import TimelineQuestView from "@/components/TimelineQuestView";
 import { QUEST_THEMES } from "@/lib/questThemes";
 import { styleMeta } from "@/lib/personality";
 import { todayKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
-import { playSoundTheme } from "@/lib/sounds";
+import { playSoundTheme, playTimeWarning } from "@/lib/sounds";
 import KidMonthCalendar from "@/components/KidMonthCalendar";
 import MysteryBox from "@/components/MysteryBox";
 import { timeOfDayOverlay, isNightTime } from "@/lib/timeOfDay";
@@ -27,6 +27,10 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [daySegments, setDaySegments] = useState([]);
   const [flashPct, setFlashPct] = useState(15);
   const [snoozeOptions, setSnoozeOptions] = useState([5, 10, 15, 20]);
+  const [warnMinutes, setWarnMinutes] = useState([3, 2, 1]);
+  // Remembers which warnings already fired, per task, so a 1-second ticker
+  // can't re-announce the same threshold every tick.
+  const firedWarnings = useRef({});
   // Hand-off popup: offers the next mission in the same section with a
   // countdown, then starts it. The countdown only runs while the child is
   // actually here — one ticking away with the app closed would silently eat
@@ -48,7 +52,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       const { data } = await api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } });
       setProgress(data);
       api.get("/config")
-        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); setSnoozeOptions(cfg.snooze_options_minutes || [5, 10, 15, 20]); })
+        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); setSnoozeOptions(cfg.snooze_options_minutes || [5, 10, 15, 20]); setWarnMinutes(cfg.duration_warning_minutes ?? [3, 2, 1]); })
         .catch(() => { setLateReasons([]); setDaySegments([]); });
     } catch (e) {
       toast.error(formatApiError(e));
@@ -76,7 +80,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       return h * 60 + m;
     };
     const seqVal = (t) => {
-      const seg = t.segment_id ? daySegments.find((x) => x.id === t.segment_id) : null;
+      const segList = progress?.segments || daySegments;
+      const seg = t.segment_id ? segList.find((x) => x.id === t.segment_id) : null;
       if (seg) return toMin(seg.start_time);
       if (t.due_time) return toMin(t.due_time);
       return 100000; // no section, no time → do whenever, queue last
@@ -219,6 +224,35 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   }, [handoff]);
 
   const handoffFiring = useRef(false);
+
+  // Countdown warnings for whichever mission is currently running. Fires once
+  // per threshold per task — crossing 3, 2 and 1 minute gives the child a real
+  // chance to wrap up instead of discovering the overrun after the fact.
+  useEffect(() => {
+    if (!warnMinutes || warnMinutes.length === 0) return;
+    const running = (progress?.tasks || []).filter(
+      (t) => t.timer_started_at && t.duration_minutes && (t.status === "pending" || t.status === "rejected")
+    );
+    for (const t of running) {
+      const startMs = new Date(t.timer_started_at).getTime();
+      const remaining = t.duration_minutes - (nowMs - startMs) / 60000;
+      if (remaining <= 0) continue;
+      const already = firedWarnings.current[t.id] || [];
+      for (const mark of warnMinutes) {
+        if (remaining <= mark && !already.includes(mark)) {
+          firedWarnings.current[t.id] = [...already, mark];
+          playTimeWarning(mark);
+          toast(
+            mark <= 1
+              ? `⏰ Tinggal ${mark} menit untuk "${t.title}" — ayo diselesaikan!`
+              : `⏳ Sisa ${mark} menit untuk "${t.title}"`,
+            { duration: 5000 }
+          );
+          break; // one announcement per tick, even if several marks lapsed at once
+        }
+      }
+    }
+  }, [nowMs, progress, warnMinutes]);
 
   const snoozeHandoff = async (minutes) => {
     const h = handoff;
@@ -624,7 +658,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
             <div className="relative z-10 px-3 pb-4 bg-slate-50/95 rounded-t-3xl pt-4 mt-2">
               <TimelineQuestView
                 tasks={timeline}
-                segments={daySegments}
+                segments={progress?.segments || daySegments}
                 activeId={next?.id}
                 helpers={{
                   forTask: (t) => {
@@ -635,7 +669,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     // ones are only actionable when they're the frontmost open task.
                     // Mirrors the backend window rule so the UI never offers
                     // an action the server would refuse.
-                    const seg = t.segment_id ? daySegments.find((x) => x.id === t.segment_id) : null;
+                    const segsNow = progress?.segments || daySegments;
+                    const seg = t.segment_id ? segsNow.find((x) => x.id === t.segment_id) : null;
                     const nowM = (() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); })();
                     const toM = (v) => { const [h, m] = v.split(":").map(Number); return h * 60 + m; };
                     const notYet = !t.is_bonus && !t.late_ack && seg && nowM < toM(seg.start_time);

@@ -173,6 +173,13 @@ function Track({ segment, tasks, helpers }) {
         {segment.start_time && (
           <span className="text-[11px] text-slate-400">
             {segment.start_time}–{segment.end_time}
+            {/* Make it obvious when this child has their own start time, so a
+                sibling comparing screens isn't confused by different hours. */}
+            {segment.is_personal && (
+              <span className="ml-1 text-teal-600 font-semibold" title={`Jam umum ${segment.general_start_time}`}>
+                · jammu
+              </span>
+            )}
           </span>
         )}
         <span className="ml-auto text-[11px] font-semibold text-slate-500">

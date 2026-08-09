@@ -2131,6 +2131,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
             </select>
             <p className="text-xs text-slate-400 mt-1">
               Jam diambil dari bagiannya — tugas cukup diatur urutannya di dalam bagian itu.
+              Rentang di atas adalah jam umum keluarga; kalau seorang anak punya jam mulai
+              sendiri (diatur di Pengaturan → Jam Mulai per Anak), jam itulah yang berlaku untuknya.
             </p>
           </div>
         </div>

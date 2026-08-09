@@ -51,3 +51,27 @@ export function playSoundTheme(theme = "ding") {
     // Audio not available in this environment — silently skip.
   }
 }
+
+/**
+ * Countdown warning for a running mission ("3 minutes left!").
+ *
+ * Deliberately different in character from the celebration themes: a pair of
+ * urgent-but-not-alarming beeps that rise in pitch, so a child instantly reads
+ * it as "hurry up" rather than "well done". Urgency scales with how little
+ * time is left — the final minute is higher and sharper than the first warning.
+ */
+export function playTimeWarning(minutesLeft = 1) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+    const urgent = minutesLeft <= 1;
+    const base = urgent ? 880 : 660;         // A5 for the last minute, E5 before
+    const beeps = urgent ? 3 : 2;
+    for (let i = 0; i < beeps; i++) {
+      tone(ctx, base, now + i * 0.18, 0.12, "square", 0.22);
+      tone(ctx, base * 1.5, now + i * 0.18 + 0.06, 0.1, "square", 0.14);
+    }
+  } catch {
+    /* audio blocked (e.g. no user gesture yet) — the on-screen toast still shows */
+  }
+}

@@ -3818,6 +3818,84 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== PENGINGAT WAKTU HAMPIR HABIS ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/config")
+    check("warn: defaults exposed newest-first", r.json()["duration_warning_minutes"] == [3, 2, 1],
+          str(r.json().get("duration_warning_minutes")))
+
+    r = c.post("/api/config", json={"duration_warning_minutes": [1, 5, 10]})
+    check("warn: custom marks accepted", r.status_code == 200, r.text[:150])
+    check("warn: stored descending (soonest warning last)",
+          c.get("/api/config").json()["duration_warning_minutes"] == [10, 5, 1],
+          str(c.get("/api/config").json()["duration_warning_minutes"]))
+    r = c.post("/api/config", json={"duration_warning_minutes": [5, 5, 3, 3]})
+    check("warn: duplicates collapsed", c.get("/api/config").json()["duration_warning_minutes"] == [5, 3],
+          str(c.get("/api/config").json()["duration_warning_minutes"]))
+    r = c.post("/api/config", json={"duration_warning_minutes": []})
+    check("warn: empty list turns the feature off", r.status_code == 200
+          and c.get("/api/config").json()["duration_warning_minutes"] == [], r.text[:150])
+    r = c.post("/api/config", json={"duration_warning_minutes": [1, 2, 3, 4, 5, 6, 7]})
+    check("warn: too many marks rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"duration_warning_minutes": [500]})
+    check("warn: absurd mark rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"duration_warning_minutes": [0, -3]})
+    check("warn: non-positive marks dropped",
+          r.status_code == 200 and c.get("/api/config").json()["duration_warning_minutes"] == [], r.text[:150])
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/config", json={"duration_warning_minutes": [9]})
+    check("warn: kid cannot change the marks", r.status_code == 403, str(r.status_code))
+    r = c.get("/api/config")
+    check("warn: kid can read them (their app needs to fire the alarm)",
+          r.status_code == 200 and "duration_warning_minutes" in r.json())
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"duration_warning_minutes": [3, 2, 1]})
+
+    # =============== TIMELINE ANAK MEMAKAI JAM PERSONALNYA ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Sore", "start_time": "15:00", "end_time": "17:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    PS = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    _wd_now = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
+
+    # No override yet → the kid sees the household hours
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    segs0 = {x["id"]: x for x in r.json()["segments"]}
+    check("personal: falls back to the shared start", segs0[PS[1]]["start_time"] == "18:00", str(segs0[PS[1]]))
+    check("personal: not flagged as personal when unset", segs0[PS[1]]["is_personal"] is False)
+
+    # Give Adskhan a later evening, leave Syila alone
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {PS[1]: {_wd_now: "18:50"}}})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    segs1 = {x["id"]: x for x in r.json()["segments"]}
+    check("personal: kid's timeline shows HIS start", segs1[PS[1]]["start_time"] == "18:50", str(segs1[PS[1]]))
+    check("personal: flagged so the child can tell it's theirs", segs1[PS[1]]["is_personal"] is True)
+    check("personal: household hour still reported for reference",
+          segs1[PS[1]]["general_start_time"] == "18:00", str(segs1[PS[1]].get("general_start_time")))
+    check("personal: untouched section keeps the shared start", segs1[PS[0]]["start_time"] == "15:00", str(segs1[PS[0]]))
+    check("personal: section end never becomes personal", segs1[PS[1]]["end_time"] == "21:00", str(segs1[PS[1]]))
+
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}")
+    segs2 = {x["id"]: x for x in r.json()["segments"]}
+    check("personal: sibling unaffected", segs2[PS[1]]["start_time"] == "18:00" and segs2[PS[1]]["is_personal"] is False,
+          str(segs2[PS[1]]))
+
+    # An override on a DIFFERENT weekday must not leak into today
+    other_wd = str((int(_wd_now) + 1) % 7)
+    c.put(f"/api/children/{syila['id']}/segment-starts", json={"starts": {PS[1]: {other_wd: "19:30"}}})
+    r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}")
+    segs3 = {x["id"]: x for x in r.json()["segments"]}
+    check("personal: another weekday's override doesn't apply today",
+          segs3[PS[1]]["start_time"] == "18:00", str(segs3[PS[1]]))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

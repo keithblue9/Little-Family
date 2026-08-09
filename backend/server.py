@@ -317,6 +317,9 @@ class AppConfigInput(BaseModel):
     # Choices offered on the "Tunda dulu" button, in minutes. Fully editable —
     # every family's idea of "just a moment" is different.
     snooze_options_minutes: Optional[List[int]] = None
+    # Minutes-remaining marks at which a running mission warns the child that
+    # time is nearly up. Empty list = no warnings at all.
+    duration_warning_minutes: Optional[List[int]] = None
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -2143,6 +2146,20 @@ async def child_day_progress(
     combo_award = await db.family_combo_awards.find_one({"parent_id": FAMILY_ID, "date_key": dk}, {"_id": 0})
     await _refresh_segments_cache()
     await _sweep_overdue_punishments()
+    # Sections as THIS child experiences them today: the start time is their
+    # personal one where a parent set one, so the kid's timeline shows the hour
+    # that actually applies to them rather than the household default.
+    _segs_for_kid = await _get_day_segments()
+    _kid_doc_seg = await db.children.find_one({"id": child_id})
+    effective_segments = []
+    for _sg in _segs_for_kid:
+        _eff = _effective_segment_start(_sg, _kid_doc_seg, dk)
+        effective_segments.append({
+            **_sg,
+            "start_time": _fmt_min(_eff),
+            "general_start_time": _sg["start_time"],
+            "is_personal": _fmt_min(_eff) != _sg["start_time"],
+        })
     active_punishment = await db.punishments.find_one({
         "parent_id": FAMILY_ID, "child_id": child_id,
         "status": {"$in": ["pending_choice", "assigned"]},
@@ -2202,6 +2219,7 @@ async def child_day_progress(
         "is_off_day": is_off,
         "family_combo": combo_award,
         "active_punishment": active_punishment,
+        "segments": effective_segments,
         "perfect_day": perfect_day,
         "perfect_day_claimed": bool(perfect_claim),
         "tasks": tasks,
@@ -4759,6 +4777,11 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
                     opt["id"] = new_id()[:8]
         if update_data.get("day_segments") is not None:
             _validate_day_segments(update_data["day_segments"])
+        if update_data.get("duration_warning_minutes") is not None:
+            warns = sorted({int(x) for x in update_data["duration_warning_minutes"] if int(x) > 0}, reverse=True)
+            if len(warns) > 6 or (warns and warns[0] > 120):
+                raise HTTPException(status_code=422, detail="Pengingat waktu maksimal 6 titik, masing-masing 1–120 menit")
+            update_data["duration_warning_minutes"] = warns
         if update_data.get("snooze_options_minutes") is not None:
             opts = sorted({int(x) for x in update_data["snooze_options_minutes"] if int(x) > 0})
             if not opts or len(opts) > 6 or opts[-1] > 240:
@@ -4809,6 +4832,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "segment_late_grace_minutes": 10,
             "auto_start_next": True,
             "snooze_options_minutes": [5, 10, 15, 20],
+            "duration_warning_minutes": [3, 2, 1],
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4833,6 +4857,11 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
                     opt["id"] = new_id()[:8]
         if incoming.get("day_segments") is not None:
             _validate_day_segments(incoming["day_segments"])
+        if incoming.get("duration_warning_minutes") is not None:
+            warns = sorted({int(x) for x in incoming["duration_warning_minutes"] if int(x) > 0}, reverse=True)
+            if len(warns) > 6 or (warns and warns[0] > 120):
+                raise HTTPException(status_code=422, detail="Pengingat waktu maksimal 6 titik, masing-masing 1–120 menit")
+            incoming["duration_warning_minutes"] = warns
         if incoming.get("snooze_options_minutes") is not None:
             opts = sorted({int(x) for x in incoming["snooze_options_minutes"] if int(x) > 0})
             if not opts or len(opts) > 6 or opts[-1] > 240:
@@ -4915,6 +4944,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "segment_late_grace_minutes": 10,
             "auto_start_next": True,
             "snooze_options_minutes": [5, 10, 15, 20],
+            "duration_warning_minutes": [3, 2, 1],
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4956,6 +4986,8 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "segment_late_grace_minutes": int(config.get("segment_late_grace_minutes", 10)),
         "auto_start_next": bool(config.get("auto_start_next", True)),
         "snooze_options_minutes": config.get("snooze_options_minutes") or [5, 10, 15, 20],
+        "duration_warning_minutes": config.get("duration_warning_minutes")
+            if config.get("duration_warning_minutes") is not None else [3, 2, 1],
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

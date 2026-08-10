@@ -3517,8 +3517,11 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("segstart: personal start blocks an early start", r.status_code == 409, str(r.status_code))
     check("segstart: message quotes the personal time", later in r.text, r.text[:180])
 
-    # Sibling with no override is NOT blocked by Adskhan's personal time
+    # Sibling with no override is NOT blocked by Adskhan's personal time.
+    # Clear Syila's overrides first: an earlier block set one for weekday 0,
+    # which silently collides whenever the suite happens to run on a Monday.
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.put(f"/api/children/{syila['id']}/segment-starts", json={"starts": {}})
     t_syi = c.post("/api/tasks", json={"title": "Syila bebas", "points": 10, "date_key": today_local,
                                        "duration_minutes": 10, "target_children": [syila["id"]],
                                        "segment_id": SID, "order": 1}).json()
@@ -3945,6 +3948,82 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("editseg: snooze cap can be cleared", not after7.get("max_snooze_minutes"), str(after7.get("max_snooze_minutes")))
 
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== REGRESI: TOMBOL TERLAMBAT HARUS MUNCUL ===============
+    # Reported: at 05:05 with a personal 04:45 start and a 10-minute grace, the
+    # card still offered "Mulai" instead of "Terlambat". The UI was deriving the
+    # window rules itself and drifted from the server, so day-progress now
+    # states each task's availability outright.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    _nl2 = server._now_local(); _nm2 = _nl2.hour * 60 + _nl2.minute
+    _f2 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
+    c.post("/api/config", json={"day_segments": [{"label": "Pagi", "start_time": "00:00", "end_time": "23:59"}],
+                                "segment_late_grace_minutes": 10})
+    AVS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    _wd2 = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
+
+    mkav = lambda title, order: c.post("/api/tasks", json={
+        "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": AVS, "order": order}).json()
+
+    # Personal start 20 minutes ago → past the 10-minute grace
+    c.put(f"/api/children/{adskhan['id']}/segment-starts",
+          json={"starts": {AVS: {_wd2: _f2(max(0, _nm2 - 20))}}})
+    av1 = mkav("Bangun pagi", 1)
+    mkav("Sholat Subuh", 2)
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    by_id = {t["id"]: t for t in r.json()["tasks"]}
+    check("avail: day-progress reports availability per task", "availability" in by_id[av1["id"]], str(by_id[av1["id"]].keys())[:120])
+    check("avail: past-grace opener marked closed (→ Terlambat)",
+          by_id[av1["id"]]["availability"] == "closed", str(by_id[av1["id"]]["availability"]))
+    check("avail: the server agrees and refuses a plain start",
+          c.post(f"/api/tasks/{av1['id']}/start").status_code == 409)
+
+    # Inside the grace → open, so "Mulai" is genuinely correct
+    c.put(f"/api/children/{adskhan['id']}/segment-starts",
+          json={"starts": {AVS: {_wd2: _f2(max(0, _nm2 - 5))}}})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("avail: inside grace stays open",
+          {t["id"]: t for t in r.json()["tasks"]}[av1["id"]]["availability"] == "open")
+
+    # Personal start still ahead → future, and the exact hour is surfaced
+    _future_start = _f2(min(_nm2 + 120, 23 * 60 + 59))
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {AVS: {_wd2: _future_start}}})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    fut = {t["id"]: t for t in r.json()["tasks"]}[av1["id"]]
+    check("avail: not-yet-started section marked future", fut["availability"] == "future", str(fut["availability"]))
+    check("avail: personal start time surfaced for the label",
+          fut.get("effective_start_time") == _future_start, str(fut.get("effective_start_time")))
+
+    # Acknowledging lateness reopens it
+    c.put(f"/api/children/{adskhan['id']}/segment-starts",
+          json={"starts": {AVS: {_wd2: _f2(max(0, _nm2 - 45))}}})
+    c.post("/api/config", json={"late_reasons": [{"label": "Bangun kesiangan", "gives_penalty_card": True, "award_points": False}]})
+    _avr = c.get("/api/config").json()["late_reasons"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    _rlr = c.post(f"/api/tasks/{av1['id']}/late-reason", json={"reason_id": _avr})
+    check("avail: overdue opener accepts a late reason", _rlr.status_code == 200, _rlr.text[:170])
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("avail: reopens after acknowledging the lateness",
+          {t["id"]: t for t in r.json()["tasks"]}[av1["id"]]["availability"] == "open")
+
+    # Bonus missions are always open regardless of section windows
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {AVS: {_wd2: _future_start}}})
+    bn = c.post("/api/tasks", json={"title": "Bonus bebas jam", "points": 5, "date_key": today_local,
+                                    "duration_minutes": 5, "target_children": [adskhan["id"]],
+                                    "segment_id": AVS, "is_bonus": True}).json()
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("avail: bonus missions ignore section windows",
+          {t["id"]: t for t in r.json()["tasks"]}[bn["id"]]["availability"] == "open")
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "segment_late_grace_minutes": 10})
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
     __import__("asyncio").run(server._refresh_segments_cache())
 
 print("\n" + "=" * 50)

@@ -2167,6 +2167,26 @@ async def child_day_progress(
             "general_start_time": _sg["start_time"],
             "is_personal": _fmt_min(_eff) != _sg["start_time"],
         })
+
+    # Tell the client exactly which actions are legal for each mission, rather
+    # than letting it re-derive the rules. The window logic (personal starts,
+    # grace, snooze deadlines, section ends) lives in one place; duplicating it
+    # in the UI is how a "Mulai" button ends up on a task the server refuses.
+    _cfg_avail = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    _grace_avail = int(_cfg_avail.get("segment_late_grace_minutes", 10))
+    _open_avail = [t for t in tasks if t.get("status") in ("pending", "rejected") and not t.get("is_bonus")]
+    _firsts_avail = _segment_first_ids(_open_avail, _segs_for_kid, tasks)
+    _tasks_with_availability = []
+    for _t in tasks:
+        _av = "open" if _t.get("is_bonus") else _task_availability(
+            _t, _segs_for_kid, _kid_doc_seg, _t["id"] in _firsts_avail, _grace_avail
+        )
+        _sg_t = _segment_for_task(_t, _segs_for_kid)
+        _tasks_with_availability.append({
+            **_t,
+            "availability": _av,
+            "effective_start_time": _fmt_min(_effective_segment_start(_sg_t, _kid_doc_seg, dk)) if _sg_t else None,
+        })
     active_punishment = await db.punishments.find_one({
         "parent_id": FAMILY_ID, "child_id": child_id,
         "status": {"$in": ["pending_choice", "assigned"]},
@@ -2227,9 +2247,9 @@ async def child_day_progress(
         "family_combo": combo_award,
         "active_punishment": active_punishment,
         "segments": effective_segments,
+        "tasks": _tasks_with_availability,
         "perfect_day": perfect_day,
         "perfect_day_claimed": bool(perfect_claim),
-        "tasks": tasks,
     }
 
 
@@ -3490,15 +3510,27 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     # already closed (sections carry the clock now, not individual tasks).
     today = _today_key()
     segments = await _get_day_segments()
-    overdue = _snooze_expired(task)
+    # Whatever the start guard refuses as "closed" must be acceptable here, or
+    # the child is stuck: unable to start AND unable to explain why they're
+    # late. Reusing the same availability call keeps the two in lockstep by
+    # construction rather than by careful duplication.
+    _cfg_lr = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    _kid_lr = await db.children.find_one({"id": task.get("child_id")})
+    _open_lr = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
+        "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True},
+        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
+    }).to_list(500)
+    _all_lr = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
+        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
+    }).to_list(500)
+    _first_lr = task_id in _segment_first_ids(_open_lr, segments, _all_lr)
+    overdue = _task_availability(
+        task, segments, _kid_lr, _first_lr, int(_cfg_lr.get("segment_late_grace_minutes", 10))
+    ) == "closed"
     if task.get("date_key") and task["date_key"] < today:
         overdue = True
-    elif task.get("date_key") == today:
-        end = _task_window_end(task, segments)
-        if end is not None:
-            # OR, not assignment: an expired snooze already made this overdue,
-            # and a still-open section must not erase that.
-            overdue = overdue or end < (_now_local().hour * 60 + _now_local().minute)
     if not overdue:
         raise HTTPException(status_code=400, detail="Misi ini belum terlewat")
 

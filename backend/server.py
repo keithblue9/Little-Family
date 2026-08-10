@@ -320,6 +320,9 @@ class AppConfigInput(BaseModel):
     # Minutes-remaining marks at which a running mission warns the child that
     # time is nearly up. Empty list = no warnings at all.
     duration_warning_minutes: Optional[List[int]] = None
+    # Whether bonus missions must wait their turn in the sequence like required
+    # ones, instead of being startable at any moment.
+    bonus_follows_sequence: Optional[bool] = None
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -3017,11 +3020,14 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
     agree with what they actually see. Tasks with no due_time sort last, since
     they can be done whenever. Bonus tasks (is_bonus=True) never block.
     """
+    cfg_seq = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    bonus_in_line = bool(cfg_seq.get("bonus_follows_sequence", True))
     query = {
         "status": {"$in": ["pending", "rejected"]},
-        "is_bonus": {"$ne": True},
         "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
     }
+    if not bonus_in_line:
+        query["is_bonus"] = {"$ne": True}
     if date_key:
         query["date_key"] = date_key
     open_tasks = await db.tasks.find(query).to_list(500)
@@ -3138,8 +3144,11 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
         if date_key > today:
             raise HTTPException(status_code=409, detail="Misi ini belum waktunya (hari yang akan datang)")
 
-    # Required tasks must be inside their section's window AND next in line.
-    if not task.get("is_bonus"):
+    # Missions must be inside their section's window AND next in line. Bonus
+    # missions follow the same queue unless the family explicitly frees them.
+    _cfg_gate = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    _gate_applies = (not task.get("is_bonus")) or bool(_cfg_gate.get("bonus_follows_sequence", True))
+    if _gate_applies:
         # The TIME WINDOW is checked first on purpose: "belum waktunya" and
         # "sudah lewat, pakai Terlambat" tell the child exactly what to do,
         # whereas the generic "finish the previous mission first" would be
@@ -4872,6 +4881,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "auto_start_next": True,
             "snooze_options_minutes": [5, 10, 15, 20],
             "duration_warning_minutes": [3, 2, 1],
+            "bonus_follows_sequence": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4984,6 +4994,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "auto_start_next": True,
             "snooze_options_minutes": [5, 10, 15, 20],
             "duration_warning_minutes": [3, 2, 1],
+            "bonus_follows_sequence": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5027,6 +5038,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "snooze_options_minutes": config.get("snooze_options_minutes") or [5, 10, 15, 20],
         "duration_warning_minutes": config.get("duration_warning_minutes")
             if config.get("duration_warning_minutes") is not None else [3, 2, 1],
+        "bonus_follows_sequence": bool(config.get("bonus_follows_sequence", True)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

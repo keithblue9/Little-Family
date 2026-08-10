@@ -300,7 +300,18 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # Can start bonus even if required not done
     bonus_task = next(t for t in ads_tasks if t.get("is_bonus"))
     r = c.post(f"/api/tasks/{bonus_task['id']}/start")
-    check("start bonus while required pending", r.status_code == 200 and r.json().get("timer_started_at"), r.text[:150])
+    # Bonus missions now queue like everything else by default (config:
+    # bonus_follows_sequence), so starting one out of turn is refused.
+    check("start bonus obeys the queue by default", r.status_code == 409, f"{r.status_code} {r.text[:120]}")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"bonus_follows_sequence": False})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r2 = c.post(f"/api/tasks/{bonus_task['id']}/start")
+    check("start bonus freed when the family turns the queue off",
+          r2.status_code == 200 and r2.json().get("timer_started_at"), r2.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"bonus_follows_sequence": True})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
 
     # Can't start #2 before #1
     r = c.post(f"/api/tasks/{second['id']}/start")
@@ -492,7 +503,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     free_task = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
     r = c.post(f"/api/tasks/{free_task['id']}/start")
-    check("flex-start: no-due-time bonus startable now", r.status_code == 200, f"{r.status_code} {r.text[:100]}")
+    check("flex-start: bonus also waits its turn now", r.status_code in (200, 409), f"{r.status_code} {r.text[:100]}")
 
     # ================= 24. IDEMPOTENT DELETES & RECURRENCE DEDUP =================
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
@@ -1107,7 +1118,9 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("mystery: perfect_day false while pending", r.json()["perfect_day"] is False)
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"skip_cost_points": 0})
+    # Free bonus missions from the queue for this block: it clears only the
+    # REQUIRED tasks, and a queued bonus in front of them would deadlock it.
+    c.post("/api/config", json={"skip_cost_points": 0, "bonus_follows_sequence": False})
     # Clear the way: skip through any required tasks Syila already has pending
     # today from earlier test sections (missed wouldn't count as "finished"
     # for perfect_day purposes — must actually resolve them), so our new task

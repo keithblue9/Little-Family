@@ -28,6 +28,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [flashPct, setFlashPct] = useState(15);
   const [snoozeOptions, setSnoozeOptions] = useState([5, 10, 15, 20]);
   const [warnMinutes, setWarnMinutes] = useState([3, 2, 1]);
+  const [bonusInLine, setBonusInLine] = useState(true);
   // Remembers which warnings already fired, per task, so a 1-second ticker
   // can't re-announce the same threshold every tick.
   const firedWarnings = useRef({});
@@ -52,7 +53,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       const { data } = await api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } });
       setProgress(data);
       api.get("/config")
-        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); setSnoozeOptions(cfg.snooze_options_minutes || [5, 10, 15, 20]); setWarnMinutes(cfg.duration_warning_minutes ?? [3, 2, 1]); })
+        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); setSnoozeOptions(cfg.snooze_options_minutes || [5, 10, 15, 20]); setWarnMinutes(cfg.duration_warning_minutes ?? [3, 2, 1]); setBonusInLine(cfg.bonus_follows_sequence !== false); })
         .catch(() => { setLateReasons([]); setDaySegments([]); });
     } catch (e) {
       toast.error(formatApiError(e));
@@ -87,7 +88,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       return 100000; // no section, no time → do whenever, queue last
     };
     const req = tasks
-      .filter((t) => !t.is_bonus)
+      .filter((t) => (bonusInLine ? true : !t.is_bonus))
       .sort((a, b) => seqVal(a) - seqVal(b) || (a.order || 0) - (b.order || 0));
     const bon = tasks.filter((t) => t.is_bonus);
     const openReq = req.filter((t) => t.status === "pending" || t.status === "rejected");
@@ -116,7 +117,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     });
 
     return { timeline: merged, next: first, done: doneReq };
-  }, [progress, daySegments]);
+  }, [progress, daySegments, bonusInLine]);
 
   const isToday = dateKey === todayKey();
   const isFuture = isFutureDate(dateKey);
@@ -440,6 +441,56 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
         </motion.div>
       )}
 
+      {/* 🕐 Reason picker for a mission whose window has passed */}
+      {lateTaskModal && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => setLateTaskModal(null)}>
+          <motion.div
+            initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }}
+            className="bg-white rounded-3xl p-5 max-w-sm w-full chunky-shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-3xl mb-1">🕐</div>
+            <h3 className="font-fun font-bold text-lg text-slate-900 mb-1">Kenapa terlambat?</h3>
+            <p className="text-xs text-slate-500 mb-3">
+              Misi "<b>{lateTaskModal.title}</b>" sudah lewat waktunya. Pilih alasan yang paling jujur ya — beberapa
+              alasan tidak mengurangi apa pun, tapi kalau memang lalai kamu dapat Kartu Hukuman dan misinya jadi tanpa poin.
+            </p>
+            <div className="space-y-2 max-h-72 overflow-y-auto">
+              {lateReasons.length === 0 && (
+                <div className="text-sm text-slate-400 text-center py-4">
+                  Belum ada pilihan alasan. Minta Abi/Ummi mengaturnya dulu di Pengaturan.
+                </div>
+              )}
+              {lateReasons.map((r) => (
+                <button
+                  key={r.id}
+                  onClick={() => submitLateReason(r.id)}
+                  disabled={busyId === lateTaskModal.id}
+                  className={`press-btn w-full text-left px-3 py-2.5 rounded-2xl border-2 disabled:opacity-60 ${
+                    r.gives_penalty_card
+                      ? "border-red-200 bg-red-50 hover:bg-red-100"
+                      : "border-emerald-200 bg-emerald-50 hover:bg-emerald-100"
+                  }`}
+                >
+                  <div className="font-fun font-bold text-sm text-slate-800">{r.label}</div>
+                  <div className={`text-[11px] ${r.gives_penalty_card ? "text-red-600" : "text-emerald-700"}`}>
+                    {r.gives_penalty_card ? "Dapat Kartu Hukuman" : "Dimaklumi"}
+                    {" · "}
+                    {r.award_points ? "poin tetap utuh" : "misi lanjut tanpa poin"}
+                  </div>
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setLateTaskModal(null)}
+              className="press-btn w-full mt-3 py-2.5 rounded-xl font-fun font-bold border-2 border-slate-200 text-slate-600"
+            >
+              Batal
+            </button>
+          </motion.div>
+        </div>
+      )}
+
       {/* ▶️ Hand-off to the next mission in the same section */}
       {handoff && (
         <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
@@ -674,7 +725,10 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     // intricate enough that two implementations WILL drift.
                     const notYet = t.availability === "future";
                     const overdueBySection = t.availability === "closed";
-                    const isActive = t.is_bonus ? !isDone : next?.id === t.id;
+                    // Bonus missions queue with everything else unless the
+                    // family frees them, so the UI must not hand them an
+                    // always-on Mulai the server would reject.
+                    const isActive = (t.is_bonus && !bonusInLine) ? !isDone : next?.id === t.id;
                     const timeStuck = !isDone && (overdueBySection || (isActive && isTimeStuck(t)));
                     return {
                       busy: busyId === t.id,

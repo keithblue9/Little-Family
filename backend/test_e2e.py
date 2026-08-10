@@ -53,7 +53,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # The anti-rapel cooldown is exercised in its own block below; everywhere
     # else it would just make unrelated tests race the clock, so keep it off.
     c.post("/api/config", json={"min_gap_seconds": 0, "notify_parent_on_start": False,
-                                "pacing_bonus_points": 0})
+                                "pacing_bonus_points": 0, "auto_approve_tasks": False})
     r = c.post("/api/config", json={"rupiah_per_point": 500, "skip_cost_points": 5})
     check("set config", r.status_code == 200, r.text[:120])
     r = c.get("/api/config")
@@ -843,7 +843,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # cooldown/bonus. Re-apply the suite-wide overrides so later tests keep
     # measuring what they intend to.
     c.post("/api/config", json={"min_gap_seconds": 0, "notify_parent_on_start": False,
-                                "pacing_bonus_points": 0})
+                                "pacing_bonus_points": 0, "auto_approve_tasks": False})
 
     # ================= 43. REGRESSION: /auth/me must include all self-editable profile fields =================
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
@@ -4037,6 +4037,187 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "segment_late_grace_minutes": 10})
     _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== "MULAI SEKARANG" MELEWATI JEDA ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={"day_segments": [{"label": "Sesi Early", "start_time": "00:00", "end_time": "23:59"}],
+                                "min_gap_seconds": 60, "bonus_follows_sequence": True})
+    EID = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mke = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                  "segment_id": EID, "order": o}).json()
+    e1, e2 = mke("Early satu", 1), mke("Early dua", 2)
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{e1['id']}/start")
+    c.post(f"/api/tasks/{e1['id']}/complete")
+    # Default: the cooldown still applies
+    r = c.post(f"/api/tasks/{e2['id']}/start")
+    check("early: cooldown still blocks a plain start", r.status_code == 429, str(r.status_code))
+    # "Mulai Sekarang" cuts it short
+    r = c.post(f"/api/tasks/{e2['id']}/start", json={"start_early": True})
+    check("early: start_early cuts the cooldown short", r.status_code == 200, r.text[:170])
+    e2_doc = _aio_tg.run(server.db.tasks.find_one({"id": e2["id"]}, {"_id": 0}))
+    check("early: the shortcut is recorded on the task", e2_doc.get("started_early") is True, str(e2_doc.get("started_early")))
+
+    # ...and it's visible to the parent rather than silently allowed
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get(f"/api/activity?child_id={adskhan['id']}&limit=40")
+    check("early: logged for the parent to see",
+          any(x["action"] == "task_started_early" for x in r.json()),
+          str([x["action"] for x in r.json()][:8]))
+    _elog = next(x for x in r.json() if x["action"] == "task_started_early")
+    check("early: log records the mission and the gap",
+          _elog["details"].get("title") and "gap_seconds" in _elog["details"], str(_elog.get("details")))
+
+    # A normal start (no rush) is NOT marked as early
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    e3 = mke("Early tiga", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{e3['id']}/start")
+    e3_doc = _aio_tg.run(server.db.tasks.find_one({"id": e3["id"]}, {"_id": 0}))
+    check("early: an ordinary start isn't flagged", not e3_doc.get("started_early"), str(e3_doc.get("started_early")))
+
+    # The shortcut must not bypass the OTHER guards
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _nl3 = server._now_local(); _nm3 = _nl3.hour * 60 + _nl3.minute
+    _f3 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
+    _wd3 = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
+    c.put(f"/api/children/{adskhan['id']}/segment-starts",
+          json={"starts": {EID: {_wd3: _f3(min(_nm3 + 120, 23 * 60 + 59))}}})
+    e4 = mke("Belum waktunya", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{e4['id']}/start", json={"start_early": True})
+    check("early: cannot bypass a section that hasn't opened", r.status_code == 409, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {}})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    q1, q2 = mke("Antre satu", 1), mke("Antre dua", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{q2['id']}/start", json={"start_early": True})
+    check("early: cannot jump the queue either", r.status_code == 409, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "min_gap_seconds": 0})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== POIN OTOMATIS (tanpa antre persetujuan) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
+    c.post("/api/config", json={"auto_approve_tasks": True, "min_gap_seconds": 0,
+                                "day_segments": [{"label": "Sesi Auto", "start_time": "00:00", "end_time": "23:59"}],
+                                "early_bonus_pct": 0, "pacing_bonus_points": 0})
+    AAS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mka = lambda t, o, **kw: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                        "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                        "segment_id": AAS, "order": o, **kw}).json()
+
+    a1 = mka("Otomatis satu", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{a1['id']}/start")
+    r = c.post(f"/api/tasks/{a1['id']}/complete")
+    check("autoapprove: reported on the completion", r.json().get("auto_approved") is True, str(r.json().get("auto_approved")))
+    check("autoapprove: task lands approved, not queued", r.json()["status"] == "approved", str(r.json()["status"]))
+    ads_aa = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("autoapprove: points awarded immediately", ads_aa["points"] == 10, str(ads_aa["points"]))
+    check("autoapprove: buckets filled too",
+          ads_aa["chiky_save"] + ads_aa["chiky_spend"] + ads_aa["chiky_share"] == 10, str(ads_aa["points"]))
+
+    # Nothing left sitting in the parent's approval queue
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    pending_q = [t for t in c.get("/api/tasks").json() if t["status"] == "completed"]
+    check("autoapprove: approval queue stays empty", len(pending_q) == 0, str(len(pending_q)))
+
+    # Parent can still review and undo — that's the whole point of "review, not gatekeep"
+    r = c.post(f"/api/tasks/{a1['id']}/undo-approval")
+    check("autoapprove: parent can undo an automatic approval", r.status_code == 200, r.text[:170])
+    ads_undo = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("autoapprove: undo takes the points back", ads_undo["points"] == 0, str(ads_undo["points"]))
+
+    # Photo-required missions still wait for a human look
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+    a2 = mka("Butuh foto", 1, photo_required=True)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{a2['id']}/start")
+    r = c.post(f"/api/tasks/{a2['id']}/complete", json={"photo_url": "data:image/png;base64,iVBORw0KGgo="})
+    check("autoapprove: photo missions still need a human check",
+          r.json()["status"] == "completed" and r.json().get("auto_approved") is False, str(r.json()["status"]))
+    check("autoapprove: photo mission awards nothing yet",
+          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 0)
+
+    # Turning it off restores the manual queue
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+    c.post("/api/config", json={"auto_approve_tasks": False})
+    a3 = mka("Manual lagi", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{a3['id']}/start")
+    r = c.post(f"/api/tasks/{a3['id']}/complete")
+    check("autoapprove: toggle off returns to the manual queue",
+          r.json()["status"] == "completed" and r.json().get("auto_approved") is False, str(r.json()["status"]))
+    check("autoapprove: no points until a parent approves",
+          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 0)
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"auto_approve_tasks": False, "day_segments": server.DEFAULT_DAY_SEGMENTS,
+                                "early_bonus_pct": 10})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== MISI YANG KELEWAT DURASI TIDAK BOLEH BUNTU ===============
+    # Reported: a running mission that overran showed "Terlambat", but the
+    # server refused it as "already started" — leaving the child unable to
+    # report AND unable to finish.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0, "penalty_cards": 0}}))
+    c.post("/api/config", json={"day_segments": [{"label": "Sesi Overrun", "start_time": "00:00", "end_time": "23:59"}],
+                                "min_gap_seconds": 0, "auto_approve_tasks": False,
+                                "late_reasons": [{"label": "Kelamaan", "gives_penalty_card": False, "award_points": True}]})
+    OVS = c.get("/api/config").json()["day_segments"][0]["id"]
+    _ovr = c.get("/api/config").json()["late_reasons"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    ov = c.post("/api/tasks", json={"title": "Kelewat durasi", "points": 10, "date_key": today_local,
+                                    "duration_minutes": 5, "target_children": [adskhan["id"]],
+                                    "segment_id": OVS, "order": 1}).json()
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{ov['id']}/start")
+    # A mission comfortably inside its time has nothing to report
+    r = c.post(f"/api/tasks/{ov['id']}/late-reason", json={"reason_id": _ovr})
+    check("overrun: a mission still in time refuses a late report", r.status_code == 400, str(r.status_code))
+
+    # Push the start back so the duration has clearly elapsed
+    _aio_tg.run(server.db.tasks.update_one({"id": ov["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=30)).isoformat()}}))
+    r = c.post(f"/api/tasks/{ov['id']}/late-reason", json={"reason_id": _ovr})
+    check("overrun: an over-run mission CAN be reported", r.status_code == 200, r.text[:180])
+    ov_doc = _aio_tg.run(server.db.tasks.find_one({"id": ov["id"]}, {"_id": 0}))
+    check("overrun: the clock restarts so it's finishable", ov_doc.get("restarted_after_late") is True, str(ov_doc.get("restarted_after_late")))
+    check("overrun: fresh timer, not the stale one",
+          server._elapsed_seconds({**ov_doc, "completed_at": server.now_iso()}) < 120,
+          str(server._elapsed_seconds({**ov_doc, "completed_at": server.now_iso()})))
+
+    # ...and the whole flow completes rather than dead-ending
+    r = c.post(f"/api/tasks/{ov['id']}/complete")
+    check("overrun: can be completed after reporting", r.status_code == 200, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{ov['id']}/approve")
+    check("overrun: can be approved", r.status_code == 200, r.text[:150])
+    check("overrun: excused reason keeps the points",
+          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 10,
+          str(next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"]))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
 print("\n" + "=" * 50)

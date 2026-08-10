@@ -323,6 +323,10 @@ class AppConfigInput(BaseModel):
     # Whether bonus missions must wait their turn in the sequence like required
     # ones, instead of being startable at any moment.
     bonus_follows_sequence: Optional[bool] = None
+    # Award points the moment a mission is marked done, instead of queueing it
+    # for a parent to approve one by one. The parent still sees everything and
+    # can undo/deduct — review after the fact rather than gatekeeping.
+    auto_approve_tasks: Optional[bool] = None
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -3120,8 +3124,14 @@ def _assert_child_owns_task(user: dict, task: dict):
         raise HTTPException(status_code=403, detail="Ini bukan misimu")
 
 
+class StartTaskInput(BaseModel):
+    # Set when the child taps "Mulai Sekarang" on the hand-off popup instead of
+    # waiting out the countdown.
+    start_early: bool = False
+
+
 @api.post("/tasks/{task_id}/start")
-async def start_task_timer(task_id: str, user: dict = Depends(get_current_user)):
+async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInput(), user: dict = Depends(get_current_user)):
     """Kid clicks Start → records timer_started_at. A required task can be
     started any time on its OWN day, as long as it's the next one in sequence
     (bonuses can be started any time and never block the sequence). We no longer
@@ -3190,6 +3200,7 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
 
     cfg_start = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
     gap_seconds = None
+    started_early = False
     prev_finish = await _last_finish_dt(task["child_id"], task.get("date_key") or _today_key(), task_id)
     if prev_finish:
         gap_seconds = (datetime.now(timezone.utc) - prev_finish).total_seconds()
@@ -3197,16 +3208,29 @@ async def start_task_timer(task_id: str, user: dict = Depends(get_current_user))
         # Bonus missions are exempt — they're meant to be opportunistic.
         min_gap = int(cfg_start.get("min_gap_seconds", 60))
         if min_gap > 0 and not task.get("is_bonus") and gap_seconds < min_gap:
-            wait = int(min_gap - gap_seconds) + 1
-            raise HTTPException(
-                status_code=429,
-                detail=f"Sabar sebentar ya — tunggu {wait} detik lagi sebelum mulai misi berikutnya.",
-            )
+            # A child who is genuinely ready shouldn't be made to stare at a
+            # countdown, so "Mulai Sekarang" may cut it short — but the choice
+            # is recorded rather than waved through. Skipping once is fine;
+            # skipping every time is exactly the batch-clicking pattern the
+            # Honesty Insight surfaces to the parent.
+            if not payload.start_early:
+                wait = int(min_gap - gap_seconds) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Sabar sebentar ya — tunggu {wait} detik lagi sebelum mulai misi berikutnya.",
+                )
+            started_early = True
 
     await db.tasks.update_one({"id": task_id}, {"$set": {
         "timer_started_at": now_iso(),
         "gap_from_prev_seconds": gap_seconds,
+        "started_early": started_early,
     }, "$unset": {"snooze_until": ""}})
+    if started_early:
+        await log_activity(FAMILY_ID, task["child_id"], "task_started_early", {
+            "task_id": task_id, "title": task.get("title"),
+            "gap_seconds": int(gap_seconds or 0),
+        })
 
     if cfg_start.get("notify_parent_on_start", True):
         _kid = await db.children.find_one({"id": task["child_id"]})
@@ -3313,6 +3337,21 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
     # of drifting off and batch-clicking everything later. Deliberately limited:
     # never across sections, never for co-op (needs both kids ready) or bonus
     # missions (those are meant to be free choice).
+    # Award the points straight away unless the family wants to gate them.
+    # Approving twenty missions a day one at a time is a chore in itself; the
+    # parent still sees every completion (and every honesty signal) and can
+    # undo an approval or dock points if something looks off. Review after the
+    # fact, rather than standing in the way of it.
+    auto_approved = False
+    if config_for_notify.get("auto_approve_tasks", True) and not task.get("photo_required"):
+        try:
+            await approve_task(task_id, TaskApproveInput(), {"id": "system", "role": "parent", "name": "Otomatis"})
+            auto_approved = True
+        except HTTPException:
+            # A co-op mission still waiting on a sibling, or any other guard —
+            # fall back to the manual queue rather than losing the completion.
+            pass
+
     updated_task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
     auto_next = None
     if config_for_notify.get("auto_start_next", True) and not task.get("is_coop"):
@@ -3332,7 +3371,7 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
                         "wait_seconds": int(config_for_notify.get("min_gap_seconds", 60)),
                         "snooze_options": _snooze_options_for(nxt, config_for_notify),
                     }
-    return {**updated_task, "auto_next": auto_next}
+    return {**updated_task, "auto_next": auto_next, "auto_approved": auto_approved}
 
 
 def _task_is_time_stuck(task: dict) -> bool:
@@ -3513,8 +3552,13 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
         raise HTTPException(status_code=400, detail="Misi ini sudah diproses")
     if task.get("late_ack"):
         raise HTTPException(status_code=400, detail="Alasan keterlambatan sudah dipilih untuk misi ini")
-    if task.get("timer_started_at"):
-        raise HTTPException(status_code=400, detail="Misi ini sudah dimulai, tidak perlu lapor terlambat")
+    # A mission that was started but ran well past its duration is exactly the
+    # case that needs explaining, so only refuse when the child is still
+    # comfortably inside their time — otherwise they'd be stuck: unable to
+    # report, and unable to finish an over-run task either.
+    await _refresh_segments_cache()
+    if task.get("timer_started_at") and not _task_is_time_stuck(task):
+        raise HTTPException(status_code=400, detail="Misi ini masih berjalan, belum perlu lapor terlambat")
     # Must actually be overdue: a past day, or today with the task's SECTION
     # already closed (sections carry the clock now, not individual tasks).
     today = _today_key()
@@ -3538,6 +3582,10 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     overdue = _task_availability(
         task, segments, _kid_lr, _first_lr, int(_cfg_lr.get("segment_late_grace_minutes", 10))
     ) == "closed"
+    # Running past the allotted duration counts as late too. The availability
+    # check only looks at section windows, so on its own it would call an
+    # over-run mission "open" and refuse the very report the UI is offering.
+    overdue = overdue or _task_is_time_stuck(task)
     if task.get("date_key") and task["date_key"] < today:
         overdue = True
     if not overdue:
@@ -3562,6 +3610,11 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
         "late_no_points": not reason.get("award_points", True),
         "late_penalized": bool(reason.get("gives_penalty_card")),
     }
+    # An over-run mission gets a clean clock: they've owned the delay, so the
+    # duration starts again rather than leaving them permanently out of time.
+    if task.get("timer_started_at"):
+        updates["timer_started_at"] = now_iso()
+        updates["restarted_after_late"] = True
     if task.get("due_time"):
         now_min = _now_local().hour * 60 + _now_local().minute
         new_due = min(now_min + int(task.get("duration_minutes") or 10), 23 * 60 + 59)
@@ -4882,6 +4935,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "snooze_options_minutes": [5, 10, 15, 20],
             "duration_warning_minutes": [3, 2, 1],
             "bonus_follows_sequence": True,
+            "auto_approve_tasks": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -4995,6 +5049,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "snooze_options_minutes": [5, 10, 15, 20],
             "duration_warning_minutes": [3, 2, 1],
             "bonus_follows_sequence": True,
+            "auto_approve_tasks": True,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5039,6 +5094,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "duration_warning_minutes": config.get("duration_warning_minutes")
             if config.get("duration_warning_minutes") is not None else [3, 2, 1],
         "bonus_follows_sequence": bool(config.get("bonus_follows_sequence", True)),
+        "auto_approve_tasks": bool(config.get("auto_approve_tasks", True)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

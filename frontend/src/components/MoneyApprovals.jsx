@@ -19,6 +19,7 @@ export default function MoneyApprovals() {
   const [graceMin, setGraceMin] = useState("10");
   const [autoNext, setAutoNext] = useState(true);
   const [bonusQueue, setBonusQueue] = useState(true);
+  const [autoApprove, setAutoApprove] = useState(true);
   const [snoozeOpts, setSnoozeOpts] = useState("5, 10, 15, 20");
   const [warnMins, setWarnMins] = useState("3, 2, 1");
   const [comboBonus, setComboBonus] = useState("");
@@ -43,6 +44,7 @@ export default function MoneyApprovals() {
       setGraceMin(String(cfg.data.segment_late_grace_minutes ?? 10));
       setAutoNext(cfg.data.auto_start_next !== false);
       setBonusQueue(cfg.data.bonus_follows_sequence !== false);
+      setAutoApprove(cfg.data.auto_approve_tasks !== false);
       setSnoozeOpts((cfg.data.snooze_options_minutes || [5, 10, 15, 20]).join(", "));
       setWarnMins((cfg.data.duration_warning_minutes ?? [3, 2, 1]).join(", "));
       setComboBonus(String(cfg.data.family_combo_bonus_points ?? 10));
@@ -90,7 +92,7 @@ export default function MoneyApprovals() {
         pacing_bonus_points: pbp, notify_parent_on_start: notifyStart,
         segment_late_grace_minutes: gm, auto_start_next: autoNext,
         snooze_options_minutes: snz, duration_warning_minutes: wrn,
-        bonus_follows_sequence: bonusQueue,
+        bonus_follows_sequence: bonusQueue, auto_approve_tasks: autoApprove,
         family_combo_bonus_points: cb,
       });
       toast.success("Pengaturan tersimpan");
@@ -217,6 +219,13 @@ export default function MoneyApprovals() {
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
             <p className="text-[11px] text-slate-400 mt-1">Tombol yang muncul saat anak menunda misi berikutnya. Pisahkan dengan koma, maks. 6 pilihan.</p>
+          </div>
+          <div className="sm:col-span-2">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input type="checkbox" checked={autoApprove} onChange={(e) => setAutoApprove(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
+              <span className="text-sm font-semibold text-slate-700">Poin otomatis diberikan saat anak menandai selesai</span>
+            </label>
+            <p className="text-[11px] text-slate-400 mt-1">Kamu tidak perlu menyetujui satu per satu — cukup review di Monitor Harian, dan batalkan persetujuan kalau ada yang janggal. Misi yang butuh foto tetap menunggu pengecekanmu.</p>
           </div>
           <div className="sm:col-span-2">
             <label className="flex items-center gap-2 cursor-pointer select-none">

@@ -18,6 +18,7 @@ const ACTION_META = {
   task_rejected: { icon: "↩️", label: "Misi perlu diulang" },
   task_skipped: { icon: "⏭️", label: "Melewati misi" },
   task_snoozed: { icon: "⏰", label: "Menunda misi" },
+  task_started_early: { icon: "⚡", label: "Mulai lebih cepat (lewati jeda)" },
   task_late_reason: { icon: "🕐", label: "Lapor terlambat" },
   punishment_issued: { icon: "⚖️", label: "Hukuman terbit" },
   punishment_chosen: { icon: "🖐️", label: "Memilih hukuman" },
@@ -32,6 +33,7 @@ function describe(item) {
   const d = item.details || {};
   let extra = d.title || "";
   if (item.action === "task_snoozed" && d.minutes) extra = `${d.title} · ${d.minutes} menit`;
+  if (item.action === "task_started_early") extra = `${d.title} · jeda ${d.gap_seconds ?? 0} detik`;
   if (item.action === "task_late_reason" && d.reason) {
     extra = `${d.title} · "${d.reason}"${d.penalized ? " · kena kartu" : ""}`;
   }

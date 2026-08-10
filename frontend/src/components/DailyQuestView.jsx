@@ -270,11 +270,17 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
   const startHandoff = async () => {
     const h = handoff;
-    if (!h || handoffFiring.current) return;
+    // A stuck guard used to freeze the popup: it stayed true after an early
+    // return, so every later tap silently did nothing. Clear it whenever there
+    // is no live hand-off rather than trusting it to unwind on its own.
+    if (!h) { handoffFiring.current = false; return; }
+    if (handoffFiring.current) return;
     handoffFiring.current = true;
     setBusyId(h.task.id);
     try {
-      await api.post(`/tasks/${h.task.id}/start`);
+      // start_early tells the server this was a deliberate "I'm ready now",
+      // so it may cut the anti-rapel cooldown short — and records that it did.
+      await api.post(`/tasks/${h.task.id}/start`, { start_early: true });
       toast.success(`"${h.task.title}" dimulai. Semangat! 💪`);
       setHandoff(null);
       await load();
@@ -282,7 +288,10 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       toast.error(formatApiError(e));
       setHandoff(null);
       await load();
-    } finally { setBusyId(null); }
+    } finally {
+      setBusyId(null);
+      handoffFiring.current = false;
+    }
   };
 
   const confirmIfFlash = (task) => {
@@ -513,7 +522,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
               </div>
             </div>
 
-            {handoff.secondsLeft > 0 ? (
+            {handoff.secondsLeft > 0 && (
               <>
                 <div className="text-xs text-slate-500 mb-1">
                   Ambil napas dulu — mulai otomatis dalam <b>{handoff.secondsLeft} detik</b>
@@ -527,15 +536,23 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                   />
                 </div>
               </>
-            ) : (
-              <button
-                onClick={startHandoff}
-                disabled={busyId === handoff.task.id}
-                className="press-btn w-full py-2.5 rounded-xl font-fun font-bold bg-indigo-600 hover:bg-indigo-700 text-white mb-2 disabled:opacity-60"
-              >
-                Mulai Sekarang ▶️
-              </button>
             )}
+            {/* Always available: the countdown is a breather, not a penalty —
+                a child who's already standing there shouldn't have to wait it
+                out just because the timer says so. */}
+            <button
+              onClick={startHandoff}
+              disabled={busyId === handoff.task.id}
+              className="press-btn w-full py-2.5 rounded-xl font-fun font-bold bg-indigo-600 hover:bg-indigo-700 text-white mb-2 disabled:opacity-60"
+            >
+              {busyId === handoff.task.id ? "Memulai…" : "Mulai Sekarang ▶️"}
+            </button>
+            <button
+              onClick={() => { handoffFiring.current = false; setHandoff(null); }}
+              className="press-btn w-full py-1.5 rounded-xl font-fun text-slate-400 text-xs mb-1"
+            >
+              Tutup
+            </button>
 
             <div className="border-t border-slate-100 pt-3 mt-1">
               {(handoff.task.snooze_options || snoozeOptions).length === 0 ? (
@@ -739,7 +756,10 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       canStart: isActive && !t.timer_started_at && gate.allowed && !timeStuck && !notYet,
                       notYet,
                       notYetLabel: notYet && t.effective_start_time ? `Mulai ${t.effective_start_time}` : null,
-                      canFinish: isActive && !!t.timer_started_at && gate.allowed && !overdue,
+                      // An over-run mission still offers Selesai once the
+                      // delay has been owned — otherwise acknowledging it would
+                      // just swap one dead end for another.
+                      canFinish: isActive && !!t.timer_started_at && gate.allowed && (!overdue || t.late_ack),
                       timeStuck,
                       onStart: () => startTimer(t),
                       onFinish: () => finishTask(t),

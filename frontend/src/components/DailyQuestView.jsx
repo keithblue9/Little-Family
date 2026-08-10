@@ -667,15 +667,15 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     const overdue = isDurationExceeded(t);
                     // Bonus tasks bypass the required sequence entirely; required
                     // ones are only actionable when they're the frontmost open task.
-                    // Mirrors the backend window rule so the UI never offers
-                    // an action the server would refuse.
-                    const segsNow = progress?.segments || daySegments;
-                    const seg = t.segment_id ? segsNow.find((x) => x.id === t.segment_id) : null;
-                    const nowM = (() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); })();
-                    const toM = (v) => { const [h, m] = v.split(":").map(Number); return h * 60 + m; };
-                    const notYet = !t.is_bonus && !t.late_ack && seg && nowM < toM(seg.start_time);
+                    // The server decides what's allowed and says so per task.
+                    // Re-deriving these rules here is what let a "Mulai" button
+                    // appear on a mission the server would refuse — the window
+                    // logic (personal start, grace, snooze, section end) is
+                    // intricate enough that two implementations WILL drift.
+                    const notYet = t.availability === "future";
+                    const overdueBySection = t.availability === "closed";
                     const isActive = t.is_bonus ? !isDone : next?.id === t.id;
-                    const timeStuck = isActive && !isDone && isTimeStuck(t);
+                    const timeStuck = !isDone && (overdueBySection || (isActive && isTimeStuck(t)));
                     return {
                       busy: busyId === t.id,
                       // An overdue task offers ONLY the Terlambat button — the
@@ -684,12 +684,15 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // guard, so the UI can't offer an action that would fail.
                       canStart: isActive && !t.timer_started_at && gate.allowed && !timeStuck && !notYet,
                       notYet,
-                      notYetLabel: notYet ? `Mulai ${seg.start_time}` : null,
+                      notYetLabel: notYet && t.effective_start_time ? `Mulai ${t.effective_start_time}` : null,
                       canFinish: isActive && !!t.timer_started_at && gate.allowed && !overdue,
                       timeStuck,
                       onStart: () => startTimer(t),
                       onFinish: () => finishTask(t),
                       onSkip: () => skipTask(t),
+                      // Overdue missions can be owned at any point in the day,
+                      // not only when they happen to hold the turn — otherwise
+                      // a missed morning task would be unreachable all evening.
                       onReportLate: t.is_bonus ? null : () => setLateTaskModal(t),
                     };
                   },

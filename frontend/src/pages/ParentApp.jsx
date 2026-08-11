@@ -1915,16 +1915,20 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         <div>
           <label className={labelClass}>📅 Jadwal misi</label>
           {isEdit ? (
-            <div>
-              <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
-              {dateKey && (
-                <p className="text-xs text-slate-500 mt-1.5">
-                  🗓️ Jatuh di hari <span className="font-semibold text-slate-700">{humanDateKey(dateKey)}</span>
-                  {recurrence !== "none" && (
-                    <> — bagian dari misi <span className="font-semibold text-indigo-600">{recurrence === "daily" ? "harian" : "mingguan"}</span>, otomatis berulang di hari yang sama tiap {recurrence === "daily" ? "hari" : "minggu"}.</>
-                  )}
-                </p>
-              )}
+            /* Editing an existing occurrence: the date is what it is. Showing
+               a date picker here contradicted the rest of the app, where a
+               routine is defined by weekday + section rather than a calendar
+               date — so it's stated as plain information instead. Scheduling
+               changes are made through the section, order and repeat fields. */
+            <div className="px-4 py-2.5 rounded-xl bg-slate-50 border-2 border-slate-100">
+              <div className="text-sm font-semibold text-slate-700">{humanDateKey(dateKey)}</div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                {recurrence !== "none" ? (
+                  <>Misi <span className="font-semibold text-indigo-600">{recurrence === "daily" ? "harian" : "mingguan"}</span> — otomatis berulang, jadi tanggalnya tidak perlu diatur di sini.</>
+                ) : (
+                  <>Misi sekali jalan pada hari ini. Untuk memindahkannya, hapus lalu buat ulang di hari yang kamu mau.</>
+                )}
+              </p>
             </div>
           ) : (
             <>

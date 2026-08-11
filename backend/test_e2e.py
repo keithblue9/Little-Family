@@ -4477,6 +4477,87 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== OFF DAY PER BAGIAN HARI ===============
+    # "Off from Friday afternoon until Monday morning": Friday's morning still
+    # counts, Monday's midday onwards resumes.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Pagi", "start_time": "05:00", "end_time": "11:59"},
+        {"label": "Siang", "start_time": "12:00", "end_time": "14:59"},
+        {"label": "Sore", "start_time": "15:00", "end_time": "17:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    SG = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    _d0 = _off_base + _dt_off.timedelta(days=5)     # "Friday"
+    _d1 = _off_base + _dt_off.timedelta(days=6)     # "Saturday"
+    _d3 = _off_base + _dt_off.timedelta(days=8)     # "Monday"
+    D0, D1, D3 = (d.strftime("%Y-%m-%d") for d in (_d0, _d1, _d3))
+
+    mko = lambda title, dk, seg: c.post("/api/tasks", json={
+        "title": title, "points": 5, "date_key": dk, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": SG[seg]}).json()
+    t_fri_am = mko("Jumat pagi", D0, "Pagi")
+    t_fri_pm = mko("Jumat sore", D0, "Sore")
+    t_fri_night = mko("Jumat malam", D0, "Malam")
+    t_sat = mko("Sabtu siang", D1, "Siang")
+    t_mon_am = mko("Senin pagi", D3, "Pagi")
+    t_mon_noon = mko("Senin siang", D3, "Siang")
+    t_mon_night = mko("Senin malam", D3, "Malam")
+
+    r = c.post("/api/off-days", json={"start_date": D0, "end_date": D3,
+                                      "start_segment_id": SG["Sore"], "end_segment_id": SG["Pagi"],
+                                      "note": "Pergi keluar kota"})
+    check("offseg: partial-day range created", r.status_code == 200, r.text[:200])
+    # Covered: Friday afternoon + Friday evening + Saturday + Monday morning.
+    check("offseg: parked exactly the covered sections", r.json()["parked_tasks"] == 4, str(r.json()))
+
+    _st = lambda tid: _aio_tg.run(server.db.tasks.find_one({"id": tid}, {"_id": 0}))["status"]
+    check("offseg: Friday MORNING stays active (before the break starts)", _st(t_fri_am["id"]) == "pending", _st(t_fri_am["id"]))
+    check("offseg: Friday afternoon is off", _st(t_fri_pm["id"]) == "off", _st(t_fri_pm["id"]))
+    check("offseg: Friday evening is off", _st(t_fri_night["id"]) == "off", _st(t_fri_night["id"]))
+    check("offseg: the whole middle day is off", _st(t_sat["id"]) == "off", _st(t_sat["id"]))
+    check("offseg: Monday morning is off (the break ends there)", _st(t_mon_am["id"]) == "off", _st(t_mon_am["id"]))
+    check("offseg: Monday midday resumes", _st(t_mon_noon["id"]) == "pending", _st(t_mon_noon["id"]))
+    check("offseg: Monday evening resumes too", _st(t_mon_night["id"]) == "pending", _st(t_mon_night["id"]))
+
+    # Recurrence/streak treat a partly-off day as a working day
+    check("offseg: a partly-off boundary day is not a full off day",
+          _aio_tg.run(server._is_off_day(D0)) is False and _aio_tg.run(server._is_off_day(D3)) is False)
+    check("offseg: a fully covered middle day IS a full off day",
+          _aio_tg.run(server._is_off_day(D1)) is True)
+
+    # Cancelling restores exactly what it parked
+    off_id = r.json()["id"]
+    r = c.delete(f"/api/off-days/{off_id}")
+    check("offseg: cancelling restores the parked tasks", r.json()["restored_tasks"] == 4, str(r.json()))
+    check("offseg: Friday morning was never touched", _st(t_fri_am["id"]) == "pending")
+    check("offseg: everything is active again", _st(t_sat["id"]) == "pending" and _st(t_mon_am["id"]) == "pending")
+
+    # Without section bounds it behaves as before: whole days off
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    r = c.post("/api/off-days", json={"start_date": D0, "end_date": D0})
+    check("offseg: no bounds = the whole day off", r.json()["parked_tasks"] == 3, str(r.json()))
+    check("offseg: full-day break marks the day as off", _aio_tg.run(server._is_off_day(D0)) is True)
+    c.delete(f"/api/off-days/{r.json()['id']}")
+
+    # Validation
+    r = c.post("/api/off-days", json={"start_date": D0, "end_date": D3, "start_segment_id": "ngawur"})
+    check("offseg: unknown section rejected", r.status_code == 404, str(r.status_code))
+    r = c.post("/api/off-days", json={"start_date": D0, "end_date": D0,
+                                      "start_segment_id": SG["Malam"], "end_segment_id": SG["Pagi"]})
+    check("offseg: reversed sections on one day rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/off-days", json={"start_date": D0, "end_date": D0,
+                                      "start_segment_id": SG["Siang"], "end_segment_id": SG["Malam"]})
+    check("offseg: a same-day partial window is fine", r.status_code == 200, r.text[:160])
+    c.delete(f"/api/off-days/{r.json()['id']}")
+
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

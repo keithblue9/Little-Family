@@ -648,6 +648,12 @@ class OffDayInput(BaseModel):
     start_date: str
     end_date: Optional[str] = None  # None/empty = single day
     note: str = Field(default="", max_length=100)
+    # Optional section boundaries, so a break can begin and end part-way
+    # through a day: "off from Friday afternoon until Monday morning" leaves
+    # Friday's morning intact and lets Monday resume at midday. Omitted = the
+    # whole of that day is off.
+    start_segment_id: Optional[str] = None
+    end_segment_id: Optional[str] = None
 
 
 class SelfPasscodeInput(BaseModel):
@@ -2888,21 +2894,45 @@ async def create_off_day(payload: OffDayInput, user: dict = Depends(require_pare
     span = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1
     if span > 31:
         raise HTTPException(status_code=422, detail="Maksimal 31 hari sekali atur")
+    _segs_off = await _get_day_segments()
+    _seg_ids = {x["id"] for x in _segs_off}
+    for _field in ("start_segment_id", "end_segment_id"):
+        _val = getattr(payload, _field)
+        if _val and _val not in _seg_ids:
+            raise HTTPException(status_code=404, detail=f"Bagian waktu tidak ditemukan: {_val}")
+    if start == end and payload.start_segment_id and payload.end_segment_id:
+        if _segment_rank(_segs_off, payload.start_segment_id) > _segment_rank(_segs_off, payload.end_segment_id):
+            raise HTTPException(status_code=422, detail="Bagian mulai harus sebelum bagian selesai pada hari yang sama")
+
     dup = await db.off_days.find_one({"parent_id": FAMILY_ID, "start_date": start, "end_date": end})
     if dup:
         raise HTTPException(status_code=409, detail="Rentang hari libur ini sudah ada")
     doc = {
         "id": new_id(), "parent_id": FAMILY_ID, "start_date": start, "end_date": end,
         "note": payload.note, "created_by_name": user.get("name", ""), "created_at": now_iso(),
+        "start_segment_id": payload.start_segment_id,
+        "end_segment_id": payload.end_segment_id,
     }
     await db.off_days.insert_one(doc)
     # Park every open task in the range so it can't be missed/penalized, and
     # tag it with this off-day's id so deleting the off-day can restore exactly
     # what it parked (and nothing else).
+    # Park only the tasks the break actually covers — on a partly-off boundary
+    # day that means just the sections from (or up to) the chosen one.
+    segments = await _get_day_segments()
+    candidates = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "date_key": {"$gte": start, "$lte": end},
+         "status": {"$in": ["pending", "rejected"]}},
+        {"_id": 0},
+    ).to_list(20000)
+    doomed_ids = [
+        t["id"] for t in candidates
+        if _off_covers(doc, t["date_key"], _segment_rank(segments, t.get("segment_id")), segments)
+    ]
     res = await db.tasks.update_many(
-        {"parent_id": FAMILY_ID, "date_key": {"$gte": start, "$lte": end}, "status": {"$in": ["pending", "rejected"]}},
+        {"parent_id": FAMILY_ID, "id": {"$in": doomed_ids}},
         {"$set": {"status": "off", "off_day_id": doc["id"]}},
-    )
+    ) if doomed_ids else type("R", (), {"modified_count": 0})()
     doc.pop("_id", None)
     await log_activity(FAMILY_ID, None, "off_day_created", {"start": start, "end": end, "parked": res.modified_count})
     return {**doc, "parked_tasks": res.modified_count}
@@ -3154,16 +3184,67 @@ def _now_local():
     return datetime.now(timezone.utc) + timedelta(hours=7)
 
 
-async def _is_off_day(dk: str) -> bool:
-    """True when the given YYYY-MM-DD falls inside any parent-declared off-day
-    range (family outing, holiday, etc). Off days: existing tasks are parked
-    (status 'off'), recurrence skips over them, and streaks bridge across them."""
-    doc = await db.off_days.find_one({
+def _segment_rank(segments: list, seg_id: Optional[str]) -> Optional[int]:
+    """Position of a section in the day, earliest first. None for a task with
+    no section — it isn't tied to any point in the day."""
+    ordered = sorted(segments, key=lambda x: _hhmm_to_min(x["start_time"]))
+    for i, sg in enumerate(ordered):
+        if sg.get("id") == seg_id:
+            return i
+    return None
+
+
+def _off_covers(off: dict, dk: str, seg_rank: Optional[int], segments: list) -> bool:
+    """Is this (day, section) inside the break?
+
+    Middle days are entirely off. The first and last day are only partly off
+    when the parent set a section boundary — that's what makes "Friday evening
+    through Monday morning" expressible. A task with no section is only counted
+    on a boundary day when that whole day is off, since there's no position in
+    the day to compare it against.
+    """
+    if not (off["start_date"] <= dk <= off["end_date"]):
+        return False
+    if off["start_date"] < dk < off["end_date"]:
+        return True  # a full day in the middle of the break
+
+    start_rank = _segment_rank(segments, off.get("start_segment_id")) if off.get("start_segment_id") else None
+    end_rank = _segment_rank(segments, off.get("end_segment_id")) if off.get("end_segment_id") else None
+
+    if dk == off["start_date"] and start_rank is not None:
+        if seg_rank is None:
+            return False  # unscheduled task on a partly-off first day: leave it
+        if seg_rank < start_rank:
+            return False
+    if dk == off["end_date"] and end_rank is not None:
+        if seg_rank is None:
+            return False
+        if seg_rank > end_rank:
+            return False
+    return True
+
+
+async def _off_days_covering(dk: str) -> list:
+    return await db.off_days.find({
         "parent_id": FAMILY_ID,
         "start_date": {"$lte": dk},
         "end_date": {"$gte": dk},
-    })
-    return doc is not None
+    }, {"_id": 0}).to_list(50)
+
+
+async def _is_off_day(dk: str) -> bool:
+    """True only when the WHOLE of this day is off.
+
+    Used for recurrence skipping and streak bridging, where a half-day break
+    shouldn't make the entire day vanish — a Friday that's only off from the
+    afternoon still has a morning worth scheduling.
+    """
+    for off in await _off_days_covering(dk):
+        starts_mid = off.get("start_segment_id") and off["start_date"] == dk
+        ends_mid = off.get("end_segment_id") and off["end_date"] == dk
+        if not starts_mid and not ends_mid:
+            return True
+    return False
 
 
 

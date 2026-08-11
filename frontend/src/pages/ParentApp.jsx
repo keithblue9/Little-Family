@@ -5,7 +5,7 @@ import {
   Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
   Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
   Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2, Copy,
-  Pencil, RotateCcw, PawPrint, ImagePlus, GripVertical,
+  Pencil, RotateCcw, PawPrint, ImagePlus, GripVertical, Scale,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
@@ -1284,6 +1284,21 @@ function SettingsView({ kids, onAdd, onRefresh }) {
     catch (e) { toast.error(formatApiError(e)); }
   };
 
+  // Repairs a wallet whose three buckets no longer add up to the balance —
+  // older resets zeroed the points but left the buckets behind.
+  const rebalanceBuckets = async (c) => {
+    if (!window.confirm(
+      `Perbaiki ChikyBank ${c.name}?\n\nKetiga kantong (Tabungan/Belanja/Sedekah) akan dihitung ulang dari poin saat ini sesuai persentase yang kamu atur.\n\nJumlah poinnya sendiri tidak berubah.`
+    )) return;
+    try {
+      const { data } = await api.post(`/children/${c.id}/rebalance-buckets`);
+      toast.success(`ChikyBank ${c.name} diperbaiki — total ${data.points} poin`);
+      onRefresh();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
+  };
+
   const resetPoints = async (c) => {
     if (!window.confirm(
       `Reset poin ${c.name} ke nol?\n\nIni mengembalikan poin, total poin, streak, misi selesai, dan makanan pet ke 0, serta menghapus riwayat penukaran & konsekuensi anak ini.\n\nTugas, passcode, avatar, dan pet TIDAK dihapus. Cocok untuk membersihkan data testing.`
@@ -1406,6 +1421,13 @@ function SettingsView({ kids, onAdd, onRefresh }) {
                   data-testid={`reset-points-btn-${c.id}`}
                 >
                   <RotateCcw className="w-4 h-4" strokeWidth={2.5} />
+                </button>
+                <button
+                  onClick={() => rebalanceBuckets(c)}
+                  className="press-btn inline-flex items-center justify-center border-2 border-emerald-300 text-emerald-700 hover:bg-emerald-50 p-2 rounded-lg"
+                  title="Perbaiki ChikyBank: hitung ulang kantong dari poin saat ini"
+                >
+                  <Scale className="w-4 h-4" strokeWidth={2.5} />
                 </button>
                 <button
                   onClick={() => resetPet(c)}

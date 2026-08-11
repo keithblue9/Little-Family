@@ -755,7 +755,13 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // guard, so the UI can't offer an action that would fail.
                       canStart: isActive && !t.timer_started_at && gate.allowed && !timeStuck && !notYet,
                       notYet,
-                      notYetLabel: notYet && t.effective_start_time ? `Mulai ${t.effective_start_time}` : null,
+                      // Only the mission that OPENS the section advertises the
+                      // clock. Showing "Mulai 18:10" on all ten made the evening
+                      // look like everything unlocks at once, when in fact they
+                      // still run one after another.
+                      notYetLabel: notYet && t.is_segment_opener && t.effective_start_time
+                        ? `Mulai ${t.effective_start_time}`
+                        : null,
                       // An over-run mission still offers Selesai once the
                       // delay has been owned — otherwise acknowledging it would
                       // just swap one dead end for another.

@@ -122,8 +122,9 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
               </span>
             )}
             {notYet && (
-              <span className="text-[9px] text-sky-600 flex items-center gap-1 px-1 py-1">
-                <Clock className="w-3 h-3" /> {notYetLabel || "Belum waktunya"}
+              <span className={`text-[9px] flex items-center gap-1 px-1 py-1 ${notYetLabel ? "text-sky-600" : "text-slate-400"}`}>
+                {notYetLabel ? <Clock className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
+                {notYetLabel || "Menunggu giliran"}
               </span>
             )}
             {!canStart && !canFinish && !timeStuck && !notYet && (

@@ -4220,6 +4220,132 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== REGRESI: SLOT DI SEGMEN BERBEDA TIDAK BOLEH MENYATU ===============
+    # Reported: one bonus chore configured in two sections showed up duplicated
+    # in both — the series identity ignored the section, so the materializer
+    # copied one slot into the other's day.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Sore", "start_time": "15:00", "end_time": "17:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    DS = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # Same title, same child, one in each section — two distinct slots. Dated in
+    # the PAST so the materializer has to revive them, which is exactly where a
+    # collapsed identity turns two slots into one (or duplicates one of them).
+    _past_dupe = (_off_base - _dt_off.timedelta(days=3)).strftime("%Y-%m-%d")
+    for sid in DS:
+        c.post("/api/tasks", json={"title": "Memberi makan white", "points": 5, "date_key": _past_dupe,
+                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                   "segment_id": sid, "is_bonus": True, "recurrence": "daily"})
+    c.post("/api/tasks/materialize-recurring?days_ahead=2")
+    before = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
+              if t["title"] == "Memberi makan white"]
+    check("dupe: two sections give exactly two slots", len(before) == 2, str(len(before)))
+
+    # The materializer must not turn them into four
+    c.post("/api/tasks/materialize-recurring?days_ahead=3")
+    after = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
+             if t["title"] == "Memberi makan white"]
+    check("dupe: materializing does not duplicate them", len(after) == 2, str(len(after)))
+    check("dupe: one slot per section", sorted(t["segment_id"] for t in after) == sorted(DS),
+          str([t["segment_id"] for t in after]))
+    c.post("/api/tasks/materialize-recurring?days_ahead=3")
+    again = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
+             if t["title"] == "Memberi makan white"]
+    check("dupe: still stable on a second sweep", len(again) == 2, str(len(again)))
+
+    # =============== HANYA MISI PEMBUKA YANG MENAMPILKAN JAM ===============
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _nl4 = server._now_local(); _nm4 = _nl4.hour * 60 + _nl4.minute
+    _f4 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
+    _later = _f4(min(_nm4 + 120, 23 * 60 + 58))
+    c.post("/api/config", json={"day_segments": [{"label": "Nanti", "start_time": _later, "end_time": "23:59"}]})
+    OSID = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    for i in range(1, 4):
+        c.post("/api/tasks", json={"title": f"Antre {i}", "points": 5, "date_key": today_local,
+                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                   "segment_id": OSID, "order": i})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    rows = sorted(r.json()["tasks"], key=lambda t: t.get("order") or 0)
+    check("opener: every mission in a future section is 'future'",
+          all(t["availability"] == "future" for t in rows), str([t["availability"] for t in rows]))
+    check("opener: exactly one is flagged as the section opener",
+          sum(1 for t in rows if t.get("is_segment_opener")) == 1,
+          str([t.get("is_segment_opener") for t in rows]))
+    check("opener: it's the first by order, not an arbitrary one",
+          rows[0].get("is_segment_opener") is True, str(rows[0].get("title")))
+    check("opener: the rest are plainly queued, not each advertising the hour",
+          all(not t.get("is_segment_opener") for t in rows[1:]),
+          str([t.get("is_segment_opener") for t in rows[1:]]))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== REGRESI: RESET POIN HARUS IKUT MENOLKAN KANTONG ===============
+    # Reported: points showed 194 while the three buckets summed to 519. The
+    # reset zeroed the total but left the buckets, so the wallet drifted
+    # permanently out of step with the balance displayed above it.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"chiky_save_pct": 40, "chiky_spend_pct": 40, "chiky_share_pct": 20})
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 100, "lifetime_points": 100, "chiky_save": 40, "chiky_spend": 40, "chiky_share": 20}}))
+
+    r = c.post(f"/api/children/{adskhan['id']}/reset-points")
+    check("reset: reset-points zeroes the balance", r.status_code == 200, r.text[:150])
+    k = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
+    check("reset: buckets zeroed along with the points",
+          k["chiky_save"] == 0 and k["chiky_spend"] == 0 and k["chiky_share"] == 0,
+          f'{k["chiky_save"]}/{k["chiky_spend"]}/{k["chiky_share"]}')
+    check("reset: wallet still equals the balance",
+          k["chiky_save"] + k["chiky_spend"] + k["chiky_share"] == k["points"], str(k["points"]))
+
+    # Reset-all must behave the same
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {
+        "points": 50, "chiky_save": 20, "chiky_spend": 20, "chiky_share": 10}}))
+    r = c.post("/api/children/reset-all-points")
+    check("reset: reset-all zeroes every wallet too",
+          all(x["chiky_save"] + x["chiky_spend"] + x["chiky_share"] == x["points"]
+              for x in c.get("/api/children").json()),
+          str([(x["points"], x["chiky_save"]) for x in c.get("/api/children").json()]))
+
+    # Repair tool for wallets that already drifted
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 194, "chiky_save": 203, "chiky_spend": 203, "chiky_share": 113}}))
+    r = c.post(f"/api/children/{adskhan['id']}/rebalance-buckets")
+    check("rebalance: repairs a drifted wallet", r.status_code == 200, r.text[:180])
+    k2 = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
+    check("rebalance: buckets now sum to the points exactly",
+          k2["chiky_save"] + k2["chiky_spend"] + k2["chiky_share"] == 194,
+          f'{k2["chiky_save"]}+{k2["chiky_spend"]}+{k2["chiky_share"]}')
+    check("rebalance: split follows the configured 40/40/20",
+          k2["chiky_save"] == 78 and k2["chiky_spend"] == 78 and k2["chiky_share"] == 38,
+          f'{k2["chiky_save"]}/{k2["chiky_spend"]}/{k2["chiky_share"]}')
+    check("rebalance: the points total itself is untouched", k2["points"] == 194, str(k2["points"]))
+    check("rebalance: reports what it changed", r.json()["before"]["chiky_save"] == 203, str(r.json().get("before")))
+
+    # Custom percentages are honoured, and rounding never loses a point
+    c.post("/api/config", json={"chiky_save_pct": 50, "chiky_spend_pct": 30, "chiky_share_pct": 20})
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 77}}))
+    c.post(f"/api/children/{adskhan['id']}/rebalance-buckets")
+    k3 = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
+    check("rebalance: honours custom percentages",
+          k3["chiky_save"] == 38 and k3["chiky_spend"] == 23, f'{k3["chiky_save"]}/{k3["chiky_spend"]}')
+    check("rebalance: odd totals still add up exactly",
+          k3["chiky_save"] + k3["chiky_spend"] + k3["chiky_share"] == 77,
+          f'{k3["chiky_save"]}+{k3["chiky_spend"]}+{k3["chiky_share"]}')
+
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/children/{adskhan['id']}/rebalance-buckets")
+    check("rebalance: kid cannot run it", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"chiky_save_pct": 40, "chiky_spend_pct": 40, "chiky_share_pct": 20})
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

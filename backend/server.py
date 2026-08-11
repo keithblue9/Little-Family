@@ -1739,10 +1739,16 @@ async def reset_child_points(child_id: str, user: dict = Depends(require_parent)
             "best_streak_days": 0,
             "last_completion_date": None,
             "tasks_completed": 0,
-        "penalty_cards": 0,
-        "pet_force_dead": False,
+            "penalty_cards": 0,
+            "pet_force_dead": False,
             "feed_balance": 0,
             "feed_lifetime": 0,
+            # The three Chikybank buckets ARE the points, split three ways —
+            # zeroing the total while leaving them behind made the wallet drift
+            # permanently out of step with the balance shown above it.
+            "chiky_save": 0,
+            "chiky_spend": 0,
+            "chiky_share": 0,
         }},
     )
     # Clear scoreboard-affecting history so the numbers genuinely start from 0.
@@ -1750,6 +1756,41 @@ async def reset_child_points(child_id: str, user: dict = Depends(require_parent)
     await db.applied_consequences.delete_many({"child_id": child_id})
     await log_activity(FAMILY_ID, child_id, "points_reset", {})
     return await db.children.find_one({"id": child_id}, {"_id": 0})
+
+
+@api.post("/children/{child_id}/rebalance-buckets")
+async def rebalance_buckets(child_id: str, user: dict = Depends(require_parent)):
+    """Re-split a child's Chikybank so the three buckets add up to their actual
+    points again.
+
+    Older resets zeroed the points total but left the buckets untouched, so a
+    wallet could drift permanently out of step with the balance shown above it.
+    This recomputes the split from the current points using the family's
+    configured percentages — no points are created or destroyed.
+    """
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    total = max(0, int(child.get("points", 0)))
+    save_pct = int(config.get("chiky_save_pct", 40))
+    spend_pct = int(config.get("chiky_spend_pct", 40))
+    share_pct = int(config.get("chiky_share_pct", 20))
+    total_pct = save_pct + spend_pct + share_pct or 100
+    p_save = round(total * save_pct / total_pct)
+    p_spend = round(total * spend_pct / total_pct)
+    p_share = total - p_save - p_spend  # remainder, so the three always sum exactly
+    before = {
+        "chiky_save": int(child.get("chiky_save", 0)),
+        "chiky_spend": int(child.get("chiky_spend", 0)),
+        "chiky_share": int(child.get("chiky_share", 0)),
+    }
+    await db.children.update_one({"id": child_id}, {"$set": {
+        "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
+    }})
+    await log_activity(FAMILY_ID, child_id, "buckets_rebalanced", {"before": before, "points": total})
+    return {
+        "success": True, "points": total, "before": before,
+        "after": {"chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share},
+    }
 
 
 @api.post("/children/reset-all-points")
@@ -1764,7 +1805,10 @@ async def reset_all_children_points(user: dict = Depends(require_parent)):
                 "points": 0, "lifetime_points": 0, "streak_days": 0,
                 "best_streak_days": 0, "last_completion_date": None,
                 "tasks_completed": 0,
-        "penalty_cards": 0, "feed_balance": 0, "feed_lifetime": 0,
+                "penalty_cards": 0, "feed_balance": 0, "feed_lifetime": 0,
+                # Same as the single-child reset: the buckets are the points,
+                # so they have to go to zero together.
+                "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0,
             }},
         )
         await db.redemptions.delete_many({"child_id": k["id"]})
@@ -2192,6 +2236,7 @@ async def child_day_progress(
         _tasks_with_availability.append({
             **_t,
             "availability": _av,
+            "is_segment_opener": _t["id"] in _firsts_avail,
             "effective_start_time": _fmt_min(_effective_segment_start(_sg_t, _kid_doc_seg, dk)) if _sg_t else None,
         })
     active_punishment = await db.punishments.find_one({
@@ -3950,6 +3995,11 @@ def _series_key(task: dict) -> tuple:
         task.get("recurrence"),
         who,
         task.get("due_time") or "",
+        # The section is part of the slot's identity now that tasks are anchored
+        # to sections rather than clock times — "Memberi makan" in Sore and the
+        # same chore in Malam are two separate slots, and collapsing them made
+        # the materializer duplicate one into the other.
+        task.get("segment_id") or "",
         bool(task.get("is_bonus")),
         weekday,
     )
@@ -4449,6 +4499,7 @@ async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
         # Same title at a DIFFERENT time of day is a different slot, not a
         # duplicate — without this, a morning task could suppress the evening one.
         "due_time": task.get("due_time"),
+        "segment_id": task.get("segment_id"),
         "is_bonus": bool(task.get("is_bonus")),
     }
     if task.get("is_coop"):

@@ -66,7 +66,14 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
         </div>
 
         <div className="flex items-center gap-1.5 mt-1 text-[10px] text-slate-500">
-          {task.due_time ? <span>🕐 {task.due_time}</span> : null}
+          {/* Forecast, not a deadline: when this mission is expected to come up
+              if the day runs as planned. Shown on every card so a child can see
+              "roughly when is my turn" at a glance. */}
+          {task.projected_start_time ? (
+            <span title="Perkiraan jam mulai">🕐 {task.projected_start_time}</span>
+          ) : task.due_time ? (
+            <span>🕐 {task.due_time}</span>
+          ) : null}
           {task.duration_minutes ? <span>⏱ {task.duration_minutes}m</span> : null}
         </div>
 
@@ -123,8 +130,8 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
             )}
             {notYet && (
               <span className={`text-[9px] flex items-center gap-1 px-1 py-1 ${notYetLabel ? "text-sky-600" : "text-slate-400"}`}>
-                {notYetLabel ? <Clock className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
-                {notYetLabel || "Menunggu giliran"}
+                <Lock className="w-3 h-3" />
+                {notYetLabel ? `Mulai ${notYetLabel.replace("Mulai ", "")}` : "Menunggu giliran"}
               </span>
             )}
             {!canStart && !canFinish && !timeStuck && !notYet && (

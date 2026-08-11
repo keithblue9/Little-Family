@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RotateCcw, RefreshCw, AlertTriangle, Undo2 } from "lucide-react";
+import { RotateCcw, RefreshCw, AlertTriangle, Undo2, Copy } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
@@ -61,6 +61,31 @@ export default function RestartScheduleCard({ onChanged }) {
     }
   };
 
+  // Cleans up copies left behind by an older duplication bug. Shows what it
+  // would remove first, because deleting tasks should never be a surprise.
+  const dedupe = async () => {
+    setBusy(true);
+    try {
+      const { data: preview } = await api.post("/tasks/dedupe", null, { params: { dry_run: true } });
+      if (preview.would_delete === 0) {
+        toast.success("Tidak ada tugas kembar — semuanya sudah rapi");
+        return;
+      }
+      const sample = (preview.sample || []).slice(0, 5).map((t) => `• ${t.title} (${t.date_key})`).join("\n");
+      if (!window.confirm(
+        `Ditemukan ${preview.would_delete} tugas kembar.\n\n${sample}${preview.would_delete > 5 ? "\n…" : ""}` +
+        `\n\nHapus salinan yang kembar? Yang sudah dikerjakan selalu dipertahankan.`
+      )) return;
+      const { data } = await api.post("/tasks/dedupe");
+      toast.success(`${data.deleted} tugas kembar dihapus`);
+      onChanged?.();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const restart = async () => {
     if (!startDate) return toast.error("Pilih tanggal mulai");
     if (!window.confirm(
@@ -106,6 +131,13 @@ export default function RestartScheduleCard({ onChanged }) {
         className="press-btn inline-flex items-center gap-2 border-2 border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold px-4 py-2 rounded-xl text-sm disabled:opacity-60"
       >
         <RefreshCw className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`} /> Segarkan Jadwal
+      </button>
+      <button
+        onClick={dedupe}
+        disabled={busy}
+        className="press-btn inline-flex items-center gap-2 border-2 border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold px-4 py-2 rounded-xl text-sm disabled:opacity-60 ml-2"
+      >
+        <Copy className="w-4 h-4" /> Bersihkan Tugas Kembar
       </button>
 
       <div className="mt-4 bg-orange-50 border-2 border-orange-200 rounded-2xl p-4 max-w-lg">

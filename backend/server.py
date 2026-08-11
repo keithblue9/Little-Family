@@ -327,6 +327,10 @@ class AppConfigInput(BaseModel):
     # for a parent to approve one by one. The parent still sees everything and
     # can undo/deduct — review after the fact rather than gatekeeping.
     auto_approve_tasks: Optional[bool] = None
+    # How long a child may sit idle after finishing one mission before the next
+    # one has to be owned via Terlambat. Measured from server timestamps, so it
+    # keeps running while the app is closed. 0 = no limit.
+    max_idle_minutes: Optional[int] = Field(default=None, ge=0, le=240)
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -2256,10 +2260,11 @@ async def child_day_progress(
             _projected[_t["id"]] = _fmt_min(_cursor)
             _cursor += int(_t.get("duration_minutes") or 0)
 
+    _idle_over = await _idle_exceeded(child_id, dk, _cfg_avail)
     _tasks_with_availability = []
     for _t in tasks:
         _av = "open" if _t.get("is_bonus") else _task_availability(
-            _t, _segs_for_kid, _kid_doc_seg, _t["id"] in _firsts_avail, _grace_avail
+            _t, _segs_for_kid, _kid_doc_seg, _t["id"] in _firsts_avail, _grace_avail, _idle_over
         )
         _sg_t = _segment_for_task(_t, _segs_for_kid)
         _tasks_with_availability.append({
@@ -2267,6 +2272,10 @@ async def child_day_progress(
             "availability": _av,
             "is_segment_opener": _t["id"] in _firsts_avail,
             "projected_start_time": _projected.get(_t["id"]),
+            # When the delay was a choice, the UI must only offer the honest
+            # (at-fault) reasons — otherwise it advertises options the server
+            # will reject.
+            "at_fault_only": _idle_over or (_snooze_expired(_t) and int(_t.get("snooze_count") or 0) > 0),
             "effective_start_time": _fmt_min(_effective_segment_start(_sg_t, _kid_doc_seg, dk)) if _sg_t else None,
         })
     active_punishment = await db.punishments.find_one({
@@ -2662,7 +2671,7 @@ def _fmt_min(m: int) -> str:
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
-def _task_availability(task: dict, segments: list, child: Optional[dict] = None, is_segment_first: bool = False, grace_minutes: int = 10) -> str:
+def _task_availability(task: dict, segments: list, child: Optional[dict] = None, is_segment_first: bool = False, grace_minutes: int = 10, idle_exceeded: bool = False) -> str:
     """Is this task doable RIGHT NOW? Three states:
 
       "open"   — its section is running now (or it has no section, or the child
@@ -2693,6 +2702,12 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     # coming back early is always fine.
     if _snooze_expired(task):
         return "closed"
+    # Idle too long since the previous mission finished. Measured on the server
+    # from real timestamps, so closing the app doesn't pause it — which is the
+    # whole point: waiting it out has to cost something, or it's just a free
+    # way to stall.
+    if idle_exceeded and not task.get("timer_started_at"):
+        return "closed"
     seg = _segment_for_task(task, segments)
     if not seg:
         return "open"  # no section = do it whenever
@@ -2715,6 +2730,25 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
         if now_min > start_min + max(0, grace_minutes):
             return "closed"
     return "open"
+
+
+async def _at_fault_only(task: dict, config: dict) -> bool:
+    """True when only the at-fault reasons should be offered for this mission."""
+    if _snooze_expired(task) and int(task.get("snooze_count") or 0) > 0:
+        return True
+    if task.get("child_id") and task.get("date_key"):
+        return await _idle_exceeded(task["child_id"], task["date_key"], config)
+    return False
+
+
+async def _idle_exceeded(child_id: str, date_key: str, config: dict) -> bool:
+    limit = int(config.get("max_idle_minutes", 20))
+    if limit <= 0:
+        return False
+    last = await _last_finish_dt(child_id, date_key)
+    if not last:
+        return False  # nothing finished yet today — there's no idling to measure
+    return (datetime.now(timezone.utc) - last).total_seconds() > limit * 60
 
 
 def _snooze_expired(task: dict) -> bool:
@@ -3338,7 +3372,8 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
             "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
         }).to_list(500)
         _is_first = task_id in _segment_first_ids(_open_now, _segs_now, _all_now)
-        _avail = _task_availability(task, _segs_now, _kid_doc, _is_first, _grace)
+        _idle_now = await _idle_exceeded(task["child_id"], task.get("date_key") or _today_key(), _cfg_now)
+        _avail = _task_availability(task, _segs_now, _kid_doc, _is_first, _grace, _idle_now)
         if _avail == "future":
             _sg = _segment_for_task(task, _segs_now)
             _st = _fmt_min(_effective_segment_start(_sg, _kid_doc, task.get("date_key")))
@@ -3749,6 +3784,10 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     # check only looks at section windows, so on its own it would call an
     # over-run mission "open" and refuse the very report the UI is offering.
     overdue = overdue or _task_is_time_stuck(task)
+    # Idling past the limit is a form of being late too — without this the
+    # child would be blocked from starting AND blocked from explaining.
+    if not overdue and task.get("child_id") and task.get("date_key"):
+        overdue = await _idle_exceeded(task["child_id"], task["date_key"], _cfg_lr)
     if task.get("date_key") and task["date_key"] < today:
         overdue = True
     if not overdue:
@@ -3759,6 +3798,17 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     reason = next((r for r in reasons if r.get("id") == payload.reason_id), None)
     if not reason:
         raise HTTPException(status_code=404, detail="Pilihan alasan tidak ditemukan")
+
+    # Deliberate stalling forfeits the benefit of the doubt. If the child
+    # already asked for extra time (snooze) and let even that run out, or sat
+    # idle past the limit, the excused reasons stop being offered — the delay
+    # was a choice, not something that happened to them.
+    if await _at_fault_only(task, config):
+        if not reason.get("gives_penalty_card"):
+            raise HTTPException(
+                status_code=422,
+                detail="Kamu sudah minta tambahan waktu dan tetap lewat batas — pilih alasan yang jujur ya, yang ini tidak bisa dimaklumi.",
+            )
 
     child_id = user["id"] if user["role"] == "child" else task.get("child_id")
     # Reschedule the slot to start now: the child gets the FULL original
@@ -5150,6 +5200,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "duration_warning_minutes": [3, 2, 1],
             "bonus_follows_sequence": True,
             "auto_approve_tasks": True,
+            "max_idle_minutes": 20,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5264,6 +5315,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "duration_warning_minutes": [3, 2, 1],
             "bonus_follows_sequence": True,
             "auto_approve_tasks": True,
+            "max_idle_minutes": 20,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5309,6 +5361,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             if config.get("duration_warning_minutes") is not None else [3, 2, 1],
         "bonus_follows_sequence": bool(config.get("bonus_follows_sequence", True)),
         "auto_approve_tasks": bool(config.get("auto_approve_tasks", True)),
+        "max_idle_minutes": int(config.get("max_idle_minutes", 20)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

@@ -3718,14 +3718,18 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post(f"/api/tasks/{s3['id']}/start")
     check("snooze: expired snooze blocks a plain start", r.status_code == 409, str(r.status_code))
     check("snooze: refusal points to Terlambat", "Terlambat" in r.text, r.text[:170])
+    # Having already asked for extra time and let it lapse, the excused reasons
+    # are no longer on offer — the delay was a choice.
     r = c.post(f"/api/tasks/{s3['id']}/late-reason", json={"reason_id": _sn_ok})
-    check("snooze: expired snooze can be owned via Terlambat", r.status_code == 200, r.text[:150])
+    check("snooze: an excused reason is refused after the snooze lapsed", r.status_code == 422, str(r.status_code))
+    r = c.post(f"/api/tasks/{s3['id']}/late-reason", json={"reason_id": _sn_bad})
+    check("snooze: expired snooze can be owned with an at-fault reason", r.status_code == 200, r.text[:150])
     r = c.post(f"/api/tasks/{s3['id']}/start")
     check("snooze: startable again after acknowledging", r.status_code == 200, r.text[:150])
     c.post(f"/api/tasks/{s3['id']}/complete")
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post(f"/api/tasks/{s3['id']}/approve")
-    check("snooze: excused overrun keeps full points", r.status_code == 200, r.text[:150])
+    check("snooze: at-fault overrun still approves fine", r.status_code == 200, r.text[:150])
 
     # At-fault overrun still costs the points
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
@@ -4607,6 +4611,81 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== BATAS MENGANGGUR (jalan walau app ditutup) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Idle", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
+        "late_reasons": [
+            {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
+            {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
+    IS = c.get("/api/config").json()["day_segments"][0]["id"]
+    _ilr = c.get("/api/config").json()["late_reasons"]
+    _ok_id, _bad_id = _ilr[0]["id"], _ilr[1]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    check("idle: limit exposed in config", c.get("/api/config").json()["max_idle_minutes"] == 20)
+
+    mki = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                  "segment_id": IS, "order": o}).json()
+    i1, i2 = mki("Idle satu", 1), mki("Idle dua", 2)
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{i1['id']}/start")
+    c.post(f"/api/tasks/{i1['id']}/complete")
+    # Straight after finishing, the next one is simply available
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("idle: next mission open right after finishing",
+          {t["id"]: t for t in r.json()["tasks"]}[i2["id"]]["availability"] == "open")
+
+    # Backdate the finish so the child has "been idle" for 40 minutes — this is
+    # what would happen while the app sat closed.
+    _aio_tg.run(server.db.tasks.update_one({"id": i1["id"]}, {"$set": {
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=40)).isoformat()}}))
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("idle: past the limit the next mission closes",
+          {t["id"]: t for t in r.json()["tasks"]}[i2["id"]]["availability"] == "closed")
+    r = c.post(f"/api/tasks/{i2['id']}/start")
+    check("idle: it can't just be started", r.status_code == 409 and "Terlambat" in r.text, r.text[:170])
+
+    # ...and stalling deliberately means only the at-fault reasons are offered
+    r = c.post(f"/api/tasks/{i2['id']}/late-reason", json={"reason_id": _ok_id})
+    check("idle: an excused reason is refused after stalling", r.status_code == 422, str(r.status_code))
+    check("idle: refusal explains why", "tidak bisa dimaklumi" in r.text, r.text[:200])
+    r = c.post(f"/api/tasks/{i2['id']}/late-reason", json={"reason_id": _bad_id})
+    check("idle: an at-fault reason is accepted", r.status_code == 200, r.text[:150])
+    check("idle: and it costs the points", r.json()["task"]["late_no_points"] is True)
+    r = c.post(f"/api/tasks/{i2['id']}/start")
+    check("idle: startable again once owned", r.status_code == 200, r.text[:150])
+
+    # A limit of 0 switches the whole thing off
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"max_idle_minutes": 0})
+    j1, j2 = mki("Tanpa batas satu", 1), mki("Tanpa batas dua", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{j1['id']}/start")
+    c.post(f"/api/tasks/{j1['id']}/complete")
+    _aio_tg.run(server.db.tasks.update_one({"id": j1["id"]}, {"$set": {
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=3)).isoformat()}}))
+    r = c.post(f"/api/tasks/{j2['id']}/start")
+    check("idle: a limit of 0 disables the guard entirely", r.status_code == 200, r.text[:150])
+
+    # The very first mission of the day has nothing to idle from
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"max_idle_minutes": 20})
+    k1 = mki("Pertama hari ini", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{k1['id']}/start")
+    check("idle: the day's first mission is never blocked by idling", r.status_code == 200, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "max_idle_minutes": 20})
     __import__("asyncio").run(server._refresh_segments_cache())
 
 print("\n" + "=" * 50)

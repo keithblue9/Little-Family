@@ -4346,6 +4346,137 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"chiky_save_pct": 40, "chiky_spend_pct": 40, "chiky_share_pct": 20})
 
+    # =============== PEMBERSIH DUPLIKAT ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Sore", "start_time": "15:00", "end_time": "17:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    DD = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    mkd = lambda title, sid, bonus=False: c.post("/api/tasks", json={
+        "title": title, "points": 5, "date_key": today_local, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": sid, "is_bonus": bonus}).json()
+
+    keep = mkd("Memberi makan white", DD[1], bonus=True)
+    dupe = mkd("Memberi makan white", DD[1], bonus=True)   # exact same slot
+    other_seg = mkd("Memberi makan white", DD[0], bonus=True)  # different section = NOT a duplicate
+    solo = mkd("Makan malam", DD[1])
+
+    r = c.post("/api/tasks/dedupe?dry_run=true")
+    check("dedupe: dry run reports without deleting", r.status_code == 200 and r.json()["would_delete"] == 1,
+          str(r.json().get("would_delete")))
+    check("dedupe: dry run really changed nothing",
+          len(c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()) == 4)
+
+    r = c.post("/api/tasks/dedupe")
+    check("dedupe: removes exactly the duplicate", r.json()["deleted"] == 1, str(r.json()))
+    left = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
+    titles = sorted(t["title"] for t in left)
+    check("dedupe: three tasks remain", len(left) == 3, str(titles))
+    check("dedupe: the OTHER section's copy is untouched",
+          any(t["segment_id"] == DD[0] and t["title"] == "Memberi makan white" for t in left), str(titles))
+    check("dedupe: unrelated task untouched", any(t["title"] == "Makan malam" for t in left), str(titles))
+    r = c.post("/api/tasks/dedupe")
+    check("dedupe: running it again finds nothing left", r.json()["deleted"] == 0, str(r.json()))
+
+    # Progress must never be thrown away: the touched copy is the one kept
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    fresh = mkd("Dobel dengan progres", DD[1])
+    done = mkd("Dobel dengan progres", DD[1])
+    _aio_tg.run(server.db.tasks.update_one({"id": done["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+    c.post("/api/tasks/dedupe")
+    survivors = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
+    check("dedupe: keeps the copy that has real progress",
+          len(survivors) == 1 and survivors[0]["id"] == done["id"],
+          str([(t["id"][:6], t["status"]) for t in survivors]))
+
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/tasks/dedupe")
+    check("dedupe: kid cannot run it", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== PERKIRAAN JAM MULAI TIAP TUGAS ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"},
+        {"label": "Pagi", "start_time": "05:00", "end_time": "09:00"}]})
+    PJ = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mkp2 = lambda title, sid, dur, order: c.post("/api/tasks", json={
+        "title": title, "points": 5, "date_key": today_local, "duration_minutes": dur,
+        "target_children": [adskhan["id"]], "segment_id": sid, "order": order}).json()
+
+    mkp2("Makan malam", PJ["Malam"], 15, 1)
+    mkp2("Cuci piring", PJ["Malam"], 5, 2)
+    mkp2("Sholat Isya", PJ["Malam"], 10, 3)
+    mkp2("Bangun", PJ["Pagi"], 20, 1)
+    mkp2("Mandi", PJ["Pagi"], 10, 2)
+    no_seg = c.post("/api/tasks", json={"title": "Kapan saja", "points": 5, "date_key": today_local,
+                                        "duration_minutes": 10, "target_children": [adskhan["id"]]}).json()
+
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    by = {t["title"]: t for t in r.json()["tasks"]}
+    check("proj: first mission starts at the section's hour",
+          by["Makan malam"]["projected_start_time"] == "18:00", str(by["Makan malam"].get("projected_start_time")))
+    check("proj: second follows the first's duration (+15m)",
+          by["Cuci piring"]["projected_start_time"] == "18:15", str(by["Cuci piring"].get("projected_start_time")))
+    check("proj: third chains on again (+5m)",
+          by["Sholat Isya"]["projected_start_time"] == "18:20", str(by["Sholat Isya"].get("projected_start_time")))
+    check("proj: each section starts from its OWN hour",
+          by["Bangun"]["projected_start_time"] == "05:00" and by["Mandi"]["projected_start_time"] == "05:20",
+          f'{by["Bangun"].get("projected_start_time")}/{by["Mandi"].get("projected_start_time")}')
+    check("proj: a task with no section has nothing to project",
+          by["Kapan saja"].get("projected_start_time") is None, str(by["Kapan saja"].get("projected_start_time")))
+
+    # A personal start time shifts the whole chain for that child only
+    _wd5 = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {PJ["Malam"]: {_wd5: "18:50"}}})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    by2 = {t["title"]: t for t in r.json()["tasks"]}
+    check("proj: personal start shifts the whole chain",
+          by2["Makan malam"]["projected_start_time"] == "18:50"
+          and by2["Cuci piring"]["projected_start_time"] == "19:05"
+          and by2["Sholat Isya"]["projected_start_time"] == "19:10",
+          f'{by2["Makan malam"]["projected_start_time"]}/{by2["Cuci piring"]["projected_start_time"]}/{by2["Sholat Isya"]["projected_start_time"]}')
+    check("proj: the other section is unaffected by that override",
+          by2["Bangun"]["projected_start_time"] == "05:00", str(by2["Bangun"].get("projected_start_time")))
+
+    # Reordering re-flows the forecast
+    ids = {t["title"]: t["id"] for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()}
+    c.post("/api/tasks/reorder", json={"task_ids": [ids["Cuci piring"], ids["Makan malam"], ids["Sholat Isya"]]})
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    by3 = {t["title"]: t for t in r.json()["tasks"]}
+    check("proj: reordering re-flows the times",
+          by3["Cuci piring"]["projected_start_time"] == "18:50"
+          and by3["Makan malam"]["projected_start_time"] == "18:55",
+          f'{by3["Cuci piring"]["projected_start_time"]}/{by3["Makan malam"]["projected_start_time"]}')
+
+    # Missions that would spill past the section's end aren't given a fake hour
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": [{"label": "Sempit", "start_time": "18:00", "end_time": "18:20"}]})
+    NS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mkp2("Muat", NS, 15, 1)
+    mkp2("Pas di batas", NS, 10, 2)
+    mkp2("Kelebihan", NS, 10, 3)
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    by4 = {t["title"]: t for t in r.json()["tasks"]}
+    check("proj: fits within the section gets a time", by4["Muat"]["projected_start_time"] == "18:00")
+    check("proj: still inside the end boundary gets one too", by4["Pas di batas"]["projected_start_time"] == "18:15")
+    check("proj: past the section's end gets none rather than a fake hour",
+          by4["Kelebihan"].get("projected_start_time") is None, str(by4["Kelebihan"].get("projected_start_time")))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

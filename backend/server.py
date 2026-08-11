@@ -2227,6 +2227,29 @@ async def child_day_progress(
     _grace_avail = int(_cfg_avail.get("segment_late_grace_minutes", 10))
     _open_avail = [t for t in tasks if t.get("status") in ("pending", "rejected") and not t.get("is_bonus")]
     _firsts_avail = _segment_first_ids(_open_avail, _segs_for_kid, tasks)
+    # Projected clock time for every mission: each section starts at its own
+    # (personal) hour, and each mission is expected to begin when the previous
+    # one in that section would have finished. Purely informational — it's a
+    # forecast built from durations, not a deadline anyone is held to, so a
+    # child can see "roughly when is my turn" without us inventing per-task
+    # times to store.
+    _projected: dict = {}
+    _by_segment: dict = {}
+    for _t in tasks:
+        _sg = _segment_for_task(_t, _segs_for_kid)
+        _by_segment.setdefault(_sg.get("id") if _sg else None, []).append(_t)
+    for _sid, _items in _by_segment.items():
+        _sg = next((x for x in _segs_for_kid if x.get("id") == _sid), None)
+        if not _sg:
+            continue  # "kapan saja" tasks have no clock to project from
+        _cursor = _effective_segment_start(_sg, _kid_doc_seg, dk)
+        _seg_end = _hhmm_to_min(_sg["end_time"])
+        for _t in sorted(_items, key=lambda x: (x.get("order") or 0, x.get("created_at") or "")):
+            if _cursor > _seg_end:
+                break  # the section is full; anything past this can't be placed
+            _projected[_t["id"]] = _fmt_min(_cursor)
+            _cursor += int(_t.get("duration_minutes") or 0)
+
     _tasks_with_availability = []
     for _t in tasks:
         _av = "open" if _t.get("is_bonus") else _task_availability(
@@ -2237,6 +2260,7 @@ async def child_day_progress(
             **_t,
             "availability": _av,
             "is_segment_opener": _t["id"] in _firsts_avail,
+            "projected_start_time": _projected.get(_t["id"]),
             "effective_start_time": _fmt_min(_effective_segment_start(_sg_t, _kid_doc_seg, dk)) if _sg_t else None,
         })
     active_punishment = await db.punishments.find_one({
@@ -4147,6 +4171,51 @@ async def reorder_tasks(payload: TaskReorderInput, user: dict = Depends(require_
 
 class BulkDeleteInput(BaseModel):
     task_ids: List[str] = Field(min_length=1, max_length=500)
+
+
+@api.post("/tasks/dedupe")
+async def dedupe_tasks(dry_run: bool = False, user: dict = Depends(require_parent)):
+    """Remove duplicate copies of the same slot, keeping one of each.
+
+    An older bug let one chore be copied into a second slot; fixing the cause
+    stops it happening again but leaves the copies already on the calendar.
+    Two tasks count as the same slot only when they'd be indistinguishable to a
+    child: same title, same child, same day, same section and same bonus flag.
+
+    Whichever copy has actually been touched (started, finished, approved) is
+    the one kept, so cleaning up can never erase real progress. Pass
+    dry_run=true to see what would go before committing to it.
+    """
+    tasks = await db.tasks.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(20000)
+
+    def touched_rank(t: dict) -> tuple:
+        # Higher sorts first: real progress beats an untouched copy.
+        status_rank = {"approved": 4, "completed": 3, "skipped": 2, "rejected": 1}.get(t.get("status"), 0)
+        return (status_rank, 1 if t.get("timer_started_at") else 0, t.get("created_at") or "")
+
+    groups: dict = {}
+    for t in tasks:
+        who = tuple(sorted(t.get("coop_participants") or [])) if t.get("is_coop") else t.get("child_id")
+        key = (t.get("title"), who, t.get("date_key"), t.get("segment_id") or "",
+               t.get("due_time") or "", bool(t.get("is_bonus")))
+        groups.setdefault(key, []).append(t)
+
+    doomed = []
+    for key, items in groups.items():
+        if len(items) < 2:
+            continue
+        items.sort(key=touched_rank, reverse=True)
+        doomed.extend(items[1:])  # keep the most-progressed copy
+
+    preview = [{"id": t["id"], "title": t["title"], "date_key": t.get("date_key"),
+                "status": t.get("status")} for t in doomed[:50]]
+    if dry_run:
+        return {"would_delete": len(doomed), "sample": preview}
+
+    if doomed:
+        await db.tasks.delete_many({"parent_id": FAMILY_ID, "id": {"$in": [t["id"] for t in doomed]}})
+        await log_activity(FAMILY_ID, None, "tasks_deduped", {"deleted": len(doomed)})
+    return {"deleted": len(doomed), "sample": preview}
 
 
 @api.post("/tasks/bulk-delete")

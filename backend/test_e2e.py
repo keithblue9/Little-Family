@@ -4558,6 +4558,57 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== REGRESI: HARI DEPAN TIDAK BOLEH DICAP TERLAMBAT ===============
+    # Reported: opening TOMORROW showed every morning mission as "Terlambat",
+    # because availability was judged against the current clock without first
+    # asking which day the task belongs to.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Pagi", "start_time": "04:45", "end_time": "11:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    FS = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    _tomorrow_k = (_off_base + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    _yesterday_k = (_off_base - _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    mkf = lambda title, dk, seg: c.post("/api/tasks", json={
+        "title": title, "points": 5, "date_key": dk, "duration_minutes": 10,
+        "target_children": [adskhan["id"]], "segment_id": FS[seg]}).json()
+
+    t_tom_am = mkf("Besok pagi", _tomorrow_k, "Pagi")
+    t_tom_pm = mkf("Besok malam", _tomorrow_k, "Malam")
+    t_yes_am = mkf("Kemarin pagi", _yesterday_k, "Pagi")
+
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={_tomorrow_k}")
+    tom = {t["title"]: t for t in r.json()["tasks"]}
+    check("futureday: tomorrow's morning is NOT late", tom["Besok pagi"]["availability"] == "future",
+          str(tom["Besok pagi"]["availability"]))
+    check("futureday: tomorrow's evening is NOT late either", tom["Besok malam"]["availability"] == "future",
+          str(tom["Besok malam"]["availability"]))
+    check("futureday: nothing tomorrow counts as time-stuck",
+          server._task_is_time_stuck(_aio_tg.run(server.db.tasks.find_one({"id": t_tom_am["id"]}, {"_id": 0}))) is False)
+
+    # ...and a genuinely past day is still closed, not quietly reopened
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={_yesterday_k}")
+    yes = {t["title"]: t for t in r.json()["tasks"]}
+    check("futureday: yesterday is still closed", yes["Kemarin pagi"]["availability"] == "closed",
+          str(yes["Kemarin pagi"]["availability"]))
+
+    # Starting a future task is refused with the "not yet" message, not a late one
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{t_tom_am['id']}/start")
+    check("futureday: starting tomorrow's task is refused as not-yet (never as late)",
+          r.status_code == 409 and "belum waktunya" in r.text.lower() and "Terlambat" not in r.text,
+          r.text[:180])
+    r = c.post(f"/api/tasks/{t_tom_am['id']}/late-reason", json={"reason_id": "apa-saja"})
+    check("futureday: tomorrow cannot be reported late", r.status_code in (400, 404), str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

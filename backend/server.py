@@ -2675,8 +2675,18 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     shouldn't freeze the afternoon. That's why the sequence skips over them
     rather than stopping there.
     """
+    # Which DAY the task belongs to decides this before any clock does. Judging
+    # a future day against the current time marked tomorrow morning as already
+    # missed, and a past day as still open — the hour only means something once
+    # you know it's today.
+    dk = task.get("date_key")
+    today_dk = _today_key()
+    if dk and dk > today_dk:
+        return "future"
     if task.get("late_ack"):
         return "open"
+    if dk and dk < today_dk:
+        return "closed"
     # An expired snooze behaves exactly like any other missed start: not a
     # failure, but it has to be owned via Terlambat before continuing. While
     # the snooze is still running the child may start whenever they're ready —
@@ -3531,6 +3541,9 @@ def _task_is_time_stuck(task: dict) -> bool:
     This is exactly the situation the 'Terlambat' flow exists for — as opposed
     to a kid simply not wanting to do a task that's still well within its
     window, which is what the points-cost Skip is for."""
+    # Nothing scheduled for a future day can be late yet.
+    if task.get("date_key") and task["date_key"] > _today_key():
+        return False
     if task.get("late_ack"):
         # The lateness was already explained via the "Terlambat" flow — the
         # task is unblocked (points behavior decided by the chosen reason).

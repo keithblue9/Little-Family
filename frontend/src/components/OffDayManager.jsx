@@ -16,12 +16,16 @@ export default function OffDayManager() {
   const [multi, setMulti] = useState(false);
   const [endDate, setEndDate] = useState("");
   const [note, setNote] = useState("");
+  const [segments, setSegments] = useState([]);
+  const [startSeg, setStartSeg] = useState("");
+  const [endSeg, setEndSeg] = useState("");
   const [saving, setSaving] = useState(false);
 
   const load = async () => {
     try {
-      const { data } = await api.get("/off-days");
+      const [{ data }, { data: cfg }] = await Promise.all([api.get("/off-days"), api.get("/config")]);
       setItems(data);
+      setSegments(cfg.day_segments || []);
     } catch { /* non-fatal */ }
   };
   useEffect(() => { load(); }, []);
@@ -35,9 +39,11 @@ export default function OffDayManager() {
         start_date: startDate,
         end_date: multi ? endDate : startDate,
         note: note.trim(),
+        start_segment_id: startSeg || null,
+        end_segment_id: endSeg || null,
       });
       toast.success(`Hari libur dibuat — ${data.parked_tasks} misi dijeda sementara`);
-      setNote(""); setMulti(false); setEndDate("");
+      setNote(""); setMulti(false); setEndDate(""); setStartSeg(""); setEndSeg("");
       load();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -91,6 +97,39 @@ export default function OffDayManager() {
             />
           </div>
         )}
+        {/* Section boundaries make a break start or end part-way through a day:
+            "off from Friday afternoon until Monday morning". Left on "sehari
+            penuh", the day is off from start to finish, as before. */}
+        <div className="grid grid-cols-2 gap-2 mt-3">
+          <div>
+            <label className="text-xs font-bold text-slate-500 block mb-1">Mulai libur dari</label>
+            <select
+              value={startSeg} onChange={(e) => setStartSeg(e.target.value)}
+              className="w-full px-2 py-2 rounded-xl border-2 border-sky-200 text-sm bg-white"
+            >
+              <option value="">Sehari penuh</option>
+              {segments.map((sg) => (
+                <option key={sg.id} value={sg.id}>{sg.emoji ? `${sg.emoji} ` : ""}{sg.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs font-bold text-slate-500 block mb-1">Libur sampai bagian</label>
+            <select
+              value={endSeg} onChange={(e) => setEndSeg(e.target.value)}
+              className="w-full px-2 py-2 rounded-xl border-2 border-sky-200 text-sm bg-white"
+            >
+              <option value="">Sehari penuh</option>
+              {segments.map((sg) => (
+                <option key={sg.id} value={sg.id}>{sg.emoji ? `${sg.emoji} ` : ""}{sg.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <p className="text-[11px] text-slate-400 mt-1">
+          Mis. mulai dari <b>Sore</b> di hari Jumat sampai <b>Pagi</b> di hari Senin — pagi Jumat tetap jalan,
+          dan siang Senin sudah aktif lagi.
+        </p>
         <input
           value={note} onChange={(e) => setNote(e.target.value.slice(0, 100))}
           placeholder="Catatan (opsional), mis. Jalan-jalan keluarga"
@@ -113,6 +152,18 @@ export default function OffDayManager() {
               <div className="flex-1 min-w-0">
                 <div className="font-semibold text-slate-800 text-sm truncate">{fmtRange(o)}</div>
                 <div className="text-[11px] text-slate-400">
+                  {(o.start_segment_id || o.end_segment_id) && (
+                    <span className="text-sky-600 font-semibold">
+                      {segments.find((x) => x.id === o.start_segment_id)?.label
+                        ? `dari ${segments.find((x) => x.id === o.start_segment_id).label}`
+                        : "dari pagi"}
+                      {" → "}
+                      {segments.find((x) => x.id === o.end_segment_id)?.label
+                        ? `sampai ${segments.find((x) => x.id === o.end_segment_id).label}`
+                        : "sampai malam"}
+                      {" · "}
+                    </span>
+                  )}
                   {o.note ? `"${o.note}" · ` : ""}dibuat {o.created_by_name || "orang tua"}
                 </div>
               </div>

@@ -1,20 +1,18 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { motion } from "framer-motion";
-import { Calendar, Target, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer } from "lucide-react";
+import { Target, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer, ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import TimelineQuestView from "@/components/TimelineQuestView";
 import { QUEST_THEMES } from "@/lib/questThemes";
 import { styleMeta } from "@/lib/personality";
-import { todayKey, humanDateKey, localTimeHHMM, isFutureDate } from "@/lib/dates";
+import { todayKey, humanDateKey, localTimeHHMM, isFutureDate, shiftDateKey } from "@/lib/dates";
 import { playSoundTheme, playTimeWarning } from "@/lib/sounds";
-import KidMonthCalendar from "@/components/KidMonthCalendar";
 import MysteryBox from "@/components/MysteryBox";
 import { timeOfDayOverlay, isNightTime } from "@/lib/timeOfDay";
 
 export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [dateKey, setDateKey] = useState(todayKey());
-  const [showCalendar, setShowCalendar] = useState(false);
   const [progress, setProgress] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState(null);
@@ -416,39 +414,62 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
           </motion.div>
         </div>
       )}
-      {/* Compact date bar: shows the selected day and a calendar toggle. The
-          full month grid stays hidden by default (it dominated the screen) and
-          only expands when the kid taps "Kalender" — keeps the mission list
-          front-and-center. */}
-      <div className="flex items-center justify-between gap-2 bg-white rounded-2xl px-4 py-2.5 border-2 border-slate-100 chunky-shadow">
-        <div className="min-w-0">
-          <div className="font-fun font-bold text-slate-900 text-sm truncate">{humanDateKey(dateKey)}</div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {!isToday && (
-            <button onClick={() => setDateKey(todayKey())} className="press-btn bg-[#FF9D23] hover:bg-[#f08e14] text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs">
-              Hari Ini
-            </button>
-          )}
-          <button
-            onClick={() => setShowCalendar((v) => !v)}
-            className={`press-btn font-fun font-bold px-3 py-1.5 rounded-xl text-xs inline-flex items-center gap-1 border-2 transition-colors ${
-              showCalendar ? "bg-indigo-500 border-indigo-500 text-white" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
-            }`}
-            data-testid="kid-calendar-toggle"
-            title="Buka/tutup kalender"
-          >
-            <Calendar className="w-3.5 h-3.5" strokeWidth={2.5} /> Kalender
-          </button>
-        </div>
-      </div>
+      {/* Date bar: plain arrows plus Kemarin / Hari Ini / Besok and a date
+          picker. This replaced a month-grid calendar that fetched a whole
+          month of progress before it could open — the kid only ever needs to
+          step a day or two, and this renders instantly with no extra request. */}
+      <div className="flex items-center gap-1.5 bg-white rounded-2xl px-2.5 py-2 border-2 border-slate-100 chunky-shadow overflow-x-auto">
+        <button
+          onClick={() => setDateKey(shiftDateKey(dateKey, -1))}
+          className="press-btn shrink-0 w-8 h-8 rounded-full border-2 border-slate-200 text-slate-500 hover:bg-slate-50 flex items-center justify-center"
+          title="Hari sebelumnya"
+          aria-label="Hari sebelumnya"
+        >
+          <ChevronLeft className="w-4 h-4" strokeWidth={2.5} />
+        </button>
 
-      {/* Month calendar — hidden until toggled. Tap any day to jump to its missions. */}
-      {showCalendar && (
-        <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}>
-          <KidMonthCalendar childId={child?.id} selectedDateKey={dateKey} onSelectDate={(d) => { setDateKey(d); setShowCalendar(false); }} />
-        </motion.div>
-      )}
+        {[
+          { label: "Kemarin", key: shiftDateKey(todayKey(), -1) },
+          { label: "Hari Ini", key: todayKey() },
+          { label: "Besok", key: shiftDateKey(todayKey(), 1) },
+        ].map((opt) => (
+          <button
+            key={opt.label}
+            onClick={() => setDateKey(opt.key)}
+            className={`press-btn shrink-0 font-fun font-bold px-3 py-1.5 rounded-xl text-xs transition-colors ${
+              dateKey === opt.key
+                ? "bg-indigo-500 text-white"
+                : "bg-slate-50 text-slate-600 hover:bg-slate-100"
+            }`}
+          >
+            {opt.label}
+          </button>
+        ))}
+
+        <button
+          onClick={() => setDateKey(shiftDateKey(dateKey, 1))}
+          className="press-btn shrink-0 w-8 h-8 rounded-full border-2 border-slate-200 text-slate-500 hover:bg-slate-50 flex items-center justify-center"
+          title="Hari berikutnya"
+          aria-label="Hari berikutnya"
+        >
+          <ChevronRight className="w-4 h-4" strokeWidth={2.5} />
+        </button>
+
+        <input
+          type="date"
+          value={dateKey}
+          onChange={(e) => e.target.value && setDateKey(e.target.value)}
+          className="shrink-0 px-2 py-1.5 rounded-xl border-2 border-slate-200 text-xs bg-white"
+          aria-label="Pilih tanggal"
+        />
+
+        {/* Only worth showing when the label buttons don't already say where we are */}
+        {![shiftDateKey(todayKey(), -1), todayKey(), shiftDateKey(todayKey(), 1)].includes(dateKey) && (
+          <span className="shrink-0 text-[11px] font-semibold text-slate-500 pl-1">
+            {humanDateKey(dateKey)}
+          </span>
+        )}
+      </div>
 
       {/* 🕐 Reason picker for a mission whose window has passed */}
       {lateTaskModal && (

@@ -195,6 +195,13 @@ function fmtElapsed(startIso, endIso) {
   } catch { return ""; }
 }
 
+function fmtMins(mins) {
+  if (mins < 60) return `${mins} mnt`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m ? `${h} jam ${m} mnt` : `${h} jam`;
+}
+
 function TaskRow({ task, bonus }) {
   const s = statusLabel[task.status] || statusLabel.pending;
   const Icon = s.icon;
@@ -231,6 +238,18 @@ function TaskRow({ task, bonus }) {
           <div className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap mt-0.5">
             {task.timer_started_at && <span title="Jam mulai">▶️ {fmtClock(task.timer_started_at)}</span>}
             {task.completed_at && <span title="Jam selesai">✅ {fmtClock(task.completed_at)}</span>}
+            {/* Idle time before this mission began. Long gaps are where a
+                routine quietly leaks an hour without any single task looking
+                wrong, so it's worth stating plainly rather than leaving the
+                parent to subtract timestamps by hand. */}
+            {task.gap_from_prev_seconds > 120 && (
+              <span
+                className={task.gap_from_prev_seconds >= 1800 ? "text-amber-600 font-semibold" : "text-slate-400"}
+                title="Jeda sejak misi sebelumnya selesai"
+              >
+                ⏸️ jeda {fmtMins(Math.round(task.gap_from_prev_seconds / 60))}
+              </span>
+            )}
             {task.timer_started_at && task.completed_at && (
               <span className="text-slate-500 font-semibold" title="Lama pengerjaan">⏳ {fmtElapsed(task.timer_started_at, task.completed_at)}</span>
             )}

@@ -491,7 +491,14 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                   Belum ada pilihan alasan. Minta Abi/Ummi mengaturnya dulu di Pengaturan.
                 </div>
               )}
-              {lateReasons.map((r) => (
+              {lateTaskModal.at_fault_only && (
+                <p className="text-[11px] text-red-600 bg-red-50 border-2 border-red-100 rounded-xl px-3 py-2 mb-1">
+                  Kamu sudah dapat tambahan waktu tapi tetap lewat batas, jadi kali ini alasannya yang jujur saja ya.
+                </p>
+              )}
+              {lateReasons
+                .filter((r) => !lateTaskModal.at_fault_only || r.gives_penalty_card)
+                .map((r) => (
                 <button
                   key={r.id}
                   onClick={() => submitLateReason(r.id)}

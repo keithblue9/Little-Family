@@ -2275,7 +2275,9 @@ async def child_day_progress(
             # When the delay was a choice, the UI must only offer the honest
             # (at-fault) reasons — otherwise it advertises options the server
             # will reject.
-            "at_fault_only": _idle_over or (_snooze_expired(_t) and int(_t.get("snooze_count") or 0) > 0),
+            "at_fault_only": (_t["id"] not in _firsts_avail) and (
+                _idle_over or (_snooze_expired(_t) and int(_t.get("snooze_count") or 0) > 0)
+            ),
             "effective_start_time": _fmt_min(_effective_segment_start(_sg_t, _kid_doc_seg, dk)) if _sg_t else None,
         })
     active_punishment = await db.punishments.find_one({
@@ -2706,7 +2708,10 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     # from real timestamps, so closing the app doesn't pause it — which is the
     # whole point: waiting it out has to cost something, or it's just a free
     # way to stall.
-    if idle_exceeded and not task.get("timer_started_at"):
+    # A section opener is judged by its own start time (with the configured
+    # grace), not by how long the child idled — they may simply have got home
+    # late, which the Terlambat flow already handles fairly.
+    if idle_exceeded and not is_segment_first and not task.get("timer_started_at"):
         return "closed"
     seg = _segment_for_task(task, segments)
     if not seg:
@@ -2732,8 +2737,20 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     return "open"
 
 
-async def _at_fault_only(task: dict, config: dict) -> bool:
-    """True when only the at-fault reasons should be offered for this mission."""
+async def _at_fault_only(task: dict, is_segment_opener: bool, config: dict) -> bool:
+    """Should ONLY the at-fault reasons be offered for this mission?
+
+    Never for the mission that opens a section. Arriving home late from school
+    is genuinely outside a child's control, so "kena macet" has to stay on the
+    table there no matter how long it took — that's the whole reason the
+    Terlambat flow exists.
+
+    For every mission after that, the child was already home and working
+    through their list. Having asked for extra time and let it lapse, or having
+    sat idle past the limit, is a choice — so only the honest reasons remain.
+    """
+    if is_segment_opener:
+        return False
     if _snooze_expired(task) and int(task.get("snooze_count") or 0) > 0:
         return True
     if task.get("child_id") and task.get("date_key"):
@@ -3803,7 +3820,8 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     # already asked for extra time (snooze) and let even that run out, or sat
     # idle past the limit, the excused reasons stop being offered — the delay
     # was a choice, not something that happened to them.
-    if await _at_fault_only(task, config):
+    _opener_lr = task_id in _segment_first_ids(_open_lr, segments, _all_lr)
+    if await _at_fault_only(task, _opener_lr, config):
         if not reason.get("gives_penalty_card"):
             raise HTTPException(
                 status_code=422,

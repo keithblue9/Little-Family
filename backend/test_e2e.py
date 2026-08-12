@@ -3710,7 +3710,13 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
     _snr = c.get("/api/config").json()["late_reasons"]
     _sn_ok, _sn_bad = _snr[0]["id"], _snr[1]["id"]
-    s3 = mksn("Tunda kelewat", 1)
+    # A section OPENER keeps its excused reasons (arriving home late is not the
+    # child's doing), so this must be a later mission to exercise the strict
+    # path — the opener case is covered on its own below.
+    _s3_opener = mksn("Pembuka sesi", 1)
+    _aio_tg.run(server.db.tasks.update_one({"id": _s3_opener["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+    s3 = mksn("Tunda kelewat", 2)
     _aio_tg.run(server.db.tasks.update_one({"id": s3["id"]}, {"$set": {
         "snooze_until": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=5)).isoformat(),
         "snooze_count": 1}}))
@@ -4686,6 +4692,88 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "max_idle_minutes": 20})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== PEMBUKA SEGMEN TETAP BOLEH DIMAKLUMI ===============
+    # Arriving home late is outside a child's control, so the mission that
+    # OPENS a section must keep its excused reasons however long it took. Only
+    # the missions after it — when the child was already home — lose them.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Opener", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
+        "segment_late_grace_minutes": 10,
+        "late_reasons": [
+            {"label": "Kena macet pulang", "gives_penalty_card": False, "award_points": True},
+            {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
+    OS2 = c.get("/api/config").json()["day_segments"][0]["id"]
+    _o = c.get("/api/config").json()["late_reasons"]
+    OK2, BAD2 = _o[0]["id"], _o[1]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mkq = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                  "segment_id": OS2, "order": o}).json()
+
+    # --- The opener, with the child idle for hours ---
+    op = mkq("Ganti baju sepulang sekolah", 1)
+    later = mkq("Kerjakan PR", 2)
+    _aio_tg.run(server.db.tasks.update_one({"id": op["id"]}, {"$set": {"snooze_count": 1,
+        "snooze_until": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    op_row = {t["id"]: t for t in r.json()["tasks"]}[op["id"]]
+    check("opener: never restricted to at-fault reasons", op_row["at_fault_only"] is False, str(op_row["at_fault_only"]))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{op['id']}/late-reason", json={"reason_id": OK2})
+    check("opener: an excused reason is still accepted for the opener", r.status_code == 200, r.text[:180])
+    check("opener: and it keeps the points", r.json()["task"]["late_no_points"] is False)
+    c.post(f"/api/tasks/{op['id']}/start")
+    c.post(f"/api/tasks/{op['id']}/complete")
+
+    # --- The mission after it, once the child has been home and idle too long ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.update_one({"id": op["id"]}, {"$set": {
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=45)).isoformat()}}))
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    later_row = {t["id"]: t for t in r.json()["tasks"]}[later["id"]]
+    check("opener: a LATER mission does get restricted", later_row["at_fault_only"] is True, str(later_row["at_fault_only"]))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{later['id']}/late-reason", json={"reason_id": OK2})
+    check("opener: excused refused for the later mission", r.status_code == 422, str(r.status_code))
+    r = c.post(f"/api/tasks/{later['id']}/late-reason", json={"reason_id": BAD2})
+    check("opener: at-fault accepted for the later mission", r.status_code == 200, r.text[:150])
+    check("opener: and that one costs the points", r.json()["task"]["late_no_points"] is True)
+
+    # --- An UNTOUCHED section opens freely even after a long idle gap ---
+    # (Once a section has been entered, its later missions are held to the idle
+    # rule — "opener" is a one-off status per section, not a rolling exemption.)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Sesi Lama", "start_time": "00:00", "end_time": "11:59"},
+        {"label": "Sesi Baru", "start_time": "12:00", "end_time": "23:59"}]})
+    OLD_S, NEW_S = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    prev = c.post("/api/tasks", json={"title": "Selesai tadi pagi", "points": 5, "date_key": today_local,
+                                      "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                      "segment_id": OLD_S, "order": 1}).json()
+    _aio_tg.run(server.db.tasks.update_one({"id": prev["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso(),
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=3)).isoformat()}}))
+    nxt_open = c.post("/api/tasks", json={"title": "Pembuka sesi baru", "points": 5, "date_key": today_local,
+                                          "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                          "segment_id": NEW_S, "order": 1}).json()
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("opener: a fresh section's opener isn't closed by earlier idling",
+          {t["id"]: t for t in r.json()["tasks"]}[nxt_open["id"]]["availability"] == "open",
+          str({t["id"]: t for t in r.json()["tasks"]}[nxt_open["id"]]["availability"]))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{nxt_open['id']}/start")
+    check("opener: and it can simply be started", r.status_code == 200, r.text[:150])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
 print("\n" + "=" * 50)

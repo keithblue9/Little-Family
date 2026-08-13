@@ -134,6 +134,8 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
                 {notYetLabel ? `Mulai ${notYetLabel.replace("Mulai ", "")}` : "Menunggu giliran"}
               </span>
             )}
+            {/* Rendered last so the Tunda button above it still appears on a
+                mission that is simply waiting its turn. */}
             {!canStart && !canFinish && !timeStuck && !notYet && (
               <span className="text-[9px] text-slate-400 flex items-center gap-1 px-1 py-1">
                 <Lock className="w-3 h-3" /> Menunggu giliran
@@ -149,7 +151,11 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
                 <Clock className="w-3 h-3" /> Ditahan — mulai kapan saja
               </span>
             )}
-            {onRequestHold && !holdStatus && (canStart || notYet) && (
+            {/* Available on any mission that hasn't started yet — including one
+                merely waiting its turn, which is exactly when a child gets
+                pulled away. Gating it on canStart/notYet hid the button in the
+                commonest case. */}
+            {onRequestHold && !holdStatus && !canFinish && (
               <button
                 onClick={onRequestHold}
                 disabled={busy}

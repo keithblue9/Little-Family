@@ -823,7 +823,16 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // An over-run mission still offers Selesai once the
                       // delay has been owned — otherwise acknowledging it would
                       // just swap one dead end for another.
-                      canFinish: isActive && !!t.timer_started_at && gate.allowed && (!overdue || t.late_ack),
+                      // Anything already under way must offer Selesai. Tying
+                      // it to isActive/overdue stranded a child who started a
+                      // mission and then had it pass out of turn or out of
+                      // time — no way to finish, no way to restart.
+                      canFinish:
+                        !!t.timer_started_at &&
+                        (t.late_ack ||
+                          t.hold_status === "approved" ||
+                          t.hold_status === "used" ||
+                          (isActive && gate.allowed && !overdue)),
                       timeStuck,
                       onStart: () => startTimer(t),
                       onFinish: () => finishTask(t),

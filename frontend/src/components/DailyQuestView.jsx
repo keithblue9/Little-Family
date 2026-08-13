@@ -800,7 +800,11 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                     // family frees them, so the UI must not hand them an
                     // always-on Mulai the server would reject.
                     const isActive = (t.is_bonus && !bonusInLine) ? !isDone : next?.id === t.id;
-                    const timeStuck = !isDone && (overdueBySection || (isActive && isTimeStuck(t)));
+                    // Trust the server's verdict alone. Re-deriving "stuck"
+                    // here didn't know about section windows, so a Sore task at
+                    // 13:00 — hours before its section even opens — was being
+                    // shown as late.
+                    const timeStuck = !isDone && overdueBySection;
                     return {
                       busy: busyId === t.id,
                       // An overdue task offers ONLY the Terlambat button — the
@@ -828,7 +832,16 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // not only when they happen to hold the turn — otherwise
                       // a missed morning task would be unreachable all evening.
                       onReportLate: t.is_bonus ? null : () => setLateTaskModal(t),
-                      onRequestHold: t.is_bonus || t.timer_started_at ? null : () => requestHold(t),
+                      // The mission that OPENS a section already has the
+                      // Terlambat flow for "I got home late" — an open-ended
+                      // hold on top of that would just be a second, weaker way
+                      // to say the same thing. Holds are for the missions after
+                      // it, when the child is home and something unplanned
+                      // interrupts the run.
+                      onRequestHold:
+                        t.is_bonus || t.timer_started_at || t.is_segment_opener
+                          ? null
+                          : () => requestHold(t),
                       holdStatus: t.hold_status || null,
                     };
                   },

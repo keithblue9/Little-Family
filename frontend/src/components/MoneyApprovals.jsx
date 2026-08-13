@@ -21,6 +21,8 @@ export default function MoneyApprovals() {
   const [bonusQueue, setBonusQueue] = useState(true);
   const [autoApprove, setAutoApprove] = useState(true);
   const [maxIdle, setMaxIdle] = useState("20");
+  const [holdExpiry, setHoldExpiry] = useState("5");
+  const [examPenalty, setExamPenalty] = useState("100");
   const [snoozeOpts, setSnoozeOpts] = useState("5, 10, 15, 20");
   const [warnMins, setWarnMins] = useState("3, 2, 1");
   const [comboBonus, setComboBonus] = useState("");
@@ -47,6 +49,8 @@ export default function MoneyApprovals() {
       setBonusQueue(cfg.data.bonus_follows_sequence !== false);
       setAutoApprove(cfg.data.auto_approve_tasks !== false);
       setMaxIdle(String(cfg.data.max_idle_minutes ?? 20));
+      setHoldExpiry(String(cfg.data.hold_auto_reject_minutes ?? 5));
+      setExamPenalty(String(cfg.data.exam_false_claim_penalty ?? 100));
       setSnoozeOpts((cfg.data.snooze_options_minutes || [5, 10, 15, 20]).join(", "));
       setWarnMins((cfg.data.duration_warning_minutes ?? [3, 2, 1]).join(", "));
       setComboBonus(String(cfg.data.family_combo_bonus_points ?? 10));
@@ -69,6 +73,8 @@ export default function MoneyApprovals() {
     const pbp = parseInt(pacingBonus || "0", 10);
     const gm = parseInt(graceMin || "0", 10);
     const mi = parseInt(maxIdle || "0", 10);
+    const he = parseInt(holdExpiry || "5", 10);
+    const ep = parseInt(examPenalty || "0", 10);
     const wrn = [...new Set(warnMins.split(",").map((x) => parseInt(x.trim(), 10)).filter((x) => x > 0))].sort((a, b) => b - a);
     const snz = [...new Set(snoozeOpts.split(",").map((x) => parseInt(x.trim(), 10)).filter((x) => x > 0))].sort((a, b) => a - b);
     const cb = parseInt(comboBonus || "0", 10);
@@ -80,6 +86,8 @@ export default function MoneyApprovals() {
     if (pbp < 0 || pbp > 100) { toast.error("Bonus ritme harus 0–100 poin"); return; }
     if (gm < 0 || gm > 180) { toast.error("Toleransi telat harus 0–180 menit"); return; }
     if (mi < 0 || mi > 240) { toast.error("Batas menganggur harus 0–240 menit"); return; }
+    if (he < 1 || he > 120) { toast.error("Batas tunggu izin tunda harus 1–120 menit"); return; }
+    if (ep < 0 || ep > 10000) { toast.error("Potongan klaim ujian palsu harus 0–10000"); return; }
     if (wrn.length > 6 || (wrn.length > 0 && wrn[0] > 120)) {
       toast.error("Pengingat waktu maksimal 6 titik, masing-masing 1–120 menit"); return;
     }
@@ -97,7 +105,7 @@ export default function MoneyApprovals() {
         segment_late_grace_minutes: gm, auto_start_next: autoNext,
         snooze_options_minutes: snz, duration_warning_minutes: wrn,
         bonus_follows_sequence: bonusQueue, auto_approve_tasks: autoApprove,
-        max_idle_minutes: mi,
+        max_idle_minutes: mi, hold_auto_reject_minutes: he, exam_false_claim_penalty: ep,
         family_combo_bonus_points: cb,
       });
       toast.success("Pengaturan tersimpan");
@@ -213,6 +221,24 @@ export default function MoneyApprovals() {
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
             <p className="text-[11px] text-slate-400 mt-1">Dihitung dari jam server, jadi tetap berjalan walau app ditutup. Lewat batas ini, misi berikutnya harus lewat tombol Terlambat — dan hanya alasan "salah sendiri" yang bisa dipilih. 0 = mati.</p>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1">Batas tunggu izin tunda (menit)</label>
+            <input
+              type="text" inputMode="numeric" value={holdExpiry}
+              onChange={(e) => setHoldExpiry(e.target.value.replace(/\D/g, "").slice(0, 3))}
+              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Kalau kamu tidak sempat menjawab dalam waktu ini, permintaan tunda batal sendiri dan misinya kembali normal.</p>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold text-slate-700 mb-1">Potongan klaim ujian palsu</label>
+            <input
+              type="text" inputMode="numeric" value={examPenalty}
+              onChange={(e) => setExamPenalty(e.target.value.replace(/\D/g, "").slice(0, 5))}
+              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 mt-1">Poin yang dikurangi saat kamu menolak Hari Ujian yang tidak benar.</p>
           </div>
           <div className="sm:col-span-2">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Pengingat waktu hampir habis (menit)</label>

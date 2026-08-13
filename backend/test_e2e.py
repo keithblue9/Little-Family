@@ -4750,9 +4750,13 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # rule — "opener" is a one-off status per section, not a rolling exemption.)
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    # Split the day at the current minute so "Sesi Baru" is always open right
+    # now, whatever time the suite happens to run.
+    _now_sp = server._now_local(); _nm_sp = _now_sp.hour * 60 + _now_sp.minute
+    _fmt_sp = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
     c.post("/api/config", json={"day_segments": [
-        {"label": "Sesi Lama", "start_time": "00:00", "end_time": "11:59"},
-        {"label": "Sesi Baru", "start_time": "12:00", "end_time": "23:59"}]})
+        {"label": "Sesi Lama", "start_time": "00:00", "end_time": _fmt_sp(max(1, _nm_sp - 30))},
+        {"label": "Sesi Baru", "start_time": _fmt_sp(max(2, _nm_sp - 29)), "end_time": "23:59"}]})
     OLD_S, NEW_S = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
     __import__("asyncio").run(server._refresh_segments_cache())
     prev = c.post("/api/tasks", json={"title": "Selesai tadi pagi", "points": 5, "date_key": today_local,
@@ -4773,6 +4777,222 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("opener: and it can simply be started", r.status_code == 200, r.text[:150])
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== HARI UJIAN (mode belajar fleksibel) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.exam_periods.delete_many({}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Malam", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
+        "exam_false_claim_penalty": 100})
+    XS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    check("exam: penalty is configurable, not hardcoded",
+          c.get("/api/config").json()["exam_false_claim_penalty"] == 100)
+
+    mkx = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                  "segment_id": XS, "order": o}).json()
+    x_before = mkx("Mandi sore", 1)
+    x_pivot = mkx("Belajar", 2)
+    x_after = mkx("Makan malam", 3)
+    x_last = mkx("Sikat gigi", 4)
+
+    # H-1 is derived from the exam range, not typed in by hand
+    _ex_start = (_off_base + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    _ex_end = (_off_base + _dt_off.timedelta(days=3)).strftime("%Y-%m-%d")
+    r = c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _ex_start,
+                                          "exam_end": _ex_end, "pivot_task_titles": ["Belajar"]})
+    check("exam: declared by a parent", r.status_code == 200, r.text[:200])
+    check("exam: study window defaults to H-1 of the whole range",
+          r.json()["flex_start"] == today_local
+          and r.json()["flex_end"] == (_off_base + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d"),
+          f'{r.json()["flex_start"]}..{r.json()["flex_end"]}')
+    exam_id = r.json()["id"]
+
+    # Only from the pivot onwards is relaxed — earlier missions still follow the clock
+    rr = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    by = {t["title"]: t for t in rr.json()["tasks"]}
+    check("exam: missions BEFORE the pivot are not relaxed", by["Mandi sore"]["exam_relaxed"] is False)
+    check("exam: the pivot itself is relaxed", by["Belajar"]["exam_relaxed"] is True)
+    check("exam: knock-on missions after it are relaxed too",
+          by["Makan malam"]["exam_relaxed"] is True and by["Sikat gigi"]["exam_relaxed"] is True)
+
+    # Idling no longer closes the relaxed stretch
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{x_pivot['id']}/start")
+    c.post(f"/api/tasks/{x_pivot['id']}/complete")
+    _aio_tg.run(server.db.tasks.update_one({"id": x_pivot["id"]}, {"$set": {
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
+    rr = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("exam: a two-hour study gap doesn't close what follows",
+          {t["title"]: t for t in rr.json()["tasks"]}["Makan malam"]["availability"] == "open")
+    # Relaxation lifts the CLOCK rules, not the queue — the earlier mission
+    # still has to be dealt with first, which is the correct behaviour.
+    r = c.post(f"/api/tasks/{x_after['id']}/start")
+    check("exam: the sequence still applies (clock rules relaxed, queue intact)",
+          r.status_code == 409 and "Selesaikan dulu" in r.text, r.text[:170])
+    for _t in (x_before["id"], x_pivot["id"]):
+        _aio_tg.run(server.db.tasks.update_one({"id": _t}, {"$set": {"status": "approved"}}))
+    r = c.post(f"/api/tasks/{x_after['id']}/start")
+    check("exam: starts fine once it's genuinely next in line", r.status_code == 200, r.text[:170])
+
+    # A day outside the window is untouched
+    _outside = (_off_base + _dt_off.timedelta(days=6)).strftime("%Y-%m-%d")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/tasks", json={"title": "Belajar", "points": 10, "date_key": _outside,
+                               "duration_minutes": 10, "target_children": [adskhan["id"]],
+                               "segment_id": XS, "order": 1})
+    rr = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={_outside}")
+    check("exam: days outside the window aren't relaxed",
+          all(t["exam_relaxed"] is False for t in rr.json()["tasks"]), str(rr.json()["tasks"])[:120])
+
+    # Guards
+    r = c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _ex_start, "exam_end": _ex_end})
+    check("exam: only one live claim per child", r.status_code == 409, str(r.status_code))
+    r = c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _ex_end, "exam_end": _ex_start})
+    check("exam: reversed dates rejected", r.status_code in (409, 422), str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _ex_start, "exam_end": _ex_end})
+    check("exam: a child can't declare one for a sibling", r.status_code == 403, str(r.status_code))
+
+    # A child CAN declare their own, and it takes effect immediately
+    _aio_tg.run(server.db.exam_periods.delete_many({}))
+    r = c.post("/api/exam-periods", json={"child_id": syila["id"], "exam_start": _ex_start,
+                                          "exam_end": _ex_end, "pivot_task_titles": ["Belajar"]})
+    check("exam: a child may declare their own", r.status_code == 200 and r.json()["status"] == "active", r.text[:180])
+    syi_exam = r.json()["id"]
+
+    # Rejection deducts the configured penalty and stops the relaxation
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.children.update_one({"id": syila["id"]}, {"$set": {
+        "points": 250, "chiky_save": 100, "chiky_spend": 100, "chiky_share": 50}}))
+    r = c.post(f"/api/exam-periods/{syi_exam}/reject", json={"note": "Tidak ada ujian minggu ini"})
+    check("exam: parent can reject it", r.status_code == 200 and r.json()["status"] == "rejected", r.text[:180])
+    syi_after = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
+    check("exam: the configured penalty is deducted", syi_after["points"] == 150, str(syi_after["points"]))
+    check("exam: buckets stay consistent with the new total",
+          syi_after["chiky_save"] + syi_after["chiky_spend"] + syi_after["chiky_share"] == 150,
+          f'{syi_after["chiky_save"]}/{syi_after["chiky_spend"]}/{syi_after["chiky_share"]}')
+    r = c.post(f"/api/exam-periods/{syi_exam}/reject")
+    check("exam: cannot reject twice", r.status_code == 400, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/exam-periods/{syi_exam}/reject")
+    check("exam: a child cannot reject", r.status_code == 403, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/activity?limit=40")
+    check("exam: declaration and rejection are both logged",
+          any(x["action"] == "exam_period_declared" for x in r.json())
+          and any(x["action"] == "exam_period_rejected" for x in r.json()))
+
+    _aio_tg.run(server.db.exam_periods.delete_many({}))
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== TAHAN SEMENTARA (hold/freeze) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.exam_periods.delete_many({}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Hold", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False})
+    HS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mkh = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                  "segment_id": HS, "order": o}).json()
+    h_prev, h_task, h_next = mkh("Selesai duluan", 1), mkh("Belajar", 2), mkh("Sikat gigi", 3)
+
+    # A child asks; it waits for a parent rather than taking effect at once
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{h_task['id']}/hold-request", json={"reason": "Diajak beli makan keluar"})
+    check("hold: child request is created", r.status_code == 200 and r.json()["hold_status"] == "pending", r.text[:180])
+    check("hold: the reason is recorded", r.json()["hold_reason"] == "Diajak beli makan keluar")
+    r = c.post(f"/api/tasks/{h_task['id']}/hold-request", json={"reason": "Sekali lagi"})
+    check("hold: duplicate request refused", r.status_code == 409, str(r.status_code))
+    r = c.post(f"/api/tasks/{h_task['id']}/hold-approve")
+    check("hold: a child cannot approve their own", r.status_code == 403, str(r.status_code))
+
+    # Parent sees it queued and approves
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/hold-requests")
+    check("hold: parent sees the pending request", any(t["id"] == h_task["id"] for t in r.json()), str(len(r.json())))
+    r = c.post(f"/api/tasks/{h_task['id']}/hold-approve", json={"note": "Oke, hati-hati di jalan"})
+    check("hold: parent approves", r.status_code == 200 and r.json()["hold_status"] == "approved", r.text[:180])
+    check("hold: no longer in the pending queue", not any(t["id"] == h_task["id"] for t in c.get("/api/hold-requests").json()))
+
+    # The clock stops: two hours later it is still perfectly startable
+    _aio_tg.run(server.db.tasks.update_one({"id": h_prev["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso(),
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    held = {t["id"]: t for t in r.json()["tasks"]}[h_task["id"]]
+    check("hold: still open after a two-hour absence", held["availability"] == "open", str(held["availability"]))
+    check("hold: not counted as time-stuck",
+          server._task_is_time_stuck(_aio_tg.run(server.db.tasks.find_one({"id": h_task["id"]}, {"_id": 0}))) is False)
+    check("hold: the idle limit doesn't fire while a hold is live",
+          _aio_tg.run(server._idle_exceeded(adskhan["id"], today_local,
+                      _aio_tg.run(server.db.app_config.find_one({"parent_id": "family-default"})) or {})) is False)
+
+    # Starting it consumes the hold; the rest of the day is timed as usual again
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{h_task['id']}/start")
+    check("hold: startable whenever the child gets back", r.status_code == 200, r.text[:180])
+    h_doc = _aio_tg.run(server.db.tasks.find_one({"id": h_task["id"]}, {"_id": 0}))
+    check("hold: marked as used once started", h_doc["hold_status"] == "used", str(h_doc["hold_status"]))
+    c.post(f"/api/tasks/{h_task['id']}/complete")
+    _aio_tg.run(server.db.tasks.update_one({"id": h_task["id"]}, {"$set": {
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=45)).isoformat()}}))
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    check("hold: normal timing resumes for what follows",
+          {t["id"]: t for t in r.json()["tasks"]}[h_next["id"]]["availability"] == "closed",
+          str({t["id"]: t for t in r.json()["tasks"]}[h_next["id"]]["availability"]))
+
+    # Rejection puts the mission back on the ordinary clock
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    h2 = mkh("Minta tunda ditolak", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{h2['id']}/hold-request", json={"reason": "Mau main dulu"})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{h2['id']}/hold-reject", json={"note": "Kerjakan dulu ya"})
+    check("hold: parent can reject", r.status_code == 200 and r.json()["hold_status"] == "rejected", r.text[:180])
+    r = c.post(f"/api/tasks/{h2['id']}/hold-approve")
+    check("hold: cannot approve an already-decided request", r.status_code == 400, str(r.status_code))
+
+    # A parent asking on the child's behalf needs no second approval
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    h3 = mkh("Diminta orang tua", 1)
+    r = c.post(f"/api/tasks/{h3['id']}/hold-request", json={"reason": "Ada tamu, saya yang minta"})
+    check("hold: a parent's own request is granted immediately",
+          r.status_code == 200 and r.json()["hold_status"] == "approved", r.text[:180])
+
+    # Guards
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{h3['id']}/hold-request", json={"reason": "Bukan misiku"})
+    check("hold: a sibling cannot request on someone else's mission", r.status_code in (400, 403), str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    h4 = mkh("Sudah dimulai", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{h4['id']}/start")
+    r = c.post(f"/api/tasks/{h4['id']}/hold-request", json={"reason": "Terlambat mintanya"})
+    check("hold: cannot hold a mission already under way", r.status_code == 400, str(r.status_code))
+    r = c.post(f"/api/tasks/{h4['id']}/hold-request", json={"reason": "x"})
+    check("hold: a too-short reason is rejected", r.status_code == 422, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/activity?limit=40")
+    check("hold: requests and decisions are logged",
+          any(x["action"] == "hold_requested" for x in r.json())
+          and any(x["action"] in ("hold_approved", "hold_rejected") for x in r.json()))
+
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 

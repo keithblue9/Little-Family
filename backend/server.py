@@ -250,6 +250,29 @@ class SegmentStartOverrideInput(BaseModel):
     starts: Dict[str, Dict[str, str]] = Field(default_factory=dict)
 
 
+class ExamPeriodInput(BaseModel):
+    child_id: str
+    exam_start: str                      # first day of the exams themselves
+    exam_end: str
+    flex_start: Optional[str] = None     # defaults to the day before exam_start
+    flex_end: Optional[str] = None       # defaults to the day before exam_end
+    pivot_task_titles: List[str] = Field(default_factory=list, max_length=10)
+    note: str = Field(default="", max_length=200)
+
+
+class HoldRequestInput(BaseModel):
+    reason: str = Field(min_length=3, max_length=300)
+
+
+class HoldReviewInput(BaseModel):
+    note: str = Field(default="", max_length=200)
+
+
+class ExamRejectInput(BaseModel):
+    penalty_points: int = Field(default=100, ge=0, le=10000)
+    note: str = Field(default="", max_length=200)
+
+
 class PunishmentOption(BaseModel):
     id: Optional[str] = None
     label: str = Field(min_length=1, max_length=120)
@@ -331,6 +354,8 @@ class AppConfigInput(BaseModel):
     # one has to be owned via Terlambat. Measured from server timestamps, so it
     # keeps running while the app is closed. 0 = no limit.
     max_idle_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    # Points deducted when a parent rejects a claimed exam day as untrue.
+    exam_false_claim_penalty: Optional[int] = Field(default=None, ge=0, le=10000)
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -2261,9 +2286,13 @@ async def child_day_progress(
             _cursor += int(_t.get("duration_minutes") or 0)
 
     _idle_over = await _idle_exceeded(child_id, dk, _cfg_avail)
+    _exam_flex = await _active_exam_flex(child_id, dk)
     _tasks_with_availability = []
     for _t in tasks:
-        _av = "open" if _t.get("is_bonus") else _task_availability(
+        _relaxed = _is_flex_relaxed(_t, _exam_flex, tasks, _segs_for_kid)
+        # A relaxed mission is simply available: the clock stops judging it for
+        # the rest of a study night.
+        _av = "open" if (_t.get("is_bonus") or _relaxed) else _task_availability(
             _t, _segs_for_kid, _kid_doc_seg, _t["id"] in _firsts_avail, _grace_avail, _idle_over
         )
         _sg_t = _segment_for_task(_t, _segs_for_kid)
@@ -2272,6 +2301,7 @@ async def child_day_progress(
             "availability": _av,
             "is_segment_opener": _t["id"] in _firsts_avail,
             "projected_start_time": _projected.get(_t["id"]),
+            "exam_relaxed": _relaxed,
             # When the delay was a choice, the UI must only offer the honest
             # (at-fault) reasons — otherwise it advertises options the server
             # will reject.
@@ -2694,6 +2724,11 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     today_dk = _today_key()
     if dk and dk > today_dk:
         return "future"
+    # An approved hold stops the clock entirely for this mission: the child is
+    # out of the house with no known return time, so there is nothing sensible
+    # to measure them against until they actually start.
+    if task.get("hold_status") == "approved" and not task.get("timer_started_at"):
+        return "open"
     if task.get("late_ack"):
         return "open"
     if dk and dk < today_dk:
@@ -2751,11 +2786,24 @@ async def _at_fault_only(task: dict, is_segment_opener: bool, config: dict) -> b
     """
     if is_segment_opener:
         return False
+    if task.get("hold_status") in ("approved", "used"):
+        return False  # the delay was granted, not taken
     if _snooze_expired(task) and int(task.get("snooze_count") or 0) > 0:
         return True
     if task.get("child_id") and task.get("date_key"):
         return await _idle_exceeded(task["child_id"], task["date_key"], config)
     return False
+
+
+async def _has_active_hold(child_id: str, date_key: str) -> bool:
+    """Is this child waiting out an approved hold right now?"""
+    doc = await db.tasks.find_one({
+        "parent_id": FAMILY_ID, "date_key": date_key, "hold_status": "approved",
+        "status": {"$in": ["pending", "rejected"]},
+        "timer_started_at": {"$in": [None, ""]},
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    })
+    return doc is not None
 
 
 async def _idle_exceeded(child_id: str, date_key: str, config: dict) -> bool:
@@ -2765,6 +2813,9 @@ async def _idle_exceeded(child_id: str, date_key: str, config: dict) -> bool:
     last = await _last_finish_dt(child_id, date_key)
     if not last:
         return False  # nothing finished yet today — there's no idling to measure
+    # Time spent under an approved hold isn't idling; it was granted.
+    if await _has_active_hold(child_id, date_key):
+        return False
     return (datetime.now(timezone.utc) - last).total_seconds() > limit * 60
 
 
@@ -2937,6 +2988,271 @@ async def reject_late_exception(request_id: str, payload: LateExceptionReviewInp
 
 
 # --------------- Off days (hari libur tugas) ---------------
+async def _rebalance_child_buckets(child_id: str, config: dict) -> None:
+    """Re-split the Chikybank so the three buckets always sum to the points.
+    Called after any adjustment that moves the total on its own."""
+    child = await db.children.find_one({"id": child_id})
+    if not child:
+        return
+    total = max(0, int(child.get("points", 0)))
+    save_pct = int(config.get("chiky_save_pct", 40))
+    spend_pct = int(config.get("chiky_spend_pct", 40))
+    share_pct = int(config.get("chiky_share_pct", 20))
+    total_pct = save_pct + spend_pct + share_pct or 100
+    p_save = round(total * save_pct / total_pct)
+    p_spend = round(total * spend_pct / total_pct)
+    await db.children.update_one({"id": child_id}, {"$set": {
+        "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": total - p_save - p_spend,
+    }})
+
+
+async def _active_exam_flex(child_id: str, date_key: str) -> Optional[dict]:
+    """The exam period covering this child on this day, if any (and not rejected)."""
+    return await db.exam_periods.find_one({
+        "parent_id": FAMILY_ID, "child_id": child_id, "status": {"$ne": "rejected"},
+        "flex_start": {"$lte": date_key}, "flex_end": {"$gte": date_key},
+    }, {"_id": 0})
+
+
+def _is_flex_relaxed(task: dict, exam: Optional[dict], tasks_today: list, segments: list) -> bool:
+    """Is this mission inside the relaxed stretch of a study day?
+
+    Relaxation begins at the chosen pivot mission (usually "Belajar") and runs
+    to the end of the day, because a long study session pushes everything after
+    it — dinner, shower, bedtime — later by knock-on effect. Judging those by
+    the usual clock would punish the child for the very thing we just allowed.
+    """
+    if not exam:
+        return False
+    pivots = exam.get("pivot_task_titles") or []
+    if not pivots:
+        return True  # no pivot chosen: treat the whole day as relaxed
+    anchor_pos = None
+    ordered = sorted(tasks_today, key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
+    for idx, t in enumerate(ordered):
+        if t.get("title") in pivots:
+            anchor_pos = idx
+            break
+    if anchor_pos is None:
+        return False
+    for idx, t in enumerate(ordered):
+        if t["id"] == task["id"]:
+            return idx >= anchor_pos
+    return False
+
+
+@api.post("/tasks/{task_id}/hold-request")
+async def request_hold(task_id: str, payload: HoldRequestInput, user: dict = Depends(get_current_user)):
+    """Ask to put a mission on hold for something genuinely outside the routine
+    — guests arriving, being taken out to eat.
+
+    Unlike a snooze, there is no end time to beat: once a parent approves, the
+    clock simply stops for that mission and the child starts whenever they get
+    back. A snooze answers "how much longer do you need?"; this answers "I have
+    no idea when I'll be free". That's why it needs a parent's word first —
+    otherwise it would be an unlimited, unaccountable pause.
+    """
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    kid_ids = task.get("coop_participants") or [task.get("child_id")]
+    if user["role"] == "child" and user["id"] not in kid_ids:
+        raise HTTPException(status_code=403, detail="Bukan misi kamu")
+    if task.get("status") not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail="Misi ini sudah diproses")
+    if task.get("timer_started_at"):
+        raise HTTPException(status_code=400, detail="Misi ini sudah dimulai")
+    if task.get("hold_status") == "pending":
+        raise HTTPException(status_code=409, detail="Sudah ada permintaan tunda yang menunggu persetujuan")
+    if task.get("hold_status") == "approved":
+        raise HTTPException(status_code=400, detail="Misi ini sudah ditahan — mulai saja kapan kamu siap")
+
+    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
+    # A parent asking on the child's behalf doesn't need to approve their own
+    # request; it takes effect at once.
+    approved_now = user["role"] == "parent"
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "hold_status": "approved" if approved_now else "pending",
+        "hold_reason": payload.reason.strip(),
+        "hold_requested_at": now_iso(),
+        "hold_requested_by": user.get("name", ""),
+        "hold_reviewed_at": now_iso() if approved_now else None,
+    }})
+    await log_activity(FAMILY_ID, child_id, "hold_requested", {
+        "task_id": task_id, "title": task.get("title"),
+        "reason": payload.reason.strip(), "auto_approved": approved_now,
+    })
+    if not approved_now:
+        _kid = await db.children.find_one({"id": child_id})
+        await send_push_to({"role": "parent"}, title="Minta tunda misi ⏸️",
+                           body=f'{(_kid or {}).get("name", "Anak")}: "{task.get("title")}" — {payload.reason.strip()[:60]}',
+                           url="/parent")
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+@api.get("/hold-requests")
+async def list_hold_requests(user: dict = Depends(get_current_user)):
+    """Missions waiting on a parent's decision (or, for a child, their own)."""
+    query = {"parent_id": FAMILY_ID, "hold_status": "pending"}
+    if user["role"] == "child":
+        query["$or"] = [{"child_id": user["id"]}, {"is_coop": True, "coop_participants": user["id"]}]
+    return await db.tasks.find(query, {"_id": 0}).sort("hold_requested_at", -1).to_list(100)
+
+
+@api.post("/tasks/{task_id}/hold-approve")
+async def approve_hold(task_id: str, payload: HoldReviewInput = HoldReviewInput(), user: dict = Depends(require_parent)):
+    """Grant the hold: the mission's clock stops until the child starts it."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("hold_status") != "pending":
+        raise HTTPException(status_code=400, detail="Tidak ada permintaan tunda yang menunggu")
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "hold_status": "approved", "hold_reviewed_at": now_iso(),
+        "hold_reviewed_by": user.get("name", ""), "hold_review_note": payload.note,
+    }, "$unset": {"snooze_until": ""}})
+    await log_activity(FAMILY_ID, task.get("child_id"), "hold_approved", {
+        "task_id": task_id, "title": task.get("title"), "by": user.get("name", ""),
+    })
+    await send_push_to({"role": "child", "member_id": task.get("child_id")},
+                       title="Tunda disetujui ⏸️",
+                       body=f'"{task.get("title")}" ditahan dulu. Mulai kapan saja kamu siap ya.',
+                       url=f"/kid/{task.get('child_id')}")
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+@api.post("/tasks/{task_id}/hold-reject")
+async def reject_hold(task_id: str, payload: HoldReviewInput = HoldReviewInput(), user: dict = Depends(require_parent)):
+    """Decline the hold — the mission goes back to its normal timing."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("hold_status") != "pending":
+        raise HTTPException(status_code=400, detail="Tidak ada permintaan tunda yang menunggu")
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "hold_status": "rejected", "hold_reviewed_at": now_iso(),
+        "hold_reviewed_by": user.get("name", ""), "hold_review_note": payload.note,
+    }})
+    await log_activity(FAMILY_ID, task.get("child_id"), "hold_rejected", {
+        "task_id": task_id, "title": task.get("title"), "by": user.get("name", ""),
+    })
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+@api.post("/exam-periods")
+async def create_exam_period(payload: ExamPeriodInput, user: dict = Depends(get_current_user)):
+    """Declare an exam period. Study runs long on the days BEFORE each exam, so
+    the flexible window defaults to H-1 of the whole range — a Tuesday-to-
+    Thursday exam relaxes Monday to Wednesday. Either a parent or the child can
+    raise it, and it takes effect immediately: asking a child to wait for
+    approval on the evening they need to study defeats the purpose. It's logged
+    plainly, and a parent who finds it untrue can reject it."""
+    if user["role"] == "child" and user["id"] != payload.child_id:
+        raise HTTPException(status_code=403, detail="Kamu hanya bisa mengajukan untuk dirimu sendiri")
+    await get_child_or_404(FAMILY_ID, payload.child_id)
+
+    ex_start = validate_date_key(payload.exam_start)
+    ex_end = validate_date_key(payload.exam_end)
+    if not ex_start or not ex_end:
+        raise HTTPException(status_code=422, detail="Tanggal ujian tidak valid (YYYY-MM-DD)")
+    if ex_end < ex_start:
+        raise HTTPException(status_code=422, detail="Tanggal selesai ujian harus sesudah tanggal mulai")
+
+    _d = lambda k, n: (datetime.strptime(k, "%Y-%m-%d") + timedelta(days=n)).strftime("%Y-%m-%d")
+    fl_start = validate_date_key(payload.flex_start) if payload.flex_start else _d(ex_start, -1)
+    fl_end = validate_date_key(payload.flex_end) if payload.flex_end else _d(ex_end, -1)
+    if not fl_start or not fl_end:
+        raise HTTPException(status_code=422, detail="Rentang hari belajar tidak valid")
+    if fl_end < fl_start:
+        raise HTTPException(status_code=422, detail="Rentang hari belajar terbalik")
+    if (datetime.strptime(fl_end, "%Y-%m-%d") - datetime.strptime(fl_start, "%Y-%m-%d")).days > 30:
+        raise HTTPException(status_code=422, detail="Rentang belajar maksimal 31 hari")
+
+    # One live claim per child: stacking them would turn this into a permanent
+    # "no rules" mode rather than an exception for a real exam week.
+    existing = await db.exam_periods.find_one({
+        "parent_id": FAMILY_ID, "child_id": payload.child_id, "status": {"$ne": "rejected"},
+        "flex_end": {"$gte": _today_key()},
+    })
+    if existing:
+        raise HTTPException(status_code=409, detail="Sudah ada Hari Ujian yang aktif. Hapus dulu yang lama kalau mau ganti.")
+
+    child = await db.children.find_one({"id": payload.child_id}, {"_id": 0})
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": payload.child_id,
+        "child_name": (child or {}).get("name", ""),
+        "exam_start": ex_start, "exam_end": ex_end,
+        "flex_start": fl_start, "flex_end": fl_end,
+        "pivot_task_titles": [t.strip() for t in payload.pivot_task_titles if t.strip()],
+        "note": payload.note.strip(),
+        "created_by": user.get("name", ""), "created_by_role": user["role"],
+        "status": "active", "created_at": now_iso(),
+    }
+    await db.exam_periods.insert_one(doc)
+    doc.pop("_id", None)
+    await log_activity(FAMILY_ID, payload.child_id, "exam_period_declared", {
+        "exam": f"{ex_start}..{ex_end}", "flex": f"{fl_start}..{fl_end}",
+        "pivots": doc["pivot_task_titles"], "by": user.get("name", ""),
+    })
+    if user["role"] == "child":
+        await send_push_to({"role": "parent"}, title="Hari Ujian didaftarkan 📚",
+                           body=f'{doc["child_name"]} menandai ujian {ex_start} s/d {ex_end}. Cek kalau tidak sesuai.',
+                           url="/parent")
+    return doc
+
+
+@api.get("/exam-periods")
+async def list_exam_periods(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        query["child_id"] = user["id"]
+    elif child_id:
+        query["child_id"] = child_id
+    return await db.exam_periods.find(query, {"_id": 0}).sort("created_at", -1).to_list(50)
+
+
+@api.delete("/exam-periods/{exam_id}")
+async def delete_exam_period(exam_id: str, user: dict = Depends(get_current_user)):
+    doc = await db.exam_periods.find_one({"id": exam_id, "parent_id": FAMILY_ID})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Hari Ujian tidak ditemukan")
+    if user["role"] == "child" and user["id"] != doc["child_id"]:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    await db.exam_periods.delete_one({"id": exam_id})
+    await log_activity(FAMILY_ID, doc["child_id"], "exam_period_removed", {"by": user.get("name", "")})
+    return {"success": True}
+
+
+@api.post("/exam-periods/{exam_id}/reject")
+async def reject_exam_period(exam_id: str, payload: ExamRejectInput = ExamRejectInput(), user: dict = Depends(require_parent)):
+    """Parent judges a claimed exam period untrue. The relaxation stops and the
+    configured penalty is deducted — points already earned that day are left
+    alone, since the deduction is the consequence for the lie itself."""
+    doc = await db.exam_periods.find_one({"id": exam_id, "parent_id": FAMILY_ID})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Hari Ujian tidak ditemukan")
+    if doc.get("status") == "rejected":
+        raise HTTPException(status_code=400, detail="Hari Ujian ini sudah ditolak")
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    penalty = payload.penalty_points if payload.penalty_points is not None else int(config.get("exam_false_claim_penalty", 100))
+
+    await db.exam_periods.update_one({"id": exam_id}, {"$set": {
+        "status": "rejected", "rejected_at": now_iso(),
+        "rejected_by": user.get("name", ""), "reject_note": payload.note,
+        "penalty_points": penalty,
+    }})
+    if penalty > 0:
+        await db.children.update_one({"id": doc["child_id"]}, {"$inc": {"points": -penalty}})
+        await _rebalance_child_buckets(doc["child_id"], config)
+    await log_activity(FAMILY_ID, doc["child_id"], "exam_period_rejected", {
+        "penalty": penalty, "by": user.get("name", ""), "note": payload.note,
+    })
+    await send_push_to({"role": "child", "member_id": doc["child_id"]},
+                       title="Hari Ujian ditolak", body=f"Poinmu dikurangi {penalty}. Yuk jujur ya lain kali.",
+                       url=f"/kid/{doc['child_id']}")
+    return await db.exam_periods.find_one({"id": exam_id}, {"_id": 0})
+
+
 @api.post("/off-days")
 async def create_off_day(payload: OffDayInput, user: dict = Depends(require_parent)):
     """Parent declares one day or a range as task-free (family trip, holiday).
@@ -3389,8 +3705,12 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
             "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
         }).to_list(500)
         _is_first = task_id in _segment_first_ids(_open_now, _segs_now, _all_now)
-        _idle_now = await _idle_exceeded(task["child_id"], task.get("date_key") or _today_key(), _cfg_now)
-        _avail = _task_availability(task, _segs_now, _kid_doc, _is_first, _grace, _idle_now)
+        _exam_now = await _active_exam_flex(task["child_id"], task.get("date_key") or _today_key())
+        _relaxed_now = _is_flex_relaxed(task, _exam_now, _all_now, _segs_now)
+        _idle_now = False if _relaxed_now else await _idle_exceeded(task["child_id"], task.get("date_key") or _today_key(), _cfg_now)
+        _avail = "open" if _relaxed_now else _task_availability(
+            task, _segs_now, _kid_doc, _is_first, _grace, _idle_now
+        )
         if _avail == "future":
             _sg = _segment_for_task(task, _segs_now)
             _st = _fmt_min(_effective_segment_start(_sg, _kid_doc, task.get("date_key")))
@@ -3437,6 +3757,9 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
         "timer_started_at": now_iso(),
         "gap_from_prev_seconds": gap_seconds,
         "started_early": started_early,
+        # Once they've begun, the hold has served its purpose — everything after
+        # this runs on the normal clock again.
+        "hold_status": "used" if task.get("hold_status") == "approved" else task.get("hold_status"),
     }, "$unset": {"snooze_until": ""}})
     if started_early:
         await log_activity(FAMILY_ID, task["child_id"], "task_started_early", {
@@ -3595,6 +3918,9 @@ def _task_is_time_stuck(task: dict) -> bool:
     window, which is what the points-cost Skip is for."""
     # Nothing scheduled for a future day can be late yet.
     if task.get("date_key") and task["date_key"] > _today_key():
+        return False
+    # A granted hold pauses the clock until the mission is actually begun.
+    if task.get("hold_status") == "approved" and not task.get("timer_started_at"):
         return False
     if task.get("late_ack"):
         # The lateness was already explained via the "Terlambat" flow — the
@@ -5219,6 +5545,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "bonus_follows_sequence": True,
             "auto_approve_tasks": True,
             "max_idle_minutes": 20,
+            "exam_false_claim_penalty": 100,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5334,6 +5661,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "bonus_follows_sequence": True,
             "auto_approve_tasks": True,
             "max_idle_minutes": 20,
+            "exam_false_claim_penalty": 100,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5380,6 +5708,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "bonus_follows_sequence": bool(config.get("bonus_follows_sequence", True)),
         "auto_approve_tasks": bool(config.get("auto_approve_tasks", True)),
         "max_idle_minutes": int(config.get("max_idle_minutes", 20)),
+        "exam_false_claim_penalty": int(config.get("exam_false_claim_penalty", 100)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

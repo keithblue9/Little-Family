@@ -90,7 +90,17 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       .sort((a, b) => seqVal(a) - seqVal(b) || (a.order || 0) - (b.order || 0));
     const bon = tasks.filter((t) => t.is_bonus);
     const openReq = req.filter((t) => t.status === "pending" || t.status === "rejected");
-    const first = openReq[0] || null;
+    // Mirror the server: a mission that isn't actually available can't hold the
+    // turn, or the whole queue stalls behind it and nothing can be started.
+    // "future" ones (their section hasn't opened) and held ones are skipped;
+    // "closed" ones keep the turn so the child is prompted to own the delay.
+    const first =
+      openReq.find(
+        (t) =>
+          t.availability !== "future" &&
+          t.hold_status !== "pending" &&
+          t.hold_status !== "approved"
+      ) || null;
     const doneReq = req.filter((t) => t.status === "approved" || t.status === "skipped" || t.status === "completed");
 
     // Interleave bonus missions INTO the required sequence by time-of-day, so a

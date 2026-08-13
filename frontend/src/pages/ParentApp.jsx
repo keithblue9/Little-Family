@@ -70,6 +70,8 @@ import LateReasonsConfig from "@/components/LateReasonsConfig";
 import PunishmentConfig from "@/components/PunishmentConfig";
 import DaySegmentsConfig from "@/components/DaySegmentsConfig";
 import SegmentStartsConfig from "@/components/SegmentStartsConfig";
+import ExamPeriodConfig from "@/components/ExamPeriodConfig";
+import HoldRequestsReview from "@/components/HoldRequestsReview";
 import HonestyInsightCard from "@/components/HonestyInsightCard";
 import ActivityLogCard from "@/components/ActivityLogCard";
 
@@ -329,6 +331,7 @@ export default function ParentApp() {
           )}
           {view === "tasks" && (
             <div className="space-y-4">
+              <HoldRequestsReview onChanged={load} />
               <TasksView
                 kids={children}
                 tasks={filteredTasks}
@@ -1492,6 +1495,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <SegmentStartsConfig kids={kids} onChanged={onRefresh} />
+      </div>
+
+      <div className="bg-white rounded-2xl border-2 border-violet-100 p-6">
+        <ExamPeriodConfig kids={kids} onChanged={onRefresh} />
       </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">

@@ -47,7 +47,7 @@ const STATUS_STYLE = {
   pending: { ring: "border-slate-200", dot: "bg-slate-300", chip: "bg-slate-100 text-slate-500", label: "Belum" },
 };
 
-function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet, notYetLabel, onStart, onFinish, onSkip, onReportLate, below }) {
+function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet, notYetLabel, onStart, onFinish, onSkip, onReportLate, onRequestHold, holdStatus, below }) {
   const st = STATUS_STYLE[task.status] || STATUS_STYLE.pending;
   const done = ["approved", "completed", "skipped"].includes(task.status);
 
@@ -138,6 +138,26 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
               <span className="text-[9px] text-slate-400 flex items-center gap-1 px-1 py-1">
                 <Lock className="w-3 h-3" /> Menunggu giliran
               </span>
+            )}
+            {holdStatus === "pending" && (
+              <span className="text-[9px] text-sky-600 flex items-center gap-1 px-1 py-1">
+                <Clock className="w-3 h-3" /> Menunggu izin tunda
+              </span>
+            )}
+            {holdStatus === "approved" && (
+              <span className="text-[9px] text-emerald-600 flex items-center gap-1 px-1 py-1">
+                <Clock className="w-3 h-3" /> Ditahan — mulai kapan saja
+              </span>
+            )}
+            {onRequestHold && !holdStatus && (canStart || notYet) && (
+              <button
+                onClick={onRequestHold}
+                disabled={busy}
+                className="press-btn bg-sky-50 hover:bg-sky-100 text-sky-700 font-fun font-semibold px-1.5 py-1 rounded-lg text-[9px] flex items-center gap-0.5 disabled:opacity-60"
+                title="Ada halangan mendadak? Minta tunda ke Abi/Ummi"
+              >
+                ⏸️ Tunda
+              </button>
             )}
             {onSkip && (canStart || canFinish || timeStuck) && (
               <button

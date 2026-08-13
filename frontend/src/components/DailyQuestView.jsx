@@ -253,6 +253,32 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     }
   }, [nowMs, progress, warnMinutes]);
 
+  // A hold is for the unplanned: guests, being taken out. Unlike a snooze there
+  // is no end time to beat — a parent grants it, and the clock simply stops
+  // until the child gets back and starts.
+  const requestHold = async (task) => {
+    const reason = window.prompt(
+      `Minta tunda "${task.title}" karena apa?\n\nMis. ada tamu, diajak keluar. Abi/Ummi akan mengeceknya dulu.`
+    );
+    if (reason === null) return;
+    if (reason.trim().length < 3) {
+      toast.error("Ceritakan sedikit alasannya ya");
+      return;
+    }
+    setBusyId(task.id);
+    try {
+      const { data } = await api.post(`/tasks/${task.id}/hold-request`, { reason: reason.trim() });
+      toast.success(
+        data.hold_status === "approved"
+          ? "Ditahan dulu. Mulai kapan saja kamu siap 🙂"
+          : "Permintaan terkirim — menunggu Abi/Ummi ya"
+      );
+      await load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally { setBusyId(null); }
+  };
+
   const snoozeHandoff = async (minutes) => {
     const h = handoff;
     if (!h) return;
@@ -802,6 +828,8 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // not only when they happen to hold the turn — otherwise
                       // a missed morning task would be unreachable all evening.
                       onReportLate: t.is_bonus ? null : () => setLateTaskModal(t),
+                      onRequestHold: t.is_bonus || t.timer_started_at ? null : () => requestHold(t),
+                      holdStatus: t.hold_status || null,
                     };
                   },
                 }}

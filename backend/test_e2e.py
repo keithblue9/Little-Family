@@ -5167,6 +5167,60 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== ANTREAN TIDAK BOLEH MACET DI MISI YANG TIDAK TERSEDIA ===============
+    # Reported: with a mission held (or its section not yet open), nothing at
+    # all could be started — the turn sat on a task that wasn't available, so
+    # the whole queue stalled behind it.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _nl6 = server._now_local(); _nm6 = _nl6.hour * 60 + _nl6.minute
+    _f6 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
+    c.post("/api/config", json={
+        "day_segments": [
+            {"label": "Sekarang", "start_time": "00:00", "end_time": _f6(min(_nm6 + 60, 23 * 60 + 58))},
+            {"label": "Nanti", "start_time": _f6(min(_nm6 + 61, 23 * 60 + 59)), "end_time": "23:59"}],
+        "min_gap_seconds": 0, "auto_approve_tasks": False})
+    NOWS, LATERS = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mkn = lambda t, seg, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                       "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                       "segment_id": seg, "order": o}).json()
+
+    # A held mission must not become the blocking turn. Holds don't apply to a
+    # section's opening mission, so put a finished one in front of it.
+    opener_q = mkn("Pembuka", NOWS, 1)
+    _aio_tg.run(server.db.tasks.update_one({"id": opener_q["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+    held = mkn("Ditahan dulu", NOWS, 2)
+    follow = mkn("Berikutnya", NOWS, 3)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{held['id']}/hold-request", json={"reason": "Diajak keluar"})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r_ha = c.post(f"/api/tasks/{held['id']}/hold-approve")
+    check("queue: the hold was actually granted", r_ha.status_code == 200, r_ha.text[:170])
+    nxt = _aio_tg.run(server.get_next_actionable_task(adskhan["id"], today_local))
+    check("queue: a held mission never holds the turn",
+          nxt and nxt["id"] == follow["id"], str(nxt and nxt["title"]))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{follow['id']}/start")
+    check("queue: the next mission starts normally", r.status_code == 200, r.text[:170])
+
+    # A mission whose section hasn't opened must not block an available one
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    future_first = mkn("Sesi nanti", LATERS, 1)
+    available = mkn("Sesi sekarang", NOWS, 2)
+    nxt2 = _aio_tg.run(server.get_next_actionable_task(adskhan["id"], today_local))
+    check("queue: a not-yet-open section doesn't stall the day",
+          nxt2 and nxt2["id"] == available["id"], str(nxt2 and nxt2["title"]))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{available['id']}/start")
+    check("queue: the available mission is startable", r.status_code == 200, r.text[:170])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

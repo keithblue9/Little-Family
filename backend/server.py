@@ -3580,7 +3580,12 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
     firsts = _segment_first_ids(open_tasks, segments, all_today)
     actionable = [
         t for t in open_tasks
-        if _task_availability(t, segments, child, t["id"] in firsts, grace) == "open"
+        # A mission under an approved hold, or still awaiting one, must not
+        # hold up the queue: the child stepped away from THAT task, not from
+        # the whole evening. Blocking everything behind it would turn a granted
+        # pause into a punishment.
+        if t.get("hold_status") not in ("pending", "approved")
+        and _task_availability(t, segments, child, t["id"] in firsts, grace) == "open"
     ]
     return actionable[0] if actionable else None
 
@@ -3778,12 +3783,16 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
                 status_code=409,
                 detail="Misi ini sudah lewat waktunya — tekan tombol Terlambat dulu untuk memilih alasannya.",
             )
-        nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-        if nxt and nxt["id"] != task_id:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
-            )
+        # A held mission is exempt from the queue in both directions: it doesn't
+        # block what follows, and it can be picked up whenever the child gets
+        # back — that IS the hold.
+        if task.get("hold_status") not in ("approved", "used"):
+            nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
+            if nxt and nxt["id"] != task_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
+                )
 
     cfg_start = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
     gap_seconds = None
@@ -3851,6 +3860,11 @@ def _check_duration_not_exceeded(task):
     duration has elapsed since Start — mirrors the frontend's disabled-button
     behavior so a direct API call can't bypass it. The kid's way forward once
     overdue is Skip (still available), not a late Finish."""
+    # Already owned the delay (Terlambat) or granted a pause (hold)? Then the
+    # elapsed time has been accounted for, and blocking Finish would leave the
+    # child unable to start it again OR complete it — a dead end.
+    if task.get("late_ack") or task.get("hold_status") in ("approved", "used"):
+        return
     started = task.get("timer_started_at")
     duration = task.get("duration_minutes")
     if not started or not duration:
@@ -3880,7 +3894,13 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
     if task["status"] not in ("pending", "rejected"):
         raise HTTPException(status_code=400, detail="Task cannot be completed in current state")
 
-    if not task.get("is_bonus"):
+    # A mission already under way must always be finishable. Re-checking the
+    # queue here could strand a child who had legitimately started something —
+    # after a granted hold, say — leaving them unable to start it again OR mark
+    # it done. Held missions are exempt for the same reason they don't block
+    # the queue: the pause applies to that task alone.
+    if not task.get("is_bonus") and not task.get("timer_started_at") \
+            and task.get("hold_status") not in ("approved", "used"):
         nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
         if nxt and nxt["id"] != task_id:
             raise HTTPException(

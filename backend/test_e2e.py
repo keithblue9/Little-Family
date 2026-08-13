@@ -5053,6 +5053,120 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== HOLD TIDAK BOLEH MEMBLOKIR ANTREAN ===============
+    # Reported: after asking to hold one mission, EVERY later mission refused to
+    # start with "finish the previous one first" — a granted pause had turned
+    # into a lock on the rest of the evening.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Blok", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "auto_approve_tasks": False})
+    BS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mkb = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                  "segment_id": BS, "order": o}).json()
+    b_open, b_held, b_after = mkb("Pembuka", 1), mkb("Cuci Piring", 2), mkb("Sholat Isya", 3)
+    _aio_tg.run(server.db.tasks.update_one({"id": b_open["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{b_held['id']}/hold-request", json={"reason": "Diajak keluar"})
+    # Even while merely PENDING it must not wall off the rest of the day
+    r = c.post(f"/api/tasks/{b_after['id']}/start")
+    check("holdq: a pending hold doesn't block the missions behind it", r.status_code == 200, r.text[:170])
+    c.post(f"/api/tasks/{b_after['id']}/complete")
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{b_held['id']}/hold-approve")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    # ...and the held mission itself is still doable whenever they get back
+    r = c.post(f"/api/tasks/{b_held['id']}/start")
+    check("holdq: the held mission can be picked up out of order", r.status_code == 200, r.text[:170])
+    check("holdq: and is marked used",
+          _aio_tg.run(server.db.tasks.find_one({"id": b_held["id"]}, {"_id": 0}))["hold_status"] == "used")
+
+    # A mission with no hold still obeys the queue as normal
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    q1, q2 = mkb("Antre satu", 1), mkb("Antre dua", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{q2['id']}/start")
+    check("holdq: ordinary missions still queue normally", r.status_code == 409, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== MISI YANG SUDAH DIMULAI HARUS SELALU BISA DISELESAIKAN ===============
+    # Reported: after a hold, the child was stuck — "Selesai" refused because
+    # the queue had moved on and the duration had run out while they were away.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Stuck", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "auto_approve_tasks": False})
+    KS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mks = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                  "duration_minutes": 5, "target_children": [adskhan["id"]],
+                                                  "segment_id": KS, "order": o}).json()
+    s_open, s_held, s_next = mks("Pembuka", 1), mks("Cuci Piring", 2), mks("Sholat Isya", 3)
+    _aio_tg.run(server.db.tasks.update_one({"id": s_open["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+
+    # Hold it, start it, then let the duration lapse while the child is away
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{s_held['id']}/hold-request", json={"reason": "Diajak keluar"})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{s_held['id']}/hold-approve")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{s_held['id']}/start")
+    _aio_tg.run(server.db.tasks.update_one({"id": s_held["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=1)).isoformat()}}))
+    r = c.post(f"/api/tasks/{s_held['id']}/complete")
+    check("stuck: a held mission can still be finished after the duration lapsed",
+          r.status_code == 200, r.text[:180])
+
+    # The same must hold for a mission whose lateness was owned via Terlambat
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"late_reasons": [
+        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True}]})
+    _sr = c.get("/api/config").json()["late_reasons"][0]["id"]
+    late_t = mks("Telat lalu selesai", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{late_t['id']}/start")
+    _aio_tg.run(server.db.tasks.update_one({"id": late_t["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=1)).isoformat()}}))
+    c.post(f"/api/tasks/{late_t['id']}/late-reason", json={"reason_id": _sr})
+    r = c.post(f"/api/tasks/{late_t['id']}/complete")
+    check("stuck: an acknowledged-late mission can be finished too", r.status_code == 200, r.text[:180])
+
+    # A started mission is finishable even when the queue has moved past it
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    m1, m2 = mks("Mulai duluan", 1), mks("Yang lain", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{m1['id']}/start")
+    _aio_tg.run(server.db.tasks.update_one({"id": m1["id"]}, {"$set": {"order": 99}}))
+    r = c.post(f"/api/tasks/{m1['id']}/complete")
+    check("stuck: a mission under way is finishable regardless of queue order",
+          r.status_code == 200, r.text[:180])
+
+    # But an untouched mission still can't jump the queue
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    n1, n2 = mks("Antre dulu", 1), mks("Belum giliran", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{n2['id']}/complete")
+    check("stuck: an untouched mission still respects the queue", r.status_code == 409, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

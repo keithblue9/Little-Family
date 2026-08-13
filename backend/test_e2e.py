@@ -4957,7 +4957,11 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # Rejection puts the mission back on the ordinary clock
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    h2 = mkh("Minta tunda ditolak", 1)
+    # Holds don't apply to a section's opening mission, so put one in front.
+    _h2_open = mkh("Pembuka dulu", 1)
+    _aio_tg.run(server.db.tasks.update_one({"id": _h2_open["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+    h2 = mkh("Minta tunda ditolak", 2)
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
     c.post(f"/api/tasks/{h2['id']}/hold-request", json={"reason": "Mau main dulu"})
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
@@ -4968,7 +4972,10 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     # A parent asking on the child's behalf needs no second approval
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    h3 = mkh("Diminta orang tua", 1)
+    _h3_open = mkh("Pembuka dulu lagi", 1)
+    _aio_tg.run(server.db.tasks.update_one({"id": _h3_open["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+    h3 = mkh("Diminta orang tua", 2)
     r = c.post(f"/api/tasks/{h3['id']}/hold-request", json={"reason": "Ada tamu, saya yang minta"})
     check("hold: a parent's own request is granted immediately",
           r.status_code == 200 and r.json()["hold_status"] == "approved", r.text[:180])
@@ -4992,6 +4999,56 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("hold: requests and decisions are logged",
           any(x["action"] == "hold_requested" for x in r.json())
           and any(x["action"] in ("hold_approved", "hold_rejected") for x in r.json()))
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== HOLD: KEDALUWARSA & BUKAN UNTUK MISI PEMBUKA ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Hold2", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "hold_auto_reject_minutes": 5, "auto_approve_tasks": False})
+    H2 = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    check("hold2: expiry window is configurable", c.get("/api/config").json()["hold_auto_reject_minutes"] == 5)
+    mkh2 = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                   "segment_id": H2, "order": o}).json()
+    opener, second = mkh2("Pembuka sesi", 1), mkh2("Misi kedua", 2)
+
+    # The opening mission uses Terlambat, not a hold
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{opener['id']}/hold-request", json={"reason": "Ada tamu"})
+    check("hold2: the section opener cannot be held", r.status_code == 400, str(r.status_code))
+    check("hold2: it points at Terlambat instead", "Terlambat" in r.text, r.text[:170])
+
+    # A later mission can, and it lapses if nobody answers
+    r = c.post(f"/api/tasks/{second['id']}/hold-request", json={"reason": "Diajak keluar mendadak"})
+    check("hold2: a later mission can be held", r.status_code == 200 and r.json()["hold_status"] == "pending", r.text[:170])
+    _aio_tg.run(server.db.tasks.update_one({"id": second["id"]}, {"$set": {
+        "hold_requested_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=9)).isoformat()}}))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.get("/api/hold-requests")
+    check("hold2: an unanswered request drops out of the queue",
+          not any(t["id"] == second["id"] for t in r.json()), str(len(r.json())))
+    sec_doc = _aio_tg.run(server.db.tasks.find_one({"id": second["id"]}, {"_id": 0}))
+    check("hold2: and is marked expired", sec_doc["hold_status"] == "expired", str(sec_doc["hold_status"]))
+    check("hold2: the mission is back on the normal clock",
+          server._task_availability(sec_doc, c.get("/api/config").json()["day_segments"], None, False, 10, True) == "closed",
+          "still frozen")
+
+    # A fresh request within the window still survives
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    o2, s2t = mkh2("Pembuka lagi", 1), mkh2("Kedua lagi", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{s2t['id']}/hold-request", json={"reason": "Tamu datang"})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    check("hold2: a recent request is still waiting",
+          any(t["id"] == s2t["id"] for t in c.get("/api/hold-requests").json()))
+    r = c.get("/api/activity?limit=40")
+    check("hold2: expiry is logged for the parent to see",
+          any(x["action"] == "hold_expired" for x in r.json()), str([x["action"] for x in r.json()][:8]))
 
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())

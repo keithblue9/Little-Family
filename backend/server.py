@@ -356,6 +356,8 @@ class AppConfigInput(BaseModel):
     max_idle_minutes: Optional[int] = Field(default=None, ge=0, le=240)
     # Points deducted when a parent rejects a claimed exam day as untrue.
     exam_false_claim_penalty: Optional[int] = Field(default=None, ge=0, le=10000)
+    # How long a hold request may wait for a parent before it lapses on its own.
+    hold_auto_reject_minutes: Optional[int] = Field(default=None, ge=1, le=120)
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -2285,6 +2287,7 @@ async def child_day_progress(
             _projected[_t["id"]] = _fmt_min(_cursor)
             _cursor += int(_t.get("duration_minutes") or 0)
 
+    await _expire_stale_holds()
     _idle_over = await _idle_exceeded(child_id, dk, _cfg_avail)
     _exam_flex = await _active_exam_flex(child_id, dk)
     _tasks_with_availability = []
@@ -3067,6 +3070,26 @@ async def request_hold(task_id: str, payload: HoldRequestInput, user: dict = Dep
     if task.get("hold_status") == "approved":
         raise HTTPException(status_code=400, detail="Misi ini sudah ditahan — mulai saja kapan kamu siap")
 
+    # The mission that opens a section is covered by the Terlambat flow, which
+    # already asks WHY they're late and prices it accordingly. Allowing an
+    # open-ended hold there too would be a softer second route to the same
+    # thing, and the honest one would stop being used.
+    _segs_h = await _get_day_segments()
+    _open_h = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
+        "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True},
+        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
+    }).to_list(500)
+    _all_h = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
+        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
+    }).to_list(500)
+    if task_id in _segment_first_ids(_open_h, _segs_h, _all_h):
+        raise HTTPException(
+            status_code=400,
+            detail="Untuk misi pembuka, pakai tombol Terlambat saja ya — di situ kamu bisa jelaskan alasannya.",
+        )
+
     child_id = user["id"] if user["role"] == "child" else task.get("child_id")
     # A parent asking on the child's behalf doesn't need to approve their own
     # request; it takes effect at once.
@@ -3090,9 +3113,40 @@ async def request_hold(task_id: str, payload: HoldRequestInput, user: dict = Dep
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
+async def _expire_stale_holds() -> int:
+    """Let a hold request lapse if no parent answers in time.
+
+    A request that sits unanswered forever would quietly freeze a mission's
+    clock by default, which is the opposite of asking permission. Expiring it
+    puts the mission back on its normal timing — the child can still explain
+    afterwards through the Terlambat flow if the interruption was real.
+    """
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    limit = int(config.get("hold_auto_reject_minutes", 5))
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=limit)).isoformat()
+    stale = await db.tasks.find({
+        "parent_id": FAMILY_ID, "hold_status": "pending",
+        "hold_requested_at": {"$lt": cutoff},
+    }, {"_id": 0}).to_list(200)
+    for t in stale:
+        await db.tasks.update_one({"id": t["id"]}, {"$set": {
+            "hold_status": "expired", "hold_reviewed_at": now_iso(),
+            "hold_review_note": f"Tidak ada jawaban dalam {limit} menit",
+        }})
+        await log_activity(FAMILY_ID, t.get("child_id"), "hold_expired", {
+            "task_id": t["id"], "title": t.get("title"), "minutes": limit,
+        })
+        await send_push_to({"role": "child", "member_id": t.get("child_id")},
+                           title="Permintaan tunda kedaluwarsa",
+                           body=f'"{t.get("title")}" kembali berjalan normal. Kalau memang ada halangan, pakai tombol Terlambat ya.',
+                           url=f"/kid/{t.get('child_id')}")
+    return len(stale)
+
+
 @api.get("/hold-requests")
 async def list_hold_requests(user: dict = Depends(get_current_user)):
     """Missions waiting on a parent's decision (or, for a child, their own)."""
+    await _expire_stale_holds()
     query = {"parent_id": FAMILY_ID, "hold_status": "pending"}
     if user["role"] == "child":
         query["$or"] = [{"child_id": user["id"]}, {"is_coop": True, "coop_participants": user["id"]}]
@@ -3449,6 +3503,7 @@ async def _run_reminder_sweep() -> dict:
         await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
         sent["task_reminders"] += 1
 
+    sent["holds_expired"] = await _expire_stale_holds()
     expired = await _sweep_overdue_punishments()
     sent["punishments_expired"] = expired
 
@@ -5546,6 +5601,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "auto_approve_tasks": True,
             "max_idle_minutes": 20,
             "exam_false_claim_penalty": 100,
+            "hold_auto_reject_minutes": 5,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5662,6 +5718,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "auto_approve_tasks": True,
             "max_idle_minutes": 20,
             "exam_false_claim_penalty": 100,
+            "hold_auto_reject_minutes": 5,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5709,6 +5766,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "auto_approve_tasks": bool(config.get("auto_approve_tasks", True)),
         "max_idle_minutes": int(config.get("max_idle_minutes", 20)),
         "exam_false_claim_penalty": int(config.get("exam_false_claim_penalty", 100)),
+        "hold_auto_reject_minutes": int(config.get("hold_auto_reject_minutes", 5)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),

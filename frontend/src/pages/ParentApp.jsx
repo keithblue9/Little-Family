@@ -1289,6 +1289,32 @@ function SettingsView({ kids, onAdd, onRefresh }) {
 
   // Repairs a wallet whose three buckets no longer add up to the balance —
   // older resets zeroed the points but left the buckets behind.
+  // Manual correction. Rules can't cover everything — a bug cost points, or
+  // something happened worth rewarding that no mission covers.
+  const adjustPoints = async (c) => {
+    const raw = window.prompt(
+      `Tambah atau kurangi poin ${c.name}?\n\nIsi angka positif untuk menambah (mis. 50), atau negatif untuk mengurangi (mis. -30).`
+    );
+    if (raw === null) return;
+    const delta = parseInt(String(raw).trim(), 10);
+    if (!Number.isFinite(delta) || delta === 0) {
+      toast.error("Isi angka selain nol ya");
+      return;
+    }
+    const reason = window.prompt("Alasannya apa? (tercatat di Log Aktivitas)") ?? "";
+    try {
+      const { data } = await api.post(`/children/${c.id}/adjust-points`, {
+        points: delta, reason: reason.trim(),
+      });
+      toast.success(
+        `${c.name}: ${data.delta > 0 ? "+" : ""}${data.delta} poin — sekarang ${data.after}`
+      );
+      onRefresh();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
+  };
+
   const rebalanceBuckets = async (c) => {
     if (!window.confirm(
       `Perbaiki ChikyBank ${c.name}?\n\nKetiga kantong (Tabungan/Belanja/Sedekah) akan dihitung ulang dari poin saat ini sesuai persentase yang kamu atur.\n\nJumlah poinnya sendiri tidak berubah.`
@@ -1424,6 +1450,13 @@ function SettingsView({ kids, onAdd, onRefresh }) {
                   data-testid={`reset-points-btn-${c.id}`}
                 >
                   <RotateCcw className="w-4 h-4" strokeWidth={2.5} />
+                </button>
+                <button
+                  onClick={() => adjustPoints(c)}
+                  className="press-btn inline-flex items-center justify-center border-2 border-indigo-300 text-indigo-700 hover:bg-indigo-50 p-2 rounded-lg"
+                  title="Tambah atau kurangi poin anak ini secara manual"
+                >
+                  <Plus className="w-4 h-4" strokeWidth={2.5} />
                 </button>
                 <button
                   onClick={() => rebalanceBuckets(c)}

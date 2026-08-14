@@ -5221,6 +5221,197 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== TIDAK BOLEH ADA MISI TANPA JALAN KELUAR ===============
+    # Reported: a mission showed only "Menunggu giliran" — no Mulai, no
+    # Terlambat, nothing to press. Whatever closes a mission, Terlambat must
+    # stay reachable so the child is never cornered.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Buntu", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
+        "late_reasons": [
+            {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
+            {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
+    DS2 = c.get("/api/config").json()["day_segments"][0]["id"]
+    _dr = c.get("/api/config").json()["late_reasons"]
+    DOK, DBAD = _dr[0]["id"], _dr[1]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mkd2 = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                   "segment_id": DS2, "order": o}).json()
+    d_prev, d_stuck = mkd2("Selesai duluan", 1), mkd2("Berpakaian lengkap", 2)
+
+    # Finish the first, then let the child idle well past the limit
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{d_prev['id']}/start")
+    c.post(f"/api/tasks/{d_prev['id']}/complete")
+    _aio_tg.run(server.db.tasks.update_one({"id": d_prev["id"]}, {"$set": {
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=90)).isoformat()}}))
+
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    row = {t["id"]: t for t in r.json()["tasks"]}[d_stuck["id"]]
+    check("noway: idling past the limit closes the mission", row["availability"] == "closed", str(row["availability"]))
+
+    # It can't be started — that's intended — but it MUST be reportable
+    r = c.post(f"/api/tasks/{d_stuck['id']}/start")
+    check("noway: it cannot simply be started", r.status_code == 409, str(r.status_code))
+    r = c.post(f"/api/tasks/{d_stuck['id']}/late-reason", json={"reason_id": DBAD})
+    check("noway: Terlambat is always accepted as the way out", r.status_code == 200, r.text[:200])
+
+    # ...and after owning it, the mission runs through to the end
+    r = c.post(f"/api/tasks/{d_stuck['id']}/start")
+    check("noway: startable again once owned", r.status_code == 200, r.text[:170])
+    r = c.post(f"/api/tasks/{d_stuck['id']}/complete")
+    check("noway: and completable", r.status_code == 200, r.text[:170])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{d_stuck['id']}/approve")
+    check("noway: and approvable — no dead end anywhere", r.status_code == 200, r.text[:170])
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== TAMBAH / KURANGI POIN MANUAL ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"chiky_save_pct": 40, "chiky_spend_pct": 40, "chiky_share_pct": 20})
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 100, "lifetime_points": 500, "chiky_save": 40, "chiky_spend": 40, "chiky_share": 20}}))
+
+    r = c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": 50, "reason": "Ganti rugi bug"})
+    check("adjust: awarding points works", r.status_code == 200 and r.json()["after"] == 150, r.text[:180])
+    k = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
+    check("adjust: buckets re-split to match the new total",
+          k["chiky_save"] + k["chiky_spend"] + k["chiky_share"] == 150,
+          f'{k["chiky_save"]}/{k["chiky_spend"]}/{k["chiky_share"]}')
+    check("adjust: a gain counts toward lifetime too", k["lifetime_points"] == 550, str(k["lifetime_points"]))
+
+    r = c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": -30, "reason": "Koreksi"})
+    check("adjust: deducting works", r.status_code == 200 and r.json()["after"] == 120, r.text[:180])
+    k2 = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
+    check("adjust: a deduction does NOT erase lifetime history", k2["lifetime_points"] == 550, str(k2["lifetime_points"]))
+    check("adjust: buckets still add up after a deduction",
+          k2["chiky_save"] + k2["chiky_spend"] + k2["chiky_share"] == 120,
+          f'{k2["chiky_save"]}/{k2["chiky_spend"]}/{k2["chiky_share"]}')
+
+    # Guards
+    r = c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": 0})
+    check("adjust: zero is refused", r.status_code == 422, str(r.status_code))
+    r = c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": 999999})
+    check("adjust: an absurd amount is refused", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/children/tidak-ada/adjust-points", json={"points": 10})
+    check("adjust: unknown child → 404", r.status_code == 404, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": 500})
+    check("adjust: a child cannot give themselves points", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # Every correction is on the record
+    r = c.get(f"/api/activity?child_id={adskhan['id']}&limit=40")
+    adj = [x for x in r.json() if x["action"] == "points_adjusted"]
+    check("adjust: logged for transparency", len(adj) >= 2, str(len(adj)))
+    check("adjust: the log records amount, reason and who did it",
+          adj[0]["details"].get("delta") is not None
+          and "reason" in adj[0]["details"] and adj[0]["details"].get("by"),
+          str(adj[0].get("details")))
+
+    # Going below zero is allowed — a deduction shouldn't be silently capped
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 20}}))
+    r = c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": -50, "reason": "Konsekuensi"})
+    check("adjust: a deduction may take the balance negative", r.json()["after"] == -30, str(r.json()["after"]))
+    k3 = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
+    check("adjust: buckets never go negative themselves",
+          k3["chiky_save"] >= 0 and k3["chiky_spend"] >= 0 and k3["chiky_share"] >= 0,
+          f'{k3["chiky_save"]}/{k3["chiky_spend"]}/{k3["chiky_share"]}')
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+
+    # =============== AUDIT MENYELURUH: KONSISTENSI & JALAN KELUAR ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # 1) Every timing rule is configurable — none of them silently hardcoded
+    cfg_all = c.get("/api/config").json()
+    for _k in ("min_gap_seconds", "flash_threshold_pct", "pacing_bonus_points",
+               "segment_late_grace_minutes", "max_idle_minutes", "auto_start_next",
+               "snooze_options_minutes", "duration_warning_minutes", "bonus_follows_sequence",
+               "auto_approve_tasks", "hold_auto_reject_minutes", "exam_false_claim_penalty",
+               "penalty_card_threshold", "punishment_mode", "punishment_options",
+               "day_segments", "late_reasons"):
+        check(f"audit: {_k} is exposed as config", _k in cfg_all, str(sorted(cfg_all.keys()))[:100])
+
+    # 2) Every rule can be switched off without breaking the app
+    r = c.post("/api/config", json={
+        "min_gap_seconds": 0, "max_idle_minutes": 0, "pacing_bonus_points": 0,
+        "duration_warning_minutes": [], "auto_start_next": False,
+        "family_combo_bonus_points": 0, "early_bonus_pct": 0})
+    check("audit: every guard can be turned off at once", r.status_code == 200, r.text[:170])
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": [{"label": "Bebas", "start_time": "00:00", "end_time": "23:59"}]})
+    FS2 = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    z = c.post("/api/tasks", json={"title": "Tanpa aturan", "points": 10, "date_key": today_local,
+                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                   "segment_id": FS2, "order": 1}).json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{z['id']}/start")
+    check("audit: a mission still runs with every guard off", r.status_code == 200, r.text[:170])
+    r = c.post(f"/api/tasks/{z['id']}/complete")
+    check("audit: and completes", r.status_code == 200, r.text[:170])
+
+    # 3) Kids can't reach anything that belongs to a parent
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    for _path, _body in [
+        ("/api/config", {"min_gap_seconds": 0}),
+        (f"/api/children/{adskhan['id']}/adjust-points", {"points": 100}),
+        (f"/api/children/{adskhan['id']}/penalty-cards", {"penalty_cards": 0}),
+        (f"/api/children/{adskhan['id']}/rebalance-buckets", {}),
+        ("/api/tasks/bulk-delete", {"task_ids": [z["id"]]}),
+        ("/api/tasks/dedupe", {}),
+        ("/api/off-days", {"start_date": today_local}),
+        ("/api/reminders/run", {}),
+    ]:
+        r = c.post(_path, json=_body)
+        check(f"audit: kid blocked from {_path}", r.status_code == 403, f"{_path} → {r.status_code}")
+
+    # 4) No mission may ever be a dead end: whatever closes it, Terlambat works
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"max_idle_minutes": 20, "late_reasons": [
+        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
+        {"label": "Lalai", "gives_penalty_card": True, "award_points": False}]})
+    _ar = c.get("/api/config").json()["late_reasons"]
+    _aok, _abad = _ar[0]["id"], _ar[1]["id"]
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    a_prev = c.post("/api/tasks", json={"title": "Sebelumnya", "points": 5, "date_key": today_local,
+                                        "duration_minutes": 5, "target_children": [adskhan["id"]],
+                                        "segment_id": FS2, "order": 1}).json()
+    a_stuck = c.post("/api/tasks", json={"title": "Yang tertutup", "points": 10, "date_key": today_local,
+                                         "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                         "segment_id": FS2, "order": 2}).json()
+    _aio_tg.run(server.db.tasks.update_one({"id": a_prev["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso(),
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{a_stuck['id']}/start")
+    check("audit: idling closes it as designed", r.status_code == 409, str(r.status_code))
+    r = c.post(f"/api/tasks/{a_stuck['id']}/late-reason", json={"reason_id": _abad})
+    check("audit: Terlambat is always a way out", r.status_code == 200, r.text[:180])
+    r = c.post(f"/api/tasks/{a_stuck['id']}/start")
+    check("audit: and the mission runs again afterwards", r.status_code == 200, r.text[:170])
+    r = c.post(f"/api/tasks/{a_stuck['id']}/complete")
+    check("audit: through to completion", r.status_code == 200, r.text[:170])
+
+    # 5) The wallet always equals the balance, whatever happened to it
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    for _delta in (250, -80, 15):
+        c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": _delta, "reason": "audit"})
+        _k = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
+        check(f"audit: wallet balances after {_delta:+}",
+              _k["chiky_save"] + _k["chiky_spend"] + _k["chiky_share"] == max(0, _k["points"]),
+              f'{_k["points"]} vs {_k["chiky_save"]}+{_k["chiky_spend"]}+{_k["chiky_share"]}')
+
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "min_gap_seconds": 0,
+                                "max_idle_minutes": 20, "early_bonus_pct": 10})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

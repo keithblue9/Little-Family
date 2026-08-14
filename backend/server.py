@@ -260,6 +260,12 @@ class ExamPeriodInput(BaseModel):
     note: str = Field(default="", max_length=200)
 
 
+class PointsAdjustInput(BaseModel):
+    # Positive to award, negative to deduct. Zero is pointless, so it's refused.
+    points: int = Field(ge=-100000, le=100000)
+    reason: str = Field(default="", max_length=200)
+
+
 class HoldRequestInput(BaseModel):
     reason: str = Field(min_length=3, max_length=300)
 
@@ -4528,6 +4534,44 @@ async def set_segment_starts(child_id: str, payload: SegmentStartOverrideInput, 
 async def get_segment_starts(child_id: str, user: dict = Depends(get_current_user)):
     child = await get_child_or_404(FAMILY_ID, child_id)
     return {"segment_starts": child.get("segment_starts") or {}}
+
+
+@api.post("/children/{child_id}/adjust-points")
+async def adjust_points(child_id: str, payload: PointsAdjustInput, user: dict = Depends(require_parent)):
+    """Award or deduct points by hand.
+
+    Rules can't anticipate everything: a bug cost a child points they'd earned,
+    or something happened worth rewarding that no mission covers. Rather than
+    leave a parent stuck with whatever the system decided, this is a plain
+    manual correction — always logged with its reason, so the trail stays
+    honest, and the Chikybank buckets are re-split so the wallet still adds up.
+    """
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    if payload.points == 0:
+        raise HTTPException(status_code=422, detail="Isi jumlah poin yang mau ditambah atau dikurangi")
+
+    before = int(child.get("points", 0))
+    inc = {"points": payload.points}
+    # Only a gain counts toward lifetime totals and levels: clawing back points
+    # shouldn't also erase a child's record of everything they've ever earned.
+    if payload.points > 0:
+        inc["lifetime_points"] = payload.points
+    await db.children.update_one({"id": child_id}, {"$inc": inc})
+
+    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    await _rebalance_child_buckets(child_id, config)
+    after = (await db.children.find_one({"id": child_id}, {"_id": 0, "points": 1}))["points"]
+
+    await log_activity(FAMILY_ID, child_id, "points_adjusted", {
+        "delta": payload.points, "before": before, "after": after,
+        "reason": payload.reason.strip(), "by": user.get("name", ""),
+    })
+    if payload.points > 0:
+        await send_push_to({"role": "child", "member_id": child_id},
+                           title=f"Dapat {payload.points} poin ✨",
+                           body=payload.reason.strip() or "Dari Abi/Ummi",
+                           url=f"/kid/{child_id}")
+    return {"success": True, "before": before, "after": after, "delta": payload.points}
 
 
 @api.post("/children/{child_id}/penalty-cards")

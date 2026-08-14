@@ -134,6 +134,21 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
                 {notYetLabel ? `Mulai ${notYetLabel.replace("Mulai ", "")}` : "Menunggu giliran"}
               </span>
             )}
+            {/* Last-resort escape hatch. If a mission somehow offers no action
+                at all — no Mulai, no Selesai, no Terlambat — the child is
+                stuck with nothing to press. Rather than trust every rule to
+                line up perfectly, always leave Terlambat reachable on the
+                mission holding the turn: it is the honest way forward and the
+                server will refuse it if it truly doesn't apply. */}
+            {isActive && !canStart && !canFinish && !timeStuck && !task.late_ack && onReportLate && (
+              <button
+                onClick={onReportLate}
+                disabled={busy}
+                className="press-btn flex-1 min-w-0 bg-amber-100 hover:bg-amber-200 text-amber-800 font-fun font-bold px-2 py-1 rounded-lg text-[10px] flex items-center justify-center gap-1 disabled:opacity-60"
+              >
+                <Clock className="w-3 h-3" strokeWidth={3} /> Terlambat
+              </button>
+            )}
             {/* Rendered last so the Tunda button above it still appears on a
                 mission that is simply waiting its turn. */}
             {!canStart && !canFinish && !timeStuck && !notYet && (

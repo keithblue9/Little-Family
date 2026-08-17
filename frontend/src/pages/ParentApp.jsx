@@ -71,6 +71,7 @@ import PunishmentConfig from "@/components/PunishmentConfig";
 import DaySegmentsConfig from "@/components/DaySegmentsConfig";
 import SegmentStartsConfig from "@/components/SegmentStartsConfig";
 import ExamPeriodConfig from "@/components/ExamPeriodConfig";
+import DayTemplateManager from "@/components/DayTemplateManager";
 import HoldRequestsReview from "@/components/HoldRequestsReview";
 import HonestyInsightCard from "@/components/HonestyInsightCard";
 import ActivityLogCard from "@/components/ActivityLogCard";
@@ -1528,6 +1529,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <SegmentStartsConfig kids={kids} onChanged={onRefresh} />
+      </div>
+
+      <div className="bg-white rounded-2xl border-2 border-indigo-100 p-6">
+        <DayTemplateManager kids={kids} onChanged={onRefresh} />
       </div>
 
       <div className="bg-white rounded-2xl border-2 border-violet-100 p-6">

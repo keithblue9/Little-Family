@@ -681,6 +681,61 @@ class LateExceptionReviewInput(BaseModel):
     note: str = Field(default="", max_length=200)
 
 
+class DayTemplateInput(BaseModel):
+    """A named kind of day — "Hari Biasa", "Tanggal Merah", "Libur Sekolah".
+    Families invent their own; nothing here is fixed in code."""
+    name: str = Field(min_length=1, max_length=60)
+    emoji: str = Field(default="", max_length=8)
+    description: str = Field(default="", max_length=200)
+    is_default: bool = False          # used for any date with no explicit assignment
+
+
+class TemplateTaskInput(BaseModel):
+    """One mission slot inside a template, at a given weekday and section."""
+    template_id: str
+    weekday: int = Field(ge=0, le=6)
+    segment_id: Optional[str] = None
+    child_id: Optional[str] = None            # None = every child gets a copy
+    title: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)
+    points: int = Field(default=10, ge=0, le=10000)
+    penalty_points: int = Field(default=0, ge=0, le=10000)
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    order: Optional[int] = Field(default=None, ge=1)
+    is_bonus: bool = False
+    photo_required: bool = False
+    task_style: Optional[TASK_STYLE] = None
+    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    together_bonus_enabled: bool = False
+    together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
+
+
+class TemplateTaskUpdate(BaseModel):
+    weekday: Optional[int] = Field(default=None, ge=0, le=6)
+    segment_id: Optional[str] = None
+    child_id: Optional[str] = None
+    title: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    description: Optional[str] = Field(default=None, max_length=500)
+    points: Optional[int] = Field(default=None, ge=0, le=10000)
+    penalty_points: Optional[int] = Field(default=None, ge=0, le=10000)
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    order: Optional[int] = Field(default=None, ge=1)
+    is_bonus: Optional[bool] = None
+    photo_required: Optional[bool] = None
+    task_style: Optional[TASK_STYLE] = None
+    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    together_bonus_enabled: Optional[bool] = None
+    together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
+
+
+class TemplateAssignInput(BaseModel):
+    """Stick a template onto real dates — a single day or a whole range."""
+    template_id: str
+    start_date: str
+    end_date: Optional[str] = None
+    replace_existing: bool = True   # clear untouched missions on those days first
+
+
 class OffDayInput(BaseModel):
     start_date: str
     end_date: Optional[str] = None  # None/empty = single day
@@ -3313,6 +3368,280 @@ async def reject_exam_period(exam_id: str, payload: ExamRejectInput = ExamReject
     return await db.exam_periods.find_one({"id": exam_id}, {"_id": 0})
 
 
+# ---------------- Day templates ----------------
+# A routine is defined once per KIND of day ("Hari Biasa", "Tanggal Merah"),
+# broken down by weekday and section. Real dates then just point at a template.
+# Before this, a school holiday falling on a Monday meant rebuilding that day
+# mission by mission; now it's one assignment.
+
+@api.post("/day-templates")
+async def create_day_template(payload: DayTemplateInput, user: dict = Depends(require_parent)):
+    if payload.is_default:
+        await db.day_templates.update_many({"parent_id": FAMILY_ID}, {"$set": {"is_default": False}})
+    doc = {
+        "id": new_id(), "parent_id": FAMILY_ID,
+        "name": payload.name.strip(), "emoji": payload.emoji.strip(),
+        "description": payload.description.strip(), "is_default": payload.is_default,
+        "created_at": now_iso(),
+    }
+    await db.day_templates.insert_one(doc)
+    doc.pop("_id", None)
+    await log_activity(FAMILY_ID, None, "day_template_created", {"name": doc["name"]})
+    return doc
+
+
+@api.get("/day-templates")
+async def list_day_templates(user: dict = Depends(get_current_user)):
+    templates = await db.day_templates.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", 1).to_list(50)
+    for t in templates:
+        t["task_count"] = await db.template_tasks.count_documents({"parent_id": FAMILY_ID, "template_id": t["id"]})
+    return templates
+
+
+@api.patch("/day-templates/{template_id}")
+async def update_day_template(template_id: str, payload: DayTemplateInput, user: dict = Depends(require_parent)):
+    existing = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
+    if payload.is_default:
+        await db.day_templates.update_many({"parent_id": FAMILY_ID}, {"$set": {"is_default": False}})
+    await db.day_templates.update_one({"id": template_id}, {"$set": {
+        "name": payload.name.strip(), "emoji": payload.emoji.strip(),
+        "description": payload.description.strip(), "is_default": payload.is_default,
+    }})
+    return await db.day_templates.find_one({"id": template_id}, {"_id": 0})
+
+
+@api.delete("/day-templates/{template_id}")
+async def delete_day_template(template_id: str, user: dict = Depends(require_parent)):
+    """Removes the template, its slots, and any future dates pointing at it.
+    Missions already generated onto real days are left alone — they may already
+    have been worked on."""
+    doc = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
+    await db.template_tasks.delete_many({"parent_id": FAMILY_ID, "template_id": template_id})
+    await db.template_assignments.delete_many({"parent_id": FAMILY_ID, "template_id": template_id})
+    await db.day_templates.delete_one({"id": template_id})
+    await log_activity(FAMILY_ID, None, "day_template_deleted", {"name": doc.get("name")})
+    return {"success": True}
+
+
+@api.post("/day-templates/{template_id}/duplicate")
+async def duplicate_day_template(template_id: str, user: dict = Depends(require_parent)):
+    """Copy a whole template with its slots — the quickest way to build a
+    holiday routine that only differs from the school-day one in places."""
+    src = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not src:
+        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
+    new_tpl = {**src, "id": new_id(), "name": f'{src["name"]} (salinan)',
+               "is_default": False, "created_at": now_iso()}
+    await db.day_templates.insert_one(new_tpl)
+    slots = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": template_id}, {"_id": 0}).to_list(2000)
+    if slots:
+        await db.template_tasks.insert_many([
+            {**sl, "id": new_id(), "template_id": new_tpl["id"], "created_at": now_iso()} for sl in slots
+        ])
+    new_tpl.pop("_id", None)
+    return {**new_tpl, "task_count": len(slots)}
+
+
+@api.post("/template-tasks")
+async def create_template_task(payload: TemplateTaskInput, user: dict = Depends(require_parent)):
+    tpl = await db.day_templates.find_one({"id": payload.template_id, "parent_id": FAMILY_ID})
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
+    if payload.segment_id:
+        segments = await _get_day_segments()
+        if not any(sg["id"] == payload.segment_id for sg in segments):
+            raise HTTPException(status_code=404, detail="Bagian waktu tidak ditemukan")
+    if payload.child_id:
+        await get_child_or_404(FAMILY_ID, payload.child_id)
+
+    order = payload.order
+    if order is None:
+        # Append to the end of that weekday+section so slots keep a sane order
+        # without the parent having to think about numbering.
+        siblings = await db.template_tasks.find({
+            "parent_id": FAMILY_ID, "template_id": payload.template_id,
+            "weekday": payload.weekday, "segment_id": payload.segment_id,
+        }, {"_id": 0, "order": 1}).to_list(500)
+        order = max([s.get("order") or 0 for s in siblings], default=0) + 1
+
+    doc = {**payload.model_dump(), "id": new_id(), "parent_id": FAMILY_ID,
+           "order": order, "created_at": now_iso()}
+    await db.template_tasks.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api.get("/template-tasks")
+async def list_template_tasks(template_id: str, weekday: Optional[int] = None, user: dict = Depends(get_current_user)):
+    query = {"parent_id": FAMILY_ID, "template_id": template_id}
+    if weekday is not None:
+        query["weekday"] = weekday
+    rows = await db.template_tasks.find(query, {"_id": 0}).to_list(2000)
+    segments = await _get_day_segments()
+    seg_pos = {sg["id"]: i for i, sg in enumerate(sorted(segments, key=lambda x: _hhmm_to_min(x["start_time"])))}
+    rows.sort(key=lambda t: (t.get("weekday", 0), seg_pos.get(t.get("segment_id"), 999), t.get("order") or 0))
+    return rows
+
+
+@api.patch("/template-tasks/{slot_id}")
+async def update_template_task(slot_id: str, payload: TemplateTaskUpdate, user: dict = Depends(require_parent)):
+    existing = await db.template_tasks.find_one({"id": slot_id, "parent_id": FAMILY_ID})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Slot template tidak ditemukan")
+    # Fields a parent may deliberately clear back to empty, as opposed to
+    # simply not sending them.
+    clearable = {"segment_id", "child_id", "duration_minutes", "task_style", "max_snooze_minutes"}
+    raw = payload.model_dump(exclude_unset=True)
+    updates = {k: v for k, v in raw.items() if v is not None or k in clearable}
+    if updates.get("segment_id"):
+        segments = await _get_day_segments()
+        if not any(sg["id"] == updates["segment_id"] for sg in segments):
+            raise HTTPException(status_code=404, detail="Bagian waktu tidak ditemukan")
+    if updates:
+        await db.template_tasks.update_one({"id": slot_id}, {"$set": updates})
+    return await db.template_tasks.find_one({"id": slot_id}, {"_id": 0})
+
+
+@api.delete("/template-tasks/{slot_id}")
+async def delete_template_task(slot_id: str, user: dict = Depends(require_parent)):
+    res = await db.template_tasks.delete_one({"id": slot_id, "parent_id": FAMILY_ID})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Slot template tidak ditemukan")
+    return {"success": True}
+
+
+async def _apply_template_to_date(template_id: str, date_key: str, replace_existing: bool) -> dict:
+    """Turn a template's slots into real missions on one date.
+
+    Only untouched missions are cleared when replacing: anything already
+    started, finished or approved stays, so re-applying a template can never
+    wipe out work a child has actually done.
+    """
+    weekday = datetime.strptime(date_key, "%Y-%m-%d").weekday()
+    slots = await db.template_tasks.find({
+        "parent_id": FAMILY_ID, "template_id": template_id, "weekday": weekday,
+    }, {"_id": 0}).to_list(2000)
+
+    removed = 0
+    if replace_existing:
+        res = await db.tasks.delete_many({
+            "parent_id": FAMILY_ID, "date_key": date_key,
+            "status": {"$in": ["pending", "rejected"]},
+            "timer_started_at": {"$in": [None, ""]},
+        })
+        removed = res.deleted_count
+
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)
+    created = 0
+    for slot in slots:
+        targets = [slot["child_id"]] if slot.get("child_id") else [k["id"] for k in kids]
+        for cid in targets:
+            if not cid:
+                continue
+            doc = {
+                "id": new_id(), "parent_id": FAMILY_ID, "child_id": cid,
+                "title": slot["title"], "description": slot.get("description", ""),
+                "points": slot.get("points", 10),
+                "penalty_points": slot.get("penalty_points", 0),
+                "duration_minutes": slot.get("duration_minutes"),
+                "segment_id": slot.get("segment_id"),
+                "order": slot.get("order") or 1,
+                "is_bonus": bool(slot.get("is_bonus")),
+                "photo_required": bool(slot.get("photo_required")),
+                "task_style": slot.get("task_style"),
+                "max_snooze_minutes": slot.get("max_snooze_minutes"),
+                "together_bonus_enabled": bool(slot.get("together_bonus_enabled")),
+                "together_bonus_points": slot.get("together_bonus_points"),
+                "date_key": date_key, "due_time": None, "recurrence": "none",
+                "status": "pending", "created_at": now_iso(),
+                "from_template_id": template_id, "from_template_slot_id": slot["id"],
+            }
+            await db.tasks.insert_one(doc)
+            created += 1
+    return {"created": created, "removed": removed, "slots": len(slots)}
+
+
+@api.post("/template-assignments")
+async def assign_template(payload: TemplateAssignInput, user: dict = Depends(require_parent)):
+    """Point one or more dates at a template and build those days from it."""
+    tpl = await db.day_templates.find_one({"id": payload.template_id, "parent_id": FAMILY_ID})
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
+    start = validate_date_key(payload.start_date)
+    if not start:
+        raise HTTPException(status_code=422, detail="Tanggal mulai tidak valid (YYYY-MM-DD)")
+    end = validate_date_key(payload.end_date) if payload.end_date else start
+    if not end:
+        raise HTTPException(status_code=422, detail="Tanggal akhir tidak valid (YYYY-MM-DD)")
+    if end < start:
+        raise HTTPException(status_code=422, detail="Tanggal akhir harus sesudah/sama dengan tanggal mulai")
+    span = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1
+    if span > 62:
+        raise HTTPException(status_code=422, detail="Maksimal 62 hari sekali tempel")
+
+    total_created = total_removed = 0
+    days = []
+    cursor = datetime.strptime(start, "%Y-%m-%d")
+    for _ in range(span):
+        dk = cursor.strftime("%Y-%m-%d")
+        await db.template_assignments.update_one(
+            {"parent_id": FAMILY_ID, "date_key": dk},
+            {"$set": {"parent_id": FAMILY_ID, "date_key": dk,
+                      "template_id": payload.template_id, "assigned_at": now_iso(),
+                      "assigned_by": user.get("name", "")}},
+            upsert=True,
+        )
+        res = await _apply_template_to_date(payload.template_id, dk, payload.replace_existing)
+        total_created += res["created"]
+        total_removed += res["removed"]
+        days.append(dk)
+        cursor += timedelta(days=1)
+
+    await log_activity(FAMILY_ID, None, "template_assigned", {
+        "template": tpl.get("name"), "days": len(days),
+        "created": total_created, "removed": total_removed,
+    })
+    return {"success": True, "template_id": payload.template_id, "template_name": tpl.get("name"),
+            "days": days, "created": total_created, "removed": total_removed}
+
+
+@api.get("/template-assignments")
+async def list_template_assignments(start_date: str, end_date: str, user: dict = Depends(get_current_user)):
+    """Which template each date in a range is using — powers the calendar."""
+    start = validate_date_key(start_date)
+    end = validate_date_key(end_date)
+    if not start or not end:
+        raise HTTPException(status_code=422, detail="Rentang tanggal tidak valid")
+    rows = await db.template_assignments.find({
+        "parent_id": FAMILY_ID, "date_key": {"$gte": start, "$lte": end},
+    }, {"_id": 0}).to_list(400)
+    return rows
+
+
+@api.delete("/template-assignments/{date_key}")
+async def unassign_template(date_key: str, remove_tasks: bool = True, user: dict = Depends(require_parent)):
+    """Detach a date from its template. Untouched missions from it are cleared
+    by default; anything already worked on is kept."""
+    dk = validate_date_key(date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    removed = 0
+    if remove_tasks:
+        res = await db.tasks.delete_many({
+            "parent_id": FAMILY_ID, "date_key": dk,
+            "from_template_id": {"$exists": True},
+            "status": {"$in": ["pending", "rejected"]},
+            "timer_started_at": {"$in": [None, ""]},
+        })
+        removed = res.deleted_count
+    await db.template_assignments.delete_many({"parent_id": FAMILY_ID, "date_key": dk})
+    return {"success": True, "removed_tasks": removed}
+
+
 @api.post("/off-days")
 async def create_off_day(payload: OffDayInput, user: dict = Depends(require_parent)):
     """Parent declares one day or a range as task-free (family trip, holiday).
@@ -4724,6 +5053,41 @@ async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] 
     return created
 
 
+async def _fill_days_from_default_template(days_ahead: int = 14) -> int:
+    """Build any upcoming day that has no template assigned from the default one.
+
+    Without this a parent would have to paste the ordinary weekday template onto
+    every single date; the whole point is that normal days look after themselves
+    and only the exceptions need attention.
+    """
+    default_tpl = await db.day_templates.find_one({"parent_id": FAMILY_ID, "is_default": True}, {"_id": 0})
+    if not default_tpl:
+        return 0
+    today = _today_key()
+    created = 0
+    for offset in range(days_ahead + 1):
+        dk = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=offset)).strftime("%Y-%m-%d")
+        if await db.template_assignments.find_one({"parent_id": FAMILY_ID, "date_key": dk}):
+            continue  # a deliberate choice already covers this date
+        if await _is_off_day(dk):
+            continue
+        # Never overwrite a day that already has missions — it may predate
+        # templates entirely, or have been built by hand.
+        if await db.tasks.find_one({"parent_id": FAMILY_ID, "date_key": dk}):
+            continue
+        res = await _apply_template_to_date(default_tpl["id"], dk, replace_existing=False)
+        if res["created"]:
+            await db.template_assignments.update_one(
+                {"parent_id": FAMILY_ID, "date_key": dk},
+                {"$set": {"parent_id": FAMILY_ID, "date_key": dk,
+                          "template_id": default_tpl["id"], "assigned_at": now_iso(),
+                          "assigned_by": "otomatis"}},
+                upsert=True,
+            )
+            created += res["created"]
+    return created
+
+
 async def _maybe_materialize_recurring():
     """Cheap throttled wrapper for read paths: at most one sweep every 10
     minutes family-wide, so the schedule self-heals in the background without
@@ -4742,7 +5106,8 @@ async def _maybe_materialize_recurring():
         {"$set": {"last_materialize_at": now.isoformat()}},
         upsert=True,
     )
-    return await _materialize_recurring()
+    filled = await _fill_days_from_default_template()
+    return (await _materialize_recurring()) + filled
 
 
 class BulkTaskImportInput(BaseModel):

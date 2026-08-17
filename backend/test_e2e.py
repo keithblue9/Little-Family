@@ -5412,6 +5412,170 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
                                 "max_idle_minutes": 20, "early_bonus_pct": 10})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== TEMPLATE HARI (rombak cara set tugas) ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.day_templates.delete_many({}))
+    _aio_tg.run(server.db.template_tasks.delete_many({}))
+    _aio_tg.run(server.db.template_assignments.delete_many({}))
+    _aio_tg.run(server.db.off_days.delete_many({}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Pagi", "start_time": "04:45", "end_time": "11:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    TSEG = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # Two kinds of day — names are the family's own, nothing fixed in code
+    r = c.post("/api/day-templates", json={"name": "Hari Biasa", "emoji": "🎒", "is_default": True})
+    check("tpl: a template can be created", r.status_code == 200, r.text[:180])
+    T_BIASA = r.json()["id"]
+    r = c.post("/api/day-templates", json={"name": "Tanggal Merah", "emoji": "🎉"})
+    T_LIBUR = r.json()["id"]
+    check("tpl: a second, differently-named template", r.status_code == 200 and r.json()["is_default"] is False)
+    check("tpl: only one default at a time",
+          len([t for t in c.get("/api/day-templates").json() if t["is_default"]]) == 1)
+
+    # Slots: same weekday, different template → different routines
+    mkslot = lambda tid, wd, seg, title, order, **kw: c.post("/api/template-tasks", json={
+        "template_id": tid, "weekday": wd, "segment_id": TSEG[seg], "title": title,
+        "points": 10, "duration_minutes": 10, "order": order, **kw})
+    for i, t in enumerate(["Bangun pagi", "Sholat Subuh", "Siap-siap sekolah"], 1):
+        check(f"tpl: weekday slot {i} added", mkslot(T_BIASA, 0, "Pagi", t, i).status_code == 200)
+    mkslot(T_BIASA, 0, "Malam", "Belajar", 1)
+    mkslot(T_LIBUR, 0, "Pagi", "Bangun santai", 1)
+    mkslot(T_LIBUR, 0, "Pagi", "Bantu bersih-bersih", 2)
+
+    r = c.get(f"/api/template-tasks?template_id={T_BIASA}")
+    check("tpl: slots listed for a template", len(r.json()) == 4, str(len(r.json())))
+    check("tpl: sorted by section then order",
+          [x["title"] for x in r.json()][:3] == ["Bangun pagi", "Sholat Subuh", "Siap-siap sekolah"],
+          str([x["title"] for x in r.json()]))
+    check("tpl: the other template is untouched",
+          len(c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()) == 2)
+    check("tpl: task_count surfaced on the list",
+          next(t for t in c.get("/api/day-templates").json() if t["id"] == T_BIASA)["task_count"] == 4)
+
+    # Paste onto a real Monday
+    _next_mon = _off_base
+    while _next_mon.weekday() != 0:
+        _next_mon += _dt_off.timedelta(days=1)
+    MON = _next_mon.strftime("%Y-%m-%d")
+    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": MON})
+    check("tpl: assigning builds the day", r.status_code == 200 and r.json()["created"] > 0, r.text[:200])
+    built = c.get(f"/api/tasks?date_key={MON}").json()
+    check("tpl: one copy per child for shared slots", len(built) == 4 * 2, str(len(built)))
+    check("tpl: slot details carried over",
+          all(t["points"] == 10 and t["duration_minutes"] == 10 for t in built))
+    check("tpl: sections carried over",
+          len([t for t in built if t["segment_id"] == TSEG["Malam"]]) == 2,
+          str([t["segment_id"] for t in built]))
+    check("tpl: tasks remember which template built them",
+          all(t.get("from_template_id") == T_BIASA for t in built))
+
+    # Swap that same Monday to the holiday routine — this is the whole point
+    r = c.post("/api/template-assignments", json={"template_id": T_LIBUR, "start_date": MON})
+    check("tpl: swapping the template rebuilds the day", r.status_code == 200, r.text[:200])
+    after = c.get(f"/api/tasks?date_key={MON}").json()
+    check("tpl: the school routine is gone", not any(t["title"] == "Sholat Subuh" for t in after),
+          str([t["title"] for t in after]))
+    check("tpl: the holiday routine is there",
+          any(t["title"] == "Bangun santai" for t in after), str([t["title"] for t in after]))
+    check("tpl: assignment recorded for the calendar",
+          c.get(f"/api/template-assignments?start_date={MON}&end_date={MON}").json()[0]["template_id"] == T_LIBUR)
+
+    # Work already done is never destroyed by re-applying
+    _kept = after[0]
+    _aio_tg.run(server.db.tasks.update_one({"id": _kept["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso()}}))
+    c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": MON})
+    kept_rows = c.get(f"/api/tasks?date_key={MON}").json()
+    check("tpl: a finished mission survives a re-apply",
+          any(t["id"] == _kept["id"] for t in kept_rows), "finished work was wiped")
+
+    # Range assignment
+    RANGE_END = (_next_mon + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
+    r = c.post("/api/template-assignments", json={"template_id": T_LIBUR, "start_date": MON, "end_date": RANGE_END})
+    check("tpl: a range can be pasted at once", r.status_code == 200 and len(r.json()["days"]) == 3, r.text[:200])
+    check("tpl: every day in the range is recorded",
+          len(c.get(f"/api/template-assignments?start_date={MON}&end_date={RANGE_END}").json()) == 3)
+
+    # Detaching a date
+    r = c.delete(f"/api/template-assignments/{RANGE_END}")
+    check("tpl: a date can be detached", r.status_code == 200, r.text[:170])
+    check("tpl: its untouched missions are cleared",
+          len(c.get(f"/api/tasks?date_key={RANGE_END}").json()) == 0)
+
+    # Duplicating a template
+    r = c.post(f"/api/day-templates/{T_BIASA}/duplicate")
+    check("tpl: duplicating copies the slots too", r.status_code == 200 and r.json()["task_count"] == 4, r.text[:200])
+    T_COPY = r.json()["id"]
+    check("tpl: the copy is not the default", r.json()["is_default"] is False)
+
+    # Editing and removing slots
+    slot = c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()[0]
+    r = c.patch(f"/api/template-tasks/{slot['id']}", json={"points": 25, "title": "Bangun agak siang"})
+    check("tpl: a slot can be edited", r.status_code == 200 and r.json()["points"] == 25, r.text[:170])
+    check("tpl: edits persist", c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()[0]["title"] == "Bangun agak siang")
+    r = c.delete(f"/api/template-tasks/{slot['id']}")
+    check("tpl: a slot can be removed", r.status_code == 200 and
+          len(c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()) == 1)
+
+    # Deleting a template cleans up after itself
+    r = c.delete(f"/api/day-templates/{T_COPY}")
+    check("tpl: a template can be deleted", r.status_code == 200)
+    check("tpl: its slots go with it", len(c.get(f"/api/template-tasks?template_id={T_COPY}").json()) == 0)
+
+    # --- negative paths ---
+    r = c.post("/api/template-assignments", json={"template_id": "ngawur", "start_date": MON})
+    check("tpl: unknown template rejected", r.status_code == 404, str(r.status_code))
+    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": "bukan-tanggal"})
+    check("tpl: bad date rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": RANGE_END, "end_date": MON})
+    check("tpl: reversed range rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": MON,
+                                                  "end_date": (_next_mon + _dt_off.timedelta(days=90)).strftime("%Y-%m-%d")})
+    check("tpl: an absurd range is rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/template-tasks", json={"template_id": T_BIASA, "weekday": 9, "title": "x"})
+    check("tpl: invalid weekday rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/template-tasks", json={"template_id": T_BIASA, "weekday": 0,
+                                            "segment_id": "ngawur", "title": "x"})
+    check("tpl: unknown section rejected", r.status_code == 404, str(r.status_code))
+    r = c.post("/api/template-tasks", json={"template_id": "ngawur", "weekday": 0, "title": "x"})
+    check("tpl: slot on a missing template rejected", r.status_code == 404, str(r.status_code))
+    r = c.patch("/api/template-tasks/tidak-ada", json={"points": 5})
+    check("tpl: editing a missing slot → 404", r.status_code == 404, str(r.status_code))
+
+    # --- permissions ---
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    for _p, _b in [("/api/day-templates", {"name": "Punyaku"}),
+                   ("/api/template-tasks", {"template_id": T_BIASA, "weekday": 0, "title": "x"}),
+                   ("/api/template-assignments", {"template_id": T_BIASA, "start_date": MON})]:
+        check(f"tpl: kid blocked from {_p}", c.post(_p, json=_b).status_code == 403, _p)
+    check("tpl: kid blocked from deleting a template",
+          c.delete(f"/api/day-templates/{T_BIASA}").status_code == 403)
+    check("tpl: but a kid may READ templates (their app needs them)",
+          c.get("/api/day-templates").status_code == 200)
+
+    # --- per-child slots ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    r = c.post("/api/template-tasks", json={"template_id": T_LIBUR, "weekday": 0,
+                                            "segment_id": TSEG["Pagi"], "title": "Khusus Adskhan",
+                                            "child_id": adskhan["id"], "points": 5})
+    check("tpl: a slot can target one child", r.status_code == 200, r.text[:170])
+    c.post("/api/template-assignments", json={"template_id": T_LIBUR, "start_date": MON})
+    built2 = c.get(f"/api/tasks?date_key={MON}").json()
+    solo = [t for t in built2 if t["title"] == "Khusus Adskhan"]
+    check("tpl: a targeted slot makes exactly one mission", len(solo) == 1, str(len(solo)))
+    check("tpl: and it goes to the right child", solo[0]["child_id"] == adskhan["id"])
+
+    _aio_tg.run(server.db.day_templates.delete_many({}))
+    _aio_tg.run(server.db.template_tasks.delete_many({}))
+    _aio_tg.run(server.db.template_assignments.delete_many({}))
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

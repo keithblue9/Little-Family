@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { LayoutTemplate, Plus, Trash2, Copy, Star, ChevronLeft, ChevronRight, X } from "lucide-react";
+import { LayoutTemplate, Plus, Trash2, Copy, Star, ChevronLeft, ChevronRight, X, FileSpreadsheet } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { todayKey } from "@/lib/dates";
@@ -79,6 +79,25 @@ export default function DayTemplateManager({ kids = [], onChanged }) {
   };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { loadAssignments(); }, [monthRange.start]);
+
+  // Downloads through the browser rather than an <a href>, so the request
+  // still carries the auth header the API expects.
+  const exportXlsx = async (params, label) => {
+    try {
+      const res = await api.get("/export/weekly-xlsx", { params, responseType: "blob" });
+      const url = URL.createObjectURL(new Blob([res.data]));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `jadwal-${label}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success("File Excel diunduh");
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
+  };
 
   const addTemplate = async () => {
     const name = window.prompt("Nama jenis hari?\n\nMis. Hari Biasa, Tanggal Merah, Libur Sekolah");
@@ -244,6 +263,15 @@ export default function DayTemplateManager({ kids = [], onChanged }) {
             </div>
           </div>
         ))}
+        {activeId && (
+          <button
+            onClick={() => exportXlsx({ template_id: activeId }, tplById(activeId)?.name || "template")}
+            className="press-btn rounded-2xl border-2 border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700 hover:bg-emerald-100 flex items-center gap-1"
+            title="Unduh rutinitas Senin–Minggu template ini sebagai Excel"
+          >
+            <FileSpreadsheet className="w-4 h-4" /> Export Excel
+          </button>
+        )}
         <button
           onClick={addTemplate}
           className="press-btn rounded-2xl border-2 border-dashed border-slate-300 px-3 py-2 text-sm text-slate-500 hover:bg-slate-50 flex items-center gap-1"
@@ -407,6 +435,12 @@ export default function DayTemplateManager({ kids = [], onChanged }) {
         <p className="text-[11px] text-slate-400 mt-2">
           Tanggal tanpa template otomatis memakai template bertanda ⭐ (harian biasa).
         </p>
+        <button
+          onClick={() => exportXlsx({ start_date: monthRange.start }, "minggu-ini")}
+          className="press-btn mt-2 inline-flex items-center gap-1.5 border-2 border-emerald-200 bg-emerald-50 text-emerald-700 font-semibold px-3 py-1.5 rounded-xl text-xs hover:bg-emerald-100"
+        >
+          <FileSpreadsheet className="w-3.5 h-3.5" /> Export jadwal nyata (Senin–Minggu)
+        </button>
       </div>
     </div>
   );

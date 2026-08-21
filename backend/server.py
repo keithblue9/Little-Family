@@ -2350,6 +2350,12 @@ async def child_day_progress(
 
     await _expire_stale_holds()
     _idle_over = await _idle_exceeded(child_id, dk, _cfg_avail)
+    # Idling only concerns the mission the child should be doing RIGHT NOW.
+    # Applying it to every remaining mission branded the whole evening as late —
+    # including ones not due for hours — and there is nothing a child can even
+    # do about those yet.
+    _turn = await get_next_actionable_task(child_id, dk)
+    _turn_id = _turn["id"] if _turn else None
     _exam_flex = await _active_exam_flex(child_id, dk)
     _tasks_with_availability = []
     for _t in tasks:
@@ -2357,7 +2363,8 @@ async def child_day_progress(
         # A relaxed mission is simply available: the clock stops judging it for
         # the rest of a study night.
         _av = "open" if (_t.get("is_bonus") or _relaxed) else _task_availability(
-            _t, _segs_for_kid, _kid_doc_seg, _t["id"] in _firsts_avail, _grace_avail, _idle_over
+            _t, _segs_for_kid, _kid_doc_seg, _t["id"] in _firsts_avail, _grace_avail,
+            _idle_over and _t["id"] == _turn_id,
         )
         _sg_t = _segment_for_task(_t, _segs_for_kid)
         _tasks_with_availability.append({
@@ -2370,7 +2377,8 @@ async def child_day_progress(
             # (at-fault) reasons — otherwise it advertises options the server
             # will reject.
             "at_fault_only": (_t["id"] not in _firsts_avail) and (
-                _idle_over or (_snooze_expired(_t) and int(_t.get("snooze_count") or 0) > 0)
+                (_idle_over and _t["id"] == _turn_id)
+                or (_snooze_expired(_t) and int(_t.get("snooze_count") or 0) > 0)
             ),
             "effective_start_time": _fmt_min(_effective_segment_start(_sg_t, _kid_doc_seg, dk)) if _sg_t else None,
         })
@@ -3642,6 +3650,164 @@ async def unassign_template(date_key: str, remove_tasks: bool = True, user: dict
     return {"success": True, "removed_tasks": removed}
 
 
+@api.get("/export/weekly-xlsx")
+async def export_weekly_xlsx(
+    template_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    user: dict = Depends(require_parent),
+):
+    """Download the week's routine as a formatted spreadsheet.
+
+    Two sources, because both are useful: pass a template_id to export the
+    routine as designed, or a start_date to export the actual missions on the
+    calendar for that week. Each child gets their own sheet, grouped by section
+    with a row per mission and running point totals.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from fastapi.responses import StreamingResponse
+    import io
+
+    segments = await _get_day_segments()
+    seg_pos = {sg["id"]: i for i, sg in enumerate(sorted(segments, key=lambda x: _hhmm_to_min(x["start_time"])))}
+    seg_name = {sg["id"]: f'{sg.get("emoji", "")} {sg["label"]}'.strip() for sg in segments}
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50)
+    if not kids:
+        raise HTTPException(status_code=400, detail="Belum ada anak untuk diekspor")
+
+    WEEKDAYS = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+
+    # Gather rows as {weekday: {child_id: [task-like dicts]}}
+    by_day: dict = {i: {k["id"]: [] for k in kids} for i in range(7)}
+    title = ""
+    if template_id:
+        tpl = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
+        if not tpl:
+            raise HTTPException(status_code=404, detail="Template tidak ditemukan")
+        title = tpl.get("name", "Template")
+        slots = await db.template_tasks.find(
+            {"parent_id": FAMILY_ID, "template_id": template_id}, {"_id": 0}
+        ).to_list(5000)
+        for sl in slots:
+            targets = [sl["child_id"]] if sl.get("child_id") else [k["id"] for k in kids]
+            for cid in targets:
+                if cid in by_day[sl["weekday"]]:
+                    by_day[sl["weekday"]][cid].append(sl)
+    else:
+        start = validate_date_key(start_date) if start_date else _today_key()
+        if not start:
+            raise HTTPException(status_code=422, detail="Tanggal tidak valid (YYYY-MM-DD)")
+        # Snap back to the Monday of that week so the sheet always reads Mon–Sun.
+        monday = datetime.strptime(start, "%Y-%m-%d") - timedelta(
+            days=datetime.strptime(start, "%Y-%m-%d").weekday()
+        )
+        title = f'Minggu {monday.strftime("%d %b %Y")}'
+        for i in range(7):
+            dk = (monday + timedelta(days=i)).strftime("%Y-%m-%d")
+            rows = await db.tasks.find(
+                {"parent_id": FAMILY_ID, "date_key": dk, "status": {"$ne": "off"}}, {"_id": 0}
+            ).to_list(2000)
+            for t in rows:
+                for cid in (t.get("coop_participants") or [t.get("child_id")]):
+                    if cid in by_day[i]:
+                        by_day[i][cid].append(t)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    HEAD_FILL = PatternFill("solid", fgColor="1F4E5F")
+    SEG_FILL = PatternFill("solid", fgColor="DCE6F1")
+    THIN = Side(style="thin", color="9CA3AF")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    HEADERS = ["Kategori", "Urutan", "Aktivitas", "Durasi", "Point Utama", "Point Bonus", "Total Point"]
+
+    for kid in kids:
+        ws = wb.create_sheet(kid["name"][:31])
+        ws["A1"] = kid["name"]
+        ws["A1"].font = Font(name="Arial", bold=True, size=13)
+        ws["C1"] = title
+        ws["C1"].font = Font(name="Arial", italic=True, size=10, color="6B7280")
+        row = 3
+
+        for wd in range(7):
+            tasks = by_day[wd][kid["id"]]
+            if not tasks:
+                continue
+            ws.cell(row=row, column=1, value=WEEKDAYS[wd]).font = Font(name="Arial", bold=True, size=12)
+            row += 1
+
+            for col, h in enumerate(HEADERS, start=1):
+                cell = ws.cell(row=row, column=col, value=h)
+                cell.font = Font(name="Arial", bold=True, color="FFFFFF")
+                cell.fill = HEAD_FILL
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = BORDER
+            header_row = row
+            row += 1
+
+            tasks.sort(key=lambda t: (seg_pos.get(t.get("segment_id"), 999), t.get("order") or 0))
+            first_data_row = row
+            current_seg = "__none__"
+            for t in tasks:
+                sid = t.get("segment_id")
+                if sid != current_seg:
+                    current_seg = sid
+                    label = seg_name.get(sid, "✨ Kapan Saja")
+                    c = ws.cell(row=row, column=1, value=label)
+                    c.font = Font(name="Arial", bold=True)
+                    for col in range(1, len(HEADERS) + 1):
+                        ws.cell(row=row, column=col).fill = SEG_FILL
+                        ws.cell(row=row, column=col).border = BORDER
+                    row += 1
+
+                bonus = t.get("together_bonus_points") if t.get("together_bonus_enabled") else None
+                values = [
+                    "",
+                    t.get("order") or "",
+                    t.get("title", ""),
+                    f'{t.get("duration_minutes")} menit' if t.get("duration_minutes") else "",
+                    t.get("points") or 0,
+                    bonus or "",
+                ]
+                for col, v in enumerate(values, start=1):
+                    c = ws.cell(row=row, column=col, value=v)
+                    c.font = Font(name="Arial", size=11)
+                    c.border = BORDER
+                    if col in (2, 4, 5, 6):
+                        c.alignment = Alignment(horizontal="center")
+                # Total stays a live formula so the sheet recalculates if edited.
+                tc = ws.cell(row=row, column=7, value=f"=E{row}+N(F{row})")
+                tc.font = Font(name="Arial", size=11)
+                tc.border = BORDER
+                tc.alignment = Alignment(horizontal="center")
+                row += 1
+
+            # Per-day totals, also as formulas
+            ws.cell(row=row, column=3, value=f"Total {WEEKDAYS[wd]}").font = Font(name="Arial", bold=True)
+            for col in (5, 7):
+                letter = get_column_letter(col)
+                tc = ws.cell(row=row, column=col, value=f"=SUM({letter}{first_data_row}:{letter}{row - 1})")
+                tc.font = Font(name="Arial", bold=True)
+                tc.alignment = Alignment(horizontal="center")
+                tc.border = BORDER
+            ws.cell(row=header_row, column=1)  # keep reference readable
+            row += 2
+
+        for col, width in enumerate([16, 9, 46, 12, 13, 13, 13], start=1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+        ws.freeze_panes = "A3"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f'jadwal-{title.lower().replace(" ", "-")}.xlsx'
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
 @api.post("/off-days")
 async def create_off_day(payload: OffDayInput, user: dict = Depends(require_parent)):
     """Parent declares one day or a range as task-free (family trip, holiday).
@@ -4102,7 +4268,13 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
         _is_first = task_id in _segment_first_ids(_open_now, _segs_now, _all_now)
         _exam_now = await _active_exam_flex(task["child_id"], task.get("date_key") or _today_key())
         _relaxed_now = _is_flex_relaxed(task, _exam_now, _all_now, _segs_now)
-        _idle_now = False if _relaxed_now else await _idle_exceeded(task["child_id"], task.get("date_key") or _today_key(), _cfg_now)
+        # Idling is only held against the mission whose turn it actually is.
+        _turn_now = await get_next_actionable_task(task["child_id"], task.get("date_key"))
+        _is_turn = bool(_turn_now and _turn_now["id"] == task_id)
+        _idle_now = (
+            False if _relaxed_now or not _is_turn
+            else await _idle_exceeded(task["child_id"], task.get("date_key") or _today_key(), _cfg_now)
+        )
         _avail = "open" if _relaxed_now else _task_availability(
             task, _segs_now, _kid_doc, _is_first, _grace, _idle_now
         )

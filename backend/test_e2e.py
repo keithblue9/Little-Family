@@ -5576,6 +5576,142 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== MENGANGGUR HANYA MENYANGKUT MISI YANG SEDANG GILIRAN ===============
+    # Reported: after idling, EVERY remaining mission that evening showed
+    # "Terlambat" — including ones not due for hours. A child can't act on
+    # those yet, so branding them late is both wrong and discouraging.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Malam", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False})
+    IDS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    mki2 = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
+                                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
+                                                   "segment_id": IDS, "order": o}).json()
+    i_done, i_turn, i_later, i_last = (mki2("Sudah selesai", 1), mki2("Giliran sekarang", 2),
+                                       mki2("Nanti", 3), mki2("Paling akhir", 4))
+    # Finish the first, then idle well past the limit
+    _aio_tg.run(server.db.tasks.update_one({"id": i_done["id"]}, {"$set": {
+        "status": "approved", "timer_started_at": server.now_iso(),
+        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=90)).isoformat()}}))
+
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    by = {t["title"]: t for t in r.json()["tasks"]}
+    check("idleturn: the mission whose turn it is IS closed by idling",
+          by["Giliran sekarang"]["availability"] == "closed", str(by["Giliran sekarang"]["availability"]))
+    check("idleturn: later missions are NOT branded late",
+          by["Nanti"]["availability"] == "open" and by["Paling akhir"]["availability"] == "open",
+          f'{by["Nanti"]["availability"]}/{by["Paling akhir"]["availability"]}')
+    check("idleturn: nor are they forced into at-fault-only reasons",
+          by["Nanti"]["at_fault_only"] is False and by["Paling akhir"]["at_fault_only"] is False)
+    check("idleturn: only the current one loses its excused reasons",
+          by["Giliran sekarang"]["at_fault_only"] is True)
+
+    # Owning the current one lets the evening carry on normally
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"late_reasons": [
+        {"label": "Lalai", "gives_penalty_card": True, "award_points": False}]})
+    _ir = c.get("/api/config").json()["late_reasons"][0]["id"]
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{i_turn['id']}/late-reason", json={"reason_id": _ir})
+    c.post(f"/api/tasks/{i_turn['id']}/start")
+    c.post(f"/api/tasks/{i_turn['id']}/complete")
+    r = c.post(f"/api/tasks/{i_later['id']}/start")
+    check("idleturn: the next mission starts normally right after", r.status_code == 200, r.text[:170])
+
+    # And a child may always begin the mission whose turn it is ahead of its
+    # projected time — the forecast is guidance, not a gate.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    e1, e2 = mki2("Pertama", 1), mki2("Kedua", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{e1['id']}/start")
+    c.post(f"/api/tasks/{e1['id']}/complete")
+    r = c.post(f"/api/tasks/{e2['id']}/start")
+    check("idleturn: starting earlier than the projected time is allowed",
+          r.status_code == 200, r.text[:170])
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== EXPORT JADWAL KE EXCEL ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.day_templates.delete_many({}))
+    _aio_tg.run(server.db.template_tasks.delete_many({}))
+    c.post("/api/config", json={"day_segments": [
+        {"label": "Pagi", "start_time": "04:45", "end_time": "11:59"},
+        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+    XSEG = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    _mon_x = _off_base - _dt_off.timedelta(days=_off_base.weekday())
+    MONX = _mon_x.strftime("%Y-%m-%d")
+    c.post("/api/tasks", json={"title": "Bangun pagi", "points": 10, "date_key": MONX,
+                               "duration_minutes": 10, "target_children": [adskhan["id"]],
+                               "segment_id": XSEG["Pagi"], "order": 1})
+    c.post("/api/tasks", json={"title": "Sholat Subuh", "points": 10, "date_key": MONX,
+                               "duration_minutes": 10, "target_children": [adskhan["id"]],
+                               "segment_id": XSEG["Pagi"], "order": 2,
+                               "together_bonus_enabled": True, "together_bonus_points": 25})
+
+    r = c.get(f"/api/export/weekly-xlsx?start_date={MONX}")
+    check("xlsx: real-week export succeeds", r.status_code == 200, r.text[:170])
+    check("xlsx: served as a spreadsheet",
+          "spreadsheetml" in r.headers.get("content-type", ""), r.headers.get("content-type", ""))
+    check("xlsx: offered as a download", "attachment" in r.headers.get("content-disposition", ""),
+          r.headers.get("content-disposition", ""))
+    check("xlsx: the file is a real xlsx (zip magic)", r.content[:2] == b"PK", str(r.content[:4]))
+
+    import io as _io_x
+    from openpyxl import load_workbook as _lwb
+    wbx = _lwb(_io_x.BytesIO(r.content))
+    check("xlsx: one sheet per child", len(wbx.sheetnames) == 2, str(wbx.sheetnames))
+    wsx = wbx[wbx.sheetnames[0]]
+    _flat = [[cc for cc in rr] for rr in wsx.iter_rows(values_only=True)]
+    _txt = str(_flat)
+    check("xlsx: the child's name heads the sheet", wsx["A1"].value == adskhan["name"], str(wsx["A1"].value))
+    check("xlsx: columns match the requested layout",
+          "Kategori" in _txt and "Urutan" in _txt and "Aktivitas" in _txt
+          and "Durasi" in _txt and "Point Utama" in _txt and "Point Bonus" in _txt and "Total Point" in _txt,
+          _txt[:200])
+    check("xlsx: sections appear as grouping rows", "Pagi" in _txt, _txt[:200])
+    check("xlsx: the day is named", "Senin" in _txt, _txt[:200])
+    check("xlsx: missions are listed", "Sholat Subuh" in _txt and "Bangun pagi" in _txt, _txt[:200])
+    check("xlsx: totals are live formulas, not baked-in numbers",
+          any(isinstance(cc, str) and cc.startswith("=") for rr in _flat for cc in rr if cc is not None), _txt[:200])
+    check("xlsx: a per-day total row exists", "Total Senin" in _txt, _txt[:200])
+
+    # Template export
+    tplx = c.post("/api/day-templates", json={"name": "Hari Biasa", "is_default": True}).json()
+    c.post("/api/template-tasks", json={"template_id": tplx["id"], "weekday": 0,
+                                        "segment_id": XSEG["Pagi"], "title": "Dari template", "points": 15})
+    r = c.get(f"/api/export/weekly-xlsx?template_id={tplx['id']}")
+    check("xlsx: template export succeeds", r.status_code == 200, r.text[:170])
+    wb2 = _lwb(_io_x.BytesIO(r.content))
+    check("xlsx: template rows are present",
+          "Dari template" in str([[cc for cc in rr] for rr in wb2[wb2.sheetnames[0]].iter_rows(values_only=True)]))
+
+    # Negative paths
+    r = c.get("/api/export/weekly-xlsx?template_id=ngawur")
+    check("xlsx: unknown template → 404", r.status_code == 404, str(r.status_code))
+    r = c.get("/api/export/weekly-xlsx?start_date=bukan-tanggal")
+    check("xlsx: invalid date → 422", r.status_code == 422, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.get(f"/api/export/weekly-xlsx?start_date={MONX}")
+    check("xlsx: a child cannot export", r.status_code == 403, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.day_templates.delete_many({}))
+    _aio_tg.run(server.db.template_tasks.delete_many({}))
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

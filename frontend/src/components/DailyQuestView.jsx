@@ -39,10 +39,23 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
     const t = setInterval(() => setNowHHMM(localTimeHHMM()), 30000);
     return () => clearInterval(t);
   }, []);
+  // A running mission needs a per-second clock for its countdown and minimum
+  // duration. When nothing is running, this ticker re-rendered the entire
+  // timeline once a second for no reason — the single biggest cause of the
+  // kid's screen feeling sluggish. Also pauses while the tab is hidden.
+  const hasRunningTimer = useMemo(
+    () =>
+      (progress?.tasks || []).some(
+        (t) => t.timer_started_at && (t.status === "pending" || t.status === "rejected")
+      ),
+    [progress]
+  );
   useEffect(() => {
+    if (!hasRunningTimer && !handoff) return undefined;
+    if (typeof document !== "undefined" && document.hidden) return undefined;
     const t = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [hasRunningTimer, handoff]);
 
   const load = useCallback(async () => {
     if (!child?.id) return;
@@ -326,6 +339,14 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
       setBusyId(null);
       handoffFiring.current = false;
     }
+  };
+
+  // Mirrors the server's minimum-duration floor so the button is visibly
+  // disabled rather than failing on tap — and shows the parent's own wording.
+  const belowMinimum = (task) => {
+    const floor = task.min_duration_minutes;
+    if (!floor || !task.timer_started_at) return false;
+    return (nowMs - new Date(task.timer_started_at).getTime()) / 60000 < floor;
   };
 
   const confirmIfFlash = (task) => {
@@ -839,6 +860,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // time — no way to finish, no way to restart.
                       canFinish:
                         !!t.timer_started_at &&
+                        !belowMinimum(t) &&
                         (t.late_ack ||
                           t.hold_status === "approved" ||
                           t.hold_status === "used" ||
@@ -857,6 +879,12 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
                       // to say the same thing. Holds are for the missions after
                       // it, when the child is home and something unplanned
                       // interrupts the run.
+                      minimumLeft:
+                        belowMinimum(t) && t.min_duration_minutes
+                          ? Math.max(1, Math.ceil(
+                              t.min_duration_minutes -
+                              (nowMs - new Date(t.timer_started_at).getTime()) / 60000))
+                          : null,
                       onRequestHold:
                         t.is_bonus || t.timer_started_at || t.is_segment_opener
                           ? null

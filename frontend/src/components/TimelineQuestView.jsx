@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { Play, Check, Clock, Lock, Star, FastForward } from "lucide-react";
+import { Play, Check, Clock, Lock, Star, FastForward , Timer } from "lucide-react";
 
 /**
  * Horizontal timeline view of a child's day.
@@ -47,7 +47,7 @@ const STATUS_STYLE = {
   pending: { ring: "border-slate-200", dot: "bg-slate-300", chip: "bg-slate-100 text-slate-500", label: "Belum" },
 };
 
-function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet, notYetLabel, onStart, onFinish, onSkip, onReportLate, onRequestHold, holdStatus, below }) {
+function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet, notYetLabel, onStart, onFinish, onSkip, onReportLate, onRequestHold, holdStatus, minimumLeft, below }) {
   const st = STATUS_STYLE[task.status] || STATUS_STYLE.pending;
   const done = ["approved", "completed", "skipped"].includes(task.status);
 
@@ -179,6 +179,11 @@ function TaskCard({ task, isActive, busy, canStart, canFinish, timeStuck, notYet
               >
                 ⏸️ Tunda
               </button>
+            )}
+            {minimumLeft && (
+              <span className="text-[9px] text-emerald-700 bg-emerald-50 px-1.5 py-1 rounded-lg flex items-center gap-1">
+                <Timer className="w-3 h-3" /> {minimumLeft} menit lagi
+              </span>
             )}
             {onSkip && (canStart || canFinish || timeStuck) && (
               <button

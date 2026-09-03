@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { Target, Play, Square, CheckCircle2, FastForward, Lock, Trophy, Star, Timer, ChevronLeft, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
+import { cacheGet, cacheSet } from "@/lib/localCache";
 import TimelineQuestView from "@/components/TimelineQuestView";
 import { QUEST_THEMES } from "@/lib/questThemes";
 import { styleMeta } from "@/lib/personality";
@@ -11,7 +12,7 @@ import { playSoundTheme, playTimeWarning } from "@/lib/sounds";
 import MysteryBox from "@/components/MysteryBox";
 import { timeOfDayOverlay, isNightTime } from "@/lib/timeOfDay";
 
-export default function DailyQuestView({ child, themeKey, onCelebrate }) {
+export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig = null }) {
   const [dateKey, setDateKey] = useState(todayKey());
   const [progress, setProgress] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -24,6 +25,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
   const [punishmentBusy, setPunishmentBusy] = useState(false);
   const [daySegments, setDaySegments] = useState([]);
   const [flashPct, setFlashPct] = useState(15);
+  const cfgLoaded = useRef(false);
   const [snoozeOptions, setSnoozeOptions] = useState([5, 10, 15, 20]);
   const [warnMinutes, setWarnMinutes] = useState([3, 2, 1]);
   const [bonusInLine, setBonusInLine] = useState(true);
@@ -59,19 +61,49 @@ export default function DailyQuestView({ child, themeKey, onCelebrate }) {
 
   const load = useCallback(async () => {
     if (!child?.id) return;
-    setLoading(true);
+    // Paint from the last known state first. The request still goes out and
+    // overwrites this a moment later — but the child sees their day
+    // immediately instead of a spinner, which is the whole difference on a
+    // cold container.
+    const cacheKey = `day:${child.id}:${dateKey}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      setProgress(cached);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     try {
       const { data } = await api.get(`/children/${child.id}/day-progress`, { params: { date_key: dateKey } });
       setProgress(data);
-      api.get("/config")
-        .then(({ data: cfg }) => { setLateReasons(cfg.late_reasons || []); setDaySegments(cfg.day_segments || []); setFlashPct(cfg.flash_threshold_pct ?? 15); setSnoozeOptions(cfg.snooze_options_minutes || [5, 10, 15, 20]); setWarnMinutes(cfg.duration_warning_minutes ?? [3, 2, 1]); setBonusInLine(cfg.bonus_follows_sequence !== false); })
-        .catch(() => { setLateReasons([]); setDaySegments([]); });
+      cacheSet(cacheKey, data);
+      // Settings arrive from the parent screen, which already loaded them.
+      // This used to re-fetch /config on every single timeline refresh —
+      // including each day you stepped through with the arrows.
+      const applyCfg = (cfg) => {
+        setLateReasons(cfg.late_reasons || []);
+        setDaySegments(cfg.day_segments || []);
+        setFlashPct(cfg.flash_threshold_pct ?? 15);
+        setSnoozeOptions(cfg.snooze_options_minutes || [5, 10, 15, 20]);
+        setWarnMinutes(cfg.duration_warning_minutes ?? [3, 2, 1]);
+        setBonusInLine(cfg.bonus_follows_sequence !== false);
+      };
+      if (appConfig) {
+        applyCfg(appConfig);
+      } else if (!cfgLoaded.current) {
+        cfgLoaded.current = true;
+        api.get("/config").then(({ data: cfg }) => applyCfg(cfg))
+          .catch(() => { setLateReasons([]); setDaySegments([]); });
+      }
     } catch (e) {
-      toast.error(formatApiError(e));
+      // With something already on screen, a failed refresh is a background
+      // problem — shouting about it would be worse than showing slightly old
+      // data the next request will correct.
+      if (!cached) toast.error(formatApiError(e));
     } finally {
       setLoading(false);
     }
-  }, [child?.id, dateKey]);
+  }, [child?.id, dateKey, appConfig]);
 
   useEffect(() => { load(); }, [load]);
 

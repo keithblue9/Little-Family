@@ -5712,6 +5712,269 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
+    # =============== DURASI MINIMAL & LEMBUR ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.exam_periods.delete_many({}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
+    c.post("/api/config", json={
+        "day_segments": [{"label": "Sesi Belajar", "start_time": "00:00", "end_time": "23:59"}],
+        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
+        "early_bonus_pct": 0, "pacing_bonus_points": 0, "overtime_bonus_interval_minutes": 10})
+    MS = c.get("/api/config").json()["day_segments"][0]["id"]
+    __import__("asyncio").run(server._refresh_segments_cache())
+    check("mindur: bonus interval is configurable",
+          c.get("/api/config").json()["overtime_bonus_interval_minutes"] == 10)
+
+    RUSH = "Eit, belajarnya buru-buru ya? Yang bener belajarnya."
+    mkm = lambda t, o, **kw: c.post("/api/tasks", json={
+        "title": t, "points": 10, "date_key": today_local, "duration_minutes": 30,
+        "target_children": [adskhan["id"]], "segment_id": MS, "order": o, **kw}).json()
+
+    study = mkm("Belajar", 1, min_duration_minutes=20, rush_message=RUSH,
+                overtime_allowed=True, overtime_bonus_points=5)
+    check("mindur: the floor is stored", study.get("min_duration_minutes") == 20, str(study.get("min_duration_minutes")))
+    check("mindur: the custom message is stored", study.get("rush_message") == RUSH, str(study.get("rush_message")))
+    check("mindur: overtime settings stored",
+          study.get("overtime_allowed") is True and study.get("overtime_bonus_points") == 5, str(study))
+
+    # Finishing too early is refused, in the parent's own words
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{study['id']}/start")
+    r = c.post(f"/api/tasks/{study['id']}/complete")
+    check("mindur: finishing before the floor is refused", r.status_code == 409, str(r.status_code))
+    check("mindur: and it uses the custom wording", RUSH in r.text, r.text[:200])
+
+    # Once the floor has passed, it finishes fine
+    _aio_tg.run(server.db.tasks.update_one({"id": study["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=25)).isoformat()}}))
+    r = c.post(f"/api/tasks/{study['id']}/complete")
+    check("mindur: finishes once the floor has passed", r.status_code == 200, r.text[:200])
+
+    # A mission with no floor is unaffected
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    quick = mkm("Tanpa batas minimal", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{quick['id']}/start")
+    r = c.post(f"/api/tasks/{quick['id']}/complete")
+    check("mindur: a mission without a floor still finishes instantly", r.status_code == 200, r.text[:170])
+
+    # Default wording when the parent didn't write one
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    plain = mkm("Floor tanpa pesan", 1, min_duration_minutes=15)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{plain['id']}/start")
+    r = c.post(f"/api/tasks/{plain['id']}/complete")
+    check("mindur: falls back to sensible default wording",
+          r.status_code == 409 and "15 menit" in r.text, r.text[:200])
+
+    # --- overtime: running long is fine, and pays ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+    long_study = mkm("Belajar lama", 1, overtime_allowed=True, overtime_bonus_points=5)
+    after_it = mkm("Mandi", 2)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{long_study['id']}/start")
+    # 30-minute mission that actually took 62 minutes → 3 full 10-minute steps
+    _aio_tg.run(server.db.tasks.update_one({"id": long_study["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=62)).isoformat()}}))
+    r = c.post(f"/api/tasks/{long_study['id']}/complete")
+    check("overtime: overrunning is allowed, not blocked", r.status_code == 200, r.text[:200])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{long_study['id']}/approve")
+    check("overtime: extra effort earns bonus points",
+          r.json()["task"]["overtime_bonus_awarded"] == 15,
+          str(r.json()["task"].get("overtime_bonus_awarded")))
+    check("overtime: base + bonus land in the wallet",
+          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 25,
+          str(next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"]))
+
+    # ...and what it pushed back is not treated as lateness
+    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+    pushed = {t["id"]: t for t in r.json()["tasks"]}[after_it["id"]]
+    check("overtime: the mission it delayed stays open", pushed["availability"] == "open", str(pushed["availability"]))
+    check("overtime: and is not forced into at-fault reasons", pushed["at_fault_only"] is False)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post(f"/api/tasks/{after_it['id']}/start")
+    check("overtime: the next mission starts cleanly", r.status_code == 200, r.text[:170])
+
+    # Overrunning a mission NOT marked overtime is still capped as before
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    strict = mkm("Bukan lembur", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{strict['id']}/start")
+    _aio_tg.run(server.db.tasks.update_one({"id": strict["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=90)).isoformat()}}))
+    r = c.post(f"/api/tasks/{strict['id']}/complete")
+    check("overtime: an ordinary mission still can't overrun freely", r.status_code == 409, str(r.status_code))
+
+    # No bonus configured → no bonus paid, even when overtime is allowed
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
+    nobonus = mkm("Lembur tanpa bonus", 1, overtime_allowed=True)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{nobonus['id']}/start")
+    _aio_tg.run(server.db.tasks.update_one({"id": nobonus["id"]}, {"$set": {
+        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=70)).isoformat()}}))
+    c.post(f"/api/tasks/{nobonus['id']}/complete")
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{nobonus['id']}/approve")
+    check("overtime: no bonus configured means no bonus", r.json()["task"]["overtime_bonus_awarded"] == 0,
+          str(r.json()["task"].get("overtime_bonus_awarded")))
+
+    # --- editing keeps everything ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    ed = mkm("Untuk diedit", 1)
+    r = c.patch(f"/api/tasks/{ed['id']}", json={"min_duration_minutes": 25, "rush_message": RUSH,
+                                                "overtime_allowed": True, "overtime_bonus_points": 8})
+    check("mindur: edit accepts the new fields", r.status_code == 200, r.text[:180])
+    got = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("mindur: edits persist",
+          got["min_duration_minutes"] == 25 and got["rush_message"] == RUSH
+          and got["overtime_allowed"] is True and got["overtime_bonus_points"] == 8, str(got)[:200])
+    c.patch(f"/api/tasks/{ed['id']}", json={"points": 99})
+    got2 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("mindur: an unrelated edit keeps them", got2["min_duration_minutes"] == 25 and got2["rush_message"] == RUSH)
+    c.patch(f"/api/tasks/{ed['id']}", json={"min_duration_minutes": None, "rush_message": None})
+    got3 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
+    check("mindur: they can be cleared again", not got3.get("min_duration_minutes") and not got3.get("rush_message"))
+
+    # --- and they flow through templates ---
+    _aio_tg.run(server.db.day_templates.delete_many({}))
+    _aio_tg.run(server.db.template_tasks.delete_many({}))
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    tpl_m = c.post("/api/day-templates", json={"name": "Belajar Template"}).json()
+    _wd_m = _dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday()
+    r = c.post("/api/template-tasks", json={
+        "template_id": tpl_m["id"], "weekday": _wd_m, "segment_id": MS, "title": "Belajar",
+        "points": 10, "duration_minutes": 30, "min_duration_minutes": 20,
+        "rush_message": RUSH, "overtime_allowed": True, "overtime_bonus_points": 5})
+    check("mindur: a template slot accepts them", r.status_code == 200, r.text[:180])
+    c.post("/api/template-assignments", json={"template_id": tpl_m["id"], "start_date": today_local})
+    made = [t for t in c.get(f"/api/tasks?date_key={today_local}").json() if t["title"] == "Belajar"]
+    check("mindur: templates carry them into real missions",
+          made and made[0]["min_duration_minutes"] == 20 and made[0]["rush_message"] == RUSH
+          and made[0]["overtime_allowed"] is True and made[0]["overtime_bonus_points"] == 5,
+          str(made[:1])[:200])
+
+    # --- validation ---
+    r = c.post("/api/tasks", json={"title": "x", "points": 5, "date_key": today_local,
+                                   "target_children": [adskhan["id"]], "min_duration_minutes": 0})
+    check("mindur: a zero floor is rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/tasks", json={"title": "x", "points": 5, "date_key": today_local,
+                                   "target_children": [adskhan["id"]], "overtime_bonus_points": 99999})
+    check("mindur: an absurd bonus is rejected", r.status_code == 422, str(r.status_code))
+
+    _aio_tg.run(server.db.day_templates.delete_many({}))
+    _aio_tg.run(server.db.template_tasks.delete_many({}))
+    _aio_tg.run(server.db.template_assignments.delete_many({}))
+    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "early_bonus_pct": 10})
+    __import__("asyncio").run(server._refresh_segments_cache())
+
+    # =============== PERFORMA: JUMLAH QUERY PER PEMBUKAAN LAYAR ANAK ===============
+    # The kid's screen was crawling. Query count is the thing that actually
+    # costs time on a phone talking to a remote database, so it's pinned here:
+    # if a future change starts re-reading config or tasks in a loop, this
+    # fails before anyone notices it on a device.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _perf_cls = type(server.db.tasks)
+    _perf_counts = {}
+    _perf_orig = {}
+    for _m in ("find", "find_one", "count_documents", "update_one", "update_many",
+               "insert_one", "insert_many", "delete_one", "delete_many"):
+        _o = getattr(_perf_cls, _m, None)
+        if not _o:
+            continue
+        _perf_orig[_m] = _o
+        def _mk(_o=_o, _m=_m):
+            def _f(self, *a, **k):
+                key = f"{self.name}.{_m}"
+                _perf_counts[key] = _perf_counts.get(key, 0) + 1
+                return _o(self, *a, **k)
+            return _f
+        setattr(_perf_cls, _m, _mk())
+    try:
+        c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+        c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")  # warm caches
+        _perf_counts.clear()
+        c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+        _total = sum(_perf_counts.values())
+        _cfg_reads = _perf_counts.get("app_config.find_one", 0)
+    finally:
+        for _m, _o in _perf_orig.items():
+            setattr(_perf_cls, _m, _o)
+
+    check("perf: one screen load stays under 25 DB queries", _total < 25, f"{_total} queries: {_perf_counts}")
+    check("perf: config is not re-read many times per request", _cfg_reads <= 2, f"{_cfg_reads} config reads")
+    check("perf: tasks are not fetched in a loop",
+          _perf_counts.get("tasks.find", 0) <= 8, str(_perf_counts.get("tasks.find")))
+
+    # A saved setting must still take effect at once despite the cache
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"daily_point_goal": 77})
+    check("perf: the config cache never serves a stale value after a write",
+          c.get("/api/config").json()["daily_point_goal"] == 77,
+          str(c.get("/api/config").json()["daily_point_goal"]))
+    c.post("/api/config", json={"daily_point_goal": 50})
+    check("perf: and again on the way back", c.get("/api/config").json()["daily_point_goal"] == 50)
+
+    # =============== MITIGASI COLD START ===============
+    r = c.get("/api/warmup")
+    check("warm: the warmup endpoint answers", r.status_code == 200 and r.json()["ok"] is True, r.text[:150])
+    check("warm: it needs no login (a scheduler has none)", "at" in r.json(), r.text[:150])
+
+    # The index pass must be guarded so later cold starts skip it entirely
+    marker = _aio_tg.run(server.db.app_meta.find_one({"_id": "indexes"}))
+    check("warm: an index marker is written after the first init",
+          marker and marker.get("version") == server._INDEX_VERSION, str(marker))
+
+    _idx_calls = {"n": 0}
+    _cls_w = type(server.db.tasks)
+    _orig_ci = getattr(_cls_w, "create_index")
+    def _count_ci(self, *a, **k):
+        _idx_calls["n"] += 1
+        return _orig_ci(self, *a, **k)
+    setattr(_cls_w, "create_index", _count_ci)
+    try:
+        server._init_done = False          # simulate a fresh container
+        _aio_tg.run(server._run_one_time_init())
+    finally:
+        setattr(_cls_w, "create_index", _orig_ci)
+    check("warm: a warm-schema cold start rebuilds no indexes", _idx_calls["n"] == 0, str(_idx_calls["n"]))
+    check("warm: and it still marks itself initialised", server._init_done is True)
+
+    # Bumping the version must make it rebuild once
+    _aio_tg.run(server.db.app_meta.update_one({"_id": "indexes"}, {"$set": {"version": -1}}))
+    _idx2 = {"n": 0}
+    def _count_ci2(self, *a, **k):
+        _idx2["n"] += 1
+        return _orig_ci(self, *a, **k)
+    setattr(_cls_w, "create_index", _count_ci2)
+    try:
+        server._init_done = False
+        _aio_tg.run(server._run_one_time_init())
+    finally:
+        setattr(_cls_w, "create_index", _orig_ci)
+    check("warm: a changed index version triggers exactly one rebuild", _idx2["n"] > 0, str(_idx2["n"]))
+    check("warm: and the marker is brought up to date",
+          _aio_tg.run(server.db.app_meta.find_one({"_id": "indexes"})).get("version") == server._INDEX_VERSION)
+
+    # The app must still work if the marker collection is unavailable
+    server._init_done = False
+    _aio_tg.run(server.db.app_meta.delete_many({}))
+    _aio_tg.run(server._run_one_time_init())
+    check("warm: init survives a missing marker", server._init_done is True)
+    check("warm: normal requests still work afterwards",
+          c.get("/api/config").status_code == 200)
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

@@ -25,7 +25,28 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator, model_valida
 
 # --------------- Setup ---------------
 mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
+def _make_client(url: str) -> AsyncIOMotorClient:
+    """Connection settings tuned for a serverless host.
+
+    A cold container pays for DNS, TLS and auth before it can answer anything,
+    and the defaults are built for long-lived servers. A small pool that is
+    never culled means a warm container keeps its connection instead of
+    re-handshaking, and the shorter timeouts fail fast rather than leaving a
+    child staring at a spinner when Atlas is briefly unreachable.
+    """
+    return AsyncIOMotorClient(
+        url,
+        maxPoolSize=10,          # serverless runs one request at a time
+        minPoolSize=0,
+        maxIdleTimeMS=270000,    # keep the socket for the container's lifetime
+        serverSelectionTimeoutMS=8000,
+        connectTimeoutMS=8000,
+        socketTimeoutMS=20000,
+        retryWrites=True,
+    )
+
+
+client = _make_client(mongo_url)
 db = client[os.environ["DB_NAME"]]
 
 # Serverless platforms (Vercel) can freeze a Python process between
@@ -53,7 +74,10 @@ def _ensure_db_bound_to_current_loop():
         return
     loop_id = id(loop)
     if _client_loop_id != loop_id:
-        client = AsyncIOMotorClient(mongo_url)
+        # Use the same tuned settings here, or a recreated client would quietly
+        # fall back to server-oriented defaults on exactly the cold paths this
+        # tuning is meant to help.
+        client = _make_client(mongo_url)
         db = client[os.environ["DB_NAME"]]
         _client_loop_id = loop_id
 
@@ -152,7 +176,7 @@ async def _enforce_maintenance_mode(member_id: str):
     get_current_user so it applies to every protected endpoint immediately —
     an already-logged-in session gets locked out on its very next request,
     not just at the next login."""
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     if not config.get("maintenance_mode"):
         return
     if member_id == config.get("maintenance_exempt_member_id"):
@@ -362,6 +386,8 @@ class AppConfigInput(BaseModel):
     max_idle_minutes: Optional[int] = Field(default=None, ge=0, le=240)
     # Points deducted when a parent rejects a claimed exam day as untrue.
     exam_false_claim_penalty: Optional[int] = Field(default=None, ge=0, le=10000)
+    # One overtime bonus step is granted per this many extra minutes.
+    overtime_bonus_interval_minutes: Optional[int] = Field(default=None, ge=1, le=240)
     # How long a hold request may wait for a parent before it lapses on its own.
     hold_auto_reject_minutes: Optional[int] = Field(default=None, ge=1, le=120)
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
@@ -607,6 +633,17 @@ class TaskInput(BaseModel):
     # options. Some things genuinely can't wait as long as others — prayer
     # shouldn't be postponable as far as tidying up. None/0 = use the default.
     max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    # Floor on how long a mission must actually take. Studying in 90 seconds
+    # isn't studying, so Finish stays disabled until this has passed.
+    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    # What the child is told if they try to finish too early. Written per
+    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
+    rush_message: Optional[str] = Field(default=None, max_length=200)
+    # Some work deserves to run long. When set, overrunning the duration is not
+    # treated as lateness — for this mission or the ones it pushes back — and
+    # the extra effort earns points instead.
+    overtime_allowed: Optional[bool] = None
+    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
     recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
@@ -657,6 +694,17 @@ class TaskUpdate(BaseModel):
     # task snapped back to "Kapan Saja" (no section) on every save.
     segment_id: Optional[str] = None
     max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    # Floor on how long a mission must actually take. Studying in 90 seconds
+    # isn't studying, so Finish stays disabled until this has passed.
+    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    # What the child is told if they try to finish too early. Written per
+    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
+    rush_message: Optional[str] = Field(default=None, max_length=200)
+    # Some work deserves to run long. When set, overrunning the duration is not
+    # treated as lateness — for this mission or the ones it pushes back — and
+    # the extra effort earns points instead.
+    overtime_allowed: Optional[bool] = None
+    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
 
 
 class RedeemMoneyInput(BaseModel):
@@ -706,6 +754,17 @@ class TemplateTaskInput(BaseModel):
     photo_required: bool = False
     task_style: Optional[TASK_STYLE] = None
     max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    # Floor on how long a mission must actually take. Studying in 90 seconds
+    # isn't studying, so Finish stays disabled until this has passed.
+    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    # What the child is told if they try to finish too early. Written per
+    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
+    rush_message: Optional[str] = Field(default=None, max_length=200)
+    # Some work deserves to run long. When set, overrunning the duration is not
+    # treated as lateness — for this mission or the ones it pushes back — and
+    # the extra effort earns points instead.
+    overtime_allowed: Optional[bool] = None
+    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
     together_bonus_enabled: bool = False
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
 
@@ -724,6 +783,17 @@ class TemplateTaskUpdate(BaseModel):
     photo_required: Optional[bool] = None
     task_style: Optional[TASK_STYLE] = None
     max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
+    # Floor on how long a mission must actually take. Studying in 90 seconds
+    # isn't studying, so Finish stays disabled until this has passed.
+    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
+    # What the child is told if they try to finish too early. Written per
+    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
+    rush_message: Optional[str] = Field(default=None, max_length=200)
+    # Some work deserves to run long. When set, overrunning the duration is not
+    # treated as lateness — for this mission or the ones it pushes back — and
+    # the extra effort earns points instead.
+    overtime_allowed: Optional[bool] = None
+    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
     together_bonus_enabled: Optional[bool] = None
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
 
@@ -883,7 +953,7 @@ async def list_members():
 async def public_branding():
     """Public: app name, login background, and custom labels for the login screen
     (no auth needed so branding shows before sign-in)."""
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     return {
         "app_name": config.get("app_name", "My Lil Famz"),
         "slideshow_background_url": config.get("slideshow_background_url", ""),
@@ -1031,7 +1101,7 @@ async def update_own_profile(payload: SelfProfileInput, user: dict = Depends(get
     # from a pet that was still alive isn't allowed in the first place.
     if "pet_type" in updates:
         current = await db.children.find_one({"id": user["id"]}) or {}
-        config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+        config = await get_config_cached()
         if current.get("pet_type") and not _pet_is_dead(current, config):
             raise HTTPException(
                 status_code=400,
@@ -1075,7 +1145,7 @@ async def redeem_points_for_money(payload: RedeemMoneyInput, user: dict = Depend
     if child.get("chiky_spend", 0) < payload.points:
         raise HTTPException(status_code=400, detail="Poin belanja tidak cukup")
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     rate = int(config.get("rupiah_per_point", 100))
     rupiah = payload.points * rate
 
@@ -1150,7 +1220,7 @@ async def request_charity(payload: CharityRequestInput, user: dict = Depends(get
         raise HTTPException(status_code=404, detail="Child not found")
     if child.get("chiky_share", 0) < payload.points:
         raise HTTPException(status_code=400, detail="Poin sedekah tidak cukup")
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     rate = int(config.get("rupiah_per_point", 100))
     rupiah = payload.points * rate
     await db.children.update_one({"id": payload.child_id}, {"$inc": {"points": -payload.points, "chiky_share": -payload.points}})
@@ -1740,7 +1810,7 @@ async def get_child_personality(child_id: str, user: dict = Depends(get_current_
 async def list_children(user: dict = Depends(get_current_user)):
     children = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(100)
     children.sort(key=lambda c: c.get("created_at", ""))
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     for c in children:
         c["pet_is_dead"] = _pet_is_dead(c, config)
     return children
@@ -1867,7 +1937,7 @@ async def rebalance_buckets(child_id: str, user: dict = Depends(require_parent))
     configured percentages — no points are created or destroyed.
     """
     child = await get_child_or_404(FAMILY_ID, child_id)
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     total = max(0, int(child.get("points", 0)))
     save_pct = int(config.get("chiky_save_pct", 40))
     spend_pct = int(config.get("chiky_spend_pct", 40))
@@ -2130,6 +2200,10 @@ async def _build_task_doc(
         "due_time": validate_due_time(payload.due_time),
         "segment_id": payload.segment_id,
         "max_snooze_minutes": payload.max_snooze_minutes,
+        "min_duration_minutes": payload.min_duration_minutes,
+        "rush_message": payload.rush_message,
+        "overtime_allowed": bool(payload.overtime_allowed),
+        "overtime_bonus_points": payload.overtime_bonus_points,
         "duration_minutes": payload.duration_minutes,
         "date_key": date_key,
         "recurrence": payload.recurrence,
@@ -2243,7 +2317,8 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
     # Sending null for these means "clear it" (back to Kapan Saja / the family
     # default), as opposed to "leave it alone" — which is what omitting does.
     clearable = {"due_date", "due_time", "duration_minutes", "task_style",
-                 "segment_id", "max_snooze_minutes"}
+                 "segment_id", "max_snooze_minutes", "min_duration_minutes", "rush_message",
+                 "overtime_bonus_points"}
     raw = payload.model_dump(exclude_unset=True)
 
     updates = {}
@@ -2283,7 +2358,7 @@ async def child_day_progress(
 ):
     """Snapshot of one child's daily quest progress for a specific date.
     Used both by the kid (own progress) and the parent (monitoring)."""
-    await get_child_or_404(FAMILY_ID, child_id)
+    _child_doc = await get_child_or_404(FAMILY_ID, child_id)
     dk = validate_date_key(date_key) or _today_key()
     # Keep repeating series alive on the kid's side too — they're often the
     # first to open the app on a new day.
@@ -2301,12 +2376,13 @@ async def child_day_progress(
     is_off = await _is_off_day(dk)
     combo_award = await db.family_combo_awards.find_one({"parent_id": FAMILY_ID, "date_key": dk}, {"_id": 0})
     await _refresh_segments_cache()
+    _cfg_shared = await get_config_cached()
     await _sweep_overdue_punishments()
     # Sections as THIS child experiences them today: the start time is their
     # personal one where a parent set one, so the kid's timeline shows the hour
     # that actually applies to them rather than the household default.
     _segs_for_kid = await _get_day_segments()
-    _kid_doc_seg = await db.children.find_one({"id": child_id})
+    _kid_doc_seg = _child_doc  # loaded above; re-reading it cost a round trip
     effective_segments = []
     for _sg in _segs_for_kid:
         _eff = _effective_segment_start(_sg, _kid_doc_seg, dk)
@@ -2321,7 +2397,9 @@ async def child_day_progress(
     # than letting it re-derive the rules. The window logic (personal starts,
     # grace, snooze deadlines, section ends) lives in one place; duplicating it
     # in the UI is how a "Mulai" button ends up on a task the server refuses.
-    _cfg_avail = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    # One config read for the whole request. It was being fetched three or four
+    # times per page load, and every round trip is felt on a phone.
+    _cfg_avail = _cfg_shared
     _grace_avail = int(_cfg_avail.get("segment_late_grace_minutes", 10))
     _open_avail = [t for t in tasks if t.get("status") in ("pending", "rejected") and not t.get("is_bonus")]
     _firsts_avail = _segment_first_ids(_open_avail, _segs_for_kid, tasks)
@@ -2348,18 +2426,23 @@ async def child_day_progress(
             _projected[_t["id"]] = _fmt_min(_cursor)
             _cursor += int(_t.get("duration_minutes") or 0)
 
-    await _expire_stale_holds()
+    await _expire_stale_holds(_cfg_shared)
     _idle_over = await _idle_exceeded(child_id, dk, _cfg_avail)
     # Idling only concerns the mission the child should be doing RIGHT NOW.
     # Applying it to every remaining mission branded the whole evening as late —
     # including ones not due for hours — and there is nothing a child can even
     # do about those yet.
-    _turn = await get_next_actionable_task(child_id, dk)
+    # Only worth computing when something is actually still open; on a finished
+    # day this saved four queries per load.
+    _turn = (await get_next_actionable_task(child_id, dk)) if any(
+        t.get("status") in ("pending", "rejected") for t in tasks
+    ) else None
     _turn_id = _turn["id"] if _turn else None
     _exam_flex = await _active_exam_flex(child_id, dk)
     _tasks_with_availability = []
     for _t in tasks:
-        _relaxed = _is_flex_relaxed(_t, _exam_flex, tasks, _segs_for_kid)
+        _relaxed = (_is_flex_relaxed(_t, _exam_flex, tasks, _segs_for_kid)
+                    or _overtime_pushed_back(_t, tasks, _segs_for_kid))
         # A relaxed mission is simply available: the clock stops judging it for
         # the rest of a study night.
         _av = "open" if (_t.get("is_bonus") or _relaxed) else _task_availability(
@@ -2387,7 +2470,7 @@ async def child_day_progress(
         "status": {"$in": ["pending_choice", "assigned"]},
     }, {"_id": 0})
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = _cfg_shared
 
     required = [t for t in tasks if not t.get("is_bonus")]
     bonus = [t for t in tasks if t.get("is_bonus")]
@@ -2519,7 +2602,7 @@ async def feed_pet(child_id: str, user: dict = Depends(get_current_user)):
     if user["role"] == "child" and user["id"] != child_id:
         raise HTTPException(status_code=403, detail="Ini bukan hewan peliharaanmu")
     child = await get_child_or_404(FAMILY_ID, child_id)
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
 
     if not child.get("pet_type"):
         raise HTTPException(status_code=400, detail="Kamu belum punya peliharaan — pilih dulu ya!")
@@ -2570,7 +2653,7 @@ async def child_month_progress(
         "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
     }, {"_id": 0, "date_key": 1, "points": 1, "status": 1, "is_bonus": 1, "is_coop": 1, "coop_participants": 1, "child_id": 1}).to_list(5000)
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     weekday_goals = config.get("weekday_goals") or {}
     default_goal = int(config.get("daily_point_goal", 50))
 
@@ -2633,7 +2716,7 @@ async def family_day_progress(
 
 # --------------- Late-arrival exception (pengajuan keterlambatan) ---------------
 async def _get_day_segments() -> list:
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     return config.get("day_segments") or DEFAULT_DAY_SEGMENTS
 
 
@@ -2707,6 +2790,31 @@ def _elapsed_seconds(task: dict) -> Optional[float]:
         return max(0.0, (b - a).total_seconds())
     except Exception:
         return None
+
+
+def _overtime_bonus(task: dict, config: dict) -> int:
+    """Reward genuinely spending longer on work that deserves it.
+
+    Only for missions explicitly marked as allowed to overrun — otherwise this
+    would pay a child for dawdling over toothbrushing. One step of points per
+    configured interval of extra time, so an hour of study is worth more than
+    five minutes over.
+    """
+    if not task.get("overtime_allowed"):
+        return 0
+    per_step = int(task.get("overtime_bonus_points") or 0)
+    if per_step <= 0:
+        return 0
+    planned = task.get("duration_minutes")
+    secs = task.get("actual_seconds")
+    if not planned or secs is None:
+        return 0
+    extra_min = (secs / 60.0) - planned
+    interval = int(config.get("overtime_bonus_interval_minutes", 10)) or 10
+    steps = int(extra_min // interval)
+    if steps <= 0:
+        return 0
+    return min(per_step * steps, per_step * 12)  # a sane ceiling per mission
 
 
 def _pacing_bonus(task: dict, config: dict) -> int:
@@ -3086,6 +3194,31 @@ async def _active_exam_flex(child_id: str, date_key: str) -> Optional[dict]:
     }, {"_id": 0})
 
 
+def _overtime_pushed_back(task: dict, tasks_today: list, segments: list) -> bool:
+    """Was this mission delayed by earlier work that was allowed to run long?
+
+    If studying legitimately took an extra hour, everything queued behind it is
+    late through no fault of the child's. Charging them for that would make the
+    overtime permission worthless — they'd still be punished, just one mission
+    later.
+    """
+    ordered = sorted(tasks_today, key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
+    overran_at = None
+    for idx, t in enumerate(ordered):
+        if not t.get("overtime_allowed"):
+            continue
+        planned = t.get("duration_minutes")
+        secs = t.get("actual_seconds")
+        if planned and secs is not None and (secs / 60.0) > planned:
+            overran_at = idx if overran_at is None else min(overran_at, idx)
+    if overran_at is None:
+        return False
+    for idx, t in enumerate(ordered):
+        if t["id"] == task["id"]:
+            return idx > overran_at
+    return False
+
+
 def _is_flex_relaxed(task: dict, exam: Optional[dict], tasks_today: list, segments: list) -> bool:
     """Is this mission inside the relaxed stretch of a study day?
 
@@ -3182,7 +3315,7 @@ async def request_hold(task_id: str, payload: HoldRequestInput, user: dict = Dep
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
-async def _expire_stale_holds() -> int:
+async def _expire_stale_holds(config: Optional[dict] = None) -> int:
     """Let a hold request lapse if no parent answers in time.
 
     A request that sits unanswered forever would quietly freeze a mission's
@@ -3190,7 +3323,7 @@ async def _expire_stale_holds() -> int:
     puts the mission back on its normal timing — the child can still explain
     afterwards through the Terlambat flow if the interruption was real.
     """
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = config if config is not None else (await get_config_cached())
     limit = int(config.get("hold_auto_reject_minutes", 5))
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=limit)).isoformat()
     stale = await db.tasks.find({
@@ -3356,7 +3489,7 @@ async def reject_exam_period(exam_id: str, payload: ExamRejectInput = ExamReject
         raise HTTPException(status_code=404, detail="Hari Ujian tidak ditemukan")
     if doc.get("status") == "rejected":
         raise HTTPException(status_code=400, detail="Hari Ujian ini sudah ditolak")
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     penalty = payload.penalty_points if payload.penalty_points is not None else int(config.get("exam_false_claim_penalty", 100))
 
     await db.exam_periods.update_one({"id": exam_id}, {"$set": {
@@ -3562,6 +3695,10 @@ async def _apply_template_to_date(template_id: str, date_key: str, replace_exist
                 "photo_required": bool(slot.get("photo_required")),
                 "task_style": slot.get("task_style"),
                 "max_snooze_minutes": slot.get("max_snooze_minutes"),
+                "min_duration_minutes": slot.get("min_duration_minutes"),
+                "rush_message": slot.get("rush_message"),
+                "overtime_allowed": bool(slot.get("overtime_allowed")),
+                "overtime_bonus_points": slot.get("overtime_bonus_points"),
                 "together_bonus_enabled": bool(slot.get("together_bonus_enabled")),
                 "together_bonus_points": slot.get("together_bonus_points"),
                 "date_key": date_key, "due_time": None, "recurrence": "none",
@@ -4056,7 +4193,7 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
     agree with what they actually see. Tasks with no due_time sort last, since
     they can be done whenever. Bonus tasks (is_bonus=True) never block.
     """
-    cfg_seq = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    cfg_seq = await get_config_cached()
     bonus_in_line = bool(cfg_seq.get("bonus_follows_sequence", True))
     query = {
         "status": {"$in": ["pending", "rejected"]},
@@ -4072,12 +4209,14 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
     segments = await _get_day_segments()
     open_tasks.sort(key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
     child = await db.children.find_one({"id": child_id})
-    cfg = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    cfg = await get_config_cached()
     grace = int(cfg.get("segment_late_grace_minutes", 10))
-    all_today = await db.tasks.find({
+    all_today = (await db.tasks.find({
         "parent_id": FAMILY_ID, "date_key": date_key,
         "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
-    }).to_list(500) if date_key else open_tasks
+    }, {"_id": 0, "id": 1, "segment_id": 1, "due_time": 1, "order": 1, "status": 1,
+        "timer_started_at": 1, "overtime_allowed": 1, "duration_minutes": 1,
+        "actual_seconds": 1}).to_list(500)) if date_key else open_tasks
     firsts = _segment_first_ids(open_tasks, segments, all_today)
     actionable = [
         t for t in open_tasks
@@ -4244,7 +4383,7 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
 
     # Missions must be inside their section's window AND next in line. Bonus
     # missions follow the same queue unless the family explicitly frees them.
-    _cfg_gate = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    _cfg_gate = await get_config_cached()
     _gate_applies = (not task.get("is_bonus")) or bool(_cfg_gate.get("bonus_follows_sequence", True))
     if _gate_applies:
         # The TIME WINDOW is checked first on purpose: "belum waktunya" and
@@ -4253,21 +4392,22 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
         # technically true but useless for a task that simply isn't due yet.
         await _refresh_segments_cache()
         _segs_now = await _get_day_segments()
-        _cfg_now = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+        _cfg_now = await get_config_cached()
         _grace = int(_cfg_now.get("segment_late_grace_minutes", 10))
         _kid_doc = await db.children.find_one({"id": task["child_id"]})
         _open_now = await db.tasks.find({
             "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
             "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True},
             "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
-        }).to_list(500)
+        }, {"_id": 0, "id": 1, "segment_id": 1, "due_time": 1, "order": 1}).to_list(500)
         _all_now = await db.tasks.find({
             "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
             "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
         }).to_list(500)
         _is_first = task_id in _segment_first_ids(_open_now, _segs_now, _all_now)
         _exam_now = await _active_exam_flex(task["child_id"], task.get("date_key") or _today_key())
-        _relaxed_now = _is_flex_relaxed(task, _exam_now, _all_now, _segs_now)
+        _relaxed_now = (_is_flex_relaxed(task, _exam_now, _all_now, _segs_now)
+                        or _overtime_pushed_back(task, _all_now, _segs_now))
         # Idling is only held against the mission whose turn it actually is.
         _turn_now = await get_next_actionable_task(task["child_id"], task.get("date_key"))
         _is_turn = bool(_turn_now and _turn_now["id"] == task_id)
@@ -4301,7 +4441,7 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
                     detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
                 )
 
-    cfg_start = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    cfg_start = await get_config_cached()
     gap_seconds = None
     started_early = False
     prev_finish = await _last_finish_dt(task["child_id"], task.get("date_key") or _today_key(), task_id)
@@ -4362,6 +4502,33 @@ class TaskApproveInput(BaseModel):
     encouragement_voice_url: Optional[str] = None
 
 
+def _check_minimum_duration(task):
+    """Block Finish until the mission has actually been worked on long enough.
+
+    A duration is a budget; a minimum is a floor. Without one, "Belajar 30
+    menit" can be dismissed in ten seconds — which is the exact behaviour the
+    points are meant to discourage.
+    """
+    floor = task.get("min_duration_minutes")
+    started = task.get("timer_started_at")
+    if not floor or not started:
+        return
+    try:
+        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except Exception:
+        return
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    elapsed_min = (datetime.now(timezone.utc) - start_dt).total_seconds() / 60
+    if elapsed_min < floor:
+        left = max(1, int(floor - elapsed_min + 0.999))
+        raise HTTPException(
+            status_code=409,
+            detail=task.get("rush_message")
+            or f"Sabar ya, misi ini minimal {floor} menit — masih kurang sekitar {left} menit lagi.",
+        )
+
+
 def _check_duration_not_exceeded(task):
     """If the task has a duration and a running timer, block Finish once that
     duration has elapsed since Start — mirrors the frontend's disabled-button
@@ -4370,6 +4537,9 @@ def _check_duration_not_exceeded(task):
     # Already owned the delay (Terlambat) or granted a pause (hold)? Then the
     # elapsed time has been accounted for, and blocking Finish would leave the
     # child unable to start it again OR complete it — a dead end.
+    # Work that's allowed to run long has no ceiling to breach.
+    if task.get("overtime_allowed"):
+        return
     if task.get("late_ack") or task.get("hold_status") in ("approved", "used"):
         return
     started = task.get("timer_started_at")
@@ -4415,6 +4585,7 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
                 detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\" (atau lewati dengan poin)",
             )
 
+    _check_minimum_duration(task)
     _check_duration_not_exceeded(task)
 
     if task.get("photo_required") and not payload.photo_url:
@@ -4431,14 +4602,14 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
             "actual_seconds": _elapsed_seconds({**task, "completed_at": now_iso()}),
             "flash_flag": _is_flash_finish(
                 {**task, "completed_at": now_iso()},
-                int((await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}).get("flash_threshold_pct", 15)),
+                int((await get_config_cached()).get("flash_threshold_pct", 15)),
             ),
             "coop_completed_by": user["id"] if task.get("is_coop") else task.get("coop_completed_by"),
             "done_together": payload.done_together if task.get("together_bonus_enabled") else None,
         }},
     )
     await log_activity(FAMILY_ID, task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
-    config_for_notify = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config_for_notify = await get_config_cached()
     if config_for_notify.get("instant_task_notifications"):
         child = await db.children.find_one({"id": task["child_id"]})
         child_name = child["name"] if child else "Anak"
@@ -4543,6 +4714,40 @@ def _segment_window_end_cached(task: dict) -> Optional[int]:
     return _task_window_end(task, segments)
 
 
+_CONFIG_CACHE = {"doc": None, "at": 0.0}
+_CONFIG_TTL_SECONDS = 5.0
+
+
+async def _write_config(update: dict, upsert: bool = True):
+    """Single funnel for config writes so the cache can never go stale."""
+    res = await db.app_config.update_one({"parent_id": FAMILY_ID}, update, upsert=upsert)
+    _invalidate_config_cache()
+    return res
+
+
+async def get_config_cached() -> dict:
+    """The family config, cached for a few seconds.
+
+    It's read from a dozen different helpers on a single page load, and it
+    changes only when a parent edits settings. Re-fetching it eight times per
+    request was pure overhead. Any write clears the cache, so a saved setting
+    still takes effect immediately.
+    """
+    import time as _t
+    now = _t.monotonic()
+    if _CONFIG_CACHE["doc"] is not None and (now - _CONFIG_CACHE["at"]) < _CONFIG_TTL_SECONDS:
+        return _CONFIG_CACHE["doc"]
+    doc = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    _CONFIG_CACHE["doc"] = doc
+    _CONFIG_CACHE["at"] = now
+    return doc
+
+
+def _invalidate_config_cache():
+    _CONFIG_CACHE["doc"] = None
+    _CONFIG_CACHE["at"] = 0.0
+
+
 async def _refresh_segments_cache():
     _SEGMENTS_CACHE["segments"] = await _get_day_segments()
 
@@ -4565,7 +4770,7 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
         if nxt and nxt["id"] != task_id:
             raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dilewati")
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     cost = int(config.get("skip_cost_points", 20))
 
     child = await db.children.find_one({"id": task["child_id"]})
@@ -4578,7 +4783,7 @@ async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
     await db.tasks.update_one({"id": task_id}, {"$set": {"status": "skipped", "completed_at": now_iso()}})
     await log_activity(FAMILY_ID, child["id"], "task_skipped", {"task_id": task_id, "title": task["title"], "cost": cost})
     updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
-    _cfg_combo = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    _cfg_combo = await get_config_cached()
     await _check_family_combo(task.get("date_key"), _cfg_combo)
     return {"task": updated, "points_spent": cost}
 
@@ -4625,7 +4830,7 @@ async def snooze_task(task_id: str, payload: SnoozeInput, user: dict = Depends(g
     if task.get("timer_started_at"):
         raise HTTPException(status_code=400, detail="Misi ini sudah dimulai")
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     allowed = _snooze_options_for(task, config)
     if not allowed:
         raise HTTPException(status_code=400, detail="Misi ini tidak boleh ditunda")
@@ -4690,7 +4895,7 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     # the child is stuck: unable to start AND unable to explain why they're
     # late. Reusing the same availability call keeps the two in lockstep by
     # construction rather than by careful duplication.
-    _cfg_lr = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    _cfg_lr = await get_config_cached()
     _kid_lr = await db.children.find_one({"id": task.get("child_id")})
     _open_lr = await db.tasks.find({
         "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
@@ -4718,7 +4923,7 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     if not overdue:
         raise HTTPException(status_code=400, detail="Misi ini belum terlewat")
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     reasons = config.get("late_reasons") or DEFAULT_LATE_REASONS
     reason = next((r for r in reasons if r.get("id") == payload.reason_id), None)
     if not reason:
@@ -5059,7 +5264,7 @@ async def adjust_points(child_id: str, payload: PointsAdjustInput, user: dict = 
         inc["lifetime_points"] = payload.points
     await db.children.update_one({"id": child_id}, {"$inc": inc})
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     await _rebalance_child_buckets(child_id, config)
     after = (await db.children.find_one({"id": child_id}, {"_id": 0, "points": 1}))["points"]
 
@@ -5177,7 +5382,7 @@ async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] 
     Idempotent: never creates a duplicate for a day that already has one,
     never backfills the past, and skips declared off days.
     """
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     if config.get("vacation_mode"):
         return 0
 
@@ -5273,9 +5478,7 @@ async def _maybe_materialize_recurring():
                 return 0
         except Exception:
             pass
-    await db.app_config.update_one(
-        {"parent_id": FAMILY_ID},
-        {"$set": {"last_materialize_at": now.isoformat()}},
+    await _write_config({"$set": {"last_materialize_at": now.isoformat()}},
         upsert=True,
     )
     filled = await _fill_days_from_default_template()
@@ -5757,7 +5960,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
     if payload.encouragement_voice_url and len(payload.encouragement_voice_url) > 2_000_000:
         raise HTTPException(status_code=413, detail="Pesan suara terlalu besar (maks ~1.5MB)")
 
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
 
     if task.get("is_coop"):
         participants = task.get("coop_participants") or [task["child_id"]]
@@ -5811,7 +6014,9 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         together_bonus_awarded = task.get("together_bonus_points") or 0
     early_bonus_awarded = _early_completion_bonus(task, task["points"], config)
     pacing_bonus_awarded = _pacing_bonus(task, config)
-    points = task["points"] + together_bonus_awarded + early_bonus_awarded + pacing_bonus_awarded
+    overtime_bonus_awarded = _overtime_bonus(task, config)
+    points = (task["points"] + together_bonus_awarded + early_bonus_awarded
+              + pacing_bonus_awarded + overtime_bonus_awarded)
     if task.get("late_no_points"):
         # At-fault lateness: the kid chose to continue anyway, which is the
         # honest thing to do — but the reward is gone. No base points and no
@@ -5820,6 +6025,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         early_bonus_awarded = 0
         together_bonus_awarded = 0
         pacing_bonus_awarded = 0
+        overtime_bonus_awarded = 0
     snap = await _apply_approval_rewards(task["child_id"], points, config)
     spawned_next_id = await _spawn_recurrence_if_due(task, config)
 
@@ -5836,6 +6042,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                 "early_bonus_awarded": early_bonus_awarded,
                 "together_bonus_awarded": together_bonus_awarded,
                 "pacing_bonus_awarded": pacing_bonus_awarded,
+                "overtime_bonus_awarded": overtime_bonus_awarded,
                 "_undo_chiky_save": snap["chiky_save"],
                 "_undo_chiky_spend": snap["chiky_spend"],
                 "_undo_chiky_share": snap["chiky_share"],
@@ -6161,7 +6368,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
                 merged = {k: v for k, v in merged.items() if v is not None}
                 update_data[dict_field] = merged
         if update_data:
-            await db.app_config.update_one({"parent_id": FAMILY_ID}, {"$set": update_data})
+            await _write_config({"$set": update_data})
     else:
         # First-ever config write for this family: start from the same defaults
         # get_app_config uses, then apply whatever the payload actually sent.
@@ -6202,6 +6409,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "auto_approve_tasks": True,
             "max_idle_minutes": 20,
             "exam_false_claim_penalty": 100,
+            "overtime_bonus_interval_minutes": 10,
             "hold_auto_reject_minutes": 5,
             "custom_labels": {},
             "vacation_mode": False,
@@ -6248,12 +6456,29 @@ class MaintenanceToggleInput(BaseModel):
     message: str = Field(default="", max_length=300)
 
 
+@api.get("/warmup")
+async def warmup():
+    """Cheap endpoint for a scheduler to ping, so a container stays alive.
+
+    Vercel freezes idle containers; the next visitor then pays for DNS, TLS,
+    auth and imports before seeing anything. Touching the database here means
+    the connection is genuinely open, not merely the process resident — a ping
+    that skips the DB would leave the expensive half of the cold start intact.
+    """
+    ok = True
+    try:
+        await db.app_config.find_one({"parent_id": FAMILY_ID}, {"_id": 1})
+    except Exception:
+        ok = False
+    return {"ok": ok, "at": now_iso()}
+
+
 @api.get("/maintenance-status")
 async def maintenance_status():
     """Public, unauthenticated — lets the frontend show a friendly 'app is
     paused' screen even for someone who isn't logged in (or whose session just
     got locked out), without needing a valid token first."""
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     return {
         "enabled": bool(config.get("maintenance_mode")),
         "message": config.get("maintenance_message") or "Aplikasi sedang nonaktif sementara. Hubungi orang tua untuk info lebih lanjut.",
@@ -6275,7 +6500,7 @@ async def toggle_maintenance(payload: MaintenanceToggleInput, user: dict = Depen
         updates["maintenance_exempt_member_id"] = None
     existing = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if existing:
-        await db.app_config.update_one({"parent_id": FAMILY_ID}, {"$set": updates})
+        await _write_config({"$set": updates})
     else:
         await db.app_config.insert_one({"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **updates})
     await log_activity(FAMILY_ID, None, "maintenance_toggled", {"enabled": payload.enabled, "by": user.get("name")})
@@ -6319,6 +6544,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "auto_approve_tasks": True,
             "max_idle_minutes": 20,
             "exam_false_claim_penalty": 100,
+            "overtime_bonus_interval_minutes": 10,
             "hold_auto_reject_minutes": 5,
             "custom_labels": {},
             "vacation_mode": False,
@@ -6367,6 +6593,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "auto_approve_tasks": bool(config.get("auto_approve_tasks", True)),
         "max_idle_minutes": int(config.get("max_idle_minutes", 20)),
         "exam_false_claim_penalty": int(config.get("exam_false_claim_penalty", 100)),
+        "overtime_bonus_interval_minutes": int(config.get("overtime_bonus_interval_minutes", 10)),
         "hold_auto_reject_minutes": int(config.get("hold_auto_reject_minutes", 5)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
@@ -6740,7 +6967,7 @@ async def list_wishlist(child_id: Optional[str] = None, user: dict = Depends(get
     items = await db.wishlist_items.find(query, {"_id": 0}).to_list(200)
 
     # Enrich with reward + progress info so the frontend doesn't need a second round-trip.
-    config = await db.app_config.find_one({"parent_id": FAMILY_ID}) or {}
+    config = await get_config_cached()
     daily_goal = int(config.get("daily_point_goal", 50))
     save_pct = int(config.get("chiky_save_pct", 40))
     spend_pct = int(config.get("chiky_spend_pct", 40))
@@ -7547,6 +7774,10 @@ _init_done = False
 _init_lock = asyncio.Lock()
 
 
+# Bump when the index set changes, so existing deployments rebuild them once.
+_INDEX_VERSION = 2
+
+
 async def _run_one_time_init():
     global _init_done
     if _init_done:
@@ -7555,9 +7786,32 @@ async def _run_one_time_init():
         if _init_done:  # double-checked after acquiring the lock
             return
         try:
+            # Every cold container used to re-issue every create_index. They're
+            # idempotent, but each is a round trip. A marker turns that into a
+            # single cheap read once the schema is in place.
+            marker = await db.app_meta.find_one({"_id": "indexes"})
+            if marker and marker.get("version") == _INDEX_VERSION:
+                _init_done = True
+                return
+        except Exception as e:
+            logger.warning(f"index marker check failed: {e}")
+        try:
             await db.members.create_index("id", unique=True)
             await db.children.create_index("parent_id")
             await db.tasks.create_index([("parent_id", 1), ("child_id", 1)])
+            # Nearly every read filters by date, and the kid's timeline hits
+            # these on every load — without them Mongo scans the whole
+            # collection, which is what made the child's screen crawl as the
+            # task history grew.
+            await db.tasks.create_index([("parent_id", 1), ("date_key", 1)])
+            await db.tasks.create_index([("parent_id", 1), ("date_key", 1), ("child_id", 1)])
+            await db.tasks.create_index([("parent_id", 1), ("date_key", 1), ("status", 1)])
+            await db.tasks.create_index([("parent_id", 1), ("hold_status", 1)])
+            await db.template_tasks.create_index([("parent_id", 1), ("template_id", 1), ("weekday", 1)])
+            await db.template_assignments.create_index([("parent_id", 1), ("date_key", 1)])
+            await db.day_templates.create_index("parent_id")
+            await db.exam_periods.create_index([("parent_id", 1), ("child_id", 1)])
+            await db.off_days.create_index([("parent_id", 1), ("start_date", 1), ("end_date", 1)])
             await db.rewards.create_index("parent_id")
             await db.consequences.create_index("parent_id")
             await db.activity.create_index([("parent_id", 1), ("created_at", -1)])
@@ -7568,6 +7822,11 @@ async def _run_one_time_init():
             await db.pet_reset_requests.create_index([("parent_id", 1), ("status", 1)])
             await seed_default_family()
             await migrate_existing_data()
+            await db.app_meta.update_one(
+                {"_id": "indexes"},
+                {"$set": {"version": _INDEX_VERSION, "at": now_iso()}},
+                upsert=True,
+            )
         except Exception as e:  # noqa: BLE001 — never let init crash request handling
             logging.getLogger("uvicorn.error").warning("one-time init skipped: %s", e)
         finally:
@@ -7597,7 +7856,11 @@ async def ensure_initialized(request: Request, call_next):
     # fresh container; the _init_done flag makes every subsequent request a
     # no-op, so there's no per-request cost once warm.
     if not _init_done:
-        await _run_one_time_init()
+        # Fire and forget. Indexes only affect speed, never correctness, so
+        # making the first request of a cold container wait for ~20 round trips
+        # to Atlas just to serve a page is the wrong trade — that wait IS the
+        # cold start the child feels.
+        asyncio.create_task(_run_one_time_init())
     return await call_next(request)
 
 

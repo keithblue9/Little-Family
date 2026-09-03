@@ -7,6 +7,7 @@ import {
   LogOut, Flame, Lock, Sparkles, Banknote, User, FastForward, Map, Heart,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
+import { cacheGet, cacheSet, cacheClear } from "@/lib/localCache";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { useAuth } from "@/contexts/AuthContext";
@@ -48,6 +49,8 @@ export default function KidHome() {
   const [rewards, setRewards] = useState([]);
   const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
   const [consequences, setConsequences] = useState([]);
+  const [kidConfig, setKidConfig] = useState(null);
+  const [shopLoaded, setShopLoaded] = useState(false);
   const [levelTitles, setLevelTitles] = useState(null); // family's custom level ladder, from config
   const [petStageNames, setPetStageNames] = useState(null);
   const [petFeedThresholds, setPetFeedThresholds] = useState(null);
@@ -64,15 +67,54 @@ export default function KidHome() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  const load = useCallback(async () => {
+  // Fetched the first time a tab that needs them is opened, then kept.
+  const loadShopData = useCallback(async () => {
+    if (shopLoaded) return;
     try {
-      const [cRes, rRes, wRes, cfgRes, consRes] = await Promise.all([
-        api.get("/children"),
+      const [rRes, wRes, consRes] = await Promise.all([
         api.get("/rewards"),
         api.get("/wishlist"),
-        api.get("/config"),
         api.get("/consequences"),
       ]);
+      setRewards(rRes.data);
+      setWishlist(wRes.data);
+      setConsequences(consRes.data);
+      setShopLoaded(true);
+    } catch { /* non-fatal — the tab shows empty and can be retried */ }
+  }, [shopLoaded]);
+
+  useEffect(() => {
+    if (tab === "money" || tab === "rewards") loadShopData();
+  }, [tab, loadShopData]);
+
+  // Show last time's profile and settings straight away; the fetch below
+  // replaces them a moment later. Without this the header, points and pet all
+  // sit blank while a cold container wakes up.
+  useEffect(() => {
+    const seed = cacheGet(`kid:${childId}`);
+    if (seed?.child) {
+      setChild(seed.child);
+      if (seed.config) {
+        setKidConfig(seed.config);
+        setLevelTitles(seed.config.level_titles);
+        setPetStageNames(seed.config.pet_stage_names);
+        setPetFeedThresholds(seed.config.pet_stage_feed_thresholds);
+        setFeedCostPerMeal(seed.config.feed_cost_per_meal ?? 5);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [childId]);
+
+  const load = useCallback(async () => {
+    try {
+      // Only what the Misi tab actually needs. Rewards, wishlist and
+      // consequences belong to the Tukar/Toko tabs — fetching them up front
+      // made every screen open wait on three requests nobody was looking at.
+      const [cRes, cfgRes] = await Promise.all([
+        api.get("/children"),
+        api.get("/config"),
+      ]);
+      cacheSet(`kid:${childId}`, { child: cRes.data.find((x) => x.id === childId), config: cfgRes.data });
       const c = cRes.data.find((x) => x.id === childId);
       if (!c) {
         toast.error("Profil tidak ditemukan");
@@ -80,9 +122,7 @@ export default function KidHome() {
         return;
       }
       setChild(c);
-      setRewards(rRes.data);
-      setWishlist(wRes.data);
-      setConsequences(consRes.data);
+      setKidConfig(cfgRes.data);
       setLevelTitles(cfgRes.data.level_titles);
       setPetStageNames(cfgRes.data.pet_stage_names);
       setPetFeedThresholds(cfgRes.data.pet_stage_feed_thresholds);
@@ -125,6 +165,9 @@ export default function KidHome() {
     if (user?.role === "parent") {
       nav("/parent");
     } else {
+      // Clear the cache on the way out, or the next child to sign in on this
+      // iPad would briefly see the previous one's points and missions.
+      cacheClear();
       await logout();
       nav("/login");
     }
@@ -275,6 +318,7 @@ export default function KidHome() {
               )}
 
               <DailyQuestView
+                appConfig={kidConfig}
                 child={child}
                 themeKey={pickQuestTheme(child)}
                 onCelebrate={() => {

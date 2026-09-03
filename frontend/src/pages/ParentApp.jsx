@@ -1672,6 +1672,10 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
   const [weekdays, setWeekdays] = useState([new Date().getDay() === 0 ? 6 : new Date().getDay() - 1]); // default = today's weekday (Mon=0..Sun=6)
   const [segmentId, setSegmentId] = useState("");
   const [maxSnooze, setMaxSnooze] = useState("");
+  const [minDuration, setMinDuration] = useState("");
+  const [rushMessage, setRushMessage] = useState("");
+  const [overtimeAllowed, setOvertimeAllowed] = useState(false);
+  const [overtimeBonus, setOvertimeBonus] = useState("");
   const [segments, setSegments] = useState([]);
   const [duration, setDuration] = useState("");
   const [isBonus, setIsBonus] = useState(false);
@@ -1712,6 +1716,10 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       setWeekdays([]);
       setSegmentId(editTask.segment_id || "");
       setMaxSnooze(editTask.max_snooze_minutes ? String(editTask.max_snooze_minutes) : "");
+      setMinDuration(editTask.min_duration_minutes ? String(editTask.min_duration_minutes) : "");
+      setRushMessage(editTask.rush_message || "");
+      setOvertimeAllowed(!!editTask.overtime_allowed);
+      setOvertimeBonus(editTask.overtime_bonus_points ? String(editTask.overtime_bonus_points) : "");
       setDuration(editTask.duration_minutes ? String(editTask.duration_minutes) : "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
@@ -1750,7 +1758,8 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
       const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
       setWeekdays([todayWd]);
       setSegmentId("");
-      setMaxSnooze(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
+      setMaxSnooze("");
+      setMinDuration(""); setRushMessage(""); setOvertimeAllowed(false); setOvertimeBonus(""); setDuration(""); setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
       setTogetherBonusEnabled(false); setTogetherBonusPoints(10);
       setRecurrence("none"); setOrder(""); setTaskStyle("");
     }
@@ -1792,6 +1801,10 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
         weekdays: useWeekdays ? weekdays : null,
         segment_id: segmentId || null,
         max_snooze_minutes: maxSnooze ? parseInt(maxSnooze, 10) : null,
+        min_duration_minutes: minDuration ? parseInt(minDuration, 10) : null,
+        rush_message: rushMessage.trim() || null,
+        overtime_allowed: overtimeAllowed,
+        overtime_bonus_points: overtimeBonus ? parseInt(overtimeBonus, 10) : null,
         duration_minutes: duration ? Number(duration) : null,
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
@@ -2172,6 +2185,57 @@ function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask 
               placeholder="mis. 15"
             />
             <p className="text-xs text-slate-400 mt-1">Berapa lama tugas dikerjakan.</p>
+          </div>
+          <div>
+            <label className={labelClass}>⏳ Durasi minimal (menit, opsional)</label>
+            <input
+              type="text" inputMode="numeric" value={minDuration}
+              onChange={(e) => setMinDuration(e.target.value.replace(/\D/g, "").slice(0, 4))}
+              placeholder="mis. 20"
+              className={inputClass}
+            />
+            <p className="text-xs text-slate-400 mt-1">
+              Tombol Selesai baru bisa ditekan setelah waktu ini lewat. Berguna untuk misi seperti belajar,
+              supaya tidak dikerjakan asal-asalan.
+            </p>
+          </div>
+          <div className="sm:col-span-2">
+            <label className={labelClass}>💬 Pesan kalau kecepatan (opsional)</label>
+            <input
+              type="text" value={rushMessage}
+              onChange={(e) => setRushMessage(e.target.value.slice(0, 200))}
+              placeholder="Eit, belajarnya buru-buru ya? Yang bener belajarnya."
+              className={inputClass}
+            />
+            <p className="text-xs text-slate-400 mt-1">
+              Yang dibaca anak saat mencoba menyelesaikan sebelum durasi minimal. Dikosongkan = pakai kalimat bawaan.
+            </p>
+          </div>
+          <div className="sm:col-span-2 rounded-xl border-2 border-emerald-100 bg-emerald-50/50 p-3">
+            <label className="flex items-center gap-2 cursor-pointer select-none">
+              <input type="checkbox" checked={overtimeAllowed}
+                     onChange={(e) => setOvertimeAllowed(e.target.checked)}
+                     className="w-4 h-4 accent-emerald-600" />
+              <span className="text-sm font-semibold text-slate-700">⏱️ Boleh lewat dari durasi (misi seperti belajar)</span>
+            </label>
+            <p className="text-xs text-slate-400 mt-1">
+              Kalau dicentang, lewat dari durasi bukan pelanggaran — dan misi setelahnya tidak dianggap terlambat
+              karena tergeser olehnya.
+            </p>
+            {overtimeAllowed && (
+              <div className="mt-2">
+                <label className="block text-xs font-bold text-slate-600 mb-1">Bonus per kelebihan waktu (poin)</label>
+                <input
+                  type="text" inputMode="numeric" value={overtimeBonus}
+                  onChange={(e) => setOvertimeBonus(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                  placeholder="mis. 5"
+                  className="w-full px-3 py-2 rounded-xl border-2 border-emerald-200 text-sm bg-white"
+                />
+                <p className="text-xs text-slate-400 mt-1">
+                  Diberikan tiap kelipatan waktu lembur (aturannya diatur di Uang &amp; Poin). Kosong = tanpa bonus.
+                </p>
+              </div>
+            )}
           </div>
           <div>
             <label className={labelClass}>⏰ Batas tunda (menit, opsional)</label>

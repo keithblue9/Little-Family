@@ -58,6 +58,8 @@ db = client[os.environ["DB_NAME"]]
 # (Skipped for the mongomock client used in tests — it has no loop affinity
 # and recreating it would wipe the in-memory test database every request.)
 _client_loop_id = None
+# Set as soon as the background schema pass is queued, so it is never queued twice.
+_init_scheduled = False
 
 
 def _is_mongomock(obj) -> bool:
@@ -74,12 +76,18 @@ def _ensure_db_bound_to_current_loop():
         return
     loop_id = id(loop)
     if _client_loop_id != loop_id:
-        # Use the same tuned settings here, or a recreated client would quietly
-        # fall back to server-oriented defaults on exactly the cold paths this
-        # tuning is meant to help.
+        # Close the outgoing client first. Without this every rebind leaked its
+        # connections: Atlas kept them open until the cluster's connection limit
+        # was reached, at which point requests start failing intermittently —
+        # which is exactly what "sering error" looks like from the outside.
+        old_client = client
         client = _make_client(mongo_url)
         db = client[os.environ["DB_NAME"]]
         _client_loop_id = loop_id
+        try:
+            old_client.close()
+        except Exception:  # noqa: BLE001 — a failed close must never break a request
+            pass
 
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_MINUTES = 60 * 24 * 30  # 30 days, shared family device
@@ -7855,12 +7863,16 @@ async def ensure_initialized(request: Request, call_next):
     # scans). This runs the guarded one-time init on the first request to a
     # fresh container; the _init_done flag makes every subsequent request a
     # no-op, so there's no per-request cost once warm.
-    if not _init_done:
-        # Fire and forget. Indexes only affect speed, never correctness, so
-        # making the first request of a cold container wait for ~20 round trips
-        # to Atlas just to serve a page is the wrong trade — that wait IS the
-        # cold start the child feels.
-        asyncio.create_task(_run_one_time_init())
+    global _init_scheduled
+    if not _init_done and not _init_scheduled:
+        # Fire and forget, but only ONCE. Marking it scheduled up front matters:
+        # _init_done is only set when the task finishes, so without this every
+        # request arriving in the meantime spawned another index build — piling
+        # concurrent work onto the very cold start we were trying to avoid.
+        _init_scheduled = True
+        task = asyncio.create_task(_run_one_time_init())
+        # Retrieve any exception so it can't surface as an unhandled-task error.
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     return await call_next(request)
 
 

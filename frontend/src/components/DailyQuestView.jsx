@@ -219,7 +219,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
       toast.success("Hukuman dipilih. Selesaikan sebelum batas waktunya ya!");
       await load();
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
     } finally { setPunishmentBusy(false); }
   };
 
@@ -245,7 +245,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
       setLateTaskModal(null);
       await load();
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
     } finally { setBusyId(null); }
   };
 
@@ -255,7 +255,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
       await api.post(`/tasks/${task.id}/start`);
       await load();
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
     } finally { setBusyId(null); }
   };
 
@@ -330,7 +330,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
       );
       await load();
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
     } finally { setBusyId(null); }
   };
 
@@ -343,7 +343,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
       setHandoff(null);
       await load();
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
     }
   };
 
@@ -364,7 +364,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
       setHandoff(null);
       await load();
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
       setHandoff(null);
       await load();
     } finally {
@@ -379,20 +379,6 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
     const floor = task.min_duration_minutes;
     if (!floor || !task.timer_started_at) return false;
     return (nowMs - new Date(task.timer_started_at).getTime()) / 60000 < floor;
-  };
-
-  // Showing a cached screen means the buttons can be a moment behind the
-  // server. When an action is refused because of that, re-syncing and saying
-  // so plainly is far better than an error the child can't act on — they did
-  // nothing wrong, the screen was simply stale.
-  const handleActionError = async (e) => {
-    const status = e?.response?.status;
-    if (status === 409 || status === 429 || status === 400) {
-      await load();
-      toast(formatApiError(e), { duration: 4000 });
-      return;
-    }
-    toast.error(formatApiError(e));
   };
 
   const confirmIfFlash = (task) => {
@@ -443,7 +429,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
         setHandoff({ task: finishData.auto_next, secondsLeft: finishData.auto_next.wait_seconds ?? 0 });
       }
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
     } finally { setBusyId(null); }
   };
 
@@ -472,7 +458,7 @@ export default function DailyQuestView({ child, themeKey, onCelebrate, appConfig
       toast.success(`Dilewati! -${data.points_spent} poin`);
       await load();
     } catch (e) {
-      await handleActionError(e);
+      toast.error(formatApiError(e));
     } finally { setBusyId(null); }
   };
 

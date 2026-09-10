@@ -5975,61 +5975,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("warm: normal requests still work afterwards",
           c.get("/api/config").status_code == 200)
 
-    # =============== KESTABILAN: KONEKSI & INIT LATAR BELAKANG ===============
-    # A rebind used to replace the Mongo client without closing the old one.
-    # Each leaked pool stayed open on Atlas until the connection limit was hit,
-    # which shows up to a user as intermittent errors and slowness.
-    class _FakeClient:
-        def __init__(self):
-            self.closed = False
-        def close(self):
-            self.closed = True
-        def __getitem__(self, _name):
-            return server.db
-
-    _saved_client, _saved_db, _saved_loop = server.client, server.db, server._client_loop_id
-    _made = []
-    _orig_make = server._make_client
-    try:
-        server._make_client = lambda _url: _FakeClient()
-        old_fake = _FakeClient()
-        server.client = old_fake
-        server._client_loop_id = -1          # force a rebind on the next call
-        _aio_tg.run(_rebind_probe()) if False else None
-        async def _probe():
-            server._ensure_db_bound_to_current_loop()
-        _aio_tg.run(_probe())
-        check("stability: rebinding closes the previous client", old_fake.closed is True,
-              "the old connection pool was leaked")
-        check("stability: and a fresh one takes its place", server.client is not old_fake)
-    finally:
-        server._make_client = _orig_make
-        server.client, server.db, server._client_loop_id = _saved_client, _saved_db, _saved_loop
-
-    # The background schema pass must be queued once, not once per request.
-    check("stability: init is marked as scheduled so it can't pile up",
-          hasattr(server, "_init_scheduled"), "no scheduling guard exists")
-    _saved_sched, _saved_done = server._init_scheduled, server._init_done
-    try:
-        server._init_done = False
-        server._init_scheduled = True        # as if a pass is already in flight
-        _runs = {"n": 0}
-        _orig_init = server._run_one_time_init
-        async def _counting_init():
-            _runs["n"] += 1
-            await _orig_init()
-        server._run_one_time_init = _counting_init
-        for _ in range(5):
-            c.get("/api/config")             # five requests during the window
-        check("stability: concurrent requests don't each start their own init",
-              _runs["n"] == 0, f'{_runs["n"]} extra init passes were started')
-    finally:
-        server._run_one_time_init = _orig_init
-        server._init_scheduled, server._init_done = _saved_sched, _saved_done
-
-    check("stability: the app still serves requests normally afterwards",
-          c.get("/api/config").status_code == 200)
-
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

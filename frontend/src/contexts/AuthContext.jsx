@@ -1,21 +1,37 @@
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import api from "@/lib/api";
+import { cacheGet, cacheSet, cacheClear } from "@/lib/localCache";
 
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null); // null=loading, false=logged out, object=logged in
+  // Start from whoever was signed in last time, so the app can render straight
+  // away instead of holding a blank "Memuat…" while /auth/me travels to a
+  // possibly-sleeping server. The real check still runs below and corrects
+  // this within the same second; the token in localStorage is what actually
+  // authorises anything, so an out-of-date guess here can't grant access —
+  // every request is still validated server-side.
+  const [user, setUser] = useState(() => {
+    try {
+      if (!localStorage.getItem("cq_token")) return false; // no token = logged out
+    } catch {
+      return null;
+    }
+    return cacheGet("auth:me", 7 * 24 * 60 * 60 * 1000) ?? null;
+  });
   const [members, setMembers] = useState([]);
 
   const fetchMe = useCallback(async (attempt = 0) => {
     try {
       const { data } = await api.get("/auth/me");
       setUser(data);
+      cacheSet("auth:me", data);
     } catch (err) {
       const status = err?.response?.status;
       if (status === 401) {
         // Genuinely not authenticated — clear the stale token and send to login.
         setUser(false);
+        cacheClear();  // the guess above must not outlive the session it came from
         localStorage.removeItem("cq_token");
       } else if (status === 503) {
         // Maintenance mode locked this session out. This is a deliberate,
@@ -63,6 +79,9 @@ export function AuthProvider({ children }) {
   const login = async (memberId, passcode) => {
     const { data } = await api.post("/auth/login", { member_id: memberId, passcode });
     if (data.token) localStorage.setItem("cq_token", data.token);
+    // A new sign-in starts clean, then seeds its own identity.
+    cacheClear();
+    cacheSet("auth:me", data);
     setUser(data);
     return data;
   };
@@ -74,6 +93,9 @@ export function AuthProvider({ children }) {
       // ignore
     }
     localStorage.removeItem("cq_token");
+    // Wipe every cached screen, not just the token: the next person to sign in
+    // on this device must never glimpse the previous one's data.
+    cacheClear();
     setUser(false);
   };
 

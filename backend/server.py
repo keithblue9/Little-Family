@@ -58,6 +58,8 @@ db = client[os.environ["DB_NAME"]]
 # (Skipped for the mongomock client used in tests — it has no loop affinity
 # and recreating it would wipe the in-memory test database every request.)
 _client_loop_id = None
+# Set as soon as the background schema pass is queued, so it is never queued twice.
+_init_scheduled = False
 
 
 def _is_mongomock(obj) -> bool:
@@ -74,12 +76,18 @@ def _ensure_db_bound_to_current_loop():
         return
     loop_id = id(loop)
     if _client_loop_id != loop_id:
-        # Use the same tuned settings here, or a recreated client would quietly
-        # fall back to server-oriented defaults on exactly the cold paths this
-        # tuning is meant to help.
+        # Close the outgoing client first. Without this every rebind leaked its
+        # connections: Atlas kept them open until the cluster's connection limit
+        # was reached, at which point requests start failing intermittently —
+        # which is exactly what "sering error" looks like from the outside.
+        old_client = client
         client = _make_client(mongo_url)
         db = client[os.environ["DB_NAME"]]
         _client_loop_id = loop_id
+        try:
+            old_client.close()
+        except Exception:  # noqa: BLE001 — a failed close must never break a request
+            pass
 
 JWT_ALGORITHM = "HS256"
 JWT_ACCESS_MINUTES = 60 * 24 * 30  # 30 days, shared family device
@@ -363,7 +371,7 @@ class AppConfigInput(BaseModel):
     notify_parent_on_start: Optional[bool] = None
     # How long after a section's (personal) start time a child may still begin
     # the first mission without it counting as late.
-    segment_late_grace_minutes: Optional[int] = Field(default=None, ge=0, le=180)
+    segment_late_grace_minutes: Optional[int] = Field(default=None, ge=0, le=15)
     # Offer the next mission automatically after finishing one (same section
     # only), with a countdown. Set False to keep it quiet.
     auto_start_next: Optional[bool] = None
@@ -2123,8 +2131,9 @@ async def list_tasks(
     date_key: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    # Self-heal the schedule before reading it, so a repeating task always has
-    # its upcoming days on the calendar even if nobody approved the last one.
+    # The parent's task list waits for the sweep: they open it to review the
+    # schedule, so it must be complete and correct. The child's timeline is the
+    # one that can't afford to wait, and that path schedules it instead.
     await _maybe_materialize_recurring()
     query = {"parent_id": FAMILY_ID}
     if child_id:
@@ -2361,8 +2370,9 @@ async def child_day_progress(
     _child_doc = await get_child_or_404(FAMILY_ID, child_id)
     dk = validate_date_key(date_key) or _today_key()
     # Keep repeating series alive on the kid's side too — they're often the
-    # first to open the app on a new day.
-    await _maybe_materialize_recurring()
+    # first to open the app on a new day. Scheduled, never awaited: the child
+    # should not wait on schedule maintenance to see today's missions.
+    _schedule_materialize()
 
     tasks = await db.tasks.find(
         {"parent_id": FAMILY_ID, "date_key": dk,
@@ -2400,7 +2410,7 @@ async def child_day_progress(
     # One config read for the whole request. It was being fetched three or four
     # times per page load, and every round trip is felt on a phone.
     _cfg_avail = _cfg_shared
-    _grace_avail = int(_cfg_avail.get("segment_late_grace_minutes", 10))
+    _grace_avail = int(_cfg_avail.get("segment_late_grace_minutes", 15))
     _open_avail = [t for t in tasks if t.get("status") in ("pending", "rejected") and not t.get("is_bonus")]
     _firsts_avail = _segment_first_ids(_open_avail, _segs_for_kid, tasks)
     # Projected clock time for every mission: each section starts at its own
@@ -3678,6 +3688,7 @@ async def _apply_template_to_date(template_id: str, date_key: str, replace_exist
 
     kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)
     created = 0
+    pending_docs: list = []
     for slot in slots:
         targets = [slot["child_id"]] if slot.get("child_id") else [k["id"] for k in kids]
         for cid in targets:
@@ -3705,8 +3716,12 @@ async def _apply_template_to_date(template_id: str, date_key: str, replace_exist
                 "status": "pending", "created_at": now_iso(),
                 "from_template_id": template_id, "from_template_slot_id": slot["id"],
             }
-            await db.tasks.insert_one(doc)
+            pending_docs.append(doc)
             created += 1
+    if pending_docs:
+        # One write instead of one per mission per child. Building a fortnight
+        # used to mean hundreds of sequential inserts.
+        await db.tasks.insert_many(pending_docs)
     return {"created": created, "removed": removed, "slots": len(slots)}
 
 
@@ -3943,6 +3958,400 @@ async def export_weekly_xlsx(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+# ================= Segment checkpoints =================
+# The checkpoint is the SECTION, not the individual activity. A section has a
+# start and an end; inside it is a checklist. The child starts the section,
+# ticks activities in whatever order suits them, and finishes the section once
+# everything required is ticked. Lateness is judged only at the two ends — a
+# late start (past the grace window) or a late finish (past the end time) — and
+# the end time never moves to accommodate a late start.
+
+ANYTIME_SEGMENT_ID = "__anytime__"
+MAX_SEGMENT_GRACE_MINUTES = 15
+
+
+def _seg_grace(config: dict) -> int:
+    """Lateness tolerance, never above the 15-minute ceiling — a value saved
+    before the cap existed must not quietly widen it."""
+    try:
+        return max(0, min(int(config.get("segment_late_grace_minutes", MAX_SEGMENT_GRACE_MINUTES)),
+                          MAX_SEGMENT_GRACE_MINUTES))
+    except (TypeError, ValueError):
+        return MAX_SEGMENT_GRACE_MINUTES
+
+
+class SegmentActionInput(BaseModel):
+    child_id: str
+    date_key: str
+    segment_id: str
+    late_reason_id: Optional[str] = None
+
+
+class ActivityCheckInput(BaseModel):
+    checked: bool
+
+
+class SegmentCheckAllInput(BaseModel):
+    child_id: str
+    date_key: str
+    segment_id: str
+    checked: bool = True
+
+
+def _now_minutes() -> int:
+    n = _now_local()
+    return n.hour * 60 + n.minute
+
+
+def _segment_bounds(seg: Optional[dict], child: Optional[dict], dk: str):
+    """(start_min, end_min) for this child on this day; None for 'anytime'."""
+    if not seg:
+        return None, None
+    return _effective_segment_start(seg, child, dk), _hhmm_to_min(seg["end_time"])
+
+
+def _segment_timing(seg: Optional[dict], child: Optional[dict], dk: str, grace: int) -> dict:
+    """Where the clock stands for one section: can it start yet, would starting
+    now be late, would finishing now be late."""
+    today = _today_key()
+    if not seg:  # 'Kapan Saja' has no clock at all
+        return {"locked": dk > today, "late_start": False, "late_finish": False}
+    start_min, end_min = _segment_bounds(seg, child, dk)
+    if dk > today:
+        return {"locked": True, "late_start": False, "late_finish": False}
+    if dk < today:
+        return {"locked": False, "late_start": True, "late_finish": True}
+    now = _now_minutes()
+    return {
+        "locked": now < start_min,
+        "late_start": now > start_min + max(0, grace),
+        "late_finish": now > end_min,
+    }
+
+
+async def _segment_tasks(child_id: str, dk: str, seg_id: str) -> list:
+    query = {
+        "parent_id": FAMILY_ID, "date_key": dk, "status": {"$ne": "off"},
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    }
+    query["segment_id"] = None if seg_id == ANYTIME_SEGMENT_ID else seg_id
+    rows = await db.tasks.find(query, {"_id": 0}).to_list(500)
+    rows.sort(key=lambda t: (t.get("order") or 0, t.get("created_at") or ""))
+    return rows
+
+
+async def _get_session(child_id: str, dk: str, seg_id: str) -> Optional[dict]:
+    return await db.segment_sessions.find_one(
+        {"parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk, "segment_id": seg_id},
+        {"_id": 0},
+    )
+
+
+async def _apply_late_reason(child_id: str, reason: dict, config: dict) -> dict:
+    """Charge a lateness reason to the child: a penalty card when the reason is
+    at-fault, and a punishment once the threshold is reached."""
+    cards = None
+    if reason.get("gives_penalty_card"):
+        child = await db.children.find_one({"id": child_id})
+        cards = int((child or {}).get("penalty_cards", 0)) + 1
+        await db.children.update_one({"id": child_id}, {"$set": {"penalty_cards": cards}})
+        threshold = int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD))
+        if cards >= threshold:
+            await _issue_punishment({**(child or {}), "id": child_id}, config, cards)
+    return {"penalty_cards": cards}
+
+
+def _find_reason(config: dict, reason_id: Optional[str]) -> Optional[dict]:
+    if not reason_id:
+        return None
+    reasons = config.get("late_reasons") or DEFAULT_LATE_REASONS
+    return next((r for r in reasons if r.get("id") == reason_id), None)
+
+
+def _resolve_segment(segments: list, seg_id: str) -> Optional[dict]:
+    if seg_id == ANYTIME_SEGMENT_ID:
+        return None
+    seg = next((s for s in segments if s.get("id") == seg_id), None)
+    if not seg:
+        raise HTTPException(status_code=404, detail="Bagian waktu tidak ditemukan")
+    return seg
+
+
+def _assert_can_act(user: dict, child_id: str):
+    if user["role"] == "child" and user["id"] != child_id:
+        raise HTTPException(status_code=403, detail="Bukan bagianmu")
+
+
+@api.get("/children/{child_id}/segments-day")
+async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Everything the child's checklist screen needs, in one response."""
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    if user["role"] == "child" and user["id"] != child_id:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    dk = validate_date_key(date_key) if date_key else _today_key()
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    _schedule_materialize()
+    await _refresh_segments_cache()
+    config = await get_config_cached()
+    grace = _seg_grace(config)
+    segments = sorted(await _get_day_segments(), key=lambda x: _hhmm_to_min(x["start_time"]))
+
+    tasks = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": dk, "status": {"$ne": "off"},
+        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
+    }, {"_id": 0}).to_list(1000)
+    sessions = {
+        s["segment_id"]: s for s in await db.segment_sessions.find(
+            {"parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk}, {"_id": 0}
+        ).to_list(50)
+    }
+    known = {s["id"] for s in segments}
+    groups: dict = {}
+    for t in tasks:
+        sid = t.get("segment_id") if t.get("segment_id") in known else ANYTIME_SEGMENT_ID
+        groups.setdefault(sid, []).append(t)
+
+    out = []
+    ordered = [(s["id"], s) for s in segments] + [(ANYTIME_SEGMENT_ID, None)]
+    for sid, seg in ordered:
+        acts = sorted(groups.get(sid, []), key=lambda t: (t.get("order") or 0, t.get("created_at") or ""))
+        if not acts:
+            continue
+        sess = sessions.get(sid) or {}
+        timing = _segment_timing(seg, child, dk, grace)
+        if sess.get("completed_at"):
+            status = "done"
+        elif sess.get("started_at"):
+            status = "in_progress"
+        elif timing["locked"]:
+            status = "locked"
+        else:
+            status = "ready"
+        start_min, _ = _segment_bounds(seg, child, dk)
+        required = [a for a in acts if not a.get("is_bonus")]
+        out.append({
+            "id": sid,
+            "label": seg["label"] if seg else "Kapan Saja",
+            "emoji": (seg or {}).get("emoji", "✨" if not seg else ""),
+            "start_time": _fmt_min(start_min) if seg else None,
+            "end_time": seg["end_time"] if seg else None,
+            "status": status,
+            "late_start": timing["late_start"] and status in ("ready", "locked"),
+            "late_finish": timing["late_finish"] and status == "in_progress",
+            "started_at": sess.get("started_at"),
+            "completed_at": sess.get("completed_at"),
+            "start_late": bool(sess.get("start_late")),
+            "finish_late": bool(sess.get("finish_late")),
+            "late_reason_label": sess.get("late_reason_label"),
+            "no_points": bool(sess.get("no_points")),
+            "activities": [{
+                "id": a["id"], "title": a["title"], "description": a.get("description", ""),
+                "points": a.get("points", 0), "is_bonus": bool(a.get("is_bonus")),
+                "checked": bool(a.get("checked")) or a.get("status") in ("completed", "approved"),
+                "status": a.get("status"),
+            } for a in acts],
+            "required_count": len(required),
+            "checked_required": sum(1 for a in required if a.get("checked") or a.get("status") in ("completed", "approved")),
+            "points_total": sum(int(a.get("points") or 0) for a in acts if not a.get("is_bonus")),
+        })
+
+    return {
+        "date_key": dk,
+        "grace_minutes": grace,
+        "now": _fmt_min(_now_minutes()),
+        "segments": out,
+        "late_reasons": config.get("late_reasons") or DEFAULT_LATE_REASONS,
+    }
+
+
+@api.post("/segment-sessions/start")
+async def start_segment(payload: SegmentActionInput, user: dict = Depends(get_current_user)):
+    _assert_can_act(user, payload.child_id)
+    child = await get_child_or_404(FAMILY_ID, payload.child_id)
+    dk = validate_date_key(payload.date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    await _refresh_segments_cache()
+    config = await get_config_cached()
+    seg = _resolve_segment(await _get_day_segments(), payload.segment_id)
+
+    existing = await _get_session(payload.child_id, dk, payload.segment_id)
+    if existing and existing.get("completed_at"):
+        raise HTTPException(status_code=400, detail="Bagian ini sudah selesai")
+    if existing and existing.get("started_at"):
+        return existing  # already running — starting twice is harmless
+
+    if not await _segment_tasks(payload.child_id, dk, payload.segment_id):
+        raise HTTPException(status_code=400, detail="Tidak ada aktivitas di bagian ini")
+
+    timing = _segment_timing(seg, child, dk, _seg_grace(config))
+    if timing["locked"]:
+        start_min, _ = _segment_bounds(seg, child, dk)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Belum waktunya — bagian ini mulai jam {_fmt_min(start_min)}." if seg else "Belum waktunya.",
+        )
+
+    doc = {
+        "parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk,
+        "segment_id": payload.segment_id, "started_at": now_iso(),
+        "start_late": False, "no_points": False,
+    }
+    if timing["late_start"]:
+        reason = _find_reason(config, payload.late_reason_id)
+        if not reason:
+            raise HTTPException(status_code=409, detail="LATE_REASON_REQUIRED")
+        await _apply_late_reason(payload.child_id, reason, config)
+        doc.update({
+            "start_late": True, "late_reason_id": reason["id"],
+            "late_reason_label": reason.get("label"),
+            "late_penalized": bool(reason.get("gives_penalty_card")),
+            "no_points": not reason.get("award_points", True),
+        })
+        await log_activity(FAMILY_ID, payload.child_id, "segment_started_late", {
+            "segment": (seg or {}).get("label", "Kapan Saja"), "reason": reason.get("label"),
+        })
+    else:
+        await log_activity(FAMILY_ID, payload.child_id, "segment_started", {
+            "segment": (seg or {}).get("label", "Kapan Saja"),
+        })
+    await db.segment_sessions.update_one(
+        {"parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "segment_id": payload.segment_id},
+        {"$set": doc}, upsert=True,
+    )
+    return await _get_session(payload.child_id, dk, payload.segment_id)
+
+
+async def _require_running_session(child_id: str, dk: str, seg_id: str) -> dict:
+    sess = await _get_session(child_id, dk, seg_id)
+    if not sess or not sess.get("started_at"):
+        raise HTTPException(status_code=409, detail="Mulai dulu bagian ini ya")
+    if sess.get("completed_at"):
+        raise HTTPException(status_code=400, detail="Bagian ini sudah selesai")
+    return sess
+
+
+@api.post("/tasks/{task_id}/check")
+async def check_activity(task_id: str, payload: ActivityCheckInput, user: dict = Depends(get_current_user)):
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
+    owners = task.get("coop_participants") or [task.get("child_id")]
+    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
+    if user["role"] == "child" and user["id"] not in owners:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    seg_id = task.get("segment_id") or ANYTIME_SEGMENT_ID
+    await _refresh_segments_cache()
+    if seg_id != ANYTIME_SEGMENT_ID and not any(s["id"] == seg_id for s in await _get_day_segments()):
+        seg_id = ANYTIME_SEGMENT_ID
+    await _require_running_session(child_id, task["date_key"], seg_id)
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
+    }})
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+@api.post("/segment-sessions/check-all")
+async def check_all_activities(payload: SegmentCheckAllInput, user: dict = Depends(get_current_user)):
+    _assert_can_act(user, payload.child_id)
+    dk = validate_date_key(payload.date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    await _require_running_session(payload.child_id, dk, payload.segment_id)
+    ids = [t["id"] for t in await _segment_tasks(payload.child_id, dk, payload.segment_id)
+           if t.get("status") in ("pending", "rejected")]
+    if ids:
+        await db.tasks.update_many({"id": {"$in": ids}}, {"$set": {
+            "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
+        }})
+    return {"success": True, "updated": len(ids)}
+
+
+@api.post("/segment-sessions/finish")
+async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_current_user)):
+    _assert_can_act(user, payload.child_id)
+    child = await get_child_or_404(FAMILY_ID, payload.child_id)
+    dk = validate_date_key(payload.date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    await _refresh_segments_cache()
+    config = await get_config_cached()
+    seg = _resolve_segment(await _get_day_segments(), payload.segment_id)
+    sess = await _require_running_session(payload.child_id, dk, payload.segment_id)
+
+    acts = await _segment_tasks(payload.child_id, dk, payload.segment_id)
+    open_required = [a for a in acts if not a.get("is_bonus")
+                     and a.get("status") in ("pending", "rejected") and not a.get("checked")]
+    if open_required:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Masih ada {len(open_required)} aktivitas yang belum dicentang",
+        )
+
+    timing = _segment_timing(seg, child, dk, _seg_grace(config))
+    finish_update = {"completed_at": now_iso(), "finish_late": False}
+    no_points = bool(sess.get("no_points"))
+    if timing["late_finish"]:
+        finish_update["finish_late"] = True
+        # One lateness, one reason: a section already excused (or charged) at
+        # its start isn't charged a second time for the same delay at its end.
+        if not sess.get("start_late"):
+            reason = _find_reason(config, payload.late_reason_id)
+            if not reason:
+                raise HTTPException(status_code=409, detail="LATE_REASON_REQUIRED")
+            await _apply_late_reason(payload.child_id, reason, config)
+            no_points = not reason.get("award_points", True)
+            finish_update.update({
+                "late_reason_id": reason["id"], "late_reason_label": reason.get("label"),
+                "late_penalized": bool(reason.get("gives_penalty_card")), "no_points": no_points,
+            })
+
+    # Turn ticked activities into finished missions and award them.
+    to_award = [a for a in acts if a.get("status") in ("pending", "rejected") and a.get("checked")]
+    auto = bool(config.get("auto_approve_tasks", True))
+    awarded = 0
+    for a in to_award:
+        await db.tasks.update_one({"id": a["id"]}, {"$set": {
+            "status": "completed", "completed_at": now_iso(),
+            "late_no_points": no_points, "late_ack": bool(finish_update.get("finish_late") or sess.get("start_late")),
+            "via_segment": payload.segment_id,
+        }})
+        if auto and not a.get("photo_required"):
+            try:
+                await approve_task(a["id"], TaskApproveInput(), {"id": "system", "role": "parent", "name": "Otomatis"})
+                awarded += 1
+            except HTTPException:
+                pass  # left for a parent to approve by hand
+
+    await db.segment_sessions.update_one(
+        {"parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "segment_id": payload.segment_id},
+        {"$set": finish_update},
+    )
+    await log_activity(FAMILY_ID, payload.child_id, "segment_finished", {
+        "segment": (seg or {}).get("label", "Kapan Saja"), "activities": len(to_award),
+        "late": finish_update["finish_late"], "no_points": no_points,
+    })
+    return {"success": True, "completed": len(to_award), "awarded": awarded,
+            "finish_late": finish_update["finish_late"], "no_points": no_points}
+
+
+@api.post("/segment-sessions/reopen")
+async def reopen_segment(payload: SegmentActionInput, user: dict = Depends(require_parent)):
+    """Parent escape hatch: reopen a finished section so it can be corrected.
+    Points already granted are left to the per-mission undo controls."""
+    dk = validate_date_key(payload.date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    res = await db.segment_sessions.update_one(
+        {"parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "segment_id": payload.segment_id},
+        {"$set": {"completed_at": None}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Sesi tidak ditemukan")
+    return {"success": True}
 
 
 @api.post("/off-days")
@@ -4210,7 +4619,7 @@ async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None
     open_tasks.sort(key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
     child = await db.children.find_one({"id": child_id})
     cfg = await get_config_cached()
-    grace = int(cfg.get("segment_late_grace_minutes", 10))
+    grace = int(cfg.get("segment_late_grace_minutes", 15))
     all_today = (await db.tasks.find({
         "parent_id": FAMILY_ID, "date_key": date_key,
         "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
@@ -4393,7 +4802,7 @@ async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInpu
         await _refresh_segments_cache()
         _segs_now = await _get_day_segments()
         _cfg_now = await get_config_cached()
-        _grace = int(_cfg_now.get("segment_late_grace_minutes", 10))
+        _grace = int(_cfg_now.get("segment_late_grace_minutes", 15))
         _kid_doc = await db.children.find_one({"id": task["child_id"]})
         _open_now = await db.tasks.find({
             "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
@@ -4908,7 +5317,7 @@ async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user
     }).to_list(500)
     _first_lr = task_id in _segment_first_ids(_open_lr, segments, _all_lr)
     overdue = _task_availability(
-        task, segments, _kid_lr, _first_lr, int(_cfg_lr.get("segment_late_grace_minutes", 10))
+        task, segments, _kid_lr, _first_lr, int(_cfg_lr.get("segment_late_grace_minutes", 15))
     ) == "closed"
     # Running past the allotted duration counts as late too. The availability
     # check only looks at section windows, so on its own it would call an
@@ -5442,15 +5851,39 @@ async def _fill_days_from_default_template(days_ahead: int = 14) -> int:
         return 0
     today = _today_key()
     created = 0
-    for offset in range(days_ahead + 1):
-        dk = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=offset)).strftime("%Y-%m-%d")
-        if await db.template_assignments.find_one({"parent_id": FAMILY_ID, "date_key": dk}):
-            continue  # a deliberate choice already covers this date
-        if await _is_off_day(dk):
-            continue
-        # Never overwrite a day that already has missions — it may predate
-        # templates entirely, or have been built by hand.
-        if await db.tasks.find_one({"parent_id": FAMILY_ID, "date_key": dk}):
+    window = [(datetime.strptime(today, "%Y-%m-%d") + timedelta(days=o)).strftime("%Y-%m-%d")
+              for o in range(days_ahead + 1)]
+
+    # Ask about the whole window at once. Probing day by day meant ~45 round
+    # trips before a single mission was written — on a remote database that is
+    # seconds of waiting, and it was happening inside the child's page load.
+    assigned = {
+        d["date_key"] for d in await db.template_assignments.find(
+            {"parent_id": FAMILY_ID, "date_key": {"$in": window}}, {"_id": 0, "date_key": 1}
+        ).to_list(200)
+    }
+    have_tasks = {
+        t["date_key"] for t in await db.tasks.find(
+            {"parent_id": FAMILY_ID, "date_key": {"$in": window}}, {"_id": 0, "date_key": 1}
+        ).to_list(20000)
+    }
+    off_rows = await db.off_days.find(
+        {"parent_id": FAMILY_ID, "end_date": {"$gte": window[0]}, "start_date": {"$lte": window[-1]}},
+        {"_id": 0},
+    ).to_list(200)
+
+    def _fully_off(dk: str) -> bool:
+        for off in off_rows:
+            if not (off["start_date"] <= dk <= off["end_date"]):
+                continue
+            starts_mid = off.get("start_segment_id") and off["start_date"] == dk
+            ends_mid = off.get("end_segment_id") and off["end_date"] == dk
+            if not starts_mid and not ends_mid:
+                return True
+        return False
+
+    for dk in window:
+        if dk in assigned or dk in have_tasks or _fully_off(dk):
             continue
         res = await _apply_template_to_date(default_tpl["id"], dk, replace_existing=False)
         if res["created"]:
@@ -5465,10 +5898,25 @@ async def _fill_days_from_default_template(days_ahead: int = 14) -> int:
     return created
 
 
+def _schedule_materialize():
+    """Kick the schedule sweep off WITHOUT making the caller wait for it.
+
+    Even throttled to once every ten minutes, the unlucky request that triggered
+    the sweep had to sit through building a fortnight of missions before it
+    could answer — so roughly every ten minutes one child would hit a page that
+    took seconds to load, for no reason they could see. Nothing on screen
+    depends on the sweep having finished, so it belongs off the request path.
+    """
+    try:
+        task = asyncio.create_task(_maybe_materialize_recurring())
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    except RuntimeError:
+        pass  # no running loop (e.g. during import) — the cron path still covers it
+
+
 async def _maybe_materialize_recurring():
-    """Cheap throttled wrapper for read paths: at most one sweep every 10
-    minutes family-wide, so the schedule self-heals in the background without
-    every page load paying for a full pass."""
+    """Cheap throttled wrapper: at most one sweep every 10 minutes family-wide,
+    so the schedule self-heals in the background."""
     now = datetime.now(timezone.utc)
     marker = await db.app_config.find_one({"parent_id": FAMILY_ID}, {"_id": 0, "last_materialize_at": 1})
     last = (marker or {}).get("last_materialize_at")
@@ -6401,7 +6849,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "flash_threshold_pct": 15,
             "pacing_bonus_points": 2,
             "notify_parent_on_start": True,
-            "segment_late_grace_minutes": 10,
+            "segment_late_grace_minutes": 15,
             "auto_start_next": True,
             "snooze_options_minutes": [5, 10, 15, 20],
             "duration_warning_minutes": [3, 2, 1],
@@ -6536,7 +6984,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
             "flash_threshold_pct": 15,
             "pacing_bonus_points": 2,
             "notify_parent_on_start": True,
-            "segment_late_grace_minutes": 10,
+            "segment_late_grace_minutes": 15,
             "auto_start_next": True,
             "snooze_options_minutes": [5, 10, 15, 20],
             "duration_warning_minutes": [3, 2, 1],
@@ -6584,7 +7032,7 @@ async def get_app_config(user: dict = Depends(get_current_user)):
         "flash_threshold_pct": int(config.get("flash_threshold_pct", 15)),
         "pacing_bonus_points": int(config.get("pacing_bonus_points", 2)),
         "notify_parent_on_start": bool(config.get("notify_parent_on_start", True)),
-        "segment_late_grace_minutes": int(config.get("segment_late_grace_minutes", 10)),
+        "segment_late_grace_minutes": int(config.get("segment_late_grace_minutes", 15)),
         "auto_start_next": bool(config.get("auto_start_next", True)),
         "snooze_options_minutes": config.get("snooze_options_minutes") or [5, 10, 15, 20],
         "duration_warning_minutes": config.get("duration_warning_minutes")
@@ -7775,7 +8223,7 @@ _init_lock = asyncio.Lock()
 
 
 # Bump when the index set changes, so existing deployments rebuild them once.
-_INDEX_VERSION = 2
+_INDEX_VERSION = 3
 
 
 async def _run_one_time_init():
@@ -7810,6 +8258,8 @@ async def _run_one_time_init():
             await db.template_tasks.create_index([("parent_id", 1), ("template_id", 1), ("weekday", 1)])
             await db.template_assignments.create_index([("parent_id", 1), ("date_key", 1)])
             await db.day_templates.create_index("parent_id")
+            await db.segment_sessions.create_index(
+                [("parent_id", 1), ("child_id", 1), ("date_key", 1), ("segment_id", 1)])
             await db.exam_periods.create_index([("parent_id", 1), ("child_id", 1)])
             await db.off_days.create_index([("parent_id", 1), ("start_date", 1), ("end_date", 1)])
             await db.rewards.create_index("parent_id")
@@ -7855,12 +8305,16 @@ async def ensure_initialized(request: Request, call_next):
     # scans). This runs the guarded one-time init on the first request to a
     # fresh container; the _init_done flag makes every subsequent request a
     # no-op, so there's no per-request cost once warm.
-    if not _init_done:
-        # Fire and forget. Indexes only affect speed, never correctness, so
-        # making the first request of a cold container wait for ~20 round trips
-        # to Atlas just to serve a page is the wrong trade — that wait IS the
-        # cold start the child feels.
-        asyncio.create_task(_run_one_time_init())
+    global _init_scheduled
+    if not _init_done and not _init_scheduled:
+        # Fire and forget, but only ONCE. Marking it scheduled up front matters:
+        # _init_done is only set when the task finishes, so without this every
+        # request arriving in the meantime spawned another index build — piling
+        # concurrent work onto the very cold start we were trying to avoid.
+        _init_scheduled = True
+        task = asyncio.create_task(_run_one_time_init())
+        # Retrieve any exception so it can't surface as an unhandled-task error.
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     return await call_next(request)
 
 

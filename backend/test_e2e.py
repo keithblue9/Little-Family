@@ -3563,10 +3563,11 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
           r.status_code == 409 and "Terlambat" in r.text, r.text[:180])
     # Widening the grace makes it acceptable again — config really is in charge
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"segment_late_grace_minutes": 120})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_late['id']}/start")
-    check("segstart: a wider grace accepts the same start", r.status_code == 200, r.text[:150])
+    # Tolerance is capped at 15 minutes, so anything wider is refused outright.
+    r = c.post("/api/config", json={"segment_late_grace_minutes": 120})
+    check("segstart: tolerance above 15 minutes is rejected", r.status_code == 422, str(r.status_code))
+    r = c.post("/api/config", json={"segment_late_grace_minutes": 15})
+    check("segstart: 15 minutes is the accepted maximum", r.status_code == 200, r.text[:150])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"segment_late_grace_minutes": 10})
 
@@ -5912,8 +5913,34 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         for _m, _o in _perf_orig.items():
             setattr(_perf_cls, _m, _o)
 
-    check("perf: one screen load stays under 25 DB queries", _total < 25, f"{_total} queries: {_perf_counts}")
+    check("perf: one screen load stays under 20 DB queries", _total < 20, f"{_total} queries: {_perf_counts}")
     check("perf: config is not re-read many times per request", _cfg_reads <= 2, f"{_cfg_reads} config reads")
+    # The worst case used to be the request that happened to trigger the
+    # schedule sweep: it built a fortnight of missions before answering, so
+    # roughly every ten minutes one child waited seconds for no visible reason.
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.app_config.update_one(
+        {"parent_id": "family-default"}, {"$unset": {"last_materialize_at": ""}}, upsert=True))
+    server._invalidate_config_cache()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    _perf_counts.clear()
+    for _m2, _o2 in _perf_orig.items():
+        def _mk2(_o=_o2, _m=_m2):
+            def _f(self, *a, **k):
+                key = f"{self.name}.{_m}"
+                _perf_counts[key] = _perf_counts.get(key, 0) + 1
+                return _o(self, *a, **k)
+            return _f
+        setattr(_perf_cls, _m2, _mk2())
+    try:
+        c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
+        _worst = sum(_perf_counts.values())
+    finally:
+        for _m2, _o2 in _perf_orig.items():
+            setattr(_perf_cls, _m2, _o2)
+    check("perf: even a sweep-due load stays fast for the child", _worst < 20,
+          f"{_worst} queries: {_perf_counts}")
+
     check("perf: tasks are not fetched in a loop",
           _perf_counts.get("tasks.find", 0) <= 8, str(_perf_counts.get("tasks.find")))
 
@@ -5974,6 +6001,237 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("warm: init survives a missing marker", server._init_done is True)
     check("warm: normal requests still work afterwards",
           c.get("/api/config").status_code == 200)
+
+    # =============== KESTABILAN: KONEKSI & INIT LATAR BELAKANG ===============
+    # A rebind used to replace the Mongo client without closing the old one.
+    # Each leaked pool stayed open on Atlas until the connection limit was hit,
+    # which shows up to a user as intermittent errors and slowness.
+    class _FakeClient:
+        def __init__(self):
+            self.closed = False
+        def close(self):
+            self.closed = True
+        def __getitem__(self, _name):
+            return server.db
+
+    _saved_client, _saved_db, _saved_loop = server.client, server.db, server._client_loop_id
+    _made = []
+    _orig_make = server._make_client
+    try:
+        server._make_client = lambda _url: _FakeClient()
+        old_fake = _FakeClient()
+        server.client = old_fake
+        server._client_loop_id = -1          # force a rebind on the next call
+        _aio_tg.run(_rebind_probe()) if False else None
+        async def _probe():
+            server._ensure_db_bound_to_current_loop()
+        _aio_tg.run(_probe())
+        check("stability: rebinding closes the previous client", old_fake.closed is True,
+              "the old connection pool was leaked")
+        check("stability: and a fresh one takes its place", server.client is not old_fake)
+    finally:
+        server._make_client = _orig_make
+        server.client, server.db, server._client_loop_id = _saved_client, _saved_db, _saved_loop
+
+    # The background schema pass must be queued once, not once per request.
+    check("stability: init is marked as scheduled so it can't pile up",
+          hasattr(server, "_init_scheduled"), "no scheduling guard exists")
+    _saved_sched, _saved_done = server._init_scheduled, server._init_done
+    try:
+        server._init_done = False
+        server._init_scheduled = True        # as if a pass is already in flight
+        _runs = {"n": 0}
+        _orig_init = server._run_one_time_init
+        async def _counting_init():
+            _runs["n"] += 1
+            await _orig_init()
+        server._run_one_time_init = _counting_init
+        for _ in range(5):
+            c.get("/api/config")             # five requests during the window
+        check("stability: concurrent requests don't each start their own init",
+              _runs["n"] == 0, f'{_runs["n"]} extra init passes were started')
+    finally:
+        server._run_one_time_init = _orig_init
+        server._init_scheduled, server._init_done = _saved_sched, _saved_done
+
+    check("stability: the app still serves requests normally afterwards",
+          c.get("/api/config").status_code == 200)
+
+    # =============== CHECKPOINT PER SEGMEN ===============
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    for _col in ("tasks", "segment_sessions"):
+        _aio_tg.run(getattr(server.db, _col).delete_many({}))
+    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
+    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
+        "points": 0, "penalty_cards": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
+    # Pin the clock at midday so this block behaves identically whenever the
+    # suite runs — near midnight the "past/now/later" sections would collide.
+    _real_now_local = server._now_local
+    _fixed_noon = _real_now_local().replace(hour=12, minute=0, second=0, microsecond=0)
+    server._now_local = lambda: _fixed_noon
+    _nm = 12 * 60
+    _hm = lambda m: f"{max(0, min(m, 1439)) // 60:02d}:{max(0, min(m, 1439)) % 60:02d}"
+    c.post("/api/config", json={
+        "day_segments": [
+            {"label": "Lalu", "start_time": "00:00", "end_time": _hm(_nm - 30)},
+            {"label": "Sekarang", "start_time": _hm(max(2, _nm - 5)), "end_time": _hm(min(_nm + 120, 1438))},
+            {"label": "Nanti", "start_time": _hm(min(_nm + 121, 1438)), "end_time": "23:59"}],
+        "segment_late_grace_minutes": 15, "auto_approve_tasks": True,
+        "early_bonus_pct": 0, "pacing_bonus_points": 0,
+        "late_reasons": [
+            {"label": "Macet", "gives_penalty_card": False, "award_points": True},
+            {"label": "Main game", "gives_penalty_card": True, "award_points": False}]})
+    __import__("asyncio").run(server._refresh_segments_cache())
+    SG2 = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+    _lr = c.get("/api/config").json()["late_reasons"]
+    OKR, BADR = _lr[0]["id"], _lr[1]["id"]
+    check("seg: default tolerance is 15 minutes",
+          server.DEFAULT_LATE_REASONS is not None and
+          int(c.get("/api/config").json().get("segment_late_grace_minutes")) == 15)
+
+    def mkact(title, seg, order, **kw):
+        return c.post("/api/tasks", json={"title": title, "points": 10, "date_key": today_local,
+                                          "target_children": [adskhan["id"]], "segment_id": SG2[seg],
+                                          "order": order, **kw}).json()
+    a1, a2, a3 = mkact("Mandi", "Sekarang", 1), mkact("Makan", "Sekarang", 2), mkact("Belajar", "Sekarang", 3)
+    ab = mkact("Bonus baca", "Sekarang", 4, is_bonus=True)
+    mkact("Nanti saja", "Nanti", 1)
+    late1 = mkact("Telat", "Lalu", 1)
+
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    day = c.get(f"/api/children/{adskhan['id']}/segments-day?date_key={today_local}").json()
+    byseg = {s["label"]: s for s in day["segments"]}
+    check("seg: sections are returned with their activities", byseg["Sekarang"]["required_count"] == 3,
+          str(byseg.get("Sekarang", {}).get("required_count")))
+    check("seg: an open section is ready", byseg["Sekarang"]["status"] == "ready", byseg["Sekarang"]["status"])
+    check("seg: a future section is locked", byseg["Nanti"]["status"] == "locked", byseg["Nanti"]["status"])
+    check("seg: a section past its end shows as late to start", byseg["Lalu"]["late_start"] is True)
+    check("seg: start and end times are exposed", byseg["Sekarang"]["start_time"] and byseg["Sekarang"]["end_time"])
+
+    body = lambda seg, **kw: {"child_id": adskhan["id"], "date_key": today_local, "segment_id": SG2[seg], **kw}
+    # Can't tick before starting
+    r = c.post(f"/api/tasks/{a1['id']}/check", json={"checked": True})
+    check("seg: ticking before starting is refused", r.status_code == 409, str(r.status_code))
+    # Locked section can't start
+    r = c.post("/api/segment-sessions/start", json=body("Nanti"))
+    check("seg: a locked section refuses to start", r.status_code == 409 and "Belum waktunya" in r.text, r.text[:140])
+
+    r = c.post("/api/segment-sessions/start", json=body("Sekarang"))
+    check("seg: starting on time needs no reason", r.status_code == 200 and r.json()["start_late"] is False, r.text[:160])
+    r = c.post("/api/segment-sessions/start", json=body("Sekarang"))
+    check("seg: starting twice is harmless", r.status_code == 200)
+
+    r = c.post("/api/segment-sessions/finish", json=body("Sekarang"))
+    check("seg: finishing with unticked activities is refused",
+          r.status_code == 409 and "belum dicentang" in r.text, r.text[:160])
+
+    c.post(f"/api/tasks/{a1['id']}/check", json={"checked": True})
+    r = c.post(f"/api/tasks/{a1['id']}/check", json={"checked": False})
+    check("seg: an activity can be unticked again", r.status_code == 200 and r.json()["checked"] is False)
+    r = c.post("/api/segment-sessions/check-all", json=body("Sekarang", checked=True))
+    check("seg: tick-all ticks everything", r.status_code == 200 and r.json()["updated"] == 4, r.text[:160])
+
+    r = c.post("/api/segment-sessions/finish", json=body("Sekarang"))
+    check("seg: finishing once all are ticked succeeds", r.status_code == 200, r.text[:200])
+    check("seg: every ticked activity is completed", r.json()["completed"] == 4, str(r.json()))
+    kid = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("seg: points are awarded (incl. the ticked bonus)", kid["points"] == 40, str(kid["points"]))
+    check("seg: the wallet still balances",
+          kid["chiky_save"] + kid["chiky_spend"] + kid["chiky_share"] == kid["points"])
+    day = c.get(f"/api/children/{adskhan['id']}/segments-day?date_key={today_local}").json()
+    check("seg: the section now reads as done",
+          {s["label"]: s for s in day["segments"]}["Sekarang"]["status"] == "done")
+    r = c.post(f"/api/tasks/{a1['id']}/check", json={"checked": False})
+    check("seg: a finished section can't be edited", r.status_code == 400, str(r.status_code))
+    r = c.post("/api/segment-sessions/finish", json=body("Sekarang"))
+    check("seg: it can't be finished twice", r.status_code in (400, 409), str(r.status_code))
+
+    # --- late start: needs a reason; at-fault costs a card and the points ---
+    r = c.post("/api/segment-sessions/start", json=body("Lalu"))
+    check("seg: a late start demands a reason", r.status_code == 409 and "LATE_REASON_REQUIRED" in r.text, r.text[:140])
+    r = c.post("/api/segment-sessions/start", json=body("Lalu", late_reason_id=BADR))
+    check("seg: an at-fault reason is accepted", r.status_code == 200 and r.json()["start_late"] is True, r.text[:160])
+    check("seg: and marks the section as pointless", r.json()["no_points"] is True)
+    c.post(f"/api/tasks/{late1['id']}/check", json={"checked": True})
+    pts_before = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"]
+    r = c.post("/api/segment-sessions/finish", json=body("Lalu"))
+    check("seg: one lateness is charged once (no second reason at the end)", r.status_code == 200, r.text[:180])
+    kid2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
+    check("seg: an at-fault late section earns no points", kid2["points"] == pts_before, f'{pts_before}→{kid2["points"]}')
+    check("seg: and costs a penalty card", kid2["penalty_cards"] == 1, str(kid2["penalty_cards"]))
+
+    # --- excused late start keeps the points ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
+    _aio_tg.run(server.db.tasks.delete_many({}))
+    late2 = mkact("Telat dimaklumi", "Lalu", 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post("/api/segment-sessions/start", json=body("Lalu", late_reason_id=OKR))
+    c.post(f"/api/tasks/{late2['id']}/check", json={"checked": True})
+    p0 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"]
+    c.post("/api/segment-sessions/finish", json=body("Lalu"))
+    p1 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"]
+    check("seg: an excused late section keeps its points", p1 - p0 == 10, f"{p0}→{p1}")
+
+    # --- on-time start but late finish: end time does NOT move ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
+    _aio_tg.run(server.db.tasks.delete_many({}))
+    lf = mkact("Selesai kelewatan", "Lalu", 1)
+    # pretend it was started on time earlier
+    _aio_tg.run(server.db.segment_sessions.insert_one({
+        "parent_id": "family-default", "child_id": adskhan["id"], "date_key": today_local,
+        "segment_id": SG2["Lalu"], "started_at": server.now_iso(), "start_late": False, "no_points": False}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.post(f"/api/tasks/{lf['id']}/check", json={"checked": True})
+    r = c.post("/api/segment-sessions/finish", json=body("Lalu"))
+    check("seg: finishing after the end time needs a reason", r.status_code == 409 and "LATE_REASON_REQUIRED" in r.text, r.text[:140])
+    r = c.post("/api/segment-sessions/finish", json=body("Lalu", late_reason_id=OKR))
+    check("seg: with a reason it finishes, marked late", r.status_code == 200 and r.json()["finish_late"] is True, r.text[:160])
+
+    # --- 'Kapan Saja' has no clock ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
+    anyt = c.post("/api/tasks", json={"title": "Rapikan kamar", "points": 5, "date_key": today_local,
+                                      "target_children": [adskhan["id"]]}).json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    any_body = {"child_id": adskhan["id"], "date_key": today_local, "segment_id": server.ANYTIME_SEGMENT_ID}
+    r = c.post("/api/segment-sessions/start", json=any_body)
+    check("seg: 'Kapan Saja' starts without any timing", r.status_code == 200 and r.json()["start_late"] is False, r.text[:140])
+    c.post(f"/api/tasks/{anyt['id']}/check", json={"checked": True})
+    r = c.post("/api/segment-sessions/finish", json=any_body)
+    check("seg: and finishes without any lateness", r.status_code == 200 and r.json()["finish_late"] is False, r.text[:140])
+
+    # --- guards ---
+    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+    r = c.post("/api/segment-sessions/start", json=body("Sekarang"))
+    check("seg: a sibling can't run someone else's section", r.status_code == 403, str(r.status_code))
+    r = c.get(f"/api/children/{adskhan['id']}/segments-day")
+    check("seg: nor read their checklist", r.status_code == 403, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/segment-sessions/start", json={"child_id": adskhan["id"], "date_key": today_local, "segment_id": "ngawur"})
+    check("seg: unknown section → 404", r.status_code == 404, str(r.status_code))
+    r = c.post("/api/segment-sessions/start", json={"child_id": adskhan["id"], "date_key": "x", "segment_id": SG2["Sekarang"]})
+    check("seg: bad date → 422", r.status_code == 422, str(r.status_code))
+    _tomorrow_s = (_off_base + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    r = c.post("/api/segment-sessions/start", json={"child_id": adskhan["id"], "date_key": _tomorrow_s, "segment_id": SG2["Sekarang"]})
+    check("seg: tomorrow can't be started today", r.status_code in (400, 409), str(r.status_code))
+
+    # --- parent can reopen ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post("/api/segment-sessions/reopen", json=any_body)
+    check("seg: a parent can reopen a finished section", r.status_code == 200, r.text[:140])
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    r = c.post("/api/segment-sessions/reopen", json=any_body)
+    check("seg: a child cannot reopen", r.status_code == 403, str(r.status_code))
+
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
+    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "early_bonus_pct": 10})
+    __import__("asyncio").run(server._refresh_segments_cache())
+    server._now_local = _real_now_local
 
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")

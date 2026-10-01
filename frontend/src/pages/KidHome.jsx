@@ -26,7 +26,7 @@ import DailyRecapCard from "@/components/DailyRecapCard";
 import RewardSuggestions from "@/components/RewardSuggestions";
 import CheersReceived from "@/components/CheersReceived";
 import ProfileEditor from "@/components/ProfileEditor";
-import DailyQuestView from "@/components/DailyQuestView";
+import SegmentQuestView from "@/components/SegmentQuestView";
 import { personalityMeta } from "@/lib/personality";
 import { pickQuestTheme } from "@/lib/questThemes";
 import { computeLevel } from "@/lib/levels";
@@ -317,10 +317,8 @@ export default function KidHome() {
                 </motion.div>
               )}
 
-              <DailyQuestView
-                appConfig={kidConfig}
+              <SegmentQuestView
                 child={child}
-                themeKey={pickQuestTheme(child)}
                 onCelebrate={() => {
                   setCelebrate(true);
                   setTimeout(() => setCelebrate(false), 3000);

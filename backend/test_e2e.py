@@ -6226,6 +6226,53 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/segment-sessions/reopen", json=any_body)
     check("seg: a child cannot reopen", r.status_code == 403, str(r.status_code))
 
+    # --- an exam period forgives a late finish ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
+    _aio_tg.run(server.db.exam_periods.delete_many({}))
+    ex_t = mkact("Belajar ujian", "Lalu", 1)
+    _aio_tg.run(server.db.segment_sessions.insert_one({
+        "parent_id": "family-default", "child_id": adskhan["id"], "date_key": today_local,
+        "segment_id": SG2["Lalu"], "started_at": server.now_iso(), "start_late": False, "no_points": False}))
+    _tom_ex = (_off_base + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+    c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _tom_ex, "exam_end": _tom_ex})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    dex = {s["label"]: s for s in c.get(f"/api/children/{adskhan['id']}/segments-day?date_key={today_local}").json()["segments"]}
+    check("seg: during an exam, a late finish isn't flagged on screen", dex["Lalu"]["late_finish"] is False)
+    c.post(f"/api/tasks/{ex_t['id']}/check", json={"checked": True})
+    r = c.post("/api/segment-sessions/finish", json=body("Lalu"))
+    check("seg: and finishing needs no lateness reason", r.status_code == 200 and r.json()["finish_late"] is False, r.text[:160])
+    _aio_tg.run(server.db.exam_periods.delete_many({}))
+
+    # --- the checklist screen stays light ---
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    _aio_tg.run(server.db.tasks.delete_many({}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
+    for _i in range(8):
+        mkact(f"Aktivitas {_i}", "Sekarang", _i + 1)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+    c.get(f"/api/children/{adskhan['id']}/segments-day?date_key={today_local}")  # warm caches
+    _sq_cls = type(server.db.tasks); _sq_counts = {}; _sq_orig = {}
+    for _m in ("find", "find_one", "count_documents", "update_one", "update_many", "insert_one", "insert_many"):
+        _o = getattr(_sq_cls, _m, None)
+        if not _o: continue
+        _sq_orig[_m] = _o
+        def _mk(_o=_o, _m=_m):
+            def _f(self, *a, **k):
+                _sq_counts[f"{self.name}.{_m}"] = _sq_counts.get(f"{self.name}.{_m}", 0) + 1
+                return _o(self, *a, **k)
+            return _f
+        setattr(_sq_cls, _m, _mk())
+    try:
+        c.get(f"/api/children/{adskhan['id']}/segments-day?date_key={today_local}")
+    finally:
+        for _m, _o in _sq_orig.items(): setattr(_sq_cls, _m, _o)
+    _sq_total = sum(_sq_counts.values())
+    check("seg: the checklist loads in under 12 DB queries", _sq_total < 12, f"{_sq_total}: {_sq_counts}")
+    check("seg: activities are not fetched one by one",
+          _sq_counts.get("tasks.find", 0) <= 2, str(_sq_counts.get("tasks.find")))
+
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({}))
     _aio_tg.run(server.db.segment_sessions.delete_many({}))

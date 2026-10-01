@@ -4109,6 +4109,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
         ).to_list(50)
     }
     known = {s["id"] for s in segments}
+    exam_today = await _active_exam_flex(child_id, dk)
     groups: dict = {}
     for t in tasks:
         sid = t.get("segment_id") if t.get("segment_id") in known else ANYTIME_SEGMENT_ID
@@ -4122,6 +4123,8 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
             continue
         sess = sessions.get(sid) or {}
         timing = _segment_timing(seg, child, dk, grace)
+        if exam_today and timing["late_finish"]:
+            timing = {**timing, "late_finish": False}
         if sess.get("completed_at"):
             status = "done"
         elif sess.get("started_at"):
@@ -4292,6 +4295,10 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
         )
 
     timing = _segment_timing(seg, child, dk, _seg_grace(config))
+    # During a declared exam period, studying is expected to run late, so
+    # finishing past the end time isn't treated as lateness on those days.
+    if timing["late_finish"] and await _active_exam_flex(payload.child_id, dk):
+        timing = {**timing, "late_finish": False}
     finish_update = {"completed_at": now_iso(), "finish_late": False}
     no_points = bool(sess.get("no_points"))
     if timing["late_finish"]:

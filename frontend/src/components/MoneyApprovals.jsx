@@ -16,7 +16,7 @@ export default function MoneyApprovals() {
   const [flashPct, setFlashPct] = useState("15");
   const [pacingBonus, setPacingBonus] = useState("2");
   const [notifyStart, setNotifyStart] = useState(true);
-  const [graceMin, setGraceMin] = useState("10");
+  const [graceMin, setGraceMin] = useState("15");
   const [autoNext, setAutoNext] = useState(true);
   const [bonusQueue, setBonusQueue] = useState(true);
   const [autoApprove, setAutoApprove] = useState(true);
@@ -45,7 +45,7 @@ export default function MoneyApprovals() {
       setFlashPct(String(cfg.data.flash_threshold_pct ?? 15));
       setPacingBonus(String(cfg.data.pacing_bonus_points ?? 2));
       setNotifyStart(cfg.data.notify_parent_on_start !== false);
-      setGraceMin(String(cfg.data.segment_late_grace_minutes ?? 10));
+      setGraceMin(String(cfg.data.segment_late_grace_minutes ?? 15));
       setAutoNext(cfg.data.auto_start_next !== false);
       setBonusQueue(cfg.data.bonus_follows_sequence !== false);
       setAutoApprove(cfg.data.auto_approve_tasks !== false);
@@ -87,7 +87,7 @@ export default function MoneyApprovals() {
     if (mg < 0 || mg > 1800) { toast.error("Jeda antar misi harus 0–1800 detik"); return; }
     if (fp < 0 || fp > 100) { toast.error("Ambang kilat harus 0–100%"); return; }
     if (pbp < 0 || pbp > 100) { toast.error("Bonus ritme harus 0–100 poin"); return; }
-    if (gm < 0 || gm > 180) { toast.error("Toleransi telat harus 0–180 menit"); return; }
+    if (gm < 0 || gm > 15) { toast.error("Toleransi telat maksimal 15 menit"); return; }
     if (mi < 0 || mi > 240) { toast.error("Batas menganggur harus 0–240 menit"); return; }
     if (oti < 1 || oti > 240) { toast.error("Kelipatan bonus lembur harus 1–240 menit"); return; }
     if (he < 1 || he > 120) { toast.error("Batas tunggu izin tunda harus 1–120 menit"); return; }
@@ -213,7 +213,7 @@ export default function MoneyApprovals() {
             <label className="block text-sm font-semibold text-slate-700 mb-1">Toleransi telat mulai (menit)</label>
             <input
               type="text" inputMode="numeric" value={graceMin}
-              onChange={(e) => setGraceMin(e.target.value.replace(/\D/g, "").slice(0, 3))}
+              onChange={(e) => setGraceMin(e.target.value.replace(/\D/g, "").slice(0, 2))}
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
             <p className="text-[11px] text-slate-400 mt-1">Berlaku pada misi pembuka tiap bagian, dan hanya bila jam mulai personal anak sudah diatur.</p>

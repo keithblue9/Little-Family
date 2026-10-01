@@ -6280,6 +6280,23 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     __import__("asyncio").run(server._refresh_segments_cache())
     server._now_local = _real_now_local
 
+    # =============== VERSI DEPLOY ===============
+    # Every open app compares its own build against this to notice a new deploy.
+    import os as _os_v
+    _saved_sha = _os_v.environ.pop("VERCEL_GIT_COMMIT_SHA", None)
+    try:
+        r = c.get("/api/version")
+        check("version: answers without login", r.status_code == 200, str(r.status_code))
+        check("version: reports dev when not on Vercel", r.json()["version"] == "dev", r.text[:80])
+        _os_v.environ["VERCEL_GIT_COMMIT_SHA"] = "a4bc26e1f2b3c4d5e6"
+        r = c.get("/api/version")
+        check("version: reports the running commit, shortened", r.json()["version"] == "a4bc26e", r.text[:80])
+        check("version: warmup reports it too", c.get("/api/warmup").json().get("version") == "a4bc26e")
+    finally:
+        _os_v.environ.pop("VERCEL_GIT_COMMIT_SHA", None)
+        if _saved_sha is not None:
+            _os_v.environ["VERCEL_GIT_COMMIT_SHA"] = _saved_sha
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

@@ -6911,6 +6911,20 @@ class MaintenanceToggleInput(BaseModel):
     message: str = Field(default="", max_length=300)
 
 
+def _deployed_version() -> str:
+    """Which commit this server is running. Vercel exposes it at runtime, so the
+    app can tell whether a device is holding an outdated bundle."""
+    sha = os.environ.get("VERCEL_GIT_COMMIT_SHA") or os.environ.get("APP_BUILD_SHA") or "dev"
+    return sha[:7] if sha != "dev" else sha
+
+
+@api.get("/version")
+async def app_version():
+    """Public and cheap: no database, no auth. Used by every open app to notice
+    a new deploy and reload itself instead of running stale code indefinitely."""
+    return {"version": _deployed_version()}
+
+
 @api.get("/warmup")
 async def warmup():
     """Cheap endpoint for a scheduler to ping, so a container stays alive.
@@ -6925,7 +6939,7 @@ async def warmup():
         await db.app_config.find_one({"parent_id": FAMILY_ID}, {"_id": 1})
     except Exception:
         ok = False
-    return {"ok": ok, "at": now_iso()}
+    return {"ok": ok, "at": now_iso(), "version": _deployed_version()}
 
 
 @api.get("/maintenance-status")

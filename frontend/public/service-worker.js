@@ -1,7 +1,7 @@
 /* My Lil Famz — service worker
    Caches the app shell so it can be installed as a PWA and work offline.
    Bump CACHE_VERSION whenever you change index.html so users get the update. */
-const CACHE_VERSION = 'mylilfamz-v5';
+const CACHE_VERSION = 'mylilfamz-v6';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -56,10 +56,16 @@ self.addEventListener('fetch', (event) => {
 
   // HTML: network-first so updates show up; fallback to cache.
   if (req.mode === 'navigate' || req.destination === 'document') {
+    // Bypass the browser's HTTP cache too: a cached index.html points at an old
+    // bundle, which is how a device kept showing a version long since replaced.
+    // Only a successful page is stored as the offline fallback — caching an
+    // error page would make it the thing shown whenever the network dropped.
     event.respondWith(
-      fetch(req).then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE_VERSION).then((c) => c.put('/index.html', copy));
+      fetch(req, { cache: 'no-store' }).then((res) => {
+        if (res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE_VERSION).then((c) => c.put('/index.html', copy)).catch(() => {});
+        }
         return res;
       }).catch(() => caches.match('/index.html'))
     );

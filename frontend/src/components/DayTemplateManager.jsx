@@ -151,7 +151,7 @@ export default function DayTemplateManager({ kids = [], onChanged }) {
     try {
       await api.post("/template-tasks", {
         template_id: activeId, weekday, segment_id: segments[0]?.id || null,
-        title: title.trim(), points: 10, duration_minutes: 10,
+        title: title.trim(), points: 10,
       });
       loadSlots(activeId);
       loadTemplates();
@@ -334,12 +334,7 @@ export default function DayTemplateManager({ kids = [], onChanged }) {
                   onBlur={(e) => patchSlot(sl, { points: parseInt(e.target.value || "0", 10) })}
                   className="w-12 px-1 py-1 rounded-lg border border-slate-200 text-[11px] text-center"
                 />
-                <input
-                  type="text" inputMode="numeric" defaultValue={sl.duration_minutes || ""} title="Durasi (menit)"
-                  onBlur={(e) => patchSlot(sl, { duration_minutes: e.target.value ? parseInt(e.target.value, 10) : null })}
-                  className="w-12 px-1 py-1 rounded-lg border border-slate-200 text-[11px] text-center"
-                  placeholder="m"
-                />
+
                 <label className="flex items-center gap-1 text-[10px] text-slate-500 cursor-pointer" title="Misi bonus">
                   <input type="checkbox" checked={!!sl.is_bonus}
                          onChange={(e) => patchSlot(sl, { is_bonus: e.target.checked })}

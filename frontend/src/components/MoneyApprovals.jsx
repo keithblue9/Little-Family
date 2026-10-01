@@ -165,7 +165,7 @@ export default function MoneyApprovals() {
               />
             </div>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Biaya lewati misi (poin)</label>
             <input
               type="text" inputMode="numeric" value={skipCost}
@@ -173,7 +173,7 @@ export default function MoneyApprovals() {
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Bonus selesai lebih cepat (%)</label>
             <input
               type="text" inputMode="numeric" value={earlyBonus}
@@ -182,7 +182,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Ekstra poin jika misi selesai sebelum jam-nya. 0 = mati.</p>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Jeda antar misi (detik)</label>
             <input
               type="text" inputMode="numeric" value={minGap}
@@ -191,7 +191,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Cegah misi "dirapel" sekaligus. 0 = mati. Misi bonus tidak terkena.</p>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Ambang "kilat" (%)</label>
             <input
               type="text" inputMode="numeric" value={flashPct}
@@ -200,7 +200,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Selesai di bawah % durasi ini → anak diminta konfirmasi, dan ditandai untukmu.</p>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Bonus ritme sehat (poin)</label>
             <input
               type="text" inputMode="numeric" value={pacingBonus}
@@ -216,9 +216,9 @@ export default function MoneyApprovals() {
               onChange={(e) => setGraceMin(e.target.value.replace(/\D/g, "").slice(0, 2))}
               className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
             />
-            <p className="text-[11px] text-slate-400 mt-1">Berlaku pada misi pembuka tiap bagian, dan hanya bila jam mulai personal anak sudah diatur.</p>
+            <p className="text-[11px] text-slate-400 mt-1">Batas terlambat saat menekan Mulai di tiap bagian hari (maksimal 15). Lewat dari ini, anak diminta memilih alasan. Jam selesai bagian tidak ikut bergeser.</p>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Batas menganggur (menit)</label>
             <input
               type="text" inputMode="numeric" value={maxIdle}
@@ -227,7 +227,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Dihitung dari jam server, jadi tetap berjalan walau app ditutup. Lewat batas ini, misi berikutnya harus lewat tombol Terlambat — dan hanya alasan "salah sendiri" yang bisa dipilih. 0 = mati.</p>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Kelipatan bonus lembur (menit)</label>
             <input
               type="text" inputMode="numeric" value={otInterval}
@@ -236,7 +236,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Untuk misi yang boleh lewat durasi: bonus diberikan tiap kelebihan waktu sebanyak ini.</p>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Batas tunggu izin tunda (menit)</label>
             <input
               type="text" inputMode="numeric" value={holdExpiry}
@@ -245,7 +245,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Kalau kamu tidak sempat menjawab dalam waktu ini, permintaan tunda batal sendiri dan misinya kembali normal.</p>
           </div>
-          <div>
+          <div className="hidden">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Potongan klaim ujian palsu</label>
             <input
               type="text" inputMode="numeric" value={examPenalty}
@@ -254,7 +254,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Poin yang dikurangi saat kamu menolak Hari Ujian yang tidak benar.</p>
           </div>
-          <div className="sm:col-span-2">
+          <div className="hidden sm:col-span-2">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Pengingat waktu hampir habis (menit)</label>
             <input
               type="text" value={warnMins}
@@ -264,7 +264,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Saat misi sedang berjalan, anak diberi bunyi alarm + pesan pada sisa waktu ini. Kosongkan untuk mematikan.</p>
           </div>
-          <div className="sm:col-span-2">
+          <div className="hidden sm:col-span-2">
             <label className="block text-sm font-semibold text-slate-700 mb-1">Pilihan tunda (menit)</label>
             <input
               type="text" value={snoozeOpts}
@@ -281,21 +281,21 @@ export default function MoneyApprovals() {
             </label>
             <p className="text-[11px] text-slate-400 mt-1">Kamu tidak perlu menyetujui satu per satu — cukup review di Monitor Harian, dan batalkan persetujuan kalau ada yang janggal. Misi yang butuh foto tetap menunggu pengecekanmu.</p>
           </div>
-          <div className="sm:col-span-2">
+          <div className="hidden sm:col-span-2">
             <label className="flex items-center gap-2 cursor-pointer select-none">
               <input type="checkbox" checked={bonusQueue} onChange={(e) => setBonusQueue(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
               <span className="text-sm font-semibold text-slate-700">Misi bonus ikut antrean urutan</span>
             </label>
             <p className="text-[11px] text-slate-400 mt-1">Kalau dimatikan, misi bonus bisa dikerjakan kapan saja tanpa menunggu giliran.</p>
           </div>
-          <div className="sm:col-span-2">
+          <div className="hidden sm:col-span-2">
             <label className="flex items-center gap-2 cursor-pointer select-none">
               <input type="checkbox" checked={autoNext} onChange={(e) => setAutoNext(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
               <span className="text-sm font-semibold text-slate-700">Tawarkan misi berikutnya otomatis setelah selesai</span>
             </label>
             <p className="text-[11px] text-slate-400 mt-1">Muncul popup penyemangat + hitung mundur (memakai "Jeda antar misi" di atas), lalu mulai sendiri. Hanya dalam bagian yang sama, tidak untuk misi bersama atau bonus.</p>
           </div>
-          <div className="sm:col-span-2">
+          <div className="hidden sm:col-span-2">
             <label className="flex items-center gap-2 cursor-pointer select-none">
               <input type="checkbox" checked={notifyStart} onChange={(e) => setNotifyStart(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
               <span className="text-sm font-semibold text-slate-700">Beri tahu saya saat anak menekan Mulai</span>

@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BUNDLE_VERSION } from "@/lib/versionCheck";
 import "@/App.css";
 import { Toaster } from "@/components/ui/sonner";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
@@ -135,6 +136,20 @@ function App() {
         <InstallPrompt />
         <PushPermissionPrompt />
         <AppBadgeSync />
+        {/* Tiny, always-visible build stamp. Without it there was no way to
+            tell whether a device was running the latest deploy or an old
+            cached one — which is exactly what made "it hasn't changed"
+            impossible to diagnose. */}
+        <div
+          aria-hidden="true"
+          style={{
+            position: "fixed", left: 6, bottom: 4, zIndex: 1,
+            fontSize: 9, color: "rgba(100,116,139,0.55)", pointerEvents: "none",
+            fontFamily: "ui-monospace, monospace",
+          }}
+        >
+          v{BUNDLE_VERSION}
+        </div>
       </AuthProvider>
     </ErrorBoundary>
   );

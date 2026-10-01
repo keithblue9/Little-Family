@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import "@/index.css";
 import App from "@/App";
 import { registerServiceWorker } from "@/serviceWorkerRegistration";
+import { startVersionWatcher } from "@/lib/versionCheck";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -24,3 +25,4 @@ root.render(
 );
 
 registerServiceWorker();
+startVersionWatcher();

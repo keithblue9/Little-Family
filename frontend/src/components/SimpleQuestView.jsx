@@ -4,8 +4,9 @@ import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/localCache";
 import { todayKey } from "@/lib/dates";
-import { enqueue, isNetworkError, haptic } from "@/lib/offlineQueue";
+import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
+import { withLiveClock } from "@/lib/segmentClock";
 
 function speak(text) {
   try {
@@ -45,11 +46,24 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
+    const onFlushed = () => load();
+    window.addEventListener("app:offline-flushed", onFlushed);
+    return () => window.removeEventListener("app:offline-flushed", onFlushed);
+  }, [load]);
+  useEffect(() => {
     const t = setInterval(() => { if (!document.hidden) load(); }, 60000);
     return () => clearInterval(t);
   }, [load]);
 
-  const segments = useMemo(() => data?.segments || [], [data]);
+  const [clock, setClock] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => { if (!document.hidden) setClock((c) => c + 1); }, 30000);
+    return () => clearInterval(t);
+  }, []);
+  const segments = useMemo(
+    () => withLiveClock(data, dateKey)?.segments || [],
+    [data, dateKey, clock], // eslint-disable-line react-hooks/exhaustive-deps
+  );
   const current = useMemo(
     () => segments.find((s) => s.status === "in_progress") || segments.find((s) => s.status === "ready"),
     [segments],
@@ -89,14 +103,30 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
     await load();
   };
 
+  // Show a section's new state at once; with no connection it stays that way
+  // (saved on the phone) and the action is sent once back online.
+  const setStatus = (segId, status) =>
+    setData((d) => d && { ...d, segments: d.segments.map((s) => s.id === segId ? { ...s, status } : s) });
+  const queueOffline = (action, payload) => {
+    enqueueSegmentAction(action, payload);
+    setData((d) => { if (d) cacheSet(cacheKey, d); return d; });
+    toast("Tersimpan di HP 📶", { duration: 2500, id: "offline" });
+  };
+
   const start = async (reasonId) => {
     if (current.late_start && !reasonId) { setReasonFor("start"); return; }
     setBusy(true);
+    const payload = body(reasonId ? { late_reason_id: reasonId } : {});
     try {
-      await api.post("/segment-sessions/start", body(reasonId ? { late_reason_id: reasonId } : {}));
       haptic();
+      setStatus(current.id, "in_progress");
+      if (pendingCount() > 0) { queueOffline("start", payload); return; }
+      await api.post("/segment-sessions/start", payload);
       await load();
-    } catch (e) { await onFail(e, "start"); } finally { setBusy(false); }
+    } catch (e) {
+      if (isNetworkError(e)) queueOffline("start", payload);
+      else await onFail(e, "start");
+    } finally { setBusy(false); }
   };
 
   const tick = async () => {
@@ -110,9 +140,9 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
       }),
     });
     try {
-      await api.post(`/tasks/${act.id}/check`, { checked: true });
+      const r = await sendOrQueue(`/tasks/${act.id}/check`, { checked: true });
+      if (r?.queued) setData((d) => { if (d) cacheSet(cacheKey, d); return d; });
     } catch (e) {
-      if (isNetworkError(e)) { enqueue(`/tasks/${act.id}/check`, { checked: true }); return; }
       await onFail(e, "check");
     }
   };
@@ -120,12 +150,18 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
   const finish = async (reasonId) => {
     if (current.late_finish && !current.start_late && !reasonId) { setReasonFor("finish"); return; }
     setBusy(true);
+    const payload = body(reasonId ? { late_reason_id: reasonId } : {});
+    const segId = current.id;
+    const done = () => { haptic([20, 40, 20]); onCelebrate?.(); setStatus(segId, "done"); };
     try {
-      await api.post("/segment-sessions/finish", body(reasonId ? { late_reason_id: reasonId } : {}));
-      haptic([20, 40, 20]);
-      onCelebrate?.();
+      if (pendingCount() > 0) { done(); queueOffline("finish", payload); return; }
+      await api.post("/segment-sessions/finish", payload);
+      done();
       await load();
-    } catch (e) { await onFail(e, "finish"); } finally { setBusy(false); }
+    } catch (e) {
+      if (isNetworkError(e)) { done(); queueOffline("finish", payload); }
+      else await onFail(e, "finish");
+    } finally { setBusy(false); }
   };
 
   const pickReason = (id) => {

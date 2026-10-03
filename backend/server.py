@@ -305,6 +305,10 @@ class SegmentStartOverrideInput(BaseModel):
     the section's global start time.
     """
     starts: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    # Optional personal FINISH per section per weekday (same shape). Lets a
+    # school-day morning close at 06:15 while the weekend runs to 11:59.
+    # None = leave the stored finishes untouched.
+    ends: Optional[Dict[str, Dict[str, str]]] = None
 
 
 class ExamPeriodInput(BaseModel):
@@ -1485,7 +1489,8 @@ async def public_view_by_token(token: str):
             "badges": badges,
             "recent_missions": [
                 {"title": t["title"], "points": t["points"], "approved_at": t.get("approved_at"),
-                 "completion_photo_url": t.get("completion_photo_url")}
+                 "completion_photo_url": _media_ref("task", t.get("id"), "completion_photo_url",
+                                                    t.get("completion_photo_url"))}
                 for t in recent
             ],
         })
@@ -1606,7 +1611,7 @@ async def child_growth_trail(child_id: str, user: dict = Depends(get_current_use
         events.append({
             "type": "photo", "date": t.get("approved_at"),
             "title": t.get("title", "Misi"), "detail": f"+{t.get('points', 0)} poin",
-            "image": t.get("completion_photo_url"),
+            "image": _media_ref("task", t.get("id"), "completion_photo_url", t.get("completion_photo_url")),
         })
 
     # Milestones: every 100 lifetime points and every 7-day streak multiple,
@@ -2526,7 +2531,7 @@ async def child_day_progress(
         if not _sg:
             continue  # "kapan saja" tasks have no clock to project from
         _cursor = _effective_segment_start(_sg, _kid_doc_seg, dk)
-        _seg_end = _hhmm_to_min(_sg["end_time"])
+        _seg_end = _effective_segment_end(_sg, _kid_doc_seg, dk)
         for _t in sorted(_items, key=lambda x: (x.get("order") or 0, x.get("created_at") or "")):
             if _cursor > _seg_end:
                 break  # the section is full; anything past this can't be placed
@@ -2985,6 +2990,26 @@ def _effective_segment_start(segment: dict, child: Optional[dict], date_key: Opt
         return base
 
 
+def _effective_segment_end(segment: dict, child: Optional[dict], date_key: Optional[str]) -> int:
+    """Minutes-into-day when THIS child's section closes on THIS date: the
+    child's personal finish for that weekday, else the section's shared end.
+    A personal finish is never later than the shared end nor before the
+    child's start that day."""
+    base = _hhmm_to_min(segment["end_time"])
+    if not child or not date_key:
+        return base
+    overrides = (child.get("segment_ends") or {}).get(segment.get("id")) or {}
+    try:
+        wd = str(datetime.strptime(date_key, "%Y-%m-%d").weekday())
+        val = overrides.get(wd)
+        if not val:
+            return base
+        m = _hhmm_to_min(val)
+    except Exception:
+        return base
+    return max(_effective_segment_start(segment, child, date_key), min(m, base))
+
+
 def _fmt_min(m: int) -> str:
     m = max(0, min(int(m), 23 * 60 + 59))
     return f"{m // 60:02d}:{m % 60:02d}"
@@ -3042,7 +3067,7 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     start_min = _effective_segment_start(seg, child, task.get("date_key"))
     if now_min < start_min:
         return "future"
-    if now_min > _hhmm_to_min(seg["end_time"]):
+    if now_min > _effective_segment_end(seg, child, task.get("date_key")):
         return "closed"
     # The FIRST mission of a section carries the "did you start on time?"
     # question. Past its personal start + grace it needs the Terlambat flow,
@@ -4569,6 +4594,9 @@ class SegmentActionInput(BaseModel):
     date_key: str
     segment_id: str
     late_reason_id: Optional[str] = None
+    # When the press really happened (ISO time) — sent by a device that was
+    # offline and is replaying a queued start/finish. Ignored unless recent.
+    happened_at: Optional[str] = None
 
 
 class ActivityCheckInput(BaseModel):
@@ -4582,22 +4610,46 @@ class SegmentCheckAllInput(BaseModel):
     checked: bool = True
 
 
-def _now_minutes() -> int:
-    n = _now_local()
+def _now_minutes(at: Optional[datetime] = None) -> int:
+    n = (at + timedelta(hours=7)) if at else _now_local()
     return n.hour * 60 + n.minute
+
+
+OFFLINE_REPLAY_MAX = timedelta(hours=12)
+
+
+def _resolve_happened_at(raw: Optional[str]) -> Optional[datetime]:
+    """The moment an offline press really happened, if believable: not in the
+    future (a little clock skew allowed) and no older than the replay window.
+    Anything else is ignored and the server clock is used, so a wrong device
+    clock can never move a press far in time."""
+    if not raw:
+        return None
+    try:
+        at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if at > now + timedelta(minutes=2) or at < now - OFFLINE_REPLAY_MAX:
+        return None
+    return min(at, now)
 
 
 def _segment_bounds(seg: Optional[dict], child: Optional[dict], dk: str):
     """(start_min, end_min) for this child on this day; None for 'anytime'."""
     if not seg:
         return None, None
-    return _effective_segment_start(seg, child, dk), _hhmm_to_min(seg["end_time"])
+    return _effective_segment_start(seg, child, dk), _effective_segment_end(seg, child, dk)
 
 
-def _segment_timing(seg: Optional[dict], child: Optional[dict], dk: str, grace: int) -> dict:
+def _segment_timing(seg: Optional[dict], child: Optional[dict], dk: str, grace: int,
+                    at: Optional[datetime] = None) -> dict:
     """Where the clock stands for one section: can it start yet, would starting
-    now be late, would finishing now be late."""
-    today = _today_key()
+    now (or at `at`, for a replayed offline press) be late, would finishing be
+    late."""
+    today = (at + timedelta(hours=7)).strftime("%Y-%m-%d") if at else _today_key()
     if not seg:  # 'Kapan Saja' has no clock at all
         return {"locked": dk > today, "late_start": False, "late_finish": False}
     start_min, end_min = _segment_bounds(seg, child, dk)
@@ -4605,7 +4657,7 @@ def _segment_timing(seg: Optional[dict], child: Optional[dict], dk: str, grace: 
         return {"locked": True, "late_start": False, "late_finish": False}
     if dk < today:
         return {"locked": False, "late_start": True, "late_finish": True}
-    now = _now_minutes()
+    now = _now_minutes(at)
     return {
         "locked": now < start_min,
         "late_start": now > start_min + max(0, grace),
@@ -4722,14 +4774,14 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
             status = "locked"
         else:
             status = "ready"
-        start_min, _ = _segment_bounds(seg, child, dk)
+        start_min, end_min = _segment_bounds(seg, child, dk)
         required = [a for a in acts if not a.get("is_bonus")]
         out.append({
             "id": sid,
             "label": seg["label"] if seg else "Kapan Saja",
             "emoji": (seg or {}).get("emoji", "✨" if not seg else ""),
             "start_time": _fmt_min(start_min) if seg else None,
-            "end_time": seg["end_time"] if seg else None,
+            "end_time": _fmt_min(end_min) if seg else None,
             "status": status,
             "late_start": timing["late_start"] and status in ("ready", "locked"),
             "late_finish": timing["late_finish"] and status == "in_progress",
@@ -4784,7 +4836,8 @@ async def start_segment(payload: SegmentActionInput, user: dict = Depends(get_cu
     if not await _segment_tasks(payload.child_id, dk, payload.segment_id):
         raise HTTPException(status_code=400, detail="Tidak ada aktivitas di bagian ini")
 
-    timing = _segment_timing(seg, child, dk, _seg_grace(config))
+    at = _resolve_happened_at(payload.happened_at)
+    timing = _segment_timing(seg, child, dk, _seg_grace(config), at)
     if timing["locked"]:
         start_min, _ = _segment_bounds(seg, child, dk)
         raise HTTPException(
@@ -4794,7 +4847,7 @@ async def start_segment(payload: SegmentActionInput, user: dict = Depends(get_cu
 
     doc = {
         "parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk,
-        "segment_id": payload.segment_id, "started_at": now_iso(),
+        "segment_id": payload.segment_id, "started_at": (at.isoformat() if at else now_iso()),
         "start_late": False, "no_points": False,
     }
     if timing["late_start"]:
@@ -4897,12 +4950,19 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
             detail="Lampirkan foto sesudah untuk: " + ", ".join(a["title"] for a in missing_photo[:3]),
         )
 
-    timing = _segment_timing(seg, child, dk, _seg_grace(config))
+    at = _resolve_happened_at(payload.happened_at)
+    if at and sess.get("started_at"):
+        try:
+            if at < datetime.fromisoformat(sess["started_at"].replace("Z", "+00:00")):
+                at = None  # can't finish before it started
+        except ValueError:
+            pass
+    timing = _segment_timing(seg, child, dk, _seg_grace(config), at)
     # During a declared exam period, studying is expected to run late, so
     # finishing past the end time isn't treated as lateness on those days.
     if timing["late_finish"] and await _active_exam_flex(payload.child_id, dk):
         timing = {**timing, "late_finish": False}
-    finish_update = {"completed_at": now_iso(), "finish_late": False}
+    finish_update = {"completed_at": (at.isoformat() if at else now_iso()), "finish_late": False}
     no_points = bool(sess.get("no_points"))
     if timing["late_finish"]:
         finish_update["finish_late"] = True
@@ -5621,7 +5681,7 @@ async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteI
         {"id": task_id},
         {"$set": {
             "status": "completed", "completed_at": now_iso(), "timer_completed_at": now_iso(),
-            "completion_photo_url": payload.photo_url,
+            "completion_photo_url": await _store_task_photo(task_id, "completion_photo_url", payload.photo_url),
             "actual_seconds": _elapsed_seconds({**task, "completed_at": now_iso()}),
             "flash_flag": _is_flash_finish(
                 {**task, "completed_at": now_iso()},
@@ -6254,15 +6314,48 @@ async def set_segment_starts(child_id: str, payload: SegmentStartOverrideInput, 
             day_map[str(wd)] = hhmm
         if day_map:
             cleaned[seg_id] = day_map
-    await db.children.update_one({"id": child_id}, {"$set": {"segment_starts": cleaned}})
+    update = {"segment_starts": cleaned}
+    if payload.ends is not None:
+        ends: dict = {}
+        for seg_id, per_day in payload.ends.items():
+            seg = seg_by_id.get(seg_id)
+            if not seg:
+                raise HTTPException(status_code=404, detail=f"Bagian waktu tidak ditemukan: {seg_id}")
+            day_map = {}
+            for wd, hhmm in (per_day or {}).items():
+                if not hhmm:
+                    continue  # empty = "use the shared finish"
+                if str(wd) not in {"0", "1", "2", "3", "4", "5", "6"}:
+                    raise HTTPException(status_code=422, detail=f"Hari tidak valid: {wd}")
+                if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", hhmm):
+                    raise HTTPException(status_code=422, detail=f"Jam tidak valid: {hhmm}")
+                m = _hhmm_to_min(hhmm)
+                start_val = (cleaned.get(seg_id) or {}).get(str(wd)) or seg["start_time"]
+                if m > _hhmm_to_min(seg["end_time"]):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f'Jam selesai {hhmm} lewat dari batas bagian "{seg["label"]}" ({seg["end_time"]})',
+                    )
+                if m <= _hhmm_to_min(start_val):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f'Jam selesai {hhmm} harus sesudah jam mulai {start_val} ("{seg["label"]}")',
+                    )
+                day_map[str(wd)] = hhmm
+            if day_map:
+                ends[seg_id] = day_map
+        update["segment_ends"] = ends
+    await db.children.update_one({"id": child_id}, {"$set": update})
+    _invalidate_member_cache()
     await log_activity(FAMILY_ID, child_id, "segment_starts_updated", {"sections": len(cleaned)})
-    return {"success": True, "segment_starts": cleaned}
+    fresh = await get_child_or_404(FAMILY_ID, child_id)
+    return {"success": True, "segment_starts": cleaned, "segment_ends": fresh.get("segment_ends") or {}}
 
 
 @api.get("/children/{child_id}/segment-starts")
 async def get_segment_starts(child_id: str, user: dict = Depends(get_current_user)):
     child = await get_child_or_404(FAMILY_ID, child_id)
-    return {"segment_starts": child.get("segment_starts") or {}}
+    return {"segment_starts": child.get("segment_starts") or {}, "segment_ends": child.get("segment_ends") or {}}
 
 
 @api.post("/children/{child_id}/adjust-points")
@@ -7907,6 +8000,12 @@ async def warmup():
         await _ensure_days_ready()
     except Exception:
         ok = False
+    try:
+        # Old inline pictures move to `media` a small batch per ping; once
+        # none are left this is a single flag lookup.
+        await _maybe_offload_task_photos(50)
+    except Exception:  # noqa: BLE001 — a warm-up must never fail on this
+        pass
     return {"ok": ok, "at": now_iso(), "version": _deployed_version()}
 
 
@@ -8599,11 +8698,72 @@ _MEDIA_SOURCES = {
 }
 
 
+# Task photos pile up (one per finished mission), so they live in their own
+# `media` collection and the task keeps only a short pointer "media:<tag>".
+# Lists and schedule scans then never drag picture bytes out of the database.
+MEDIA_POINTER = "media:"
+
+
+def _media_tag(value: str) -> str:
+    return _hashlib.sha1((str(len(value)) + value[:64] + value[-64:]).encode()).hexdigest()[:12]
+
+
 def _media_ref(kind: str, doc_id: str, field: str, value):
-    if not isinstance(value, str) or not value.startswith("data:") or not doc_id:
+    if not isinstance(value, str) or not doc_id:
         return value
-    tag = _hashlib.sha1((str(len(value)) + value[:64] + value[-64:]).encode()).hexdigest()[:12]
+    if value.startswith(MEDIA_POINTER):
+        tag = value[len(MEDIA_POINTER):]
+    elif value.startswith("data:"):
+        tag = _media_tag(value)
+    else:
+        return value
     return f"{MEDIA_PREFIX}{kind}/{doc_id}/{field}?v={tag}&s={_media_sig(kind, doc_id, field, tag)}"
+
+
+async def _store_task_photo(task_id: str, field: str, value):
+    """Keep a task picture in `media` and return the pointer to store on the
+    task. Anything that isn't an inline picture is returned unchanged."""
+    if not isinstance(value, str) or not value.startswith("data:"):
+        return value
+    tag = _media_tag(value)
+    await db.media.update_one(
+        {"_id": f"task:{task_id}:{field}"},
+        {"$set": {"parent_id": FAMILY_ID, "kind": "task", "doc_id": task_id, "field": field,
+                  "tag": tag, "data": value, "size": len(value), "updated_at": now_iso()}},
+        upsert=True,
+    )
+    return MEDIA_POINTER + tag
+
+
+async def _maybe_offload_task_photos(limit: int = 100) -> int:
+    """Background tick: keep moving old inline pictures out until none are
+    left, then remember that and stop scanning."""
+    if await db.app_meta.find_one({"_id": "photos_offloaded"}):
+        return 0
+    moved = await _offload_task_photos(limit)
+    if moved < limit:
+        await db.app_meta.update_one({"_id": "photos_offloaded"}, {"$set": {"at": now_iso()}}, upsert=True)
+    return moved
+
+
+async def _offload_task_photos(limit: int = 100) -> int:
+    """Move pictures still stored inline on tasks (from before the `media`
+    collection existed) out to it, a bounded batch at a time."""
+    moved = 0
+    for coll in ("tasks", "tasks_archive"):
+        for field in _MEDIA_SOURCES["task"][1]:
+            if moved >= limit:
+                return moved
+            rows = await db[coll].find(
+                {field: {"$regex": "^data:"}}, {"_id": 0, "id": 1, field: 1},
+            ).to_list(limit - moved)
+            for r in rows:
+                if not r.get("id"):
+                    continue
+                pointer = await _store_task_photo(r["id"], field, r[field])
+                await db[coll].update_one({"id": r["id"], field: r[field]}, {"$set": {field: pointer}})
+                moved += 1
+    return moved
 
 
 def _media_sig(kind: str, doc_id: str, field: str, tag: str) -> str:
@@ -8637,7 +8797,14 @@ async def get_media(kind: str, doc_id: str, field: str, v: str = "", s: str = ""
         raise HTTPException(status_code=403, detail="Forbidden")
     coll, _ = src
     doc = await db[coll].find_one({"id": doc_id, "parent_id": FAMILY_ID}, {"_id": 0, field: 1})
+    if not doc and coll == "tasks":  # restored-from-archive views can still point here
+        doc = await db.tasks_archive.find_one({"id": doc_id, "parent_id": FAMILY_ID}, {"_id": 0, field: 1})
     value = (doc or {}).get(field)
+    if isinstance(value, str) and value.startswith(MEDIA_POINTER):
+        stored = await db.media.find_one({"_id": f"{kind}:{doc_id}:{field}"}, {"data": 1, "tag": 1})
+        if not stored or stored.get("tag") != value[len(MEDIA_POINTER):]:
+            raise HTTPException(status_code=404, detail="Not found")
+        value = stored.get("data")
     if not isinstance(value, str) or not value.startswith("data:") or "," not in value:
         raise HTTPException(status_code=404, detail="Not found")
     if _media_ref(kind, doc_id, field, value).split("?v=", 1)[1].split("&", 1)[0] != v:
@@ -8744,7 +8911,8 @@ async def attach_task_photo(task_id: str, payload: TaskPhotoInput, user: dict = 
     if task.get("status") in ("approved", "skipped", "off"):
         raise HTTPException(status_code=409, detail="Misi ini sudah ditutup")
     field = "before_photo_url" if payload.kind == "before" else "completion_photo_url"
-    await db.tasks.update_one({"id": task_id}, {"$set": {field: payload.photo_url, f"{field}_at": now_iso()}})
+    stored = await _store_task_photo(task_id, field, payload.photo_url)
+    await db.tasks.update_one({"id": task_id}, {"$set": {field: stored, f"{field}_at": now_iso()}})
     updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
     return _with_media_refs("task", updated)
 
@@ -9033,6 +9201,10 @@ async def cron_send_reminders(request: Request):
         await _ensure_days_ready(force=True)
     except Exception as e:  # noqa: BLE001 — reminders must still go out
         logger.warning(f"cron day prep failed: {e}")
+    try:
+        await _maybe_offload_task_photos()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"photo offload failed: {e}")
 
     now = _now_local()
     today = now.strftime("%Y-%m-%d")

@@ -346,7 +346,7 @@ export default function ParentApp() {
               {/* The weekly routine is the schedule now; per-date missions are
                   generated from it. The old per-date list stays reachable for
                   one-off corrections, folded away so it doesn't compete. */}
-              <RoutineManager kids={children} onChanged={load} />
+              <RoutineManager kids={children} childId={selectedChildId || null} onChanged={load} />
               <details className="bg-white rounded-2xl border border-slate-200">
                 <summary className="cursor-pointer px-5 py-3 text-sm font-semibold text-slate-600 select-none">
                   🛠️ Koreksi tugas per tanggal (lanjutan)

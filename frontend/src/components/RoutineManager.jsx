@@ -14,7 +14,9 @@ const todayWeekday = () => (new Date().getDay() + 6) % 7; // Monday = 0
  * Set it once; every week repeats it. Dates that differ are handled below as
  * exceptions, so the routine itself never has to be edited for a one-off.
  */
-export default function RoutineManager({ kids = [], onChanged }) {
+// `childId` (the child picked at the top of the page) narrows the routine to
+// that child: their own activities plus the ones shared by every child.
+export default function RoutineManager({ kids = [], childId = null, onChanged }) {
   const [data, setData] = useState(null);
   const [weekday, setWeekday] = useState(todayWeekday());
   const [copyOpen, setCopyOpen] = useState(false);
@@ -33,8 +35,12 @@ export default function RoutineManager({ kids = [], onChanged }) {
   useEffect(() => { load(); }, [load]);
 
   const segments = useMemo(() => [...(data?.segments || []), { id: ANYTIME, label: "Kapan Saja", emoji: "✨" }], [data]);
-  const daySlots = useMemo(() => (data?.slots || []).filter((s) => s.weekday === weekday), [data, weekday]);
-  const countFor = (wd) => (data?.slots || []).filter((s) => s.weekday === wd).length;
+  const visible = useMemo(
+    () => (data?.slots || []).filter((s) => !childId || !s.child_id || s.child_id === childId),
+    [data, childId],
+  );
+  const daySlots = useMemo(() => visible.filter((s) => s.weekday === weekday), [visible, weekday]);
+  const countFor = (wd) => visible.filter((s) => s.weekday === wd).length;
 
   const run = async (fn, okMsg) => {
     setBusy(true);
@@ -88,7 +94,7 @@ export default function RoutineManager({ kids = [], onChanged }) {
         {copyOpen && (
           <div className="border-2 border-slate-100 rounded-2xl p-3 mb-4 bg-slate-50">
             <div className="text-sm font-semibold text-slate-700 mb-2">
-              Salin seluruh jadwal {DAYS[weekday]} ke hari: <span className="font-normal text-slate-500">(jadwal hari tujuan akan diganti)</span>
+              Salin seluruh jadwal {DAYS[weekday]} ke hari: <span className="font-normal text-slate-500">(jadwal hari tujuan akan diganti{childId ? ", untuk semua anak" : ""})</span>
             </div>
             <div className="flex flex-wrap gap-1.5 mb-3">
               {DAYS.map((d, i) => i === weekday ? null : (
@@ -122,7 +128,7 @@ export default function RoutineManager({ kids = [], onChanged }) {
 
         <div className="space-y-4">
           {segments.map((sg) => (
-            <SegmentCard key={sg.id} segment={sg} weekday={weekday} kids={kids} busy={busy}
+            <SegmentCard key={sg.id} segment={sg} weekday={weekday} kids={kids} busy={busy} childId={childId}
               slots={daySlots.filter((s) => (s.segment_id || ANYTIME) === sg.id)}
               onAdd={(body) => run(() => api.post("/routine/slots", {
                 weekdays: [weekday], segment_id: sg.id === ANYTIME ? null : sg.id, ...body }))}
@@ -136,11 +142,12 @@ export default function RoutineManager({ kids = [], onChanged }) {
   );
 }
 
-function SegmentCard({ segment, slots, kids, busy, onAdd, onPatch, onMove, onRemove }) {
+function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMove, onRemove }) {
   const [title, setTitle] = useState("");
   const [dur, setDur] = useState("");
   const [pts, setPts] = useState("10");
-  const [who, setWho] = useState("");
+  const [who, setWho] = useState(childId || "");
+  useEffect(() => { setWho(childId || ""); }, [childId]); // new activities go to the picked child
   const window_ = segment.start_time ? toMin(segment.end_time) - toMin(segment.start_time) : null;
   const total = slots.reduce((n, s) => n + (s.duration_minutes || 0), 0);
   const over = window_ != null && total > window_;

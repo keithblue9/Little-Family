@@ -1,7 +1,8 @@
 /* My Lil Famz — service worker
    Caches the app shell so it can be installed as a PWA and work offline.
    Bump CACHE_VERSION whenever you change index.html so users get the update. */
-const CACHE_VERSION = 'mylilfamz-v6';
+const CACHE_VERSION = 'mylilfamz-v7';
+const MEDIA_CACHE = 'mylilfamz-media-v1';
 const APP_SHELL = [
   '/',
   '/index.html',
@@ -21,7 +22,7 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k)))
+      Promise.all(keys.filter((k) => k !== CACHE_VERSION && k !== MEDIA_CACHE).map((k) => caches.delete(k)))
     ).then(() => self.clients.claim())
   );
 });
@@ -37,6 +38,20 @@ self.addEventListener('fetch', (event) => {
   // they did nothing even though they'd actually succeeded (the fresh data
   // only landed in the cache for NEXT time, with nothing to trigger a
   // re-render when it arrived). Cache is now only a fallback for offline use.
+  // Pictures served by /api/media/ are versioned in their URL and never
+  // change: cache-first, so a profile photo or reward image downloads once.
+  if (req.url.includes('/api/media/')) {
+    event.respondWith(
+      caches.open(MEDIA_CACHE).then((cache) =>
+        cache.match(req).then((hit) => hit || fetch(req).then((res) => {
+          if (res.ok) cache.put(req, res.clone()).catch(() => {});
+          return res;
+        }))
+      )
+    );
+    return;
+  }
+
   if (req.url.includes('/api/')) {
     event.respondWith(
       fetch(req)

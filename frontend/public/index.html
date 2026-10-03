@@ -17,10 +17,27 @@
 
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <!-- Core fonts only, and non-blocking: text paints immediately in the
+             system font and swaps when these arrive. Theme-only fonts (Baloo 2,
+             Orbitron) are loaded on demand by src/lib/fonts.js. -->
         <link
-            href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;500;600;700;800&family=Fredoka:wght@400;500;600;700&family=Nunito:wght@400;600;700;800&family=Manrope:wght@400;500;600;700;800&family=Orbitron:wght@500;700;900&display=swap"
-            rel="stylesheet"
+            rel="preload"
+            as="style"
+            href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800&family=Manrope:wght@500;600;700;800&display=swap"
         />
+        <link
+            href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800&family=Manrope:wght@500;600;700;800&display=swap"
+            rel="stylesheet"
+            media="print"
+            onload="this.media='all'"
+        />
+        <noscript>
+            <link
+                href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800&family=Manrope:wght@500;600;700;800&display=swap"
+                rel="stylesheet"
+            />
+        </noscript>
+
         <title>My Lil Famz — tugas seru untuk keluarga</title>
         <script>window.addEventListener("error",function(e){if(e.error instanceof DOMException&&e.error.name==="DataCloneError"&&e.message&&e.message.includes("PerformanceServerTiming")){e.stopImmediatePropagation();e.preventDefault()}},true);</script>
     </head>

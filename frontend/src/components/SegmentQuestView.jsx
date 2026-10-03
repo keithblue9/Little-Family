@@ -5,6 +5,8 @@ import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/localCache";
 import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
+import { enqueue, isNetworkError, haptic } from "@/lib/offlineQueue";
+import PageSkeleton from "@/components/PageSkeleton";
 
 /**
  * The child's day as a handful of sections, each a checklist.
@@ -56,6 +58,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     const detail = e?.response?.data?.detail;
     if (detail === "LATE_REASON_REQUIRED") {
       setReasonFor({ segment: seg, action });
+      load(); // undo the optimistic status while the child picks a reason
       return;
     }
     await load();
@@ -68,6 +71,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       return;
     }
     setBusy(seg.id);
+    setSegStatus(seg.id, "in_progress");
     try {
       await api.post("/segment-sessions/start", body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {}));
       toast.success(`${seg.label} dimulai. Semangat! 💪`);
@@ -82,10 +86,12 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       return;
     }
     setBusy(seg.id);
+    setSegStatus(seg.id, "done");
     try {
       const { data: r } = await api.post(
         "/segment-sessions/finish", body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {})
       );
+      haptic([20, 40, 20]);
       onCelebrate?.();
       toast.success(
         r.no_points
@@ -96,6 +102,10 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     } catch (e) { await onFail(e, seg, "finish"); }
     finally { setBusy(null); }
   };
+
+  // Start/finish show their new state at once; a refusal re-syncs via onFail.
+  const setSegStatus = (segId, status) =>
+    setData((d) => d && { ...d, segments: d.segments.map((s) => s.id === segId ? { ...s, status } : s) });
 
   // Ticks update on screen instantly and roll back if the server refuses.
   const patchActivity = (segId, actId, checked) =>
@@ -112,13 +122,27 @@ export default function SegmentQuestView({ child, onCelebrate }) {
   const toggle = async (seg, act) => {
     const next = !act.checked;
     patchActivity(seg.id, act.id, next);
+    if (next) haptic();
     try {
       await api.post(`/tasks/${act.id}/check`, { checked: next });
     } catch (e) {
+      if (isNetworkError(e)) {
+        // No connection: keep the tick and send it when we're back online.
+        enqueue(`/tasks/${act.id}/check`, { checked: next });
+        toast("Tersimpan di HP — dikirim otomatis saat internet kembali 📶", { duration: 3000 });
+        return;
+      }
       patchActivity(seg.id, act.id, !next);
       await onFail(e, seg, "check");
     }
   };
+
+  // Queued ticks reached the server: show the server's view again.
+  useEffect(() => {
+    const onFlushed = () => load();
+    window.addEventListener("app:offline-flushed", onFlushed);
+    return () => window.removeEventListener("app:offline-flushed", onFlushed);
+  }, [load]);
 
   const toggleAll = async (seg, checked) => {
     setData((d) => d && {
@@ -180,7 +204,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
         )}
       </div>
 
-      {loading && !data && <div className="text-center text-slate-400 py-8">Memuat…</div>}
+      {loading && !data && <PageSkeleton compact rows={2} />}
 
       {data && data.segments.length === 0 && (
         <div className="bg-white rounded-3xl p-6 text-center text-slate-500 border-2 border-slate-100">
@@ -252,7 +276,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                     } ${canTick ? "press-btn hover:border-indigo-200" : "opacity-70 cursor-default"}`}>
                     <span className={`w-6 h-6 rounded-lg border-2 flex items-center justify-center shrink-0 ${
                       a.checked ? "bg-emerald-500 border-emerald-500" : "border-slate-300 bg-white"}`}>
-                      {a.checked && <Check className="w-4 h-4 text-white" strokeWidth={3} />}
+                      {a.checked && <Check className="w-4 h-4 text-white pop-check" strokeWidth={3} />}
                     </span>
                     <span className={`flex-1 min-w-0 font-semibold text-sm ${
                       a.checked ? "text-slate-500 line-through" : "text-slate-800"}`}>

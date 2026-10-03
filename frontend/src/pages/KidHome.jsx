@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import PageSkeleton from "@/components/PageSkeleton";
 import { useNavigate, useParams } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import Confetti from "react-confetti";
 import {
   Star, Trophy, CheckCircle2, Gift, Home as HomeIcon,
   LogOut, Flame, Lock, Sparkles, Banknote, User, FastForward, Map, Heart,
@@ -11,26 +11,53 @@ import { cacheGet, cacheSet, cacheClear } from "@/lib/localCache";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { useAuth } from "@/contexts/AuthContext";
-import ThemeSwitcher from "@/components/ThemeSwitcher";
-import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
-import Leaderboard from "@/components/Leaderboard";
-import Achievements from "@/components/Achievements";
-import MoneyExchange from "@/components/MoneyExchange";
-import ChikyBankCard from "@/components/ChikyBankCard";
-import KidChallenges from "@/components/KidChallenges";
-import GrowthTrail from "@/components/GrowthTrail";
-import StickerBook from "@/components/StickerBook";
 import VirtualPetMascot from "@/components/VirtualPetMascot";
-import PetManagerCard from "@/components/PetManagerCard";
-import DailyRecapCard from "@/components/DailyRecapCard";
-import RewardSuggestions from "@/components/RewardSuggestions";
-import CheersReceived from "@/components/CheersReceived";
-import ProfileEditor from "@/components/ProfileEditor";
 import SegmentQuestView from "@/components/SegmentQuestView";
 import { personalityMeta } from "@/lib/personality";
 import { pickQuestTheme } from "@/lib/questThemes";
 import { computeLevel } from "@/lib/levels";
 import { useLabels } from "@/lib/labels";
+
+// Only the Misi tab is needed for the first paint; every other tab's pieces
+// load on first visit (and start loading the moment a finger touches the tab).
+const ThemeSwitcherLoader = () => import("@/components/ThemeSwitcher");
+const ThemeSwitcher = lazy(ThemeSwitcherLoader);
+const ProfilePhotoUploadLoader = () => import("@/components/ProfilePhotoUpload");
+const ProfilePhotoUpload = lazy(ProfilePhotoUploadLoader);
+const LeaderboardLoader = () => import("@/components/Leaderboard");
+const Leaderboard = lazy(LeaderboardLoader);
+const AchievementsLoader = () => import("@/components/Achievements");
+const Achievements = lazy(AchievementsLoader);
+const MoneyExchangeLoader = () => import("@/components/MoneyExchange");
+const MoneyExchange = lazy(MoneyExchangeLoader);
+const ChikyBankCardLoader = () => import("@/components/ChikyBankCard");
+const ChikyBankCard = lazy(ChikyBankCardLoader);
+const KidChallengesLoader = () => import("@/components/KidChallenges");
+const KidChallenges = lazy(KidChallengesLoader);
+const GrowthTrailLoader = () => import("@/components/GrowthTrail");
+const GrowthTrail = lazy(GrowthTrailLoader);
+const StickerBookLoader = () => import("@/components/StickerBook");
+const StickerBook = lazy(StickerBookLoader);
+const PetManagerCardLoader = () => import("@/components/PetManagerCard");
+const PetManagerCard = lazy(PetManagerCardLoader);
+const DailyRecapCardLoader = () => import("@/components/DailyRecapCard");
+const DailyRecapCard = lazy(DailyRecapCardLoader);
+const RewardSuggestionsLoader = () => import("@/components/RewardSuggestions");
+const RewardSuggestions = lazy(RewardSuggestionsLoader);
+const CheersReceivedLoader = () => import("@/components/CheersReceived");
+const CheersReceived = lazy(CheersReceivedLoader);
+const ProfileEditorLoader = () => import("@/components/ProfileEditor");
+const ProfileEditor = lazy(ProfileEditorLoader);
+const Confetti = lazy(() => import("react-confetti"));
+const TAB_PREFETCH = {
+  money: [MoneyExchangeLoader, ChikyBankCardLoader],
+  rewards: [RewardSuggestionsLoader],
+  champs: [CheersReceivedLoader, LeaderboardLoader, KidChallengesLoader, StickerBookLoader, AchievementsLoader, GrowthTrailLoader],
+  profile: [PetManagerCardLoader, ProfileEditorLoader, ProfilePhotoUploadLoader, ThemeSwitcherLoader],
+};
+function prefetchTab(key) {
+  (TAB_PREFETCH[key] || []).forEach((f) => { f().catch(() => {}); });
+}
 
 const TABS = [
   { key: "tasks", label: "Misi", labelKey: "kid.tab_tasks", icon: Map, testId: TEST_IDS.kid.tabTasks },
@@ -110,12 +137,19 @@ export default function KidHome() {
       // Only what the Misi tab actually needs. Rewards, wishlist and
       // consequences belong to the Tukar/Toko tabs — fetching them up front
       // made every screen open wait on three requests nobody was looking at.
-      const [cRes, cfgRes] = await Promise.all([
-        api.get("/children"),
-        api.get("/config"),
-      ]);
-      cacheSet(`kid:${childId}`, { child: cRes.data.find((x) => x.id === childId), config: cfgRes.data });
-      const c = cRes.data.find((x) => x.id === childId);
+      // One request for both (and without the large uploaded images the
+      // child's screen never shows).
+      let c;
+      let cfgRes;
+      try {
+        const { data } = await api.get(`/kid/${childId}/bootstrap`);
+        c = data.child;
+        cfgRes = { data: data.config };
+      } catch (err) {
+        if (err?.response?.status === 404) c = null;
+        else throw err;
+      }
+      if (c) cacheSet(`kid:${childId}`, { child: c, config: cfgRes.data });
       if (!c) {
         toast.error("Profil tidak ditemukan");
         nav("/");
@@ -174,7 +208,7 @@ export default function KidHome() {
   };
 
   if (!child) {
-    return <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">Memuat…</div>;
+    return <PageSkeleton />;
   }
 
   const levelInfo = computeLevel(child.lifetime_points || 0, levelTitles);
@@ -182,7 +216,9 @@ export default function KidHome() {
   return (
     <div className="min-h-screen kid-shell grain relative font-body pb-28 safe-x" data-testid={TEST_IDS.kid.home}>
       {celebrate && (
-        <Confetti width={dims.w} height={dims.h} numberOfPieces={220} recycle={false} gravity={0.25} />
+        <Suspense fallback={null}>
+          <Confetti width={dims.w} height={dims.h} numberOfPieces={220} recycle={false} gravity={0.25} />
+        </Suspense>
       )}
 
       {/* Header */}
@@ -233,7 +269,9 @@ export default function KidHome() {
       </div>
 
       {showRecap && (
-        <DailyRecapCard childId={childId} child={child} onClose={() => setShowRecap(false)} />
+        <Suspense fallback={null}>
+          <DailyRecapCard childId={childId} child={child} onClose={() => setShowRecap(false)} />
+        </Suspense>
       )}
 
       {/* Points hero */}
@@ -295,6 +333,7 @@ export default function KidHome() {
 
       {/* Tab content */}
       <div className="relative z-10 px-5 md:px-10 pt-6">
+        <Suspense fallback={<PageSkeleton compact rows={2} />}>
         <AnimatePresence mode="wait">
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
@@ -511,6 +550,7 @@ export default function KidHome() {
             </motion.div>
           )}
         </AnimatePresence>
+        </Suspense>
       </div>
 
       {/* Bottom nav */}
@@ -524,6 +564,8 @@ export default function KidHome() {
               <button
                 key={t.key}
                 onClick={() => setTab(t.key)}
+                onPointerDown={() => prefetchTab(t.key)}
+                onMouseEnter={() => prefetchTab(t.key)}
                 data-testid={t.testId}
                 className={`press-btn flex flex-col items-center gap-0.5 px-4 py-2 rounded-full font-fun font-semibold text-xs transition-colors ${
                   active ? "bg-[#FF9D23] text-white" : "text-slate-500 hover:text-slate-800"

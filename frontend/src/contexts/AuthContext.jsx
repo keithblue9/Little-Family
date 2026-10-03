@@ -63,9 +63,10 @@ export function AuthProvider({ children }) {
   }, []);
 
   useEffect(() => {
+    // Only the session check runs at start-up. The member list (with photos)
+    // is the login screen's business, and it fetches its own.
     fetchMe();
-    fetchMembers();
-  }, [fetchMe, fetchMembers]);
+  }, [fetchMe]);
 
   useEffect(() => {
     // Any in-flight request elsewhere in the app hitting a 503 lockout should

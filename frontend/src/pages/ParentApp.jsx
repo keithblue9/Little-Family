@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import PageSkeleton from "@/components/PageSkeleton";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
 import {
@@ -8,34 +9,54 @@ import {
   Pencil, RotateCcw, PawPrint, ImagePlus, GripVertical, Scale,
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
+import { cacheGet, cacheSet } from "@/lib/localCache";
 import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
-import MoneyApprovals from "@/components/MoneyApprovals";
-import CharityRequestsReview from "@/components/CharityRequestsReview";
-import ProfileEditor from "@/components/ProfileEditor";
-import ConfigMenu from "@/components/ConfigMenu";
-import MemberPasscodeManager from "@/components/ChildPasscodeManager";
-import ThemeSwitcher from "@/components/ThemeSwitcher";
-import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
-import ReminderCreator from "@/components/ReminderCreator";
-import Leaderboard from "@/components/Leaderboard";
-import Achievements from "@/components/Achievements";
-import AnalyticsDashboard from "@/components/AnalyticsDashboard";
-import PushNotificationManager from "@/components/PushNotificationManager";
-import FamilyDayMonitor from "@/components/FamilyDayMonitor";
-import MonthHeatmap from "@/components/MonthHeatmap";
-import WeeklyReport from "@/components/WeeklyReport";
-import LabelEditor from "@/components/LabelEditor";
-import EncourageModal from "@/components/EncourageModal";
-import RewardSuggestionsReview from "@/components/RewardSuggestionsReview";
-import ViewLinksManager from "@/components/ViewLinksManager";
-import FamilyChallenges from "@/components/FamilyChallenges";
 import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
 import { QUEST_THEME_LIST } from "@/lib/questThemes";
 import { todayKey, humanDateKey, shiftDateKey, nextDateForWeekday } from "@/lib/dates";
+import { filterTaskIdeas } from "@/lib/taskIdeaBank";
+
+// Every tab's heavier pieces load on first use, so opening the dashboard
+// only downloads what the Overview needs.
+const MoneyApprovals = lazy(() => import("@/components/MoneyApprovals"));
+const CharityRequestsReview = lazy(() => import("@/components/CharityRequestsReview"));
+const ProfileEditor = lazy(() => import("@/components/ProfileEditor"));
+const ConfigMenu = lazy(() => import("@/components/ConfigMenu"));
+const MemberPasscodeManager = lazy(() => import("@/components/ChildPasscodeManager"));
+const Leaderboard = lazy(() => import("@/components/Leaderboard"));
+const Achievements = lazy(() => import("@/components/Achievements"));
+const AnalyticsDashboard = lazy(() => import("@/components/AnalyticsDashboard"));
+const PushNotificationManager = lazy(() => import("@/components/PushNotificationManager"));
+const FamilyDayMonitor = lazy(() => import("@/components/FamilyDayMonitor"));
+const MonthHeatmap = lazy(() => import("@/components/MonthHeatmap"));
+const WeeklyReport = lazy(() => import("@/components/WeeklyReport"));
+const LabelEditor = lazy(() => import("@/components/LabelEditor"));
+const EncourageModal = lazy(() => import("@/components/EncourageModal"));
+const RewardSuggestionsReview = lazy(() => import("@/components/RewardSuggestionsReview"));
+const ViewLinksManager = lazy(() => import("@/components/ViewLinksManager"));
+const FamilyChallenges = lazy(() => import("@/components/FamilyChallenges"));
+const LevelConfigEditor = lazy(() => import("@/components/LevelConfigEditor"));
+const PetConfigEditor = lazy(() => import("@/components/PetConfigEditor"));
+const PetResetRequestsReview = lazy(() => import("@/components/PetResetRequestsReview"));
+const MaintenanceModeCard = lazy(() => import("@/components/MaintenanceModeCard"));
+const OffDayManager = lazy(() => import("@/components/OffDayManager"));
+const CompactScheduleCard = lazy(() => import("@/components/CompactScheduleCard"));
+const RestartScheduleCard = lazy(() => import("@/components/RestartScheduleCard"));
+const RestoreWeeklyPlanCard = lazy(() => import("@/components/RestoreWeeklyPlanCard"));
+const LateReasonsConfig = lazy(() => import("@/components/LateReasonsConfig"));
+const PunishmentConfig = lazy(() => import("@/components/PunishmentConfig"));
+const DaySegmentsConfig = lazy(() => import("@/components/DaySegmentsConfig"));
+const SegmentStartsConfig = lazy(() => import("@/components/SegmentStartsConfig"));
+const ExamPeriodConfig = lazy(() => import("@/components/ExamPeriodConfig"));
+const DayTemplateManager = lazy(() => import("@/components/DayTemplateManager"));
+const HonestyInsightCard = lazy(() => import("@/components/HonestyInsightCard"));
+const ActivityLogCard = lazy(() => import("@/components/ActivityLogCard"));
+const TemplateManagerModal = lazy(() => import("@/components/TemplateManagerModal"));
+const HoldRequestsReview = lazy(() => import("@/components/HoldRequestsReview"));
 
 // Format a stored ISO timestamp as the family-local wall clock (GMT+7). Used
 // in the approval list so parents can see exactly when a kid started/finished.
@@ -57,24 +78,6 @@ function fmtDuration(startIso, endIso) {
     return `${Math.floor(mins / 60)} jam ${mins % 60} mnt`;
   } catch { return ""; }
 }
-import { filterTaskIdeas } from "@/lib/taskIdeaBank";
-import TemplateManagerModal from "@/components/TemplateManagerModal";
-import LevelConfigEditor from "@/components/LevelConfigEditor";
-import PetConfigEditor from "@/components/PetConfigEditor";
-import PetResetRequestsReview from "@/components/PetResetRequestsReview";
-import MaintenanceModeCard from "@/components/MaintenanceModeCard";
-import OffDayManager from "@/components/OffDayManager";
-import RestartScheduleCard from "@/components/RestartScheduleCard";
-import RestoreWeeklyPlanCard from "@/components/RestoreWeeklyPlanCard";
-import LateReasonsConfig from "@/components/LateReasonsConfig";
-import PunishmentConfig from "@/components/PunishmentConfig";
-import DaySegmentsConfig from "@/components/DaySegmentsConfig";
-import SegmentStartsConfig from "@/components/SegmentStartsConfig";
-import ExamPeriodConfig from "@/components/ExamPeriodConfig";
-import DayTemplateManager from "@/components/DayTemplateManager";
-import HoldRequestsReview from "@/components/HoldRequestsReview";
-import HonestyInsightCard from "@/components/HonestyInsightCard";
-import ActivityLogCard from "@/components/ActivityLogCard";
 
 const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
 const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
@@ -153,31 +156,63 @@ export default function ParentApp() {
   const [editingCons, setEditingCons] = useState(null);
   const [applyConsModal, setApplyConsModal] = useState(null);
 
+  // The task list covers a window around today (plus anything still waiting
+  // on a parent), not the family's entire history. Opening a date outside it
+  // widens the window; opening a future day builds that day first.
+  const [taskWindow, setTaskWindow] = useState(() => ({
+    start: shiftDateKey(todayKey(), -14),
+    end: shiftDateKey(todayKey(), 14),
+  }));
+  const applyBootstrap = useCallback((d) => {
+    setChildren(d.children || []);
+    setTasks(d.tasks || []);
+    setRewards(d.rewards || []);
+    setConsequences(d.consequences || []);
+    setRedemptions(d.redemptions || []);
+    setStats(d.stats || null);
+  }, []);
+  // Paint instantly from the last visit, then refresh from the server.
+  const [hydrated] = useState(() => {
+    const cached = cacheGet("parent:bootstrap", 24 * 60 * 60 * 1000);
+    return cached || null;
+  });
+  useEffect(() => {
+    if (hydrated) applyBootstrap(hydrated);
+  }, [hydrated, applyBootstrap]);
+
   const load = useCallback(async () => {
     try {
-      const [c, t, r, cq, rd, s] = await Promise.all([
-        api.get("/children"),
-        api.get("/tasks"),
-        api.get("/rewards"),
-        api.get("/consequences"),
-        api.get("/redemptions"),
-        api.get("/stats/dashboard"),
-      ]);
-      setChildren(c.data);
-      setTasks(t.data);
-      setRewards(r.data);
-      setConsequences(cq.data);
-      setRedemptions(rd.data);
-      setStats(s.data);
+      const { data } = await api.get("/parent/bootstrap", {
+        params: { start_date: taskWindow.start, end_date: taskWindow.end },
+      });
+      applyBootstrap(data);
+      cacheSet("parent:bootstrap", data);
       if (selectedChildId === undefined) setSelectedChildId(null);
     } catch (e) {
       toast.error(formatApiError(e));
     }
-  }, [selectedChildId]);
+  }, [selectedChildId, taskWindow, applyBootstrap]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  const ensureDate = useCallback(async (dk) => {
+    if (!dk || dk === "all") return;
+    const tomorrow = shiftDateKey(todayKey(), 1);
+    let built = false;
+    if (dk > tomorrow) {
+      try {
+        const { data } = await api.post(`/days/${dk}/prepare`);
+        built = (data?.created || 0) > 0;
+      } catch { /* outside the allowed range — just show what exists */ }
+    }
+    if (dk < taskWindow.start || dk > taskWindow.end) {
+      setTaskWindow((w) => ({ start: dk < w.start ? dk : w.start, end: dk > w.end ? dk : w.end }));
+    } else if (built) {
+      load();
+    }
+  }, [taskWindow, load]);
 
   const doLogout = async () => {
     await logout();
@@ -284,6 +319,7 @@ export default function ParentApp() {
         </div>
 
         <div className="p-4 md:p-8 max-w-6xl">
+          <Suspense fallback={<PageSkeleton compact rows={2} />}>
           {/* Child filter tabs */}
           {children.length > 0 && view !== "settings" && view !== "monitor" && (
             <div className="flex items-center gap-2 mb-5 flex-wrap" data-testid="parent-child-tabs">
@@ -346,6 +382,8 @@ export default function ParentApp() {
                   setTaskModal(true);
                 }}
                 onRefresh={load}
+                onEnsureDate={ensureDate}
+                taskWindow={taskWindow}
                 onApplyConsequence={(task) => setApplyConsModal({ task })}
                 onAddChild={() => setChildModal(true)}
               />
@@ -395,9 +433,11 @@ export default function ParentApp() {
               onRefresh={load}
             />
           )}
+          </Suspense>
         </div>
       </main>
 
+      <Suspense fallback={null}>
       {/* Modals */}
       <ChildFormModal open={childModal} onClose={() => setChildModal(false)} onSaved={load} />
       <TaskFormModal
@@ -420,6 +460,7 @@ export default function ParentApp() {
         selectedChildId={selectedChildId}
         onSaved={load}
       />
+      </Suspense>
     </div>
   );
 }
@@ -526,7 +567,7 @@ function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNaviga
 }
 
 // ─────────────────────────────────────────────────────────
-function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild }) {
+function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild, onEnsureDate, taskWindow }) {
   // Drag-and-drop reordering of the active list. We keep a local copy while
   // dragging so the row follows the cursor instantly, then persist the whole
   // visible slice in one call. If the save fails we reload from the server
@@ -657,6 +698,10 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
     try { sessionStorage.setItem("tasksDateFilter", v); } catch { /* storage unavailable — non-fatal */ }
   };
   const isDateMode = dateFilter !== "all"; // dateFilter is either "all" or a YYYY-MM-DD string
+  // Days are built lazily on the server: make sure the one on screen exists.
+  useEffect(() => {
+    if (isDateMode && onEnsureDate) onEnsureDate(dateFilter);
+  }, [dateFilter]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const displayTasks = useMemo(() => {
     if (selectedChildId) return tasks; // specific child → individual tasks
@@ -892,6 +937,11 @@ function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, o
           >
             Semua Tanggal
           </button>
+          {!isDateMode && taskWindow && (
+            <span className="text-xs text-slate-400" title="Riwayat lebih lama: pilih tanggalnya di kalender">
+              {humanDateKey(taskWindow.start)} – {humanDateKey(taskWindow.end)}
+            </span>
+          )}
           {isDateMode && (
             <span className="text-xs text-slate-500 font-semibold">{humanDateKey(dateFilter)}</span>
           )}
@@ -1557,6 +1607,10 @@ function SettingsView({ kids, onAdd, onRefresh }) {
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <RestartScheduleCard onChanged={onRefresh} />
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-200 p-6">
+        <CompactScheduleCard onChanged={onRefresh} />
       </div>
 
       <div className="bg-white rounded-2xl border-2 border-red-100 p-6">

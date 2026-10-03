@@ -5,6 +5,8 @@ import "@/index.css";
 import App from "@/App";
 import { registerServiceWorker } from "@/serviceWorkerRegistration";
 import { startVersionWatcher } from "@/lib/versionCheck";
+import { watchThemeFonts } from "@/lib/fonts";
+import { startOfflineSync } from "@/lib/offlineQueue";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -24,5 +26,7 @@ root.render(
   </React.StrictMode>,
 );
 
+watchThemeFonts();
+startOfflineSync();
 registerServiceWorker();
 startVersionWatcher();

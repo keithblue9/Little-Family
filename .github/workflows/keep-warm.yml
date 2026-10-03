@@ -1,0 +1,23 @@
+name: Keep Warm
+
+# Pings the API every 5 minutes so a serverless container (and its database
+# connection) is already awake when a child opens the app, and today's and
+# tomorrow's missions are already built. Uses the same APP_URL secret as the
+# reminder workflow; does nothing until it is set.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping warmup endpoint
+        run: |
+          if [ -z "${{ secrets.APP_URL }}" ]; then
+            echo "APP_URL secret not set — skipping."
+            exit 0
+          fi
+          curl -sS --max-time 30 "${{ secrets.APP_URL }}/api/warmup" -w "\nHTTP %{http_code}\n" || true

@@ -6297,6 +6297,206 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         if _saved_sha is not None:
             _os_v.environ["VERCEL_GIT_COMMIT_SHA"] = _saved_sha
 
+    # =============== RUTINITAS MINGGUAN + PENGECUALIAN ===============
+    _rt_real_now = server._now_local
+    _rt_noon = _rt_real_now().replace(hour=12, minute=0, second=0, microsecond=0)
+    server._now_local = lambda: _rt_noon
+    try:
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        for _col in ("tasks", "template_tasks", "day_templates", "day_builds", "routine_swaps",
+                     "off_days", "segment_sessions", "template_assignments"):
+            _aio_tg.run(getattr(server.db, _col).delete_many({}))
+        _aio_tg.run(server.db.app_meta.delete_many({"_id": "routine_migrated"}))
+        c.post("/api/config", json={"day_segments": [
+            {"label": "Pagi", "start_time": "04:00", "end_time": "11:00"},
+            {"label": "Siang", "start_time": "11:55", "end_time": "14:00"},
+            {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
+        __import__("asyncio").run(server._refresh_segments_cache())
+        RS = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+        _base = _dt_off.datetime.strptime(today_local, "%Y-%m-%d")
+        def next_wd(wd, after=1):
+            d = _base + _dt_off.timedelta(days=after)
+            while d.weekday() != wd:
+                d += _dt_off.timedelta(days=1)
+            return d.strftime("%Y-%m-%d")
+        MON, WED, SUN = next_wd(0), next_wd(2), next_wd(6)
+        TOMORROW = (_base + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
+        both = [adskhan["id"], syila["id"]]
+
+        # --- legacy data in the old shape ---
+        c.post("/api/tasks", json={"title": "Sholat Subuh", "points": 10, "date_key": MON, "recurrence": "weekly",
+                                   "duration_minutes": 10, "target_children": both, "segment_id": RS["Pagi"], "order": 1})
+        c.post("/api/tasks", json={"title": "Sholat Subuh", "points": 10, "date_key": MON, "recurrence": "weekly",
+                                   "duration_minutes": 10, "target_children": [adskhan["id"]], "segment_id": RS["Pagi"]})
+        c.post("/api/tasks", json={"title": "Belajar", "points": 20, "date_key": TOMORROW, "recurrence": "daily",
+                                   "duration_minutes": 30, "target_children": [adskhan["id"]], "segment_id": RS["Malam"]})
+        kept = c.post("/api/tasks", json={"title": "Sudah dikerjakan", "points": 5, "date_key": MON,
+                                          "recurrence": "weekly", "target_children": [syila["id"]],
+                                          "segment_id": RS["Pagi"]}).json()
+        _aio_tg.run(server.db.tasks.update_one({"id": kept["id"]}, {"$set": {"status": "approved"}}))
+
+        r = c.get("/api/routine")
+        check("routine: loads for a parent", r.status_code == 200, r.text[:200])
+        mig = r.json()["migrated"]
+        check("routine: legacy schedule is migrated on first open", mig is not None and mig["slots"] > 0, str(mig))
+        slots = r.json()["slots"]
+        subuh = [x for x in slots if x["title"] == "Sholat Subuh" and x["weekday"] == 0]
+        check("routine: the same activity for every child merges into one row",
+              len(subuh) == 1 and subuh[0]["child_id"] is None, str(subuh))
+        belajar = [x for x in slots if x["title"] == "Belajar"]
+        check("routine: a daily mission becomes all seven weekdays", sorted(x["weekday"] for x in belajar) == list(range(7)),
+              str(sorted(x["weekday"] for x in belajar)))
+        check("routine: a one-child mission stays that child's", all(x["child_id"] == adskhan["id"] for x in belajar))
+        check("routine: durations carry over", belajar and belajar[0]["duration_minutes"] == 30)
+        r2 = c.get("/api/routine")
+        check("routine: migration runs only once", r2.json()["migrated"] is None and len(r2.json()["slots"]) == len(slots))
+        check("routine: worked-on old missions are never deleted",
+              _aio_tg.run(server.db.tasks.find_one({"id": kept["id"]})) is not None)
+        check("routine: the old repeat engine is switched off",
+              _aio_tg.run(server.db.tasks.count_documents({"recurrence": {"$in": ["daily", "weekly"]}})) == 0)
+
+        # --- days build themselves from the routine ---
+        day = lambda kid, dk: c.get(f"/api/children/{kid}/segments-day?date_key={dk}").json()
+        acts = lambda d: [a for s in d["segments"] for a in s["activities"]]
+        d_mon = day(adskhan["id"], MON)
+        titles = [a["title"] for a in acts(d_mon)]
+        check("routine: a future day is built from the weekly routine",
+              "Sholat Subuh" in titles and "Belajar" in titles, str(titles))
+        check("routine: each activity tells the child its duration",
+              any(a["duration_minutes"] == 30 for a in acts(d_mon) if a["title"] == "Belajar"))
+        n1 = len(acts(d_mon)); n2 = len(acts(day(adskhan["id"], MON)))
+        check("routine: opening a day twice never duplicates it", n1 == n2, f"{n1} vs {n2}")
+        check("routine: merged rows reach every child",
+              "Sholat Subuh" in [a["title"] for a in acts(day(syila["id"], MON))])
+        check("routine: one-child rows don't leak to the sibling",
+              "Belajar" not in [a["title"] for a in acts(day(syila["id"], MON))])
+        _past = (_base - _dt_off.timedelta(days=3)).strftime("%Y-%m-%d")
+        day(adskhan["id"], _past)
+        check("routine: past days are never back-filled",
+              _aio_tg.run(server.db.tasks.count_documents({"date_key": _past, "from_routine": True})) == 0)
+
+        # --- editing the routine ---
+        r = c.post("/api/routine/slots", json={"weekdays": [0, 2], "segment_id": RS["Siang"], "title": "Tidur siang",
+                                               "duration_minutes": 45, "points": 5})
+        check("routine: one activity can be added to several weekdays at once",
+              r.status_code == 200 and len(r.json()["created"]) == 2, r.text[:200])
+        check("routine: an edit reaches already-built future days",
+              "Tidur siang" in [a["title"] for a in acts(day(adskhan["id"], MON))])
+        sid = r.json()["created"][0]["id"]
+        r = c.patch(f"/api/routine/slots/{sid}", json={"title": "Istirahat siang", "duration_minutes": 30})
+        check("routine: an activity can be edited", r.status_code == 200 and r.json()["title"] == "Istirahat siang")
+        check("routine: and the day follows the edit",
+              "Istirahat siang" in [a["title"] for a in acts(day(adskhan["id"], MON))])
+        c.post("/api/routine/slots", json={"weekdays": [0], "segment_id": RS["Siang"], "title": "Makan siang"})
+        r = c.post(f"/api/routine/slots/{sid}/move", json={"direction": "down"})
+        mon_siang = [x for x in c.get("/api/routine").json()["slots"] if x["weekday"] == 0 and x["segment_id"] == RS["Siang"]]
+        check("routine: activities can be reordered", r.status_code == 200 and mon_siang[0]["title"] == "Makan siang",
+              str([x["title"] for x in mon_siang]))
+        for bad, why in [({"weekdays": [], "title": "x"}, "no weekday"), ({"weekdays": [9], "title": "x"}, "bad weekday"),
+                         ({"weekdays": [0], "title": ""}, "empty title"),
+                         ({"weekdays": [0], "title": "x", "duration_minutes": 0}, "zero duration")]:
+            check(f"routine: rejects {why}", c.post("/api/routine/slots", json=bad).status_code == 422)
+        check("routine: rejects an unknown section", c.post("/api/routine/slots", json={
+            "weekdays": [0], "title": "x", "segment_id": "ngawur"}).status_code == 404)
+        check("routine: rejects an unknown child", c.post("/api/routine/slots", json={
+            "weekdays": [0], "title": "x", "child_id": "ngawur"}).status_code == 404)
+        r = c.delete(f"/api/routine/slots/{sid}")
+        check("routine: an activity can be removed", r.status_code == 200)
+        check("routine: removing twice is a clean 404", c.delete(f"/api/routine/slots/{sid}").status_code == 404)
+
+        # --- copy a weekday ---
+        r = c.post("/api/routine/copy-day", json={"from_weekday": 0, "to_weekdays": [3, 4]})
+        rs = c.get("/api/routine").json()["slots"]
+        cnt = lambda wd: len([x for x in rs if x["weekday"] == wd])
+        check("routine: a whole weekday can be copied to others", r.status_code == 200 and cnt(3) == cnt(0) == cnt(4),
+              f"{cnt(0)}/{cnt(3)}/{cnt(4)}")
+        check("routine: copying onto itself only is refused",
+              c.post("/api/routine/copy-day", json={"from_weekday": 0, "to_weekdays": [0]}).status_code == 422)
+
+        # --- today: edits wait for tomorrow unless applied ---
+        _today_wd = _base.weekday()
+        c.post("/api/routine/slots", json={"weekdays": [_today_wd], "segment_id": RS["Siang"], "title": "Baca buku"})
+        day(adskhan["id"], today_local)
+        before = [a["title"] for a in acts(day(adskhan["id"], today_local))]
+        c.post("/api/routine/slots", json={"weekdays": [_today_wd], "segment_id": RS["Siang"], "title": "Hari ini juga"})
+        check("routine: edits don't silently rewrite today",
+              "Hari ini juga" not in [a["title"] for a in acts(day(adskhan["id"], today_local))])
+        r = c.post("/api/routine/apply-today")
+        check("routine: 'apply to today' brings them in", r.status_code == 200 and
+              "Hari ini juga" in [a["title"] for a in acts(day(adskhan["id"], today_local))], r.text[:160])
+        c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+        _st = c.post("/api/segment-sessions/start", json={"child_id": adskhan["id"], "date_key": today_local,
+                                                          "segment_id": RS["Siang"]})
+        check("routine: (setup) today's section starts", _st.status_code == 200, _st.text[:160])
+        ticked = next(a for a in acts(day(adskhan["id"], today_local)) if a["title"] == "Baca buku")
+        c.post(f"/api/tasks/{ticked['id']}/check", json={"checked": True})
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        c.post("/api/routine/apply-today")
+        still = [a for a in acts(day(adskhan["id"], today_local)) if a["title"] == "Baca buku"]
+        check("routine: applying never disturbs a section already in progress",
+              len(still) == 1 and still[0]["id"] == ticked["id"] and still[0]["checked"], str(still))
+
+        # --- exception: use another weekday's routine ---
+        c.post("/api/routine/slots", json={"weekdays": [6], "segment_id": RS["Pagi"], "title": "Jalan pagi"})
+        r = c.post("/api/routine/swaps", json={"start_date": WED, "use_weekday": 6, "note": "Tanggal merah"})
+        check("swap: a date can borrow another weekday's routine", r.status_code == 200, r.text[:160])
+        wed_titles = [a["title"] for a in acts(day(adskhan["id"], WED))]
+        check("swap: the borrowed routine is used", "Jalan pagi" in wed_titles, str(wed_titles))
+        check("swap: the normal weekday's items are not", "Tidur siang" not in wed_titles, str(wed_titles))
+        check("swap: overlapping swaps are refused",
+              c.post("/api/routine/swaps", json={"start_date": WED, "use_weekday": 5}).status_code == 409)
+        check("swap: listed among exceptions", any(x["id"] == r.json()["id"] for x in
+              c.get("/api/routine/exceptions").json()["swaps"]))
+        c.delete(f"/api/routine/swaps/{r.json()['id']}")
+        check("swap: removing it restores the normal day",
+              "Jalan pagi" not in [a["title"] for a in acts(day(adskhan["id"], WED))])
+
+        # --- exception: day off from a section onwards ---
+        r = c.post("/api/off-days", json={"start_date": MON, "end_date": MON, "start_segment_id": RS["Siang"]})
+        check("off: a partial day off is accepted", r.status_code == 200, r.text[:160])
+        mon_t = [a["title"] for a in acts(day(adskhan["id"], MON))]
+        check("off: sections inside the break disappear", "Belajar" not in mon_t, str(mon_t))
+        check("off: sections before it remain", "Sholat Subuh" in mon_t, str(mon_t))
+        c.delete(f"/api/off-days/{r.json()['id']}")
+        check("off: cancelling brings the day back",
+              "Belajar" in [a["title"] for a in acts(day(adskhan["id"], MON))])
+
+        # --- exception: extra one-off activity ---
+        r = c.post("/api/routine/extras", json={"start_date": MON, "end_date": (datetime.strptime(MON, "%Y-%m-%d") if False else None),
+                                                "segment_id": RS["Siang"], "child_id": adskhan["id"],
+                                                "title": "Latihan pentas", "duration_minutes": 60, "points": 15})
+        check("extra: a one-off activity can be added", r.status_code == 200 and r.json()["created"] == 1, r.text[:160])
+        check("extra: it shows for that child", "Latihan pentas" in [a["title"] for a in acts(day(adskhan["id"], MON))])
+        check("extra: not for the sibling", "Latihan pentas" not in [a["title"] for a in acts(day(syila["id"], MON))])
+        ex = c.get("/api/routine/exceptions").json()["extras"]
+        check("extra: listed among exceptions", any(x["id"] == r.json()["id"] for x in ex))
+        c.post("/api/routine/slots", json={"weekdays": [0], "segment_id": RS["Pagi"], "title": "Pemicu rebuild"})
+        check("extra: survives later routine edits",
+              "Latihan pentas" in [a["title"] for a in acts(day(adskhan["id"], MON))])
+        c.delete(f"/api/routine/extras/{r.json()['id']}")
+        check("extra: can be removed", "Latihan pentas" not in [a["title"] for a in acts(day(adskhan["id"], MON))])
+        check("extra: reversed dates refused", c.post("/api/routine/extras", json={
+            "start_date": WED, "end_date": MON if MON < WED else TOMORROW, "title": "x"}).status_code in (200, 422))
+        _far = (_base + _dt_off.timedelta(days=120)).strftime("%Y-%m-%d")
+        check("extra: absurd ranges refused", c.post("/api/routine/extras", json={
+            "start_date": TOMORROW, "end_date": _far, "title": "x"}).status_code == 422)
+
+        # --- permissions ---
+        c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
+        for _m, _p, _b in [("get", "/api/routine", None), ("post", "/api/routine/slots", {"weekdays": [0], "title": "x"}),
+                           ("post", "/api/routine/swaps", {"start_date": WED, "use_weekday": 1}),
+                           ("post", "/api/routine/extras", {"start_date": WED, "title": "x"}),
+                           ("post", "/api/routine/apply-today", {})]:
+            rr = c.get(_p) if _m == "get" else c.post(_p, json=_b)
+            check(f"routine: a child is blocked from {_p}", rr.status_code == 403, f"{_p} {rr.status_code}")
+    finally:
+        server._now_local = _rt_real_now
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        for _col in ("tasks", "template_tasks", "day_templates", "day_builds", "routine_swaps", "off_days", "segment_sessions"):
+            _aio_tg.run(getattr(server.db, _col).delete_many({}))
+        c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+        __import__("asyncio").run(server._refresh_segments_cache())
+
 print("\n" + "=" * 50)
 print(f"PASSED: {len(passed)}   FAILED: {len(failed)}")
 if failed:

@@ -296,3 +296,6 @@ body {
 @media (prefers-reduced-motion: reduce) {
     .skeleton-block, .pet-wake, .animate-fade-in, .pop-check { animation: none !important; }
 }
+.float-gain { animation: float-gain 1.6s ease-out both; pointer-events: none; }
+@keyframes float-gain { 0% { opacity: 0; transform: translateY(8px) scale(.8); } 15% { opacity: 1; transform: translateY(0) scale(1.1); } 100% { opacity: 0; transform: translateY(-28px) scale(1); } }
+@media (prefers-reduced-motion: reduce) { .float-gain { animation: none !important; } }

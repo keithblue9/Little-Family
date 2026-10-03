@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import PageSkeleton from "@/components/PageSkeleton";
 import { useNavigate, useParams } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { cacheGet, cacheSet, cacheClear } from "@/lib/localCache";
+import { haptic } from "@/lib/offlineQueue";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { useAuth } from "@/contexts/AuthContext";
@@ -17,6 +18,8 @@ import { personalityMeta } from "@/lib/personality";
 import { pickQuestTheme } from "@/lib/questThemes";
 import { computeLevel } from "@/lib/levels";
 import { useLabels } from "@/lib/labels";
+import { useQueryClient } from "@tanstack/react-query";
+import { qk } from "@/lib/queries";
 
 // Only the Misi tab is needed for the first paint; every other tab's pieces
 // load on first visit (and start loading the moment a finger touches the tab).
@@ -49,6 +52,9 @@ const CheersReceived = lazy(CheersReceivedLoader);
 const ProfileEditorLoader = () => import("@/components/ProfileEditor");
 const ProfileEditor = lazy(ProfileEditorLoader);
 const Confetti = lazy(() => import("react-confetti"));
+const FamilyMissionCard = lazy(() => import("@/components/FamilyMissionCard"));
+const MemoriesCollage = lazy(() => import("@/components/MemoriesCollage"));
+const SimpleQuestView = lazy(() => import("@/components/SimpleQuestView"));
 const TAB_PREFETCH = {
   money: [MoneyExchangeLoader, ChikyBankCardLoader],
   rewards: [RewardSuggestionsLoader],
@@ -72,6 +78,7 @@ export default function KidHome() {
   const nav = useNavigate();
   const { user, logout } = useAuth();
   const { t: L } = useLabels();
+  const queryClient = useQueryClient();
   const [child, setChild] = useState(null);
   const [rewards, setRewards] = useState([]);
   const [wishlist, setWishlist] = useState([]); // array of { id, reward_id, ... }
@@ -85,6 +92,7 @@ export default function KidHome() {
   const [rupiahPerPoint, setRupiahPerPoint] = useState(100);
   const [showRecap, setShowRecap] = useState(false);
   const [tab, setTab] = useState("tasks");
+  const [fullView, setFullView] = useState(false); // simple-mode kids can peek at the full checklist
   const [celebrate, setCelebrate] = useState(false);
   const [dims, setDims] = useState({ w: window.innerWidth, h: window.innerHeight });
 
@@ -195,6 +203,33 @@ export default function KidHome() {
     }
   };
 
+  // Points going up and levels being reached deserve a moment: a floating
+  // "+N", a little buzz, and confetti on a new level.
+  const prevProgress = useRef(null);
+  const [gain, setGain] = useState(null);
+  useEffect(() => {
+    if (!child) return undefined;
+    const lvl = computeLevel(child.lifetime_points || 0, levelTitles).level;
+    const prev = prevProgress.current;
+    let timer;
+    if (prev && prev.id === child.id) {
+      const diff = (child.points || 0) - prev.points;
+      if (diff > 0) {
+        setGain(diff);
+        haptic(15);
+        timer = setTimeout(() => setGain(null), 1600);
+      }
+      if (lvl > prev.level) {
+        toast.success(`Naik ke Level ${lvl}! 🎉`);
+        setCelebrate(true);
+        setTimeout(() => setCelebrate(false), 3000);
+        haptic([30, 50, 30]);
+      }
+    }
+    prevProgress.current = { id: child.id, points: child.points || 0, level: lvl };
+    return () => clearTimeout(timer);
+  }, [child, levelTitles]);
+
   const tryExit = async () => {
     if (user?.role === "parent") {
       nav("/parent");
@@ -288,7 +323,12 @@ export default function KidHome() {
               <div className="flex items-center gap-1.5 mb-0.5 text-white/80 text-xs font-bold uppercase tracking-wide">
                 <Sparkles className="w-3.5 h-3.5" strokeWidth={2.5} /> Poin kamu
               </div>
-              <div className="font-fun font-bold text-6xl leading-none">{child.points || 0}</div>
+              <div className="relative font-fun font-bold text-6xl leading-none">
+                <span key={child.points || 0} className="inline-block pop-check">{child.points || 0}</span>
+                {gain && (
+                  <span className="float-gain absolute left-full ml-2 top-0 text-2xl text-yellow-200" aria-live="polite">+{gain}</span>
+                )}
+              </div>
             </div>
             <button
               onClick={() => setTab("money")}
@@ -340,6 +380,9 @@ export default function KidHome() {
               <div className="mb-5">
                 <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} petStageNames={petStageNames} petFeedThresholds={petFeedThresholds} feedCostPerMeal={feedCostPerMeal} />
               </div>
+              <div className="mb-5">
+                <Suspense fallback={null}><FamilyMissionCard compact /></Suspense>
+              </div>
               <h2 className="font-fun font-bold text-xl text-slate-900 mb-3">Misi Hari Ini 🗺️</h2>
 
               {child.mbti && personalityMeta(child.mbti) && (
@@ -356,14 +399,33 @@ export default function KidHome() {
                 </motion.div>
               )}
 
-              <SegmentQuestView
-                child={child}
-                onCelebrate={() => {
-                  setCelebrate(true);
-                  setTimeout(() => setCelebrate(false), 3000);
-                  load();
-                }}
-              />
+              {child.simple_mode && !fullView ? (
+                <SimpleQuestView
+                  child={child}
+                  onUseFullView={() => setFullView(true)}
+                  onCelebrate={() => {
+                    setCelebrate(true);
+                    setTimeout(() => setCelebrate(false), 3000);
+                    load();
+                    queryClient.invalidateQueries({ queryKey: qk.familyMission });
+                  }}
+                />
+              ) : (
+                <SegmentQuestView
+                  child={child}
+                  onCelebrate={() => {
+                    setCelebrate(true);
+                    setTimeout(() => setCelebrate(false), 3000);
+                    load();
+                    queryClient.invalidateQueries({ queryKey: qk.familyMission });
+                  }}
+                />
+              )}
+              {child.simple_mode && fullView && (
+                <button onClick={() => setFullView(false)} className="mt-3 w-full text-center text-sm text-slate-400 underline">
+                  Kembali ke tampilan sederhana
+                </button>
+              )}
             </motion.div>
           )}
 
@@ -516,6 +578,7 @@ export default function KidHome() {
               <StickerBook childId={childId} />
               <Achievements childId={childId} />
               <GrowthTrail childId={childId} childName={child.name} />
+              <MemoriesCollage childId={childId} title="Kenanganku" />
             </motion.div>
           )}
 

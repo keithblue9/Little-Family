@@ -576,6 +576,9 @@ class ChildUpdate(BaseModel):
     sound_theme: Optional[Literal["ding", "fanfare", "chime", "drum"]] = None
     pet_type: Optional[PET_TYPE] = None
     pet_equipped: Optional[List[str]] = None
+    # Big-button, one-mission-at-a-time screen with spoken instructions for
+    # children who can't read the checklist comfortably yet.
+    simple_mode: Optional[bool] = None
     _check_pet_equipped = field_validator("pet_equipped")(classmethod(lambda cls, v: _validate_pet_accessories(v)))
 
 
@@ -1524,7 +1527,8 @@ async def _challenge_progress(ch: dict) -> dict:
             {"child_id": {"$in": ch["participant_ids"]}},
             {"is_coop": True, "coop_participants": {"$in": ch["participant_ids"]}},
         ],
-    }, {"_id": 0}).to_list(5000)
+    }, {"_id": 0, "child_id": 1, "is_coop": 1, "coop_participants": 1, "points": 1,
+        "coop_points_split": 1, "together_bonus_awarded": 1, "early_bonus_awarded": 1}).to_list(None)
     earned = 0
     for t in tasks:
         if t.get("is_coop"):
@@ -2627,7 +2631,7 @@ async def child_day_progress(
         "family_combo": combo_award,
         "active_punishment": active_punishment,
         "segments": effective_segments,
-        "tasks": _tasks_with_availability,
+        "tasks": _with_media_refs("task", _tasks_with_availability),
         "perfect_day": perfect_day,
         "perfect_day_claimed": bool(perfect_claim),
     }
@@ -4267,6 +4271,10 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                 "points": a.get("points", 0), "is_bonus": bool(a.get("is_bonus")),
                 "checked": bool(a.get("checked")) or a.get("status") in ("completed", "approved"),
                 "status": a.get("status"),
+                "photo_required": bool(a.get("photo_required")),
+                # Photos as cacheable media URLs, never inline base64.
+                "before_photo_url": _media_ref("task", a["id"], "before_photo_url", a.get("before_photo_url")),
+                "completion_photo_url": _media_ref("task", a["id"], "completion_photo_url", a.get("completion_photo_url")),
             } for a in acts],
             "required_count": len(required),
             "checked_required": sum(1 for a in required if a.get("checked") or a.get("status") in ("completed", "approved")),
@@ -4404,6 +4412,15 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
         raise HTTPException(
             status_code=409,
             detail=f"Masih ada {len(open_required)} aktivitas yang belum dicentang",
+        )
+    # A mission the parent marked "photo required" needs its after-photo
+    # before the section can be closed.
+    missing_photo = [a for a in acts if a.get("photo_required") and a.get("checked")
+                     and a.get("status") in ("pending", "rejected") and not a.get("completion_photo_url")]
+    if missing_photo:
+        raise HTTPException(
+            status_code=422,
+            detail="Lampirkan foto sesudah untuk: " + ", ".join(a["title"] for a in missing_photo[:3]),
         )
 
     timing = _segment_timing(seg, child, dk, _seg_grace(config))
@@ -7442,7 +7459,12 @@ async def toggle_maintenance(payload: MaintenanceToggleInput, user: dict = Depen
 
 
 @api.get("/config")
-async def get_app_config(user: dict = Depends(get_current_user)):
+async def get_app_config(user: dict = Depends(get_current_user), lite: bool = False):
+    if lite:
+        # Labels/language/goals only — without the uploaded background image,
+        # which can be hundreds of KB and is only shown on the login screen.
+        full = await get_app_config(user, False)
+        return {k: v for k, v in full.items() if k not in _HEAVY_CONFIG_FIELDS and k != "_id"}
     config = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if not config:
         return {
@@ -8087,7 +8109,7 @@ MEDIA_PREFIX = "/api/media/"
 _MEDIA_SOURCES = {
     "child": ("children", {"profile_photo_url"}),
     "reward": ("rewards", {"image"}),
-    "task": ("tasks", {"completion_photo_url"}),
+    "task": ("tasks", {"completion_photo_url", "before_photo_url"}),
 }
 
 
@@ -8146,6 +8168,219 @@ async def get_media(kind: str, doc_id: str, field: str, v: str = "", s: str = ""
         "Cache-Control": "private, max-age=31536000, immutable",
     })
 
+# ---- Family Mission: one shared weekly goal --------------------------------
+# Every child's approved points this week count toward ONE family target, with
+# a shared reward. Cooperation instead of competition, and it resets itself
+# every week — nothing for a parent to recreate.
+class FamilyMissionInput(BaseModel):
+    enabled: bool = True
+    title: str = Field(default="Misi Keluarga", min_length=1, max_length=60)
+    target_points: int = Field(default=300, ge=10, le=100000)
+    reward: str = Field(default="", max_length=120)
+    emoji: str = Field(default="🏰", max_length=8)
+
+
+def _week_bounds(today: str) -> tuple:
+    d = datetime.strptime(today, "%Y-%m-%d")
+    start = d - timedelta(days=d.weekday())
+    return start.strftime("%Y-%m-%d"), (start + timedelta(days=6)).strftime("%Y-%m-%d")
+
+
+@api.get("/family-mission")
+async def get_family_mission(user: dict = Depends(get_current_user)):
+    config = await get_config_cached()
+    fm = config.get("family_mission") or {}
+    today = _today_key()
+    start, end = _week_bounds(today)
+    base = {
+        "enabled": bool(fm.get("enabled")), "title": fm.get("title") or "Misi Keluarga",
+        "target_points": int(fm.get("target_points") or 300), "reward": fm.get("reward") or "",
+        "emoji": fm.get("emoji") or "🏰", "week_start": start, "week_end": end,
+    }
+    if not base["enabled"]:
+        return {**base, "earned_points": 0, "percent": 0, "goal_met": False, "contributions": []}
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1, "name": 1,
+                                                             "avatar_emoji": 1, "avatar_color": 1}).to_list(50)
+    rows = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "status": "approved", "date_key": {"$gte": start, "$lte": end}},
+        {"_id": 0, "child_id": 1, "is_coop": 1, "coop_participants": 1, "points": 1},
+    ).to_list(None)
+    per_kid = {k["id"]: 0 for k in kids}
+    for t in rows:
+        for kid_id in per_kid:
+            per_kid[kid_id] += _child_share_of_task(t, kid_id) if (
+                t.get("is_coop") or t.get("child_id") == kid_id) else 0
+    earned = sum(per_kid.values())
+    target = base["target_points"]
+    days_left = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days + 1
+    return {
+        **base,
+        "earned_points": earned,
+        "percent": min(100, int(earned * 100 / target)) if target else 100,
+        "goal_met": earned >= target,
+        "days_left": days_left,
+        "per_day_needed": max(0, -(-(target - earned) // days_left)) if days_left > 0 else 0,
+        "contributions": [{**k, "points": per_kid[k["id"]]} for k in kids],
+    }
+
+
+@api.put("/family-mission")
+async def set_family_mission(payload: FamilyMissionInput, user: dict = Depends(require_parent)):
+    await _write_config({"$set": {"family_mission": payload.model_dump()}})
+    return await get_family_mission(user)
+
+
+# ---- Before/after photos ----------------------------------------------------
+class TaskPhotoInput(BaseModel):
+    kind: Literal["before", "after"]
+    photo_url: str = Field(min_length=1)
+
+    @field_validator("photo_url")
+    @classmethod
+    def _check_photo(cls, v):
+        if not v.startswith("data:image/"):
+            raise ValueError("Foto harus berupa gambar")
+        if len(v) > 2_000_000:
+            raise ValueError("Foto terlalu besar (maks ~1.4MB)")
+        return v
+
+
+@api.post("/tasks/{task_id}/photo")
+async def attach_task_photo(task_id: str, payload: TaskPhotoInput, user: dict = Depends(get_current_user)):
+    """A child attaches a 'before' or 'after' picture to a mission (e.g. a room
+    before and after tidying). Parents see them side by side when reviewing."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    owners = task.get("coop_participants") or [task.get("child_id")]
+    if user["role"] == "child" and user["id"] not in owners:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    if task.get("status") in ("approved", "skipped", "off"):
+        raise HTTPException(status_code=409, detail="Misi ini sudah ditutup")
+    field = "before_photo_url" if payload.kind == "before" else "completion_photo_url"
+    await db.tasks.update_one({"id": task_id}, {"$set": {field: payload.photo_url, f"{field}_at": now_iso()}})
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return _with_media_refs("task", updated)
+
+
+# ---- Adaptive schedule suggestions -------------------------------------------
+@api.get("/schedule/suggestions")
+async def schedule_suggestions(days: int = 28, user: dict = Depends(require_parent)):
+    """Looks at the last few weeks per child and mission and suggests small
+    adjustments: a mission that keeps being missed may be too hard, too long or
+    in the wrong part of the day; one that is always done might deserve a step
+    up. Suggestions only — nothing changes until a parent applies one."""
+    days = max(7, min(days, 90))
+    today = _today_key()
+    since = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "date_key": {"$gte": since, "$lt": today},
+         "status": {"$in": ["approved", "completed", "missed", "pending", "rejected", "skipped"]},
+         "is_bonus": {"$ne": True}},
+        {"_id": 0, "child_id": 1, "title": 1, "status": 1, "points": 1, "segment_id": 1,
+         "from_template_slot_id": 1, "checked": 1, "date_key": 1},
+    ).to_list(None)
+    kids = {k["id"]: k for k in await db.children.find(
+        {"parent_id": FAMILY_ID}, {"_id": 0, "id": 1, "name": 1, "avatar_emoji": 1}).to_list(50)}
+    stats: dict = {}
+    for t in rows:
+        key = (t.get("child_id"), t.get("title"))
+        st = stats.setdefault(key, {"done": 0, "total": 0, "points": t.get("points", 0),
+                                    "slot_id": t.get("from_template_slot_id"), "segment_id": t.get("segment_id")})
+        st["total"] += 1
+        if t.get("status") in ("approved", "completed") or t.get("checked"):
+            st["done"] += 1
+        if t.get("from_template_slot_id"):
+            st["slot_id"] = t["from_template_slot_id"]
+    out = []
+    for (child_id, title), st in stats.items():
+        if child_id not in kids or st["total"] < 6:
+            continue
+        rate = st["done"] / st["total"]
+        base = {"child_id": child_id, "child_name": kids[child_id]["name"],
+                "avatar_emoji": kids[child_id].get("avatar_emoji"), "title": title,
+                "done": st["done"], "total": st["total"], "rate": round(rate * 100),
+                "points": st["points"], "slot_id": st["slot_id"]}
+        if rate < 0.5:
+            new_pts = max(1, round(st["points"] * 1.25))
+            out.append({**base, "kind": "struggling", "severity": 2 if rate < 0.3 else 1,
+                        "message": f"{title} baru selesai {st['done']} dari {st['total']} kali. "
+                                   "Mungkin terlalu berat, terlalu lama, atau jamnya kurang pas — coba bicarakan, "
+                                   "pindahkan ke bagian hari lain, atau naikkan sedikit poinnya sebagai penyemangat.",
+                        "action": {"type": "set_points", "points": new_pts} if st["slot_id"] else None})
+        elif rate >= 0.95 and st["total"] >= 10:
+            out.append({**base, "kind": "mastered", "severity": 0,
+                        "message": f"{title} hampir selalu beres ({st['done']}/{st['total']}). "
+                                   "Sudah jadi kebiasaan! Bisa diganti tantangan baru, atau jadikan misi bonus.",
+                        "action": {"type": "make_bonus"} if st["slot_id"] else None})
+    out.sort(key=lambda x: (-x["severity"], x["rate"]))
+    return {"since": since, "until": today, "suggestions": out[:20]}
+
+
+class SuggestionApplyInput(BaseModel):
+    slot_id: str
+    type: Literal["set_points", "make_bonus"]
+    points: Optional[int] = Field(default=None, ge=1, le=10000)
+
+
+@api.post("/schedule/suggestions/apply")
+async def apply_schedule_suggestion(payload: SuggestionApplyInput, user: dict = Depends(require_parent)):
+    """Applies a suggestion to the routine (template slot) going forward."""
+    slot = await db.template_tasks.find_one({"id": payload.slot_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not slot:
+        raise HTTPException(status_code=404, detail="Slot rutinitas tidak ditemukan")
+    update = {"points": payload.points} if payload.type == "set_points" else {"is_bonus": True}
+    if payload.type == "set_points" and not payload.points:
+        raise HTTPException(status_code=422, detail="Poin baru wajib diisi")
+    await db.template_tasks.update_one({"id": payload.slot_id}, {"$set": update})
+    _invalidate_days_ready()
+    await log_activity(FAMILY_ID, slot.get("child_id"), "suggestion_applied",
+                       {"title": slot.get("title"), **update})
+    return await db.template_tasks.find_one({"id": payload.slot_id}, {"_id": 0})
+
+
+# ---- Memories: this month's photos, as a collage ------------------------------
+async def _memories(month: str, child_ids: Optional[List[str]] = None) -> dict:
+    if not re.match(r"^\d{4}-\d{2}$", month or ""):
+        raise HTTPException(status_code=422, detail="Bulan tidak valid (YYYY-MM)")
+    q = {"parent_id": FAMILY_ID, "date_key": {"$gte": f"{month}-01", "$lte": f"{month}-31"},
+         "status": {"$in": ["approved", "completed"]},
+         "$or": [{"completion_photo_url": {"$nin": [None, ""]}}, {"before_photo_url": {"$nin": [None, ""]}}]}
+    if child_ids:
+        q["child_id"] = {"$in": child_ids}
+    rows = await db.tasks.find(q, {"_id": 0, "id": 1, "title": 1, "date_key": 1, "child_id": 1,
+                                   "completion_photo_url": 1, "before_photo_url": 1}).sort("date_key", 1).to_list(200)
+    kids = {k["id"]: k for k in await db.children.find(
+        {"parent_id": FAMILY_ID}, {"_id": 0, "id": 1, "name": 1, "avatar_emoji": 1, "avatar_color": 1}).to_list(50)}
+    badges = await db.badges.count_documents({"earned_at": {"$gte": f"{month}-01", "$lte": f"{month}-31T23:59:59"},
+                                              **({"child_id": {"$in": child_ids}} if child_ids else {})})
+    photos = []
+    for t in _with_media_refs("task", rows):
+        k = kids.get(t.get("child_id"), {})
+        photos.append({"id": t["id"], "title": t["title"], "date_key": t["date_key"],
+                       "child_name": k.get("name"), "avatar_emoji": k.get("avatar_emoji"),
+                       "after": t.get("completion_photo_url"), "before": t.get("before_photo_url")})
+    return {"month": month, "photos": photos, "badges_earned": badges}
+
+
+@api.get("/memories")
+async def list_memories(month: Optional[str] = None, child_id: Optional[str] = None,
+                        user: dict = Depends(get_current_user)):
+    month = month or _today_key()[:7]
+    ids = [child_id] if child_id else None
+    if user["role"] == "child":
+        ids = [user["id"]]
+    return await _memories(month, ids)
+
+
+@api.get("/public/view/{token}/memories")
+async def public_memories(token: str, month: Optional[str] = None):
+    """The same collage for a grandparent's view link (only its children)."""
+    link = await db.view_links.find_one({"token": token}, {"_id": 0})
+    if not link or link.get("revoked"):
+        raise HTTPException(status_code=404, detail="Link tidak ditemukan atau sudah dicabut")
+    return await _memories(month or _today_key()[:7], link.get("child_ids") or None)
+
 # ---- Bootstrap: one round trip per screen ---------------------------------
 # A parent's dashboard used to open with six parallel requests, each paying its
 # own auth check and (on a cold container) its own wait. One request that runs
@@ -8188,7 +8423,7 @@ async def kid_bootstrap(child_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Bukan milikmu")
     child = await get_child_or_404(FAMILY_ID, child_id)
     child = {k: v for k, v in child.items() if k != "_id"}
-    config, _ = await asyncio.gather(get_app_config(user), _ensure_days_ready())
+    config, _ = await asyncio.gather(get_app_config(user, False), _ensure_days_ready())
     child["pet_is_dead"] = _pet_is_dead(child, await get_config_cached())
     _with_media_refs("child", child)
     config = {k: v for k, v in (config or {}).items() if k not in _HEAVY_CONFIG_FIELDS and k != "_id"}

@@ -272,6 +272,119 @@ with TestClient(server.app, base_url="https://testserver") as c:
     c.patch(f"/api/rewards/{rw['id']}", json={"image": ""})
     check("media: an old URL stops working once the image changes", c.get(listed["image"]).status_code == 404)
 
+    # ---------------- Family mission ----------------
+    reset_schedule()
+    r = c.get("/api/family-mission")
+    check("mission: disabled by default", r.status_code == 200 and r.json()["enabled"] is False, r.text[:150])
+    r = c.put("/api/family-mission", json={"enabled": True, "title": "Ke Kebun Binatang", "target_points": 50,
+                                           "reward": "Jalan-jalan", "emoji": "🦁"})
+    check("mission: parent can set it", r.status_code == 200 and r.json()["target_points"] == 50, r.text[:150])
+    t1 = c.post("/api/tasks", json={"title": "Bantu masak", "points": 30, "date_key": TODAY,
+                                    "target_children": [adskhan["id"]]}).json()
+    run(server.db.tasks.update_one({"id": t1["id"]}, {"$set": {"status": "approved"}}))
+    other = next(k for k in kids if k["id"] != adskhan["id"])
+    t2 = c.post("/api/tasks", json={"title": "Siram bunga", "points": 25, "date_key": TODAY,
+                                    "target_children": [other["id"]]}).json()
+    run(server.db.tasks.update_one({"id": t2["id"]}, {"$set": {"status": "approved"}}))
+    m = c.get("/api/family-mission").json()
+    check("mission: everyone's points add up", m["earned_points"] == 55 and m["goal_met"] is True, str(m)[:200])
+    check("mission: per-child contributions",
+          {x["name"]: x["points"] for x in m["contributions"]} == {adskhan["name"]: 30, other["name"]: 25},
+          str(m["contributions"]))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    check("mission: kids can see it", c.get("/api/family-mission").json()["title"] == "Ke Kebun Binatang")
+    check("mission: kids cannot change it",
+          c.put("/api/family-mission", json={"enabled": False}).status_code == 403)
+
+    # ---------------- Before/after photos ----------------
+    t3 = run(server.db.tasks.find_one({"id": t1["id"]}))
+    run(server.db.tasks.update_one({"id": t1["id"]}, {"$set": {"status": "pending"}}))
+    r = c.post(f"/api/tasks/{t1['id']}/photo", json={"kind": "before", "photo_url": img})
+    check("photo: kid attaches a before picture", r.status_code == 200
+          and r.json()["before_photo_url"].startswith("/api/media/task/"), r.text[:150])
+    r = c.post(f"/api/tasks/{t1['id']}/photo", json={"kind": "after", "photo_url": img})
+    check("photo: and an after picture", r.status_code == 200
+          and r.json()["completion_photo_url"].startswith("/api/media/task/"), r.text[:150])
+    check("photo: served via media", c.get(r.json()["before_photo_url"]).status_code == 200)
+    r = c.post(f"/api/tasks/{t2['id']}/photo", json={"kind": "before", "photo_url": img})
+    check("photo: not on a sibling's mission", r.status_code == 403, str(r.status_code))
+    r = c.post(f"/api/tasks/{t1['id']}/photo", json={"kind": "before", "photo_url": "http://x"})
+    check("photo: must be an image", r.status_code == 422, str(r.status_code))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    dp = c.get("/api/family/day-progress").json()
+    all_tasks = [t for ch in dp["children"] for t in ch["tasks"]]
+    check("photo: day-progress carries URLs, not base64",
+          all(not str(t.get("before_photo_url") or "").startswith("data:") for t in all_tasks))
+
+    # ---------------- Memories ----------------
+    run(server.db.tasks.update_one({"id": t1["id"]}, {"$set": {"status": "approved"}}))
+    r = c.get(f"/api/memories?month={TODAY[:7]}")
+    mem = r.json()
+    check("memories: this month's photos", r.status_code == 200 and any(p["title"] == "Bantu masak" for p in mem["photos"]),
+          r.text[:200])
+    check("memories: before and after both present",
+          all(p["before"] and p["after"] for p in mem["photos"] if p["title"] == "Bantu masak"))
+    check("memories: bad month → 422", c.get("/api/memories?month=2026-13-01").status_code == 422)
+    link = c.post("/api/view-links", json={"label": "Nenek"}).json()
+    r = c.get(f"/api/public/view/{link['token']}/memories?month={TODAY[:7]}")
+    check("memories: grandparents' link shows them", r.status_code == 200 and len(r.json()["photos"]) >= 1, r.text[:150])
+    check("memories: unknown link → 404", c.get("/api/public/view/nope/memories").status_code == 404)
+
+    # ---------------- Adaptive suggestions ----------------
+    reset_schedule()
+    tpl = c.post("/api/day-templates", json={"name": "Biasa", "is_default": True}).json()
+    slot = c.post("/api/template-tasks", json={"template_id": tpl["id"], "weekday": 0, "segment_id": first_seg,
+                                               "title": "Latihan piano", "points": 8}).json()
+    docs = []
+    for i in range(1, 11):
+        docs.append({"id": f"sg-{i}", "parent_id": "family-default", "child_id": adskhan["id"],
+                     "title": "Latihan piano", "points": 8, "date_key": day(-i), "is_bonus": False,
+                     "status": "approved" if i <= 2 else "missed", "from_template_slot_id": slot["id"]})
+        docs.append({"id": f"sg2-{i}", "parent_id": "family-default", "child_id": adskhan["id"],
+                     "title": "Sikat gigi", "points": 5, "date_key": day(-i), "is_bonus": False,
+                     "status": "approved", "from_template_slot_id": slot["id"]})
+    run(server.db.tasks.insert_many(docs))
+    sug = c.get("/api/schedule/suggestions").json()["suggestions"]
+    piano = next((x for x in sug if x["title"] == "Latihan piano"), None)
+    check("suggest: flags a mission that keeps being missed", piano and piano["kind"] == "struggling", str(sug)[:200])
+    check("suggest: notices a mastered habit", any(x["title"] == "Sikat gigi" and x["kind"] == "mastered" for x in sug))
+    r = c.post("/api/schedule/suggestions/apply", json={"slot_id": slot["id"], "type": "set_points",
+                                                         "points": piano["action"]["points"]})
+    check("suggest: applying updates the routine", r.status_code == 200 and r.json()["points"] == piano["action"]["points"],
+          r.text[:150])
+    check("suggest: unknown slot → 404", c.post("/api/schedule/suggestions/apply",
+          json={"slot_id": "nope", "type": "make_bonus"}).status_code == 404)
+
+    # ---------------- Simple mode flag ----------------
+    r = c.patch(f"/api/children/{adskhan['id']}", json={"simple_mode": True})
+    check("simple: parent can switch a child to simple mode", r.status_code == 200 and r.json().get("simple_mode") is True)
+
+    # ---------------- Photo-required missions in the section flow ----------------
+    reset_schedule()
+    c.post("/api/config", json={"min_gap_seconds": 0})
+    pr = c.post("/api/tasks", json={"title": "Rapikan meja", "points": 5, "date_key": TODAY,
+                                    "segment_id": first_seg, "photo_required": True,
+                                    "target_children": [adskhan["id"]]}).json()
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    sd = c.get(f"/api/children/{adskhan['id']}/segments-day").json()
+    seg = next(x for x in sd["segments"] if any(a["id"] == pr["id"] for a in x["activities"]))
+    act = next(a for a in seg["activities"] if a["id"] == pr["id"])
+    check("photo-req: flag reaches the child's checklist", act["photo_required"] is True)
+    reason = (sd.get("late_reasons") or [{}])[0].get("id")
+    sbody = {"child_id": adskhan["id"], "date_key": TODAY, "segment_id": seg["id"]}
+    r = c.post("/api/segment-sessions/start", json=sbody)
+    if r.status_code == 409 and reason:
+        r = c.post("/api/segment-sessions/start", json={**sbody, "late_reason_id": reason})
+    check("photo-req: section starts", r.status_code == 200, r.text[:150])
+    c.post(f"/api/tasks/{pr['id']}/check", json={"checked": True})
+    r = c.post("/api/segment-sessions/finish", json={**sbody, "late_reason_id": reason})
+    check("photo-req: cannot finish without the after-photo", r.status_code == 422 and "foto" in r.text.lower(),
+          r.text[:150])
+    c.post(f"/api/tasks/{pr['id']}/photo", json={"kind": "after", "photo_url": img})
+    r = c.post("/api/segment-sessions/finish", json={**sbody, "late_reason_id": reason})
+    check("photo-req: finishes once the photo is attached", r.status_code == 200, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})
     check("gzip: large JSON is compressed",

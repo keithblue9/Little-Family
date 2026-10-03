@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { QUEST_THEMES, pickQuestTheme } from "@/lib/questThemes";
 import { todayKey, shiftDateKey, humanDateKey, isFutureDate } from "@/lib/dates";
+import BeforeAfter from "@/components/BeforeAfter";
 import MonthHeatmap from "@/components/MonthHeatmap";
 import GrowthTrail from "@/components/GrowthTrail";
 
@@ -207,8 +208,11 @@ function TaskRow({ task, bonus }) {
   const Icon = s.icon;
   const isDone = task.status === "approved" || task.status === "completed" || task.status === "skipped";
   const hasTimes = task.timer_started_at || task.completed_at;
+  const hasPhoto = task.before_photo_url || task.completion_photo_url;
+  const [showPhoto, setShowPhoto] = useState(false);
 
   return (
+    <div className="space-y-1.5">
     <div className={`flex items-center gap-2 p-2 rounded-xl ${isDone ? "bg-slate-50" : "bg-white"} border border-slate-100`}>
       <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
         task.status === "approved" ? "bg-green-100" :
@@ -256,10 +260,20 @@ function TaskRow({ task, bonus }) {
           </div>
         )}
       </div>
+      {hasPhoto && (
+        <button onClick={() => setShowPhoto((v) => !v)} title="Lihat foto misi"
+                className="press-btn shrink-0 w-9 h-9 rounded-lg overflow-hidden border border-slate-200">
+          <img src={task.completion_photo_url || task.before_photo_url} alt="" loading="lazy" className="w-full h-full object-cover" />
+        </button>
+      )}
       <div className="flex items-center gap-0.5 text-xs font-bold text-amber-600 shrink-0">
         <Star className="w-3 h-3 fill-amber-500 text-amber-500" />
         {task.points}
       </div>
+    </div>
+    {showPhoto && hasPhoto && (
+      <BeforeAfter before={task.before_photo_url} after={task.completion_photo_url} alt={task.title} />
+    )}
     </div>
   );
 }

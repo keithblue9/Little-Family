@@ -38,8 +38,31 @@ Buka http://localhost:3000.
 - Tugas per anak (poin, penalti, jatuh tempo, pengulangan), reward, dan konsekuensi.
 - Poin, streak, dan badge otomatis; log aktivitas & statistik dashboard untuk pemantauan.
 - **PWA**: tombol *Install App* (Android/desktop) dan petunjuk *Add to Home Screen* (iOS).
+- **Misi Keluarga** mingguan, foto **sebelum/sesudah**, **Saran Jadwal** adaptif,
+  **Kenangan Bulan Ini**, **Mode Sederhana** untuk anak kecil, dan **Ctrl/⌘+K**
+  untuk perintah cepat orang tua.
 - **5 tema**: `clean` (orang tua), `candy` & `mermaid` (anak perempuan 8-10),
   `cyber` & `galaxy` (anak laki-laki 11-14). Terapkan via `applyTheme(id)` di `src/lib/theme.js`.
+
+## Performa & penjadwalan
+- **Hari dibangun saat dibutuhkan.** Hanya hari ini dan besok yang disiapkan otomatis
+  (tidak ada lagi sapuan 14 hari). Hari lain disiapkan saat orang tua membukanya
+  (`POST /api/days/{tanggal}/prepare`) atau menambah tugas ke tanggal itu.
+- **Rapikan Jadwal** (Pengaturan) menghapus salinan lama hari-hari ke depan yang belum
+  disentuh; semuanya diarsipkan dan bisa dibatalkan.
+- **Satu request per layar**: `/api/parent/bootstrap` dan `/api/kid/{id}/bootstrap`.
+- **Gambar** dikirim sebagai URL bertanda tangan (`/api/media/...`) yang di-cache browser,
+  bukan base64 di setiap respons.
+- **Keep-warm**: workflow `.github/workflows/keep-warm.yml` memanggil `/api/warmup` tiap
+  5 menit. Isi secret `APP_URL` di GitHub agar aktif.
+
+## Tes
+```bash
+cd backend
+pip install mongomock-motor httpx
+python test_e2e.py            # suite lengkap
+python test_lazy_schedule.py  # penjadwalan lazy, bootstrap, media, fitur baru
+```
 
 ## Catatan pengembangan
 Repo ini sudah dibersihkan dari seluruh scaffolding/branding pihak ketiga.

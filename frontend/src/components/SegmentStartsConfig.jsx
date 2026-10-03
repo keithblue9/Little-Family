@@ -10,19 +10,20 @@ const DAYS = [
 ];
 
 /**
- * Personal start time per child, per section, per weekday.
+ * Personal start AND finish time per child, per section, per weekday.
  *
  * Siblings genuinely don't share one clock — one gets home from an activity at
- * 18:50 while the other starts at 18:00, and it shifts by weekday. Only the
- * START moves; the section's END stays shared, since "when the day wraps up"
- * is a household rule rather than a personal one.
+ * 18:50 while the other starts at 18:00, and it shifts by weekday. The finish
+ * can be pulled earlier too: a school-day morning closes at 06:15 so the child
+ * leaves on time, while the weekend morning runs to the shared 11:59.
  *
- * Left blank, a day simply falls back to the section's shared start time, so
- * partial configuration is always safe.
+ * Left blank, a day simply falls back to the section's shared time, so partial
+ * configuration is always safe.
  */
 export default function SegmentStartsConfig({ kids = [], onChanged }) {
   const [segments, setSegments] = useState([]);
   const [byChild, setByChild] = useState({}); // childId -> { segId: { day: "HH:MM" } }
+  const [endsByChild, setEndsByChild] = useState({}); // same shape, personal finish
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState(null);
 
@@ -34,13 +35,14 @@ export default function SegmentStartsConfig({ kids = [], onChanged }) {
         kids.map(async (k) => {
           try {
             const { data } = await api.get(`/children/${k.id}/segment-starts`);
-            return [k.id, data.segment_starts || {}];
+            return [k.id, data.segment_starts || {}, data.segment_ends || {}];
           } catch {
-            return [k.id, {}];
+            return [k.id, {}, {}];
           }
         })
       );
-      setByChild(Object.fromEntries(entries));
+      setByChild(Object.fromEntries(entries.map(([id, st]) => [id, st])));
+      setEndsByChild(Object.fromEntries(entries.map(([id, , en]) => [id, en])));
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -50,8 +52,8 @@ export default function SegmentStartsConfig({ kids = [], onChanged }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); }, [kids.length]);
 
-  const setVal = (childId, segId, day, value) =>
-    setByChild((prev) => ({
+  const setVal = (childId, segId, day, value, which = "start") =>
+    (which === "end" ? setEndsByChild : setByChild)((prev) => ({
       ...prev,
       [childId]: {
         ...(prev[childId] || {}),
@@ -64,9 +66,11 @@ export default function SegmentStartsConfig({ kids = [], onChanged }) {
     try {
       const { data } = await api.put(`/children/${kid.id}/segment-starts`, {
         starts: byChild[kid.id] || {},
+        ends: endsByChild[kid.id] || {},
       });
       setByChild((prev) => ({ ...prev, [kid.id]: data.segment_starts || {} }));
-      toast.success(`Jam mulai ${kid.name} tersimpan`);
+      setEndsByChild((prev) => ({ ...prev, [kid.id]: data.segment_ends || {} }));
+      toast.success(`Jam mulai & selesai ${kid.name} tersimpan`);
       onChanged?.();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -80,11 +84,12 @@ export default function SegmentStartsConfig({ kids = [], onChanged }) {
   return (
     <div>
       <h3 className="font-parent font-bold text-lg text-slate-900 mb-1 flex items-center gap-2">
-        <CalendarClock className="w-5 h-5 text-teal-600" /> Jam Mulai per Anak
+        <CalendarClock className="w-5 h-5 text-teal-600" /> Jam Mulai &amp; Selesai per Anak
       </h3>
       <p className="text-sm text-slate-500 mb-4">
-        Atur jam mulai tiap bagian hari untuk masing-masing anak, per hari. Berguna kalau jam pulang ekskul
-        berbeda-beda. Dikosongkan = ikut jam bagian yang umum. Jam selesai bagian tetap sama untuk semua.
+        Atur jam mulai dan jam selesai tiap bagian hari untuk masing-masing anak, per hari. Misalnya Pagi
+        selesai 06.15 di hari sekolah supaya tidak terlambat, tapi 11.59 di akhir pekan. Jam selesai tidak
+        boleh melewati batas bagian yang umum. Dikosongkan = ikut jam bagian yang umum.
       </p>
 
       {kids.length === 0 && <div className="text-sm text-slate-400">Belum ada anak.</div>}
@@ -122,12 +127,27 @@ export default function SegmentStartsConfig({ kids = [], onChanged }) {
                         <div className="text-[10px] text-slate-400 mb-0.5">{d.label}</div>
                         <input
                           type="time"
+                          aria-label={`${sg.label} ${d.label} mulai`}
+                          title="Mulai"
                           value={((byChild[kid.id] || {})[sg.id] || {})[d.i] || ""}
                           onChange={(e) => setVal(kid.id, sg.id, d.i, e.target.value)}
                           className="w-full px-1 py-1 rounded-lg border-2 border-slate-200 text-[11px] text-center"
                         />
+                        <input
+                          type="time"
+                          aria-label={`${sg.label} ${d.label} selesai`}
+                          title="Selesai"
+                          max={sg.end_time}
+                          value={((endsByChild[kid.id] || {})[sg.id] || {})[d.i] || ""}
+                          onChange={(e) => setVal(kid.id, sg.id, d.i, e.target.value, "end")}
+                          className="mt-1 w-full px-1 py-1 rounded-lg border-2 border-rose-100 bg-rose-50/40 text-[11px] text-center"
+                        />
                       </div>
                     ))}
+                  </div>
+                  <div className="flex gap-3 mt-1 text-[10px] text-slate-400">
+                    <span>Baris atas: mulai</span>
+                    <span className="text-rose-400">Baris bawah: selesai</span>
                   </div>
                 </div>
               ))}

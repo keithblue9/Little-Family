@@ -484,6 +484,41 @@ with TestClient(server.app, base_url="https://testserver") as c:
     check("offline: a finish before the start falls back to server time",
           sess and dt.datetime.fromisoformat(sess["completed_at"]) > pressed, str(sess and sess.get("completed_at")))
 
+    # ---------------- Personal finish per weekday ----------------
+    segs = c.get("/api/config").json()["day_segments"]
+    sg0 = segs[0]
+    wd_today = str(dt.datetime.strptime(TODAY, "%Y-%m-%d").weekday())
+    wd_other = str((int(wd_today) + 1) % 7)
+    st = server._hhmm_to_min(sg0["start_time"]); en = server._hhmm_to_min(sg0["end_time"])
+    early_end = server._fmt_min(st + 30)
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts",
+              json={"starts": {}, "ends": {sg0["id"]: {wd_today: early_end}}})
+    check("finish: saved", r.status_code == 200 and r.json()["segment_ends"][sg0["id"]][wd_today] == early_end, r.text[:200])
+    got = c.get(f"/api/children/{adskhan['id']}/segment-starts").json()
+    check("finish: read back", got["segment_ends"][sg0["id"]][wd_today] == early_end)
+    kid_doc = run(server.db.children.find_one({"id": adskhan["id"]}))
+    check("finish: applies on that weekday",
+          server._effective_segment_end(sg0, kid_doc, TODAY) == st + 30)
+    check("finish: other weekdays keep the shared end",
+          server._effective_segment_end(sg0, kid_doc, TOMORROW) == en)
+    sib = next(k for k in kids if k["id"] != adskhan["id"])
+    sib_doc = run(server.db.children.find_one({"id": sib["id"]}))
+    check("finish: a sibling is not affected", server._effective_segment_end(sg0, sib_doc, TODAY) == en)
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts",
+              json={"starts": {}, "ends": {sg0["id"]: {wd_today: server._fmt_min(min(en + 1, 1439))}}})
+    check("finish: past the shared end is refused", r.status_code == 422 or en == 1439, str(r.status_code))
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts",
+              json={"starts": {sg0["id"]: {wd_today: server._fmt_min(st + 40)}}, "ends": {sg0["id"]: {wd_today: early_end}}})
+    check("finish: before the start is refused", r.status_code == 422, str(r.status_code))
+    r = c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {}})
+    check("finish: saving starts only keeps finishes",
+          r.json()["segment_ends"].get(sg0["id"], {}).get(wd_today) == early_end, r.text[:200])
+    tm = server._segment_timing(sg0, kid_doc, TODAY, 0,
+                                (dt.datetime.strptime(TODAY, "%Y-%m-%d") + dt.timedelta(minutes=st + 45) - dt.timedelta(hours=7)).replace(tzinfo=dt.timezone.utc))
+    check("finish: finishing after the personal end is late", tm["late_finish"], str(tm))
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {}, "ends": {}})
+    check("finish: cleared", not c.get(f"/api/children/{adskhan['id']}/segment-starts").json()["segment_ends"])
+
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})
     check("gzip: large JSON is compressed",

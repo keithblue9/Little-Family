@@ -305,6 +305,10 @@ class SegmentStartOverrideInput(BaseModel):
     the section's global start time.
     """
     starts: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    # Optional personal FINISH per section per weekday (same shape). Lets a
+    # school-day morning close at 06:15 while the weekend runs to 11:59.
+    # None = leave the stored finishes untouched.
+    ends: Optional[Dict[str, Dict[str, str]]] = None
 
 
 class ExamPeriodInput(BaseModel):
@@ -2527,7 +2531,7 @@ async def child_day_progress(
         if not _sg:
             continue  # "kapan saja" tasks have no clock to project from
         _cursor = _effective_segment_start(_sg, _kid_doc_seg, dk)
-        _seg_end = _hhmm_to_min(_sg["end_time"])
+        _seg_end = _effective_segment_end(_sg, _kid_doc_seg, dk)
         for _t in sorted(_items, key=lambda x: (x.get("order") or 0, x.get("created_at") or "")):
             if _cursor > _seg_end:
                 break  # the section is full; anything past this can't be placed
@@ -2986,6 +2990,26 @@ def _effective_segment_start(segment: dict, child: Optional[dict], date_key: Opt
         return base
 
 
+def _effective_segment_end(segment: dict, child: Optional[dict], date_key: Optional[str]) -> int:
+    """Minutes-into-day when THIS child's section closes on THIS date: the
+    child's personal finish for that weekday, else the section's shared end.
+    A personal finish is never later than the shared end nor before the
+    child's start that day."""
+    base = _hhmm_to_min(segment["end_time"])
+    if not child or not date_key:
+        return base
+    overrides = (child.get("segment_ends") or {}).get(segment.get("id")) or {}
+    try:
+        wd = str(datetime.strptime(date_key, "%Y-%m-%d").weekday())
+        val = overrides.get(wd)
+        if not val:
+            return base
+        m = _hhmm_to_min(val)
+    except Exception:
+        return base
+    return max(_effective_segment_start(segment, child, date_key), min(m, base))
+
+
 def _fmt_min(m: int) -> str:
     m = max(0, min(int(m), 23 * 60 + 59))
     return f"{m // 60:02d}:{m % 60:02d}"
@@ -3043,7 +3067,7 @@ def _task_availability(task: dict, segments: list, child: Optional[dict] = None,
     start_min = _effective_segment_start(seg, child, task.get("date_key"))
     if now_min < start_min:
         return "future"
-    if now_min > _hhmm_to_min(seg["end_time"]):
+    if now_min > _effective_segment_end(seg, child, task.get("date_key")):
         return "closed"
     # The FIRST mission of a section carries the "did you start on time?"
     # question. Past its personal start + grace it needs the Terlambat flow,
@@ -4617,7 +4641,7 @@ def _segment_bounds(seg: Optional[dict], child: Optional[dict], dk: str):
     """(start_min, end_min) for this child on this day; None for 'anytime'."""
     if not seg:
         return None, None
-    return _effective_segment_start(seg, child, dk), _hhmm_to_min(seg["end_time"])
+    return _effective_segment_start(seg, child, dk), _effective_segment_end(seg, child, dk)
 
 
 def _segment_timing(seg: Optional[dict], child: Optional[dict], dk: str, grace: int,
@@ -4750,14 +4774,14 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
             status = "locked"
         else:
             status = "ready"
-        start_min, _ = _segment_bounds(seg, child, dk)
+        start_min, end_min = _segment_bounds(seg, child, dk)
         required = [a for a in acts if not a.get("is_bonus")]
         out.append({
             "id": sid,
             "label": seg["label"] if seg else "Kapan Saja",
             "emoji": (seg or {}).get("emoji", "✨" if not seg else ""),
             "start_time": _fmt_min(start_min) if seg else None,
-            "end_time": seg["end_time"] if seg else None,
+            "end_time": _fmt_min(end_min) if seg else None,
             "status": status,
             "late_start": timing["late_start"] and status in ("ready", "locked"),
             "late_finish": timing["late_finish"] and status == "in_progress",
@@ -6290,15 +6314,48 @@ async def set_segment_starts(child_id: str, payload: SegmentStartOverrideInput, 
             day_map[str(wd)] = hhmm
         if day_map:
             cleaned[seg_id] = day_map
-    await db.children.update_one({"id": child_id}, {"$set": {"segment_starts": cleaned}})
+    update = {"segment_starts": cleaned}
+    if payload.ends is not None:
+        ends: dict = {}
+        for seg_id, per_day in payload.ends.items():
+            seg = seg_by_id.get(seg_id)
+            if not seg:
+                raise HTTPException(status_code=404, detail=f"Bagian waktu tidak ditemukan: {seg_id}")
+            day_map = {}
+            for wd, hhmm in (per_day or {}).items():
+                if not hhmm:
+                    continue  # empty = "use the shared finish"
+                if str(wd) not in {"0", "1", "2", "3", "4", "5", "6"}:
+                    raise HTTPException(status_code=422, detail=f"Hari tidak valid: {wd}")
+                if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", hhmm):
+                    raise HTTPException(status_code=422, detail=f"Jam tidak valid: {hhmm}")
+                m = _hhmm_to_min(hhmm)
+                start_val = (cleaned.get(seg_id) or {}).get(str(wd)) or seg["start_time"]
+                if m > _hhmm_to_min(seg["end_time"]):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f'Jam selesai {hhmm} lewat dari batas bagian "{seg["label"]}" ({seg["end_time"]})',
+                    )
+                if m <= _hhmm_to_min(start_val):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f'Jam selesai {hhmm} harus sesudah jam mulai {start_val} ("{seg["label"]}")',
+                    )
+                day_map[str(wd)] = hhmm
+            if day_map:
+                ends[seg_id] = day_map
+        update["segment_ends"] = ends
+    await db.children.update_one({"id": child_id}, {"$set": update})
+    _invalidate_member_cache()
     await log_activity(FAMILY_ID, child_id, "segment_starts_updated", {"sections": len(cleaned)})
-    return {"success": True, "segment_starts": cleaned}
+    fresh = await get_child_or_404(FAMILY_ID, child_id)
+    return {"success": True, "segment_starts": cleaned, "segment_ends": fresh.get("segment_ends") or {}}
 
 
 @api.get("/children/{child_id}/segment-starts")
 async def get_segment_starts(child_id: str, user: dict = Depends(get_current_user)):
     child = await get_child_or_404(FAMILY_ID, child_id)
-    return {"segment_starts": child.get("segment_starts") or {}}
+    return {"segment_starts": child.get("segment_starts") or {}, "segment_ends": child.get("segment_ends") or {}}
 
 
 @api.post("/children/{child_id}/adjust-points")

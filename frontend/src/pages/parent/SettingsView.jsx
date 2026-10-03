@@ -19,16 +19,12 @@ const LevelConfigEditor = lazy(() => import("@/components/LevelConfigEditor"));
 const PetConfigEditor = lazy(() => import("@/components/PetConfigEditor"));
 const PetResetRequestsReview = lazy(() => import("@/components/PetResetRequestsReview"));
 const MaintenanceModeCard = lazy(() => import("@/components/MaintenanceModeCard"));
-const OffDayManager = lazy(() => import("@/components/OffDayManager"));
 const CompactScheduleCard = lazy(() => import("@/components/CompactScheduleCard"));
-const RestartScheduleCard = lazy(() => import("@/components/RestartScheduleCard"));
-const RestoreWeeklyPlanCard = lazy(() => import("@/components/RestoreWeeklyPlanCard"));
 const LateReasonsConfig = lazy(() => import("@/components/LateReasonsConfig"));
 const PunishmentConfig = lazy(() => import("@/components/PunishmentConfig"));
 const DaySegmentsConfig = lazy(() => import("@/components/DaySegmentsConfig"));
 const SegmentStartsConfig = lazy(() => import("@/components/SegmentStartsConfig"));
 const ExamPeriodConfig = lazy(() => import("@/components/ExamPeriodConfig"));
-const DayTemplateManager = lazy(() => import("@/components/DayTemplateManager"));
 
 export function SettingsView({ kids, onAdd, onRefresh }) {
   const { user } = useAuth();
@@ -296,9 +292,6 @@ export function SettingsView({ kids, onAdd, onRefresh }) {
         <SegmentStartsConfig kids={kids} onChanged={onRefresh} />
       </div>
 
-      <div className="bg-white rounded-2xl border-2 border-indigo-100 p-6">
-        <DayTemplateManager kids={kids} onChanged={onRefresh} />
-      </div>
 
       <div className="bg-white rounded-2xl border-2 border-violet-100 p-6">
         <ExamPeriodConfig kids={kids} onChanged={onRefresh} />
@@ -312,17 +305,8 @@ export function SettingsView({ kids, onAdd, onRefresh }) {
         <PunishmentConfig onChanged={onRefresh} />
       </div>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <OffDayManager />
-      </div>
 
-      <div className="bg-white rounded-2xl border-2 border-emerald-100 p-6">
-        <RestoreWeeklyPlanCard onChanged={onRefresh} />
-      </div>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <RestartScheduleCard onChanged={onRefresh} />
-      </div>
 
       <div className="bg-white rounded-2xl border border-slate-200 p-6">
         <CompactScheduleCard onChanged={onRefresh} />

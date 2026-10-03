@@ -2463,6 +2463,7 @@ async def child_day_progress(
     Used both by the kid (own progress) and the parent (monitoring)."""
     _child_doc = await get_child_or_404(FAMILY_ID, child_id)
     dk = validate_date_key(date_key) or _today_key()
+    await _ensure_day_built(dk)
     # Keep repeating series alive on the kid's side too — they're often the
     # first to open the app on a new day. Normally a background nudge; only an
     # EMPTY near day is built inline, because a serverless host may freeze the
@@ -4070,6 +4071,477 @@ async def export_weekly_xlsx(
     )
 
 
+# ================= Weekly routine + exceptions =================
+# The schedule is now defined once as a WEEK: weekday x section -> an ordered
+# checklist. Real days are built from it lazily, the first time anyone looks at
+# that day. Exceptions bend specific dates without touching the routine:
+#   - Libur            -> existing off-days (whole day, or from/to a section)
+#   - Jadwal hari lain -> a date (range) borrows another weekday's routine
+#   - Aktivitas khusus -> one-off activities added to particular dates
+# Durations are informational only: they tell the child roughly how long each
+# activity should take; the section's start and end are the only clock.
+
+class RoutineSlotInput(BaseModel):
+    weekdays: List[int] = Field(min_length=1, max_length=7)
+    segment_id: Optional[str] = None          # None = Kapan Saja
+    child_id: Optional[str] = None            # None = every child
+    title: str = Field(min_length=1, max_length=120)
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=600)
+    points: int = Field(default=10, ge=0, le=10000)
+    is_bonus: bool = False
+
+
+class RoutineSlotUpdate(BaseModel):
+    segment_id: Optional[str] = None
+    child_id: Optional[str] = None
+    title: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=600)
+    points: Optional[int] = Field(default=None, ge=0, le=10000)
+    is_bonus: Optional[bool] = None
+
+
+class RoutineMoveInput(BaseModel):
+    direction: Literal["up", "down"]
+
+
+class RoutineCopyInput(BaseModel):
+    from_weekday: int = Field(ge=0, le=6)
+    to_weekdays: List[int] = Field(min_length=1, max_length=7)
+    replace: bool = True
+
+
+class RoutineSwapInput(BaseModel):
+    start_date: str
+    end_date: Optional[str] = None
+    use_weekday: int = Field(ge=0, le=6)
+    note: str = Field(default="", max_length=100)
+
+
+class RoutineExtraInput(BaseModel):
+    start_date: str
+    end_date: Optional[str] = None
+    segment_id: Optional[str] = None
+    child_id: Optional[str] = None
+    title: str = Field(min_length=1, max_length=120)
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=600)
+    points: int = Field(default=10, ge=0, le=10000)
+    note: str = Field(default="", max_length=100)
+
+
+ROUTINE_MAX_SPAN_DAYS = 62
+
+
+async def _routine_template(create: bool = True) -> Optional[dict]:
+    tpl = await db.day_templates.find_one({"parent_id": FAMILY_ID, "is_routine": True}, {"_id": 0})
+    if tpl or not create:
+        return tpl
+    tpl = {"id": new_id(), "parent_id": FAMILY_ID, "name": "Rutinitas Mingguan", "emoji": "🗓️",
+           "description": "", "is_default": False, "is_routine": True, "created_at": now_iso()}
+    await db.day_templates.insert_one(tpl)
+    tpl.pop("_id", None)
+    return tpl
+
+
+def _date_span(start: str, end: Optional[str]) -> List[str]:
+    s = validate_date_key(start)
+    e = validate_date_key(end) if end else s
+    if not s or not e:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid (YYYY-MM-DD)")
+    if e < s:
+        raise HTTPException(status_code=422, detail="Tanggal akhir harus sesudah/sama dengan tanggal mulai")
+    d0 = datetime.strptime(s, "%Y-%m-%d")
+    n = (datetime.strptime(e, "%Y-%m-%d") - d0).days + 1
+    if n > ROUTINE_MAX_SPAN_DAYS:
+        raise HTTPException(status_code=422, detail=f"Maksimal {ROUTINE_MAX_SPAN_DAYS} hari sekaligus")
+    return [(d0 + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
+
+
+async def _check_segment_and_child(segment_id: Optional[str], child_id: Optional[str]):
+    if segment_id:
+        await _refresh_segments_cache()
+        if not any(sg["id"] == segment_id for sg in await _get_day_segments()):
+            raise HTTPException(status_code=404, detail="Bagian waktu tidak ditemukan")
+    if child_id:
+        await get_child_or_404(FAMILY_ID, child_id)
+
+
+async def _ensure_day_built(dk: str) -> int:
+    """Create a day's activities from the routine, once. Past days are never
+    back-filled, and the build is idempotent per routine slot, so a repeat or a
+    race can't produce duplicates."""
+    if not dk or dk < _today_key():
+        return 0
+    tpl = await _routine_template(create=False)
+    if not tpl:
+        return 0
+    if await db.day_builds.find_one({"parent_id": FAMILY_ID, "date_key": dk}):
+        return 0
+    try:
+        await db.day_builds.insert_one({"parent_id": FAMILY_ID, "date_key": dk, "built_at": now_iso()})
+    except Exception:  # noqa: BLE001 — another request is building this day
+        return 0
+    try:
+        swap = await db.routine_swaps.find_one(
+            {"parent_id": FAMILY_ID, "start_date": {"$lte": dk}, "end_date": {"$gte": dk}}, {"_id": 0})
+        weekday = swap["use_weekday"] if swap else datetime.strptime(dk, "%Y-%m-%d").weekday()
+        slots = await db.template_tasks.find(
+            {"parent_id": FAMILY_ID, "template_id": tpl["id"], "weekday": weekday}, {"_id": 0}).to_list(2000)
+        if not slots:
+            return 0
+        await _refresh_segments_cache()
+        segments = await _get_day_segments()
+        offs = await _off_days_covering(dk)
+        existing = {(t.get("from_routine_slot_id"), t.get("child_id")) for t in await db.tasks.find(
+            {"parent_id": FAMILY_ID, "date_key": dk, "from_routine_slot_id": {"$exists": True}},
+            {"_id": 0, "from_routine_slot_id": 1, "child_id": 1}).to_list(5000)}
+        kids = [k["id"] for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)]
+        docs = []
+        for sl in slots:
+            rank = _segment_rank(segments, sl.get("segment_id"))
+            if any(_off_covers(o, dk, rank, segments) for o in offs):
+                continue
+            for cid in ([sl["child_id"]] if sl.get("child_id") else kids):
+                if (sl["id"], cid) in existing:
+                    continue
+                docs.append({
+                    "id": new_id(), "parent_id": FAMILY_ID, "child_id": cid,
+                    "title": sl["title"], "description": sl.get("description", ""),
+                    "points": sl.get("points", 10), "penalty_points": 0,
+                    "duration_minutes": sl.get("duration_minutes"),
+                    "segment_id": sl.get("segment_id"), "order": sl.get("order") or 1,
+                    "is_bonus": bool(sl.get("is_bonus")), "date_key": dk, "due_time": None,
+                    "recurrence": "none", "status": "pending", "created_at": now_iso(),
+                    "from_routine_slot_id": sl["id"], "from_routine": True,
+                })
+        if docs:
+            await db.tasks.insert_many(docs)
+        return len(docs)
+    except Exception:
+        await db.day_builds.delete_many({"parent_id": FAMILY_ID, "date_key": dk})
+        raise
+
+
+async def _invalidate_days(start: str, end: Optional[str] = None, include_today: bool = True) -> int:
+    """Forget built days so they rebuild from the current routine/exceptions.
+    Only untouched routine activities are removed, never anything a child has
+    started or ticked, and never a section already in progress."""
+    _invalidate_days_ready()  # the routine/exceptions changed: re-check near days
+    today = _today_key()
+    lo = start if start > today else (today if include_today else
+                                      (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d"))
+    q_dates = {"$gte": lo} if end is None else {"$gte": lo, "$lte": end}
+    if end is not None and end < lo:
+        return 0
+    started = {(s["child_id"], s["date_key"], s["segment_id"]) for s in await db.segment_sessions.find(
+        {"parent_id": FAMILY_ID, "date_key": q_dates, "started_at": {"$nin": [None, ""]}},
+        {"_id": 0, "child_id": 1, "date_key": 1, "segment_id": 1}).to_list(5000)}
+    rows = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": q_dates, "from_routine": True,
+        "status": {"$in": ["pending", "rejected"]}, "checked": {"$ne": True},
+        "timer_started_at": {"$in": [None, ""]},
+    }, {"_id": 0, "id": 1, "child_id": 1, "date_key": 1, "segment_id": 1}).to_list(20000)
+    doomed = [r["id"] for r in rows
+              if (r["child_id"], r["date_key"], r.get("segment_id") or ANYTIME_SEGMENT_ID) not in started]
+    if doomed:
+        await db.tasks.delete_many({"parent_id": FAMILY_ID, "id": {"$in": doomed}})
+    await db.day_builds.delete_many({"parent_id": FAMILY_ID, "date_key": q_dates})
+    return len(doomed)
+
+
+async def _migrate_legacy_to_routine() -> Optional[dict]:
+    """One-time conversion of the old per-task schedule into the weekly routine.
+
+    Repeating missions (daily/weekly) and any default-template slots become
+    routine activities. Identical activities for every child are merged into one
+    'Semua anak' row; exact duplicates collapse. Untouched FUTURE copies of the
+    old repeating missions are removed (the routine rebuilds them); today and
+    anything already worked on is left exactly as it is.
+    """
+    if await db.app_meta.find_one({"_id": "routine_migrated"}):
+        return None
+    tpl = await _routine_template(create=True)
+    today = _today_key()
+    summary = {"slots": 0, "removed_future": 0, "sources": 0}
+    if not await db.template_tasks.find_one({"parent_id": FAMILY_ID, "template_id": tpl["id"]}):
+        await _refresh_segments_cache()
+        segments = await _get_day_segments()
+        kids = [k["id"] for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)]
+        cands = []
+        legacy = await db.tasks.find(
+            {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}}, {"_id": 0}).to_list(20000)
+        latest: dict = {}
+        for t in legacy:
+            seg = _segment_for_task(t, segments)
+            wds = list(range(7)) if t.get("recurrence") == "daily" else \
+                [datetime.strptime(t["date_key"], "%Y-%m-%d").weekday()] if t.get("date_key") else []
+            owners = t.get("coop_participants") or [t.get("child_id")]
+            for wd in wds:
+                for cid in owners:
+                    key = (wd, seg["id"] if seg else None, t.get("title"), cid, bool(t.get("is_bonus")))
+                    if key not in latest or (t.get("date_key") or "") > (latest[key].get("date_key") or ""):
+                        latest[key] = {**t, "_wd": wd, "_seg": seg["id"] if seg else None, "_cid": cid}
+        for t in latest.values():
+            cands.append({"weekday": t["_wd"], "segment_id": t["_seg"], "child_id": t["_cid"],
+                          "title": t.get("title"), "points": t.get("points", 10),
+                          "duration_minutes": t.get("duration_minutes"),
+                          "is_bonus": bool(t.get("is_bonus")), "order": t.get("order") or 0})
+        dflt = await db.day_templates.find_one(
+            {"parent_id": FAMILY_ID, "is_default": True, "is_routine": {"$ne": True}}, {"_id": 0})
+        if dflt:
+            for sl in await db.template_tasks.find(
+                    {"parent_id": FAMILY_ID, "template_id": dflt["id"]}, {"_id": 0}).to_list(5000):
+                for cid in ([sl["child_id"]] if sl.get("child_id") else kids):
+                    cands.append({"weekday": sl["weekday"], "segment_id": sl.get("segment_id"),
+                                  "child_id": cid, "title": sl["title"], "points": sl.get("points", 10),
+                                  "duration_minutes": sl.get("duration_minutes"),
+                                  "is_bonus": bool(sl.get("is_bonus")), "order": sl.get("order") or 0})
+        summary["sources"] = len(cands)
+        groups: dict = {}
+        for c in cands:
+            k = (c["weekday"], c["segment_id"], c["title"], c["is_bonus"], c["points"], c["duration_minutes"])
+            g = groups.setdefault(k, {**c, "children": set(), "order": c["order"]})
+            g["children"].add(c["child_id"])
+            g["order"] = min(g["order"], c["order"]) if g["order"] else c["order"]
+        rows = []
+        for g in groups.values():
+            if set(kids) and set(kids) <= g["children"]:
+                rows.append({**g, "child_id": None})
+            else:
+                rows.extend({**g, "child_id": cid} for cid in sorted(c for c in g["children"] if c))
+        rows.sort(key=lambda r: (r["weekday"], str(r["segment_id"]), r["order"] or 0, r["title"]))
+        counters: dict = {}
+        docs = []
+        for r in rows:
+            n = counters.get((r["weekday"], r["segment_id"]), 0) + 1
+            counters[(r["weekday"], r["segment_id"])] = n
+            docs.append({"id": new_id(), "parent_id": FAMILY_ID, "template_id": tpl["id"],
+                         "weekday": r["weekday"], "segment_id": r["segment_id"], "child_id": r["child_id"],
+                         "title": r["title"], "points": r["points"], "duration_minutes": r["duration_minutes"],
+                         "is_bonus": r["is_bonus"], "order": n, "created_at": now_iso()})
+        if docs:
+            await db.template_tasks.insert_many(docs)
+        summary["slots"] = len(docs)
+        res = await db.tasks.delete_many({
+            "parent_id": FAMILY_ID, "date_key": {"$gt": today},
+            "$or": [{"recurrence": {"$in": ["daily", "weekly"]}}, {"from_template_id": {"$exists": True}}],
+            "status": {"$in": ["pending", "rejected"]}, "checked": {"$ne": True},
+            "timer_started_at": {"$in": [None, ""]},
+        })
+        summary["removed_future"] = res.deleted_count
+        await db.tasks.update_many({"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}},
+                                   {"$set": {"recurrence": "none", "migrated_to_routine": True}})
+    # Today already has its missions; mark it built so nothing is doubled.
+    if await db.tasks.find_one({"parent_id": FAMILY_ID, "date_key": today}):
+        try:
+            await db.day_builds.insert_one({"parent_id": FAMILY_ID, "date_key": today, "built_at": now_iso()})
+        except Exception:  # noqa: BLE001
+            pass
+    await db.app_meta.update_one({"_id": "routine_migrated"},
+                                 {"$set": {"at": now_iso(), **summary}}, upsert=True)
+    await log_activity(FAMILY_ID, None, "routine_migrated", summary)
+    return summary
+
+
+def _slot_out(sl: dict) -> dict:
+    return {k: sl.get(k) for k in ("id", "weekday", "segment_id", "child_id", "title",
+                                   "duration_minutes", "points", "is_bonus", "order")}
+
+
+@api.get("/routine")
+async def get_routine(user: dict = Depends(require_parent)):
+    migrated = await _migrate_legacy_to_routine()
+    tpl = await _routine_template(create=True)
+    await _refresh_segments_cache()
+    segments = sorted(await _get_day_segments(), key=lambda x: _hhmm_to_min(x["start_time"]))
+    slots = await db.template_tasks.find(
+        {"parent_id": FAMILY_ID, "template_id": tpl["id"]}, {"_id": 0}).to_list(5000)
+    pos = {sg["id"]: i for i, sg in enumerate(segments)}
+    slots.sort(key=lambda s: (s["weekday"], pos.get(s.get("segment_id"), 99), s.get("order") or 0))
+    return {"segments": segments, "slots": [_slot_out(s) for s in slots], "migrated": migrated}
+
+
+async def _next_order(tpl_id: str, wd: int, seg: Optional[str]) -> int:
+    rows = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": tpl_id, "weekday": wd,
+                                         "segment_id": seg}, {"_id": 0, "order": 1}).to_list(500)
+    return max([r.get("order") or 0 for r in rows], default=0) + 1
+
+
+@api.post("/routine/slots")
+async def add_routine_slot(payload: RoutineSlotInput, user: dict = Depends(require_parent)):
+    await _check_segment_and_child(payload.segment_id, payload.child_id)
+    if any(w < 0 or w > 6 for w in payload.weekdays):
+        raise HTTPException(status_code=422, detail="Hari tidak valid")
+    tpl = await _routine_template()
+    made = []
+    for wd in sorted(set(payload.weekdays)):
+        doc = {"id": new_id(), "parent_id": FAMILY_ID, "template_id": tpl["id"], "weekday": wd,
+               "segment_id": payload.segment_id, "child_id": payload.child_id,
+               "title": payload.title.strip(), "duration_minutes": payload.duration_minutes,
+               "points": payload.points, "is_bonus": payload.is_bonus,
+               "order": await _next_order(tpl["id"], wd, payload.segment_id), "created_at": now_iso()}
+        await db.template_tasks.insert_one(doc)
+        made.append(_slot_out(doc))
+    await _invalidate_days(_today_key(), include_today=False)
+    return {"created": made}
+
+
+@api.patch("/routine/slots/{slot_id}")
+async def edit_routine_slot(slot_id: str, payload: RoutineSlotUpdate, user: dict = Depends(require_parent)):
+    tpl = await _routine_template()
+    sl = await db.template_tasks.find_one({"id": slot_id, "parent_id": FAMILY_ID, "template_id": tpl["id"]})
+    if not sl:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
+    raw = payload.model_dump(exclude_unset=True)
+    upd = {k: v for k, v in raw.items() if v is not None or k in ("segment_id", "child_id", "duration_minutes")}
+    if "title" in upd:
+        upd["title"] = upd["title"].strip()
+    await _check_segment_and_child(upd.get("segment_id"), upd.get("child_id"))
+    if "segment_id" in upd and upd["segment_id"] != sl.get("segment_id"):
+        upd["order"] = await _next_order(tpl["id"], sl["weekday"], upd["segment_id"])
+    if upd:
+        await db.template_tasks.update_one({"id": slot_id}, {"$set": upd})
+        await _invalidate_days(_today_key(), include_today=False)
+    return _slot_out(await db.template_tasks.find_one({"id": slot_id}, {"_id": 0}))
+
+
+@api.delete("/routine/slots/{slot_id}")
+async def delete_routine_slot(slot_id: str, user: dict = Depends(require_parent)):
+    tpl = await _routine_template()
+    res = await db.template_tasks.delete_one({"id": slot_id, "parent_id": FAMILY_ID, "template_id": tpl["id"]})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
+    await _invalidate_days(_today_key(), include_today=False)
+    return {"success": True}
+
+
+@api.post("/routine/slots/{slot_id}/move")
+async def move_routine_slot(slot_id: str, payload: RoutineMoveInput, user: dict = Depends(require_parent)):
+    tpl = await _routine_template()
+    sl = await db.template_tasks.find_one({"id": slot_id, "parent_id": FAMILY_ID, "template_id": tpl["id"]}, {"_id": 0})
+    if not sl:
+        raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
+    sib = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": tpl["id"], "weekday": sl["weekday"],
+                                        "segment_id": sl.get("segment_id")}, {"_id": 0}).to_list(500)
+    sib.sort(key=lambda x: (x.get("order") or 0, x.get("created_at") or ""))
+    i = next(n for n, x in enumerate(sib) if x["id"] == slot_id)
+    j = i - 1 if payload.direction == "up" else i + 1
+    if 0 <= j < len(sib):
+        sib[i], sib[j] = sib[j], sib[i]
+        for n, x in enumerate(sib, start=1):
+            await db.template_tasks.update_one({"id": x["id"]}, {"$set": {"order": n}})
+        await _invalidate_days(_today_key(), include_today=False)
+    return {"success": True}
+
+
+@api.post("/routine/copy-day")
+async def copy_routine_day(payload: RoutineCopyInput, user: dict = Depends(require_parent)):
+    tpl = await _routine_template()
+    src = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": tpl["id"],
+                                        "weekday": payload.from_weekday}, {"_id": 0}).to_list(500)
+    targets = sorted({w for w in payload.to_weekdays if 0 <= w <= 6 and w != payload.from_weekday})
+    if not targets:
+        raise HTTPException(status_code=422, detail="Pilih minimal satu hari tujuan yang berbeda")
+    copied = 0
+    for wd in targets:
+        if payload.replace:
+            await db.template_tasks.delete_many({"parent_id": FAMILY_ID, "template_id": tpl["id"], "weekday": wd})
+        for sl in src:
+            await db.template_tasks.insert_one({**sl, "id": new_id(), "weekday": wd, "created_at": now_iso(),
+                                                "order": sl.get("order") if payload.replace else
+                                                await _next_order(tpl["id"], wd, sl.get("segment_id"))})
+            copied += 1
+    await _invalidate_days(_today_key(), include_today=False)
+    return {"success": True, "copied": copied, "to_weekdays": targets}
+
+
+@api.post("/routine/apply-today")
+async def apply_routine_today(user: dict = Depends(require_parent)):
+    """Routine edits start tomorrow by default; this pulls them into today too,
+    leaving any section a child has already started untouched."""
+    removed = await _invalidate_days(_today_key(), _today_key(), include_today=True)
+    created = await _ensure_day_built(_today_key())
+    return {"success": True, "removed": removed, "created": created}
+
+
+@api.get("/routine/exceptions")
+async def list_routine_exceptions(user: dict = Depends(require_parent)):
+    today = _today_key()
+    offs = await db.off_days.find({"parent_id": FAMILY_ID, "end_date": {"$gte": today}}, {"_id": 0}).to_list(200)
+    swaps = await db.routine_swaps.find({"parent_id": FAMILY_ID, "end_date": {"$gte": today}}, {"_id": 0}).to_list(200)
+    extras_rows = await db.tasks.find({"parent_id": FAMILY_ID, "extra_group_id": {"$exists": True},
+                                       "date_key": {"$gte": today}}, {"_id": 0}).to_list(5000)
+    groups: dict = {}
+    for t in extras_rows:
+        g = groups.setdefault(t["extra_group_id"], {
+            "id": t["extra_group_id"], "title": t["title"], "segment_id": t.get("segment_id"),
+            "duration_minutes": t.get("duration_minutes"), "points": t.get("points"),
+            "child_id": t.get("extra_child_id"), "note": t.get("extra_note", ""),
+            "start_date": t["date_key"], "end_date": t["date_key"]})
+        g["start_date"] = min(g["start_date"], t["date_key"])
+        g["end_date"] = max(g["end_date"], t["date_key"])
+    by_start = lambda x: x["start_date"]
+    return {"off_days": sorted(offs, key=by_start), "swaps": sorted(swaps, key=by_start),
+            "extras": sorted(groups.values(), key=by_start)}
+
+
+@api.post("/routine/swaps")
+async def add_routine_swap(payload: RoutineSwapInput, user: dict = Depends(require_parent)):
+    days = _date_span(payload.start_date, payload.end_date)
+    clash = await db.routine_swaps.find_one({"parent_id": FAMILY_ID, "start_date": {"$lte": days[-1]},
+                                             "end_date": {"$gte": days[0]}})
+    if clash:
+        raise HTTPException(status_code=409, detail="Sudah ada pergantian jadwal di tanggal itu. Hapus dulu yang lama.")
+    doc = {"id": new_id(), "parent_id": FAMILY_ID, "start_date": days[0], "end_date": days[-1],
+           "use_weekday": payload.use_weekday, "note": payload.note.strip(), "created_at": now_iso()}
+    await db.routine_swaps.insert_one(doc)
+    doc.pop("_id", None)
+    await _invalidate_days(days[0], days[-1])
+    await log_activity(FAMILY_ID, None, "routine_swap_added", {"start": days[0], "end": days[-1],
+                                                               "use_weekday": payload.use_weekday})
+    return doc
+
+
+@api.delete("/routine/swaps/{swap_id}")
+async def delete_routine_swap(swap_id: str, user: dict = Depends(require_parent)):
+    doc = await db.routine_swaps.find_one({"id": swap_id, "parent_id": FAMILY_ID})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Pergantian jadwal tidak ditemukan")
+    await db.routine_swaps.delete_one({"id": swap_id})
+    await _invalidate_days(doc["start_date"], doc["end_date"])
+    return {"success": True}
+
+
+@api.post("/routine/extras")
+async def add_routine_extra(payload: RoutineExtraInput, user: dict = Depends(require_parent)):
+    days = _date_span(payload.start_date, payload.end_date)
+    await _check_segment_and_child(payload.segment_id, payload.child_id)
+    kids = [payload.child_id] if payload.child_id else \
+        [k["id"] for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)]
+    gid = new_id()
+    docs = []
+    for dk in days:
+        for cid in kids:
+            docs.append({"id": new_id(), "parent_id": FAMILY_ID, "child_id": cid, "title": payload.title.strip(),
+                         "description": "", "points": payload.points, "penalty_points": 0,
+                         "duration_minutes": payload.duration_minutes, "segment_id": payload.segment_id,
+                         "order": 999, "is_bonus": False, "date_key": dk, "due_time": None,
+                         "recurrence": "none", "status": "pending", "created_at": now_iso(),
+                         "extra_group_id": gid, "extra_child_id": payload.child_id, "extra_note": payload.note.strip()})
+    if docs:
+        await db.tasks.insert_many(docs)
+    return {"success": True, "id": gid, "created": len(docs), "days": len(days)}
+
+
+@api.delete("/routine/extras/{group_id}")
+async def delete_routine_extra(group_id: str, user: dict = Depends(require_parent)):
+    res = await db.tasks.delete_many({"parent_id": FAMILY_ID, "extra_group_id": group_id,
+                                      "status": {"$in": ["pending", "rejected"]}, "checked": {"$ne": True}})
+    left = await db.tasks.count_documents({"parent_id": FAMILY_ID, "extra_group_id": group_id})
+    if res.deleted_count == 0 and left == 0:
+        raise HTTPException(status_code=404, detail="Aktivitas khusus tidak ditemukan")
+    return {"success": True, "removed": res.deleted_count, "kept_done": left}
+
+
 # ================= Segment checkpoints =================
 # The checkpoint is the SECTION, not the individual activity. A section has a
 # start and an end; inside it is a checklist. The child starts the section,
@@ -4203,6 +4675,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
     dk = validate_date_key(date_key) if date_key else _today_key()
     if not dk:
         raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    await _ensure_day_built(dk)
     await _refresh_segments_cache()
     config = await get_config_cached()
     grace = _seg_grace(config)
@@ -4269,6 +4742,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
             "activities": [{
                 "id": a["id"], "title": a["title"], "description": a.get("description", ""),
                 "points": a.get("points", 0), "is_bonus": bool(a.get("is_bonus")),
+                "duration_minutes": a.get("duration_minutes"),
                 "checked": bool(a.get("checked")) or a.get("status") in ("completed", "approved"),
                 "status": a.get("status"),
                 "photo_required": bool(a.get("photo_required")),
@@ -4550,6 +5024,7 @@ async def create_off_day(payload: OffDayInput, user: dict = Depends(require_pare
     ) if doomed_ids else type("R", (), {"modified_count": 0})()
     doc.pop("_id", None)
     await log_activity(FAMILY_ID, None, "off_day_created", {"start": start, "end": end, "parked": res.modified_count})
+    await _invalidate_days(doc["start_date"], doc["end_date"])
     return {**doc, "parked_tasks": res.modified_count}
 
 
@@ -4572,6 +5047,7 @@ async def delete_off_day(off_day_id: str, user: dict = Depends(require_parent)):
     )
     await db.off_days.delete_one({"id": off_day_id})
     await log_activity(FAMILY_ID, None, "off_day_deleted", {"start": doc["start_date"], "end": doc["end_date"], "restored": res.modified_count})
+    await _invalidate_days(doc["start_date"], doc["end_date"])
     return {"success": True, "restored_tasks": res.modified_count}
 
 
@@ -6091,6 +6567,8 @@ async def _fill_days_from_default_template(days_ahead: int = 14, only_days: Opti
     every single date; the whole point is that normal days look after themselves
     and only the exceptions need attention.
     """
+    if await _routine_template(create=False):
+        return 0  # the weekly routine builds days itself, lazily
     default_tpl = await db.day_templates.find_one({"parent_id": FAMILY_ID, "is_default": True}, {"_id": 0})
     if not default_tpl:
         return 0
@@ -6196,7 +6674,15 @@ async def _ensure_days_ready(days: Optional[List[str]] = None, force: bool = Fal
         _DAYS_READY["at"][d] = now_m
     _DAYS_READY["dirty"] = False
     try:
-        created = await _fill_days_from_default_template(only_days=due)
+        created = 0
+        # The weekly routine is the schedule. Its builder is idempotent per
+        # slot and remembers each built day, so it is safe to call for any day.
+        for d in due:
+            created += await _ensure_day_built(d)
+        # The old default template is superseded once the routine took over
+        # (its slots were migrated); building from it too would double days.
+        if not await db.app_meta.find_one({"_id": "routine_migrated"}, {"_id": 1}):
+            created += await _fill_days_from_default_template(only_days=due)
         created += await _materialize_recurring(only_days=due)
     except Exception:
         for d in due:
@@ -9085,7 +9571,7 @@ _init_lock = asyncio.Lock()
 
 
 # Bump when the index set changes, so existing deployments rebuild them once.
-_INDEX_VERSION = 3
+_INDEX_VERSION = 4
 
 
 async def _run_one_time_init():
@@ -9120,6 +9606,9 @@ async def _run_one_time_init():
             await db.template_tasks.create_index([("parent_id", 1), ("template_id", 1), ("weekday", 1)])
             await db.template_assignments.create_index([("parent_id", 1), ("date_key", 1)])
             await db.day_templates.create_index("parent_id")
+            await db.day_builds.create_index([("parent_id", 1), ("date_key", 1)], unique=True)
+            await db.routine_swaps.create_index([("parent_id", 1), ("start_date", 1), ("end_date", 1)])
+            await db.tasks.create_index([("parent_id", 1), ("date_key", 1), ("from_routine_slot_id", 1)])
             await db.segment_sessions.create_index(
                 [("parent_id", 1), ("child_id", 1), ("date_key", 1), ("segment_id", 1)])
             await db.exam_periods.create_index([("parent_id", 1), ("child_id", 1)])

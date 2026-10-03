@@ -385,6 +385,37 @@ with TestClient(server.app, base_url="https://testserver") as c:
     check("photo-req: finishes once the photo is attached", r.status_code == 200, r.text[:150])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # ---------------- Weekly routine + lazy days ----------------
+    reset_schedule()
+    run(server.db.app_meta.delete_many({"_id": "routine_migrated"}))
+    run(server.db.day_builds.delete_many({}))
+    r = c.post("/api/routine/slots", json={"weekdays": list(range(7)), "segment_id": first_seg,
+                                           "title": "Rutin pagi", "points": 7})
+    check("routine: slot added for the whole week", r.status_code == 200, r.text[:200])
+    rows = [t for t in c.get("/api/tasks").json() if t["title"] == "Rutin pagi"]
+    got = sorted(t["date_key"] for t in rows)
+    check("routine: parent list builds today + tomorrow", TODAY in got and TOMORROW in got, str(got))
+    check("routine: one copy per child per day", len(rows) == 2 * len(kids), str(len(rows)))
+    n = run(server.db.tasks.count_documents({"title": "Rutin pagi"}))
+    c.get("/api/tasks"); c.post(f"/api/days/{TODAY}/prepare"); c.post(f"/api/days/{TOMORROW}/prepare")
+    check("routine: repeated reads never duplicate", run(server.db.tasks.count_documents({"title": "Rutin pagi"})) == n)
+    # an old default template must not double a routine-built day after migration
+    tplx = c.post("/api/day-templates", json={"name": "Lama", "is_default": True}).json()
+    for wd in range(7):
+        c.post("/api/template-tasks", json={"template_id": tplx["id"], "weekday": wd, "segment_id": first_seg,
+                                            "title": "Dari template lama", "points": 3})
+    run(server.db.app_meta.update_one({"_id": "routine_migrated"}, {"$set": {"at": "x"}}, upsert=True))
+    c.post(f"/api/days/{day(3)}/prepare")
+    d3 = [t["title"] for t in c.get(f"/api/tasks?date_key={day(3)}").json()]
+    check("routine: day 3 comes from the routine", d3.count("Rutin pagi") == len(kids), str(d3))
+    check("routine: superseded template adds nothing", "Dari template lama" not in d3, str(d3))
+    # editing the routine shows up on the parent's list straight away
+    for slot in [x for x in c.get("/api/routine").json()["slots"] if x["title"] == "Rutin pagi"]:
+        c.patch(f"/api/routine/slots/{slot['id']}", json={"points": 21})
+    after = [t for t in c.get(f"/api/tasks?date_key={TOMORROW}").json() if t["title"] == "Rutin pagi"]
+    check("routine: an edit is visible without waiting", after and all(t["points"] == 21 for t in after),
+          str([t["points"] for t in after]))
+
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})
     check("gzip: large JSON is compressed",

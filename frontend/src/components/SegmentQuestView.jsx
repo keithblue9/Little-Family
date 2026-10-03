@@ -293,6 +293,11 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                       {a.title}
                       {a.is_bonus && <span className="ml-1.5 text-[10px] text-amber-600 font-bold">BONUS</span>}
                     </span>
+                    {a.duration_minutes ? (
+                      <span className="text-[11px] text-slate-500 shrink-0" title="Perkiraan lama mengerjakan">
+                        ⏱ {a.duration_minutes} mnt
+                      </span>
+                    ) : null}
                     <span className="text-[11px] font-bold text-indigo-600 shrink-0">+{a.points}</span>
                   </button>
                   {(a.photo_required || a.before_photo_url || a.completion_photo_url) && (

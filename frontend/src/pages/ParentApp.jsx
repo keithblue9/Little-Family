@@ -34,6 +34,7 @@ const MemoriesCollage = lazy(() => import("@/components/MemoriesCollage"));
 const CommandPalette = lazy(() => import("@/components/CommandPalette"));
 const HonestyInsightCard = lazy(() => import("@/components/HonestyInsightCard"));
 const ActivityLogCard = lazy(() => import("@/components/ActivityLogCard"));
+const RoutineManager = lazy(() => import("@/components/RoutineManager"));
 const HoldRequestsReview = lazy(() => import("@/components/HoldRequestsReview"));
 
 // Start downloading a tab's code the moment a finger or cursor reaches it.
@@ -342,24 +343,35 @@ export default function ParentApp() {
           {view === "tasks" && (
             <div className="space-y-4">
               <HoldRequestsReview onChanged={load} />
-              <TasksView
-                kids={children}
-                tasks={filteredTasks}
-                selectedChildId={selectedChildId}
-                onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
-                onOpenTemplates={() => setTemplateModal(true)}
-                onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
-                onDuplicate={(t) => {
-                  // Pre-fill form with task values but as a NEW task (not edit)
-                  setEditingTask({ ...t, id: null, _isDuplicate: true });
-                  setTaskModal(true);
-                }}
-                onRefresh={load}
-                onEnsureDate={ensureDate}
-                taskWindow={taskWindow}
-                onApplyConsequence={(task) => setApplyConsModal({ task })}
-                onAddChild={() => setChildModal(true)}
-              />
+              {/* The weekly routine is the schedule now; per-date missions are
+                  generated from it. The old per-date list stays reachable for
+                  one-off corrections, folded away so it doesn't compete. */}
+              <RoutineManager kids={children} onChanged={load} />
+              <details className="bg-white rounded-2xl border border-slate-200">
+                <summary className="cursor-pointer px-5 py-3 text-sm font-semibold text-slate-600 select-none">
+                  🛠️ Koreksi tugas per tanggal (lanjutan)
+                </summary>
+                <div className="p-3 pt-0">
+                  <TasksView
+                    kids={children}
+                    tasks={filteredTasks}
+                    selectedChildId={selectedChildId}
+                    onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
+                    onOpenTemplates={() => setTemplateModal(true)}
+                    onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
+                    onDuplicate={(t) => {
+                      // Pre-fill form with task values but as a NEW task (not edit)
+                      setEditingTask({ ...t, id: null, _isDuplicate: true });
+                      setTaskModal(true);
+                    }}
+                    onRefresh={load}
+                    onEnsureDate={ensureDate}
+                    taskWindow={taskWindow}
+                    onApplyConsequence={(task) => setApplyConsModal({ task })}
+                    onAddChild={() => setChildModal(true)}
+                  />
+                </div>
+              </details>
             </div>
           )}
           {view === "rewards" && (

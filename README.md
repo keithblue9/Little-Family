@@ -52,7 +52,15 @@ Buka http://localhost:3000.
   disentuh; semuanya diarsipkan dan bisa dibatalkan.
 - **Satu request per layar**: `/api/parent/bootstrap` dan `/api/kid/{id}/bootstrap`.
 - **Gambar** dikirim sebagai URL bertanda tangan (`/api/media/...`) yang di-cache browser,
-  bukan base64 di setiap respons.
+  bukan base64 di setiap respons. Foto tugas disimpan di koleksi `media` terpisah; dokumen
+  tugas hanya menyimpan penunjuk `media:<tag>`. Foto lama dipindahkan otomatis bertahap
+  oleh `/api/warmup` dan cron.
+- **Cache GET bersama** (`src/lib/api.js`): GET yang sama dan sedang berjalan dipakai
+  bersama; `/config`, `/children`, dll. dipakai ulang sebentar. Setiap tulis (POST/PUT/
+  PATCH/DELETE) mengosongkan cache. `{ fresh: true }` untuk melewatinya.
+- **Offline anak**: Mulai, centang, dan Selesai tetap jalan tanpa internet, diantrikan
+  berurutan dan dikirim saat online. Mulai/Selesai membawa `happened_at` (jam asli
+  ditekan, maks. 12 jam ke belakang) sehingga tidak dianggap terlambat.
 - **Keep-warm**: workflow `.github/workflows/keep-warm.yml` memanggil `/api/warmup` tiap
   5 menit. Isi secret `APP_URL` di GitHub agar aktif.
 

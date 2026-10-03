@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import api from "@/lib/api";
+import api, { clearApiCache } from "@/lib/api";
 import { cacheGet, cacheSet, cacheClear } from "@/lib/localCache";
 
 const AuthContext = createContext(null);
@@ -100,6 +100,7 @@ export function AuthProvider({ children }) {
     // Wipe every cached screen, not just the token: the next person to sign in
     // on this device must never glimpse the previous one's data.
     cacheClear();
+    clearApiCache();
     queryClient.clear();
     setUser(false);
   };

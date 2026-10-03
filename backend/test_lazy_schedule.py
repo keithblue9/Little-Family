@@ -316,6 +316,31 @@ with TestClient(server.app, base_url="https://testserver") as c:
     check("photo: day-progress carries URLs, not base64",
           all(not str(t.get("before_photo_url") or "").startswith("data:") for t in all_tasks))
 
+    # ---------------- Photos live in `media`, tasks keep a pointer ----------------
+    raw = run(server.db.tasks.find_one({"id": t1["id"]}))
+    check("media: task stores a short pointer, not the picture",
+          str(raw.get("before_photo_url")).startswith("media:") and str(raw.get("completion_photo_url")).startswith("media:"),
+          str(raw.get("before_photo_url"))[:40])
+    check("media: picture kept in the media collection",
+          run(server.db.media.find_one({"_id": f"task:{t1['id']}:before_photo_url"})) is not None)
+    # An older task with the picture still inline is moved out, and its URL stays the same.
+    run(server.db.tasks.update_one({"id": t2["id"]}, {"$set": {"completion_photo_url": img}}))
+    url_before = server._media_ref("task", t2["id"], "completion_photo_url", img)
+    run(server.db.app_meta.delete_one({"_id": "photos_offloaded"}))
+    moved = run(server._maybe_offload_task_photos(100))
+    raw2 = run(server.db.tasks.find_one({"id": t2["id"]}))
+    check("media: old inline picture is moved out", moved >= 1 and raw2["completion_photo_url"].startswith("media:"),
+          str(moved))
+    check("media: its URL does not change",
+          server._media_ref("task", t2["id"], "completion_photo_url", raw2["completion_photo_url"]) == url_before)
+    got = c.get(url_before)
+    check("media: moved picture is still served", got.status_code == 200 and got.headers["content-type"].startswith("image/"),
+          str(got.status_code))
+    check("media: done flag set once nothing is left",
+          run(server.db.app_meta.find_one({"_id": "photos_offloaded"})) is not None)
+    check("media: wrong version is refused",
+          c.get(url_before.replace("v=", "v=0")).status_code in (403, 404))
+
     # ---------------- Memories ----------------
     run(server.db.tasks.update_one({"id": t1["id"]}, {"$set": {"status": "approved"}}))
     r = c.get(f"/api/memories?month={TODAY[:7]}")
@@ -415,6 +440,49 @@ with TestClient(server.app, base_url="https://testserver") as c:
     after = [t for t in c.get(f"/api/tasks?date_key={TOMORROW}").json() if t["title"] == "Rutin pagi"]
     check("routine: an edit is visible without waiting", after and all(t["points"] == 21 for t in after),
           str([t["points"] for t in after]))
+
+    # ---------------- Offline replay: start/finish keep their real time ----------------
+    UTC = dt.timezone.utc
+    now_utc = dt.datetime.now(UTC)
+    check("offline: a recent time is believed",
+          server._resolve_happened_at((now_utc - dt.timedelta(hours=1)).isoformat()) is not None)
+    check("offline: a future time is ignored",
+          server._resolve_happened_at((now_utc + dt.timedelta(hours=1)).isoformat()) is None)
+    check("offline: a stale time is ignored",
+          server._resolve_happened_at((now_utc - dt.timedelta(hours=13)).isoformat()) is None)
+    check("offline: junk is ignored", server._resolve_happened_at("kemarin") is None)
+    seg_probe = {"id": "s", "start_time": "07:00", "end_time": "08:00"}
+    probe_dk = (now_utc + dt.timedelta(hours=7)).strftime("%Y-%m-%d")
+    early = (dt.datetime.strptime(probe_dk + " 06:50", "%Y-%m-%d %H:%M") - dt.timedelta(hours=7)).replace(tzinfo=UTC)
+    late = (dt.datetime.strptime(probe_dk + " 07:40", "%Y-%m-%d %H:%M") - dt.timedelta(hours=7)).replace(tzinfo=UTC)
+    tm_early = server._segment_timing(seg_probe, None, probe_dk, 10, early)
+    tm_late = server._segment_timing(seg_probe, None, probe_dk, 10, late)
+    check("offline: timing uses the press time (before start = locked)", tm_early["locked"] and not tm_early["late_start"])
+    check("offline: timing uses the press time (late start, on-time finish)",
+          tm_late["late_start"] and not tm_late["locked"] and not tm_late["late_finish"])
+
+    reset_schedule()
+    c.post("/api/tasks", json={"title": "Baca buku", "points": 5, "date_key": TODAY,
+                               "target_children": [adskhan["id"]]})
+    anytime = server.ANYTIME_SEGMENT_ID
+    pressed = (now_utc - dt.timedelta(minutes=30)).replace(microsecond=0)
+    r = c.post("/api/segment-sessions/start", json={"child_id": adskhan["id"], "date_key": TODAY,
+                                                     "segment_id": anytime, "happened_at": pressed.isoformat()})
+    check("offline: queued start accepted", r.status_code == 200, r.text[:200])
+    check("offline: started_at is when it was pressed",
+          r.status_code == 200 and dt.datetime.fromisoformat(r.json()["started_at"]) == pressed,
+          r.text[:200])
+    act = next(t for t in c.get(f"/api/tasks?date_key={TODAY}").json()
+               if t["title"] == "Baca buku" and t["child_id"] == adskhan["id"])
+    c.post(f"/api/tasks/{act['id']}/check", json={"checked": True})
+    r = c.post("/api/segment-sessions/finish", json={"child_id": adskhan["id"], "date_key": TODAY,
+                                                      "segment_id": anytime,
+                                                      "happened_at": (pressed - dt.timedelta(minutes=5)).isoformat()})
+    check("offline: queued finish accepted", r.status_code == 200, r.text[:200])
+    sess = run(server.db.segment_sessions.find_one({"child_id": adskhan["id"], "date_key": TODAY,
+                                                    "segment_id": anytime}))
+    check("offline: a finish before the start falls back to server time",
+          sess and dt.datetime.fromisoformat(sess["completed_at"]) > pressed, str(sess and sess.get("completed_at")))
 
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})

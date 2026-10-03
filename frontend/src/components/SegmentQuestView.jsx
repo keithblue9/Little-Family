@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { Camera, Check, ChevronLeft, ChevronRight, Lock, Clock, PartyPopper, Play } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/localCache";
 import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
-import { enqueue, isNetworkError, haptic } from "@/lib/offlineQueue";
+import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
+import { withLiveClock } from "@/lib/segmentClock";
 import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
 
 /**
@@ -23,6 +24,13 @@ export default function SegmentQuestView({ child, onCelebrate }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(null);          // segment id currently acting
   const [reasonFor, setReasonFor] = useState(null); // { segment, action }
+
+  const [clock, setClock] = useState(0);            // re-derives locked/late from the device clock
+  useEffect(() => {
+    const t = setInterval(() => { if (!document.hidden) setClock((c) => c + 1); }, 30000);
+    return () => clearInterval(t);
+  }, []);
+  const view = useMemo(() => withLiveClock(data, dateKey), [data, dateKey, clock]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const cacheKey = child?.id ? `segday:${child.id}:${dateKey}` : null;
 
@@ -73,11 +81,16 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     }
     setBusy(seg.id);
     setSegStatus(seg.id, "in_progress");
+    const payload = body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {});
     try {
-      await api.post("/segment-sessions/start", body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {}));
+      if (pendingCount() > 0) { queueOffline("start", payload); return; }
+      await api.post("/segment-sessions/start", payload);
       toast.success(`${seg.label} dimulai. Semangat! 💪`);
       await load();
-    } catch (e) { await onFail(e, seg, "start"); }
+    } catch (e) {
+      if (isNetworkError(e)) queueOffline("start", payload);
+      else await onFail(e, seg, "start");
+    }
     finally { setBusy(null); }
   };
 
@@ -88,10 +101,10 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     }
     setBusy(seg.id);
     setSegStatus(seg.id, "done");
+    const payload = body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {});
     try {
-      const { data: r } = await api.post(
-        "/segment-sessions/finish", body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {})
-      );
+      if (pendingCount() > 0) { queueOffline("finish", payload); haptic([20, 40, 20]); onCelebrate?.(); return; }
+      const { data: r } = await api.post("/segment-sessions/finish", payload);
       haptic([20, 40, 20]);
       onCelebrate?.();
       toast.success(
@@ -100,8 +113,19 @@ export default function SegmentQuestView({ child, onCelebrate }) {
           : `${seg.label} selesai! 🎉`
       );
       await load();
-    } catch (e) { await onFail(e, seg, "finish"); }
+    } catch (e) {
+      if (isNetworkError(e)) { queueOffline("finish", payload); haptic([20, 40, 20]); onCelebrate?.(); }
+      else await onFail(e, seg, "finish");
+    }
     finally { setBusy(null); }
+  };
+
+  // No connection: keep what the child did on screen (and in the saved copy,
+  // so it survives closing the app) and send it, in order, once back online.
+  const queueOffline = (action, payload) => {
+    enqueueSegmentAction(action, payload);
+    setData((d) => { if (d && cacheKey) cacheSet(cacheKey, d); return d; });
+    toast("Tersimpan di HP — dikirim otomatis saat internet kembali 📶", { duration: 3000 });
   };
 
   const patchPhoto = (segId, actId, patch) =>
@@ -133,14 +157,13 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     patchActivity(seg.id, act.id, next);
     if (next) haptic();
     try {
-      await api.post(`/tasks/${act.id}/check`, { checked: next });
-    } catch (e) {
-      if (isNetworkError(e)) {
-        // No connection: keep the tick and send it when we're back online.
-        enqueue(`/tasks/${act.id}/check`, { checked: next });
-        toast("Tersimpan di HP — dikirim otomatis saat internet kembali 📶", { duration: 3000 });
-        return;
+      const r = await sendOrQueue(`/tasks/${act.id}/check`, { checked: next });
+      if (r?.queued) {
+        // No connection: the tick stays and is sent when we're back online.
+        setData((d) => { if (d && cacheKey) cacheSet(cacheKey, d); return d; });
+        toast("Tersimpan di HP — dikirim otomatis saat internet kembali 📶", { duration: 3000, id: "offline" });
       }
+    } catch (e) {
       patchActivity(seg.id, act.id, !next);
       await onFail(e, seg, "check");
     }
@@ -148,7 +171,15 @@ export default function SegmentQuestView({ child, onCelebrate }) {
 
   // Queued ticks reached the server: show the server's view again.
   useEffect(() => {
-    const onFlushed = () => load();
+    const onFlushed = (e) => {
+      const refused = (e.detail?.refused || []).filter(Boolean);
+      if (refused.includes("LATE_REASON_REQUIRED")) {
+        toast("Ada bagian yang terlambat — pilih alasannya lagi ya 🕐", { duration: 5000 });
+      } else if (refused.length) {
+        toast(String(refused[0]), { duration: 5000 });
+      }
+      load();
+    };
     window.addEventListener("app:offline-flushed", onFlushed);
     return () => window.removeEventListener("app:offline-flushed", onFlushed);
   }, [load]);
@@ -215,13 +246,13 @@ export default function SegmentQuestView({ child, onCelebrate }) {
 
       {loading && !data && <PageSkeleton compact rows={2} />}
 
-      {data && data.segments.length === 0 && (
+      {view && view.segments.length === 0 && (
         <div className="bg-white rounded-3xl p-6 text-center text-slate-500 border-2 border-slate-100">
           Belum ada aktivitas untuk hari ini 🌤️
         </div>
       )}
 
-      {data?.segments.map((seg) => {
+      {view?.segments.map((seg) => {
         const allDone = seg.required_count > 0 && seg.checked_required >= seg.required_count;
         const anyUnticked = seg.activities.some((a) => !a.checked);
         const running = seg.status === "in_progress";
@@ -238,7 +269,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                 {seg.start_time && (
                   <div className="text-xs text-slate-500 flex items-center gap-1">
                     <Clock className="w-3 h-3" /> {seg.start_time} – {seg.end_time}
-                    <span className="text-slate-400">· toleransi {data.grace_minutes} mnt</span>
+                    <span className="text-slate-400">· toleransi {view.grace_minutes} mnt</span>
                   </div>
                 )}
               </div>

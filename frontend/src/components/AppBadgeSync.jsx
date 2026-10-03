@@ -31,9 +31,18 @@ export default function AppBadgeSync() {
       }
     };
 
-    sync();
-    const interval = setInterval(sync, 60000); // refresh every minute while app is open
-    return () => { cancelled = true; clearInterval(interval); };
+    // Wait until the first screen has painted, and skip ticks while the app is
+    // in the background — the badge only matters when someone can see it.
+    const first = setTimeout(sync, 4000);
+    const interval = setInterval(() => { if (!document.hidden) sync(); }, 60000);
+    const onVisible = () => { if (!document.hidden) sync(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      clearTimeout(first);
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [user]);
 
   return null;

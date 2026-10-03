@@ -4,15 +4,22 @@ import "@/App.css";
 import { Toaster } from "@/components/ui/sonner";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import ErrorBoundary from "@/components/ErrorBoundary";
-import LoginPage from "@/pages/LoginPage";
-import GrandparentView from "@/pages/GrandparentView";
-import ParentApp from "@/pages/ParentApp";
-import KidHome from "@/pages/KidHome";
-import ChildPicker from "@/pages/ChildPicker";
-import InstallPrompt from "@/components/InstallPrompt";
-import PushPermissionPrompt from "@/components/PushPermissionPrompt";
+import { lazy, Suspense } from "react";
 import LabelProvider from "@/components/LabelProvider";
-import AppBadgeSync from "@/components/AppBadgeSync";
+import PageSkeleton from "@/components/PageSkeleton";
+import { lazyWithRetry, prefetchRoute } from "@/lib/lazyRoutes";
+
+// Each screen is its own chunk: a child never downloads the parent dashboard
+// (and its charts), and the login screen paints before either is fetched.
+const LoginPage = lazyWithRetry(() => import("@/pages/LoginPage"), "login");
+const GrandparentView = lazyWithRetry(() => import("@/pages/GrandparentView"), "grandparent");
+const ParentApp = lazyWithRetry(() => import("@/pages/ParentApp"), "parent");
+const KidHome = lazyWithRetry(() => import("@/pages/KidHome"), "kid");
+const ChildPicker = lazyWithRetry(() => import("@/pages/ChildPicker"), "picker");
+// Prompts and badge sync are never needed for the first paint.
+const InstallPrompt = lazy(() => import("@/components/InstallPrompt"));
+const PushPermissionPrompt = lazy(() => import("@/components/PushPermissionPrompt"));
+const AppBadgeSync = lazy(() => import("@/components/AppBadgeSync"));
 
 function ConnectionErrorScreen() {
   const { refresh } = useAuth();
@@ -51,11 +58,7 @@ function MaintenanceScreen({ message }) {
 function Protected({ children, role }) {
   const { user } = useAuth();
   if (user === null) {
-    return (
-      <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">
-        Memuat…
-      </div>
-    );
+    return <PageSkeleton />;
   }
   if (user === "error") return <ConnectionErrorScreen />;
   if (user && typeof user === "object" && user.maintenance) return <MaintenanceScreen message={user.message} />;
@@ -69,15 +72,12 @@ function Protected({ children, role }) {
 function HomeRedirect() {
   const { user } = useAuth();
   if (user === null) {
-    return (
-      <div className="min-h-screen kid-shell flex items-center justify-center font-parent text-slate-500">
-        Memuat…
-      </div>
-    );
+    return <PageSkeleton />;
   }
   if (user === "error") return <ConnectionErrorScreen />;
   if (user && typeof user === "object" && user.maintenance) return <MaintenanceScreen message={user.message} />;
   if (user === false) return <Navigate to="/login" replace />;
+  prefetchRoute(user.role === "parent" ? "parent" : "kid");
   return <Navigate to={user.role === "parent" ? "/parent" : `/kid/${user.id}`} replace />;
 }
 
@@ -99,6 +99,7 @@ function App() {
         <BrowserRouter>
           <LabelProvider>
           <MaintenanceGate>
+          <Suspense fallback={<PageSkeleton />}>
           <Routes>
             <Route path="/" element={<HomeRedirect />} />
             <Route path="/login" element={<LoginPage />} />
@@ -129,13 +130,16 @@ function App() {
             />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
+          </Suspense>
           </MaintenanceGate>
           </LabelProvider>
         </BrowserRouter>
         <Toaster position="top-center" richColors />
-        <InstallPrompt />
-        <PushPermissionPrompt />
-        <AppBadgeSync />
+        <Suspense fallback={null}>
+          <InstallPrompt />
+          <PushPermissionPrompt />
+          <AppBadgeSync />
+        </Suspense>
         {/* Tiny, always-visible build stamp. Without it there was no way to
             tell whether a device was running the latest deploy or an old
             cached one — which is exactly what made "it hasn't changed"

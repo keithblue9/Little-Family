@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Check, ChevronLeft, ChevronRight, Lock, Clock, PartyPopper, Play } from "lucide-react";
+import { Camera, Check, ChevronLeft, ChevronRight, Lock, Clock, PartyPopper, Play } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { cacheGet, cacheSet } from "@/lib/localCache";
 import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
+import { enqueue, isNetworkError, haptic } from "@/lib/offlineQueue";
+import PageSkeleton from "@/components/PageSkeleton";
+import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
 
 /**
  * The child's day as a handful of sections, each a checklist.
@@ -56,6 +59,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     const detail = e?.response?.data?.detail;
     if (detail === "LATE_REASON_REQUIRED") {
       setReasonFor({ segment: seg, action });
+      load(); // undo the optimistic status while the child picks a reason
       return;
     }
     await load();
@@ -68,6 +72,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       return;
     }
     setBusy(seg.id);
+    setSegStatus(seg.id, "in_progress");
     try {
       await api.post("/segment-sessions/start", body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {}));
       toast.success(`${seg.label} dimulai. Semangat! 💪`);
@@ -82,10 +87,12 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       return;
     }
     setBusy(seg.id);
+    setSegStatus(seg.id, "done");
     try {
       const { data: r } = await api.post(
         "/segment-sessions/finish", body(seg, lateReasonId ? { late_reason_id: lateReasonId } : {})
       );
+      haptic([20, 40, 20]);
       onCelebrate?.();
       toast.success(
         r.no_points
@@ -96,6 +103,18 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     } catch (e) { await onFail(e, seg, "finish"); }
     finally { setBusy(null); }
   };
+
+  const patchPhoto = (segId, actId, patch) =>
+    setData((d) => d && {
+      ...d,
+      segments: d.segments.map((s) => s.id !== segId ? s : {
+        ...s, activities: s.activities.map((a) => a.id === actId ? { ...a, ...patch } : a),
+      }),
+    });
+
+  // Start/finish show their new state at once; a refusal re-syncs via onFail.
+  const setSegStatus = (segId, status) =>
+    setData((d) => d && { ...d, segments: d.segments.map((s) => s.id === segId ? { ...s, status } : s) });
 
   // Ticks update on screen instantly and roll back if the server refuses.
   const patchActivity = (segId, actId, checked) =>
@@ -112,13 +131,27 @@ export default function SegmentQuestView({ child, onCelebrate }) {
   const toggle = async (seg, act) => {
     const next = !act.checked;
     patchActivity(seg.id, act.id, next);
+    if (next) haptic();
     try {
       await api.post(`/tasks/${act.id}/check`, { checked: next });
     } catch (e) {
+      if (isNetworkError(e)) {
+        // No connection: keep the tick and send it when we're back online.
+        enqueue(`/tasks/${act.id}/check`, { checked: next });
+        toast("Tersimpan di HP — dikirim otomatis saat internet kembali 📶", { duration: 3000 });
+        return;
+      }
       patchActivity(seg.id, act.id, !next);
       await onFail(e, seg, "check");
     }
   };
+
+  // Queued ticks reached the server: show the server's view again.
+  useEffect(() => {
+    const onFlushed = () => load();
+    window.addEventListener("app:offline-flushed", onFlushed);
+    return () => window.removeEventListener("app:offline-flushed", onFlushed);
+  }, [load]);
 
   const toggleAll = async (seg, checked) => {
     setData((d) => d && {
@@ -180,7 +213,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
         )}
       </div>
 
-      {loading && !data && <div className="text-center text-slate-400 py-8">Memuat…</div>}
+      {loading && !data && <PageSkeleton compact rows={2} />}
 
       {data && data.segments.length === 0 && (
         <div className="bg-white rounded-3xl p-6 text-center text-slate-500 border-2 border-slate-100">
@@ -245,14 +278,15 @@ export default function SegmentQuestView({ child, onCelebrate }) {
               {seg.activities.map((a) => {
                 const canTick = running;
                 return (
-                  <button key={a.id} type="button" disabled={!canTick}
+                  <div key={a.id} className="space-y-1.5">
+                  <button type="button" disabled={!canTick}
                     onClick={() => canTick && toggle(seg, a)}
                     className={`w-full flex items-center gap-3 rounded-2xl border-2 px-3 py-2.5 text-left transition-colors ${
                       a.checked ? "border-emerald-200 bg-emerald-50/60" : "border-slate-100 bg-white"
                     } ${canTick ? "press-btn hover:border-indigo-200" : "opacity-70 cursor-default"}`}>
                     <span className={`w-6 h-6 rounded-lg border-2 flex items-center justify-center shrink-0 ${
                       a.checked ? "bg-emerald-500 border-emerald-500" : "border-slate-300 bg-white"}`}>
-                      {a.checked && <Check className="w-4 h-4 text-white" strokeWidth={3} />}
+                      {a.checked && <Check className="w-4 h-4 text-white pop-check" strokeWidth={3} />}
                     </span>
                     <span className={`flex-1 min-w-0 font-semibold text-sm ${
                       a.checked ? "text-slate-500 line-through" : "text-slate-800"}`}>
@@ -266,6 +300,11 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                     ) : null}
                     <span className="text-[11px] font-bold text-indigo-600 shrink-0">+{a.points}</span>
                   </button>
+                  {(a.photo_required || a.before_photo_url || a.completion_photo_url) && (
+                    <PhotoRow activity={a} canEdit={running && a.status !== "approved"}
+                              onSaved={(patch) => patchPhoto(seg.id, a.id, patch)} />
+                  )}
+                  </div>
                 );
               })}
             </div>
@@ -329,6 +368,49 @@ export default function SegmentQuestView({ child, onCelebrate }) {
           </motion.div>
         </div>
       )}
+    </div>
+  );
+}
+
+
+/**
+ * "Sebelum" and "Sesudah" photos for a mission — e.g. a messy room and the
+ * tidied one. Pictures are shrunk on the phone before upload.
+ */
+function PhotoRow({ activity, canEdit, onSaved }) {
+  const [busy, setBusy] = useState(null);
+  const upload = async (kind, file) => {
+    if (!file) return;
+    setBusy(kind);
+    try {
+      const dataUrl = await fileToDownscaledDataUrl(file, { maxDim: 960, quality: 0.78 });
+      const { data } = await api.post(`/tasks/${activity.id}/photo`, { kind, photo_url: dataUrl });
+      onSaved({ before_photo_url: data.before_photo_url, completion_photo_url: data.completion_photo_url });
+      toast.success(kind === "before" ? "Foto sebelum tersimpan 📸" : "Foto sesudah tersimpan ✨");
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const slot = (kind, label, url) => (
+    <label className={`flex-1 flex items-center gap-2 rounded-xl border-2 border-dashed px-2 py-1.5 text-xs font-semibold ${
+      url ? "border-emerald-200 bg-emerald-50/50 text-emerald-700" : "border-slate-200 text-slate-500"} ${
+      canEdit ? "cursor-pointer hover:border-indigo-300" : "opacity-70"}`}>
+      {url
+        ? <img src={url} alt={label} className="w-8 h-8 rounded-lg object-cover" />
+        : <Camera className="w-4 h-4" />}
+      <span>{busy === kind ? "Mengunggah…" : label}</span>
+      {canEdit && (
+        <input type="file" accept="image/*" capture="environment" className="sr-only"
+               onChange={(e) => upload(kind, e.target.files?.[0])} disabled={!!busy} />
+      )}
+    </label>
+  );
+  return (
+    <div className="flex gap-2 pl-9">
+      {slot("before", "Foto sebelum", activity.before_photo_url)}
+      {slot("after", activity.photo_required ? "Foto sesudah (wajib)" : "Foto sesudah", activity.completion_photo_url)}
     </div>
   );
 }

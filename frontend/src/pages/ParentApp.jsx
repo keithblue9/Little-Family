@@ -1,80 +1,58 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import PageSkeleton from "@/components/PageSkeleton";
 import { useNavigate } from "react-router-dom";
-import { motion } from "framer-motion";
-import {
-  Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut,
-  Plus, Trash2, CheckCircle2, XCircle, AlertTriangle, Star, Users,
-  Rocket, Menu, X, PartyPopper, Clock, ChevronLeft, ChevronRight, Undo2, Copy,
-  Pencil, RotateCcw, PawPrint, ImagePlus, GripVertical, Scale,
-} from "lucide-react";
+import { Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut, Rocket, Menu, PartyPopper, Clock, ChevronLeft, ChevronRight, Search } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
-import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
+import { cacheGet, cacheSet } from "@/lib/localCache";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
-import MoneyApprovals from "@/components/MoneyApprovals";
-import CharityRequestsReview from "@/components/CharityRequestsReview";
-import ProfileEditor from "@/components/ProfileEditor";
-import ConfigMenu from "@/components/ConfigMenu";
-import MemberPasscodeManager from "@/components/ChildPasscodeManager";
-import ThemeSwitcher from "@/components/ThemeSwitcher";
-import ProfilePhotoUpload from "@/components/ProfilePhotoUpload";
-import ReminderCreator from "@/components/ReminderCreator";
-import Leaderboard from "@/components/Leaderboard";
-import Achievements from "@/components/Achievements";
-import AnalyticsDashboard from "@/components/AnalyticsDashboard";
-import PushNotificationManager from "@/components/PushNotificationManager";
-import FamilyDayMonitor from "@/components/FamilyDayMonitor";
-import MonthHeatmap from "@/components/MonthHeatmap";
-import WeeklyReport from "@/components/WeeklyReport";
-import LabelEditor from "@/components/LabelEditor";
-import EncourageModal from "@/components/EncourageModal";
-import RewardSuggestionsReview from "@/components/RewardSuggestionsReview";
-import ViewLinksManager from "@/components/ViewLinksManager";
-import FamilyChallenges from "@/components/FamilyChallenges";
+import { useQueryClient } from "@tanstack/react-query";
+import { qk } from "@/lib/queries";
 import { useLabels } from "@/lib/labels";
 import { TEST_IDS } from "@/constants/testIds/app";
-import { ALL_MBTI, PERSONALITY_PROFILES, TASK_STYLES } from "@/lib/personality";
-import { QUEST_THEME_LIST } from "@/lib/questThemes";
-import { todayKey, humanDateKey, shiftDateKey, nextDateForWeekday } from "@/lib/dates";
+import { todayKey, shiftDateKey } from "@/lib/dates";
+import { Overview } from "@/pages/parent/Overview";
 
-// Format a stored ISO timestamp as the family-local wall clock (GMT+7). Used
-// in the approval list so parents can see exactly when a kid started/finished.
-function fmtClock(iso) {
-  if (!iso) return "";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
-  } catch { return ""; }
-}
-function fmtDuration(startIso, endIso) {
-  try {
-    const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
-    if (ms < 0) return "";
-    const mins = Math.floor(ms / 60000);
-    const secs = Math.floor((ms % 60000) / 1000);
-    if (mins < 1) return `${secs} dtk`;
-    if (mins < 60) return `${mins} mnt`;
-    return `${Math.floor(mins / 60)} jam ${mins % 60} mnt`;
-  } catch { return ""; }
-}
-import { filterTaskIdeas } from "@/lib/taskIdeaBank";
-import TemplateManagerModal from "@/components/TemplateManagerModal";
-import LevelConfigEditor from "@/components/LevelConfigEditor";
-import PetConfigEditor from "@/components/PetConfigEditor";
-import PetResetRequestsReview from "@/components/PetResetRequestsReview";
-import MaintenanceModeCard from "@/components/MaintenanceModeCard";
-import LateReasonsConfig from "@/components/LateReasonsConfig";
-import PunishmentConfig from "@/components/PunishmentConfig";
-import DaySegmentsConfig from "@/components/DaySegmentsConfig";
-import SegmentStartsConfig from "@/components/SegmentStartsConfig";
-import ExamPeriodConfig from "@/components/ExamPeriodConfig";
-import RoutineManager from "@/components/RoutineManager";
-import HoldRequestsReview from "@/components/HoldRequestsReview";
-import HonestyInsightCard from "@/components/HonestyInsightCard";
-import ActivityLogCard from "@/components/ActivityLogCard";
+// The Overview is the first screen and ships with this file; every other
+// view and form is its own chunk, fetched on first use.
+const TasksView = lazy(() => import("@/pages/parent/TasksView").then((m) => ({ default: m.TasksView })));
+const RewardsView = lazy(() => import("@/pages/parent/RewardsView").then((m) => ({ default: m.RewardsView })));
+const ConsequencesView = lazy(() => import("@/pages/parent/ConsequencesView").then((m) => ({ default: m.ConsequencesView })));
+const SettingsView = lazy(() => import("@/pages/parent/SettingsView").then((m) => ({ default: m.SettingsView })));
+const ChildFormModal = lazy(() => import("@/pages/parent/ChildFormModal").then((m) => ({ default: m.ChildFormModal })));
+const TaskFormModal = lazy(() => import("@/pages/parent/TaskFormModal").then((m) => ({ default: m.TaskFormModal })));
+const RewardFormModal = lazy(() => import("@/pages/parent/RewardFormModal").then((m) => ({ default: m.RewardFormModal })));
+const TemplateModal = lazy(() => import("@/pages/parent/TemplateModal").then((m) => ({ default: m.TemplateModal })));
+const ConsequenceFormModal = lazy(() => import("@/pages/parent/ConsequenceModals").then((m) => ({ default: m.ConsequenceFormModal })));
+const ApplyConsequenceModal = lazy(() => import("@/pages/parent/ConsequenceModals").then((m) => ({ default: m.ApplyConsequenceModal })));
+const MoneyApprovals = lazy(() => import("@/components/MoneyApprovals"));
+const CharityRequestsReview = lazy(() => import("@/components/CharityRequestsReview"));
+const AnalyticsDashboard = lazy(() => import("@/components/AnalyticsDashboard"));
+const FamilyDayMonitor = lazy(() => import("@/components/FamilyDayMonitor"));
+const ScheduleSuggestionsCard = lazy(() => import("@/components/ScheduleSuggestionsCard"));
+const MemoriesCollage = lazy(() => import("@/components/MemoriesCollage"));
+const CommandPalette = lazy(() => import("@/components/CommandPalette"));
+const HonestyInsightCard = lazy(() => import("@/components/HonestyInsightCard"));
+const ActivityLogCard = lazy(() => import("@/components/ActivityLogCard"));
+const RoutineManager = lazy(() => import("@/components/RoutineManager"));
+const HoldRequestsReview = lazy(() => import("@/components/HoldRequestsReview"));
 
-const AVATAR_COLORS = ["#FF9D23", "#4DB8FF", "#34D399", "#FF5C5C", "#A78BFA", "#F472B6"];
-const AVATAR_EMOJIS = ["🦁", "🐯", "🐻", "🦊", "🐼", "🐨", "🐰", "🐸", "🦄", "🐢", "🦖", "🐝"];
+// Start downloading a tab's code the moment a finger or cursor reaches it.
+const VIEW_PREFETCH = {
+  tasks: () => import("@/pages/parent/TasksView"),
+  rewards: () => import("@/pages/parent/RewardsView"),
+  consequences: () => import("@/pages/parent/ConsequencesView"),
+  settings: () => import("@/pages/parent/SettingsView"),
+  monitor: () => import("@/components/FamilyDayMonitor"),
+  money: () => import("@/components/MoneyApprovals"),
+  analytics: () => import("@/components/AnalyticsDashboard"),
+};
+function prefetchView(key) {
+  VIEW_PREFETCH[key]?.().catch(() => {});
+}
+
+const BOTTOM_NAV = ["overview", "tasks", "monitor", "money"];
+const BOTTOM_LABELS = { overview: "Beranda", tasks: "Tugas", monitor: "Monitor", money: "Uang" };
 
 const NAV = [
   { key: "overview", label: "Overview", icon: Home },
@@ -87,41 +65,10 @@ const NAV = [
   { key: "settings", label: "Pengaturan", icon: Settings, testId: TEST_IDS.parent.tabSettings },
 ];
 
-// ─────────────────────────────────────────────────────────
-// Modal wrapper
-function Modal({ open, onClose, title, children }) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4">
-      <motion.div
-        initial={{ scale: 0.95, y: 10, opacity: 0 }}
-        animate={{ scale: 1, y: 0, opacity: 1 }}
-        className="bg-white rounded-3xl w-full max-w-lg border border-slate-200 shadow-xl max-h-[90vh] flex flex-col"
-      >
-        <div className="flex justify-between items-center px-6 pt-6 pb-4 shrink-0">
-          <h3 className="font-parent font-bold text-xl text-slate-900">{title}</h3>
-          <button onClick={onClose} className="p-2 rounded-full hover:bg-slate-100" data-testid="modal-close-btn">
-            <X className="w-5 h-5 text-slate-500" />
-          </button>
-        </div>
-        <div className="px-6 pb-6 overflow-y-auto">
-          {children}
-        </div>
-      </motion.div>
-    </div>
-  );
-}
-
-const inputClass = "w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-[#6366F1] focus:outline-none font-body text-slate-800";
-const labelClass = "block text-sm font-semibold text-slate-700 mb-1";
-const btnPrimary = "inline-flex items-center gap-2 bg-[#6366F1] hover:bg-[#4f46e5] text-white font-semibold px-4 py-2.5 rounded-xl transition-colors";
-const btnGhost = "inline-flex items-center gap-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold px-4 py-2.5 rounded-xl transition-colors";
-const btnDanger = "inline-flex items-center gap-2 bg-white border border-red-200 hover:bg-red-50 text-red-600 font-semibold px-3 py-2 rounded-xl transition-colors";
-
-// ─────────────────────────────────────────────────────────
 export default function ParentApp() {
   const nav = useNavigate();
   const { user, logout } = useAuth();
+  const queryClient = useQueryClient();
   const { t } = useLabels();
   const navLabelKey = {
     overview: "nav.overview", monitor: "nav.monitor", tasks: "nav.tasks",
@@ -129,6 +76,10 @@ export default function ParentApp() {
     analytics: "nav.analytics", settings: "nav.settings",
   };
   const [view, setView] = useState("overview");
+  const viewTitle = (() => {
+    const key = navLabelKey[view];
+    return (key && t(key)) || NAV.find((x) => x.key === view)?.label || view;
+  })();
   const [children, setChildren] = useState([]);
   const [selectedChildId, setSelectedChildId] = useState(undefined); // undefined = not yet initialized, null = "All"
   const [tasks, setTasks] = useState([]);
@@ -137,6 +88,18 @@ export default function ParentApp() {
   const [redemptions, setRedemptions] = useState([]);
   const [stats, setStats] = useState(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  // Ctrl/⌘+K opens the palette even before its code has loaded.
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && !paletteOpen) {
+        e.preventDefault();
+        setPaletteOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [paletteOpen]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   // Modals
@@ -150,31 +113,64 @@ export default function ParentApp() {
   const [editingCons, setEditingCons] = useState(null);
   const [applyConsModal, setApplyConsModal] = useState(null);
 
+  // The task list covers a window around today (plus anything still waiting
+  // on a parent), not the family's entire history. Opening a date outside it
+  // widens the window; opening a future day builds that day first.
+  const [taskWindow, setTaskWindow] = useState(() => ({
+    start: shiftDateKey(todayKey(), -14),
+    end: shiftDateKey(todayKey(), 14),
+  }));
+  const applyBootstrap = useCallback((d) => {
+    setChildren(d.children || []);
+    setTasks(d.tasks || []);
+    setRewards(d.rewards || []);
+    setConsequences(d.consequences || []);
+    setRedemptions(d.redemptions || []);
+    setStats(d.stats || null);
+  }, []);
+  // Paint instantly from the last visit, then refresh from the server.
+  const [hydrated] = useState(() => {
+    const cached = cacheGet("parent:bootstrap", 24 * 60 * 60 * 1000);
+    return cached || null;
+  });
+  useEffect(() => {
+    if (hydrated) applyBootstrap(hydrated);
+  }, [hydrated, applyBootstrap]);
+
   const load = useCallback(async () => {
     try {
-      const [c, t, r, cq, rd, s] = await Promise.all([
-        api.get("/children"),
-        api.get("/tasks"),
-        api.get("/rewards"),
-        api.get("/consequences"),
-        api.get("/redemptions"),
-        api.get("/stats/dashboard"),
-      ]);
-      setChildren(c.data);
-      setTasks(t.data);
-      setRewards(r.data);
-      setConsequences(cq.data);
-      setRedemptions(rd.data);
-      setStats(s.data);
+      const { data } = await api.get("/parent/bootstrap", {
+        params: { start_date: taskWindow.start, end_date: taskWindow.end },
+      });
+      applyBootstrap(data);
+      cacheSet("parent:bootstrap", data);
+      queryClient.invalidateQueries({ queryKey: qk.familyMission });
       if (selectedChildId === undefined) setSelectedChildId(null);
     } catch (e) {
       toast.error(formatApiError(e));
     }
-  }, [selectedChildId]);
+  }, [selectedChildId, taskWindow, applyBootstrap, queryClient]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  const ensureDate = useCallback(async (dk) => {
+    if (!dk || dk === "all") return;
+    const tomorrow = shiftDateKey(todayKey(), 1);
+    let built = false;
+    if (dk > tomorrow) {
+      try {
+        const { data } = await api.post(`/days/${dk}/prepare`);
+        built = (data?.created || 0) > 0;
+      } catch { /* outside the allowed range — just show what exists */ }
+    }
+    if (dk < taskWindow.start || dk > taskWindow.end) {
+      setTaskWindow((w) => ({ start: dk < w.start ? dk : w.start, end: dk > w.end ? dk : w.end }));
+    } else if (built) {
+      load();
+    }
+  }, [taskWindow, load]);
 
   const doLogout = async () => {
     await logout();
@@ -220,6 +216,8 @@ export default function ParentApp() {
               <button
                 key={n.key}
                 onClick={() => { setView(n.key); setMobileNavOpen(false); }}
+                onPointerDown={() => prefetchView(n.key)}
+                onMouseEnter={() => prefetchView(n.key)}
                 data-testid={n.testId}
                 title={lbl}
                 className={`w-full text-left flex items-center gap-3 px-3 py-2.5 rounded-xl font-parent font-semibold text-sm transition-colors ${sidebarCollapsed ? "md:justify-center" : ""} ${
@@ -274,13 +272,24 @@ export default function ParentApp() {
           <button className="md:hidden p-2" onClick={() => setMobileNavOpen(true)}>
             <Menu className="w-5 h-5" />
           </button>
-          <div className="flex-1">
-            <div className="font-parent font-bold text-xl md:text-2xl text-slate-900 capitalize">{view}</div>
-            <div className="text-sm text-slate-500">Hi {user?.name} · manage your family</div>
+          <div className="flex-1 min-w-0">
+            <div className="font-parent font-bold text-xl md:text-2xl text-slate-900 truncate">{viewTitle}</div>
+            <div className="text-sm text-slate-500 truncate">Hi {user?.name} · kelola keluargamu</div>
           </div>
+          <button
+            onClick={() => setPaletteOpen(true)}
+            className="press-btn flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 text-sm shrink-0"
+            title="Perintah cepat (Ctrl+K)"
+            aria-label="Perintah cepat"
+          >
+            <Search className="w-4 h-4" />
+            <span className="hidden md:inline">Cari / perintah</span>
+            <kbd className="hidden md:inline text-[10px] bg-slate-100 rounded px-1.5 py-0.5">Ctrl K</kbd>
+          </button>
         </div>
 
-        <div className="p-4 md:p-8 max-w-6xl">
+        <div className="p-4 md:p-8 max-w-6xl pb-28 md:pb-8">
+          <Suspense fallback={<PageSkeleton compact rows={2} />}>
           {/* Child filter tabs */}
           {children.length > 0 && view !== "settings" && view !== "monitor" && (
             <div className="flex items-center gap-2 mb-5 flex-wrap" data-testid="parent-child-tabs">
@@ -320,8 +329,12 @@ export default function ParentApp() {
             <div className="space-y-4">
               <FamilyDayMonitor />
               <div className="bg-white rounded-2xl border border-slate-200 p-6">
+                <ScheduleSuggestionsCard />
+              </div>
+              <div className="bg-white rounded-2xl border border-slate-200 p-6">
                 <HonestyInsightCard />
               </div>
+              <MemoriesCollage title="Kenangan Keluarga" />
               <div className="bg-white rounded-2xl border border-slate-200 p-6">
                 <ActivityLogCard kids={children} />
               </div>
@@ -339,22 +352,24 @@ export default function ParentApp() {
                   🛠️ Koreksi tugas per tanggal (lanjutan)
                 </summary>
                 <div className="p-3 pt-0">
-              <TasksView
-                kids={children}
-                tasks={filteredTasks}
-                selectedChildId={selectedChildId}
-                onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
-                onOpenTemplates={() => setTemplateModal(true)}
-                onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
-                onDuplicate={(t) => {
-                  // Pre-fill form with task values but as a NEW task (not edit)
-                  setEditingTask({ ...t, id: null, _isDuplicate: true });
-                  setTaskModal(true);
-                }}
-                onRefresh={load}
-                onApplyConsequence={(task) => setApplyConsModal({ task })}
-                onAddChild={() => setChildModal(true)}
-              />
+                  <TasksView
+                    kids={children}
+                    tasks={filteredTasks}
+                    selectedChildId={selectedChildId}
+                    onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
+                    onOpenTemplates={() => setTemplateModal(true)}
+                    onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
+                    onDuplicate={(t) => {
+                      // Pre-fill form with task values but as a NEW task (not edit)
+                      setEditingTask({ ...t, id: null, _isDuplicate: true });
+                      setTaskModal(true);
+                    }}
+                    onRefresh={load}
+                    onEnsureDate={ensureDate}
+                    taskWindow={taskWindow}
+                    onApplyConsequence={(task) => setApplyConsModal({ task })}
+                    onAddChild={() => setChildModal(true)}
+                  />
                 </div>
               </details>
             </div>
@@ -403,9 +418,52 @@ export default function ParentApp() {
               onRefresh={load}
             />
           )}
+          </Suspense>
         </div>
+
+        {/* Mobile bottom navigation: the four places a parent goes most, one
+            thumb-tap away; everything else stays in the side menu. */}
+        <nav className="md:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur border-t border-slate-200 flex justify-around px-2 pt-1.5"
+             style={{ paddingBottom: "calc(0.375rem + env(safe-area-inset-bottom))" }} aria-label="Navigasi utama">
+          {BOTTOM_NAV.map((key) => {
+            const n = NAV.find((x) => x.key === key);
+            const active = view === key;
+            return (
+              <button key={key} onClick={() => setView(key)} onPointerDown={() => prefetchView(key)} aria-current={active ? "page" : undefined}
+                      className={`press-btn relative flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl text-[11px] font-semibold ${active ? "text-indigo-600" : "text-slate-500"}`}>
+                <n.icon className="w-5 h-5" strokeWidth={2.5} />
+                {BOTTOM_LABELS[key]}
+                {key === "tasks" && (stats?.pending_approval || 0) > 0 && (
+                  <span className="absolute top-0 right-1 min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-orange-500 text-white text-[10px] leading-[1.1rem]">
+                    {stats.pending_approval}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+          <button onClick={() => setMobileNavOpen(true)}
+                  className="press-btn flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl text-[11px] font-semibold text-slate-500">
+            <Menu className="w-5 h-5" strokeWidth={2.5} />
+            Lainnya
+          </button>
+        </nav>
       </main>
 
+      <Suspense fallback={null}>
+        {paletteOpen && (
+          <CommandPalette
+            open={paletteOpen}
+            onOpenChange={setPaletteOpen}
+            kids={children}
+            nav={NAV}
+            onNavigate={setView}
+            onOpenTaskForm={() => { setEditingTask(null); setTaskModal(true); }}
+            onCreated={load}
+          />
+        )}
+      </Suspense>
+
+      <Suspense fallback={null}>
       {/* Modals */}
       <ChildFormModal open={childModal} onClose={() => setChildModal(false)} onSaved={load} />
       <TaskFormModal
@@ -428,2213 +486,7 @@ export default function ParentApp() {
         selectedChildId={selectedChildId}
         onSaved={load}
       />
+      </Suspense>
     </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────
-function StatCard({ label, value, sub, color = "#6366F1", icon: Icon, onClick }) {
-  const clickable = !!onClick;
-  return (
-    <button
-      onClick={onClick}
-      disabled={!clickable}
-      className={`text-left bg-white rounded-2xl p-5 border border-slate-200 transition-all w-full ${
-        clickable ? "hover:border-slate-300 hover:shadow-md hover:-translate-y-0.5 cursor-pointer active:scale-[0.98]" : "cursor-default"
-      }`}
-    >
-      <div className="flex items-start justify-between mb-3">
-        <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: `${color}22` }}>
-          <Icon className="w-5 h-5" style={{ color }} strokeWidth={2.5} />
-        </div>
-        {clickable && <span className="text-xs text-slate-300">›</span>}
-      </div>
-      <div className="font-parent font-bold text-3xl text-slate-900">{value}</div>
-      <div className="text-sm text-slate-500">{label}</div>
-      {sub && <div className="text-xs text-slate-400 mt-1">{sub}</div>}
-    </button>
-  );
-}
-
-function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNavigate }) {
-  return (
-    <div className="space-y-6">
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard label="Anak" value={stats?.children_count ?? "—"} icon={Users} color="#6366F1" onClick={() => onNavigate("settings")} />
-        <StatCard label="Menunggu cek" value={stats?.pending_approval ?? "—"} sub="Tugas menunggumu" icon={Clock} color="#FF9D23" onClick={() => onNavigate("tasks")} />
-        <StatCard label="Disetujui hari ini" value={stats?.approved_today ?? "—"} icon={CheckCircle2} color="#34D399" onClick={() => onNavigate("monitor")} />
-        <StatCard label="Total poin" value={stats?.total_points ?? "—"} sub="Semua anak" icon={Star} color="#4DB8FF" onClick={() => onNavigate("money")} />
-      </div>
-
-      <div className="grid md:grid-cols-3 gap-6">
-        <div className="md:col-span-2 bg-white rounded-2xl p-6 border border-slate-200">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-parent font-bold text-lg text-slate-900">Anak-anak</h3>
-            <button onClick={onAddChild} data-testid={TEST_IDS.parent.addChildBtn} className={btnPrimary}>
-              <Plus className="w-4 h-4" strokeWidth={2.5} /> Tambah anak
-            </button>
-          </div>
-          {kids.length === 0 ? (
-            <div className="text-center py-10 text-slate-400">Belum ada anak. Tambahkan untuk mulai.</div>
-          ) : (
-            <div className="grid sm:grid-cols-2 gap-4">
-              {kids.map((c) => {
-                const pending = tasks.filter((t) => t.child_id === c.id && t.status === "completed").length;
-                return (
-                  <div key={c.id} data-testid={`${TEST_IDS.parent.childCard}-${c.name}`} className="border border-slate-200 rounded-2xl p-4 flex gap-3 items-center">
-                    <div className="w-14 h-14 rounded-2xl flex items-center justify-center text-2xl flex-shrink-0" style={{ background: c.avatar_color }}>
-                      {c.avatar_emoji}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="font-parent font-bold text-slate-900 truncate">{c.name}</div>
-                      <div className="text-xs text-slate-500">{c.points} poin · {c.streak_days || 0} hari streak</div>
-                      {pending > 0 && (
-                        <div className="text-xs text-[#FF9D23] font-semibold mt-1">{pending} menunggu cek</div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        <div className="bg-white rounded-2xl p-6 border border-slate-200">
-          <h3 className="font-parent font-bold text-lg text-slate-900 mb-4">Permintaan hadiah</h3>
-          {pendingRedemptions.length === 0 ? (
-            <div className="text-sm text-slate-400 py-4">Tidak ada permintaan hadiah.</div>
-          ) : (
-            <div className="space-y-3">
-              {pendingRedemptions.slice(0, 5).map((r) => (
-                <div key={r.id} className="text-sm">
-                  <div className="font-semibold text-slate-800">{r.reward_name}</div>
-                  <div className="text-xs text-slate-500">{r.cost_points} poin</div>
-                </div>
-              ))}
-              <button onClick={() => onNavigate("rewards")} className="text-sm text-[#6366F1] font-semibold mt-2">Kelola →</button>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Merged: Leaderboard */}
-      {kids.length > 0 && (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200">
-          <Leaderboard />
-        </div>
-      )}
-
-      {/* Family challenges */}
-      {kids.length > 0 && <FamilyChallenges kids={kids} />}
-
-      {/* Merged: Weekly report */}
-      {kids.length > 0 && <WeeklyReport />}
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────
-function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild }) {
-  // Drag-and-drop reordering of the active list. We keep a local copy while
-  // dragging so the row follows the cursor instantly, then persist the whole
-  // visible slice in one call. If the save fails we reload from the server
-  // rather than leaving the screen showing an order that isn't real.
-  const [dragId, setDragId] = useState(null);
-  const [overId, setOverId] = useState(null);
-  const [localOrder, setLocalOrder] = useState(null);
-  const [savingOrder, setSavingOrder] = useState(false);
-  const [selectedIds, setSelectedIds] = useState([]);
-  const [bulkDeleting, setBulkDeleting] = useState(false);
-
-  const toggleSelected = (id) =>
-    setSelectedIds((ids) => (ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]));
-
-  const bulkDelete = async () => {
-    if (selectedIds.length === 0) return;
-    if (!window.confirm(
-      `Hapus ${selectedIds.length} tugas terpilih?\n\nTindakan ini permanen.`
-    )) return;
-    setBulkDeleting(true);
-    try {
-      const { data } = await api.post("/tasks/bulk-delete", { task_ids: selectedIds });
-      toast.success(`${data.deleted} tugas dihapus`);
-      setSelectedIds([]);
-      onRefresh();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    } finally {
-      setBulkDeleting(false);
-    }
-  };
-
-  // Reordering uses POINTER events, not HTML5 drag-and-drop: the latter simply
-  // never fires on touch screens, so on an iPad the list looked draggable but
-  // wasn't. Pointer events cover mouse, pen and touch with one code path.
-  // Dragging is bound to an explicit grip handle so ordinary scrolling and
-  // button taps inside a row keep working normally.
-  const dragState = useRef(null);
-
-  const commitOrder = async (list) => {
-    const original = grouped.pending.map((x) => x.id).join(",");
-    if (list.map((x) => x.id).join(",") === original) { setLocalOrder(null); return; }
-    setSavingOrder(true);
-    try {
-      await api.post("/tasks/reorder", { task_ids: list.map((x) => x.id) });
-      toast.success("Urutan disimpan");
-      setLocalOrder(null);
-      onRefresh();
-    } catch (e) {
-      toast.error(formatApiError(e));
-      setLocalOrder(null); // fall back to the server's truth
-      onRefresh();
-    } finally { setSavingOrder(false); }
-  };
-
-  const beginDrag = (e, task) => {
-    if (savingOrder) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const startList = localOrder || grouped.pending;
-    dragState.current = { id: task.id, list: [...startList] };
-    setDragId(task.id);
-    setLocalOrder([...startList]);
-
-    const move = (ev) => {
-      const st = dragState.current;
-      if (!st) return;
-      const point = ev.touches ? ev.touches[0] : ev;
-      const el = document.elementFromPoint(point.clientX, point.clientY);
-      const row = el && el.closest("[data-task-row]");
-      if (!row) return;
-      const overTaskId = row.getAttribute("data-task-row");
-      if (!overTaskId || overTaskId === st.id) return;
-      setOverId(overTaskId);
-      const list = [...st.list];
-      const from = list.findIndex((x) => x.id === st.id);
-      const to = list.findIndex((x) => x.id === overTaskId);
-      if (from === -1 || to === -1 || from === to) return;
-      list.splice(to, 0, list.splice(from, 1)[0]);
-      st.list = list;
-      setLocalOrder(list);
-    };
-
-    const end = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", end);
-      window.removeEventListener("pointercancel", end);
-      const st = dragState.current;
-      dragState.current = null;
-      setDragId(null);
-      setOverId(null);
-      if (st) commitOrder(st.list);
-    };
-
-    window.addEventListener("pointermove", move, { passive: false });
-    window.addEventListener("pointerup", end);
-    window.addEventListener("pointercancel", end);
-  };
-  // When viewing "Semua" (selectedChildId === null), collapse broadcast siblings
-  // (same broadcast_id) into a single representative row that lists all the kids
-  // it was assigned to — e.g. "Adskhan & Syila". Editing/duplicating still targets
-  // the representative task; deleting removes the whole group. When a specific
-  // child is selected, tasks show individually so per-child edits are possible.
-  const kidName = (id) => kids.find((k) => k.id === id)?.name || "?";
-
-  // Recurring/weekday-scheduled tasks can easily produce many upcoming AND
-  // overdue pending occurrences at once. Give the parent real day-by-day
-  // navigation (Kemarin / Hari Ini / Besok / tanggal custom) instead of one
-  // fuzzy "today-ish" bucket, so what's on screen always matches one specific
-  // day — mirroring the same mental model as the kid's own calendar view.
-  const [dateFilter, setDateFilterState] = useState(() => {
-    const stored = sessionStorage.getItem("tasksDateFilter");
-    // Guard against a stale value from the previous filter format (which only
-    // ever stored the literal strings "today" or "all", not a real date) —
-    // anything that isn't "all" or a proper YYYY-MM-DD falls back to today.
-    if (stored === "all") return "all";
-    // Only restore a stored date if it's today or in the future. A stored PAST
-    // date (e.g. yesterday, saved before local midnight rolled over) would
-    // otherwise silently show an old day's tasks — the #1 "why are today's
-    // done tasks under yesterday?" confusion. Past dates snap back to today.
-    if (stored && /^\d{4}-\d{2}-\d{2}$/.test(stored) && stored >= todayKey()) return stored;
-    return todayKey();
-  });
-  const [showCalendar, setShowCalendar] = useState(false);
-  const [encourageTask, setEncourageTask] = useState(null);
-  const setDateFilter = (v) => {
-    setDateFilterState(v);
-    try { sessionStorage.setItem("tasksDateFilter", v); } catch { /* storage unavailable — non-fatal */ }
-  };
-  const isDateMode = dateFilter !== "all"; // dateFilter is either "all" or a YYYY-MM-DD string
-
-  const displayTasks = useMemo(() => {
-    if (selectedChildId) return tasks; // specific child → individual tasks
-    const groups = new Map();
-    const singles = [];
-    for (const t of tasks) {
-      if (t.broadcast_id) {
-        const key = `${t.broadcast_id}::${t.date_key}::${t.title}`;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(t);
-      } else {
-        singles.push(t);
-      }
-    }
-    const collapsed = [];
-    for (const [, siblings] of groups) {
-      // representative = first sibling, annotated with the group's kid names + ids
-      const rep = { ...siblings[0], _groupKidIds: siblings.map((s) => s.child_id), _groupTaskIds: siblings.map((s) => s.id) };
-      collapsed.push(rep);
-    }
-    return [...singles, ...collapsed];
-  }, [tasks, selectedChildId, kids]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const grouped = useMemo(() => {
-    const byOrder = (a, b) => (a.order || 0) - (b.order || 0);
-    // In date mode, EVERY section (pending, awaiting, done, missed) must be
-    // scoped to the selected day. Previously only `pending` was filtered, so
-    // e.g. today's completed/awaiting tasks leaked into the "Kemarin" view.
-    // Undated tasks (no date_key) always show — there's no day to exclude them by.
-    const inSelectedDay = (t) => !isDateMode || !t.date_key || t.date_key === dateFilter;
-
-    let pendingBase = displayTasks.filter((t) => t.status === "pending" || t.status === "rejected");
-    const otherDatesCount = isDateMode
-      ? pendingBase.filter((t) => t.date_key && t.date_key !== dateFilter).length
-      : 0;
-    pendingBase = pendingBase.filter(inSelectedDay);
-
-    const pending = pendingBase.sort(byOrder);
-    const awaiting = displayTasks.filter((t) => t.status === "completed" && inSelectedDay(t)).sort(byOrder);
-    const done = displayTasks.filter((t) => (t.status === "approved" || t.status === "skipped") && inSelectedDay(t)).sort(byOrder);
-    const missed = displayTasks.filter((t) => t.status === "missed" && inSelectedDay(t));
-    // Sum of a group's own points — a broadcast row collapsed to one
-    // representative still only has one `points` value (same for every kid
-    // it was sent to), so a plain sum doesn't double-count per sibling.
-    const sumPoints = (list) => list.reduce((sum, t) => sum + (Number(t.points) || 0), 0);
-    return {
-      pending, awaiting, done, missed, otherDatesCount,
-      pendingPoints: sumPoints(pending),
-      awaitingPoints: sumPoints(awaiting),
-      donePoints: sumPoints(done),
-    };
-  }, [displayTasks, dateFilter, isDateMode]);
-
-  const act = async (fn) => {
-    try {
-      await fn();
-      onRefresh();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    }
-  };
-
-  const approve = (t) => act(async () => {
-    const { data } = await api.post(`/tasks/${t.id}/approve`);
-    toast.success(`Disetujui! +${t.points} poin`);
-    if (data.new_badges?.length) {
-      data.new_badges.forEach((b) => toast.success(`Badge baru terbuka: ${b.name} 🏆`));
-    }
-  });
-  const reject = (t) => act(async () => { await api.post(`/tasks/${t.id}/reject`); toast.info("Dikembalikan ke anak"); });
-  const miss = (t) => act(async () => { await api.post(`/tasks/${t.id}/miss`); toast(`Ditandai terlewat${t.penalty_points ? ` · -${t.penalty_points} poin` : ""}`); });
-  const undoMiss = (t) => {
-    if (!window.confirm(`Batalkan status "Terlewat" untuk "${t.title}"? Penalti akan dikembalikan dan misi aktif lagi.`)) return;
-    act(async () => {
-      await api.post(`/tasks/${t.id}/undo-miss`);
-      toast.success("Status terlewat dibatalkan, penalti dikembalikan");
-    });
-  };
-  const del = (t) => {
-    const isGroup = t._groupTaskIds && t._groupTaskIds.length > 1;
-    const msg = isGroup
-      ? `Hapus tugas "${t.title}" untuk ${t._groupKidIds.map(kidName).join(" & ")}?`
-      : `Hapus tugas "${t.title}"?`;
-    if (!window.confirm(msg)) return;
-    act(async () => {
-      if (isGroup) {
-        await Promise.all(t._groupTaskIds.map((id) => api.delete(`/tasks/${id}`)));
-      } else {
-        await api.delete(`/tasks/${t.id}`);
-      }
-      toast.success("Tugas dihapus");
-    });
-  };
-
-  // Display name for a task row: group kids ("Adskhan & Syila") or single kid.
-  const rowName = (t) =>
-    t._groupKidIds && t._groupKidIds.length > 1
-      ? t._groupKidIds.map(kidName).join(" & ")
-      : kidName(t.child_id);
-
-  const editBtn = (t) => (
-    <>
-      <button onClick={() => onEditTask(t)} className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-500" title="Edit tugas">
-        <Settings className="w-4 h-4" strokeWidth={2.5} />
-      </button>
-      <button onClick={() => onDuplicate(t)} className="press-btn p-1.5 rounded-lg hover:bg-indigo-50 text-indigo-500" title="Duplikat tugas ke hari/anak lain">
-        <Copy className="w-4 h-4" strokeWidth={2.5} />
-      </button>
-    </>
-  );
-
-  if (kids.length === 0) {
-    return (
-      <div className="bg-white rounded-2xl p-10 text-center border border-slate-200">
-        <Users className="w-10 h-10 text-slate-300 mx-auto mb-3" strokeWidth={2.5} />
-        <div className="font-parent font-bold text-lg text-slate-900">Tambah anak dulu</div>
-        <div className="text-sm text-slate-500 mb-4">Tugas harus diberikan ke seorang anak.</div>
-        <button onClick={onAddChild} className={btnPrimary} data-testid={TEST_IDS.parent.addChildBtn}>
-          <Plus className="w-4 h-4" strokeWidth={2.5} /> Tambah anak
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-6">
-      <div className="flex justify-between gap-2 flex-wrap">
-        <button
-          onClick={() => setShowCalendar((v) => !v)}
-          className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-slate-200 text-slate-600 hover:bg-slate-50 font-semibold px-4 py-2 rounded-xl text-sm"
-        >
-          📅 {showCalendar ? "Sembunyikan Kalender" : "Lihat Kalender"}
-        </button>
-        <div className="flex gap-2 flex-wrap">
-          <button onClick={onOpenTemplates} className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-indigo-200 text-indigo-600 hover:bg-indigo-50 font-semibold px-4 py-2 rounded-xl text-sm">
-            📋 Dari Template
-          </button>
-          <button onClick={onAddTask} data-testid={TEST_IDS.parent.addTaskBtn} className={btnPrimary}>
-            <Plus className="w-4 h-4" strokeWidth={2.5} /> Tugas baru
-          </button>
-        </div>
-      </div>
-
-      {showCalendar && (
-        <div className={`grid grid-cols-1 ${selectedChildId ? "" : "md:grid-cols-2"} gap-4`}>
-          {(selectedChildId ? kids.filter((k) => k.id === selectedChildId) : kids).map((k) => (
-            <MonthHeatmap key={k.id} childId={k.id} childName={k.name} />
-          ))}
-        </div>
-      )}
-
-      {grouped.awaiting.length > 0 && (
-        <Section title="⏳ Menunggu persetujuan" count={grouped.awaiting.length} pointsTotal={grouped.awaitingPoints}>
-          {grouped.awaiting.map((t) => (
-            <TaskRow key={t.id} task={t} childName={rowName(t)}>
-              <button onClick={() => approve(t)} data-testid={`${TEST_IDS.parent.approveTaskBtn}-${t.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
-                <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Setujui
-              </button>
-              <button onClick={() => setEncourageTask({ ...t, child_name: rowName(t) })} className="press-btn p-1.5 rounded-lg hover:bg-pink-50 text-pink-500" title="Setujui dengan pesan semangat">
-                💌
-              </button>
-              <button onClick={() => reject(t)} data-testid={`${TEST_IDS.parent.rejectTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-500" title="Tolak, kembalikan ke anak">
-                <XCircle className="w-4 h-4" strokeWidth={2.5} />
-              </button>
-            </TaskRow>
-          ))}
-        </Section>
-      )}
-
-      {encourageTask && (
-        <EncourageModal task={encourageTask} onClose={() => setEncourageTask(null)} onApproved={onRefresh} />
-      )}
-
-      <Section title="📋 Aktif" count={grouped.pending.length} pointsTotal={grouped.pendingPoints}>
-        <div className="flex items-center gap-2 mb-3 -mt-1 flex-wrap">
-          {isDateMode && (
-            <button
-              onClick={() => setDateFilter(shiftDateKey(dateFilter, -1))}
-              className="press-btn p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500"
-              title="Hari sebelumnya"
-            >
-              <ChevronLeft className="w-3.5 h-3.5" />
-            </button>
-          )}
-          <button
-            onClick={() => setDateFilter(shiftDateKey(todayKey(), -1))}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === shiftDateKey(todayKey(), -1) ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-          >
-            Kemarin
-          </button>
-          <button
-            onClick={() => setDateFilter(todayKey())}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === todayKey() ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-          >
-            Hari Ini
-          </button>
-          <button
-            onClick={() => setDateFilter(shiftDateKey(todayKey(), 1))}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === shiftDateKey(todayKey(), 1) ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-          >
-            Besok
-          </button>
-          {isDateMode && (
-            <button
-              onClick={() => setDateFilter(shiftDateKey(dateFilter, 1))}
-              className="press-btn p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500"
-              title="Hari berikutnya"
-            >
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
-          )}
-          <input
-            type="date"
-            value={isDateMode ? dateFilter : ""}
-            onChange={(e) => e.target.value && setDateFilter(e.target.value)}
-            className="px-2 py-1 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600"
-            title="Pilih tanggal custom"
-          />
-          <select
-            value=""
-            onChange={(e) => { if (e.target.value !== "") setDateFilter(nextDateForWeekday(Number(e.target.value))); }}
-            className="px-2 py-1 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600 bg-white"
-            title="Lompat ke hari tertentu (minggu ini/depan)"
-          >
-            <option value="">📆 Pilih Hari…</option>
-            {["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"].map((label, i) => (
-              <option key={i} value={i}>{label}</option>
-            ))}
-          </select>
-          <button
-            onClick={() => setDateFilter("all")}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold transition-colors ${dateFilter === "all" ? "bg-indigo-500 text-white" : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}
-          >
-            Semua Tanggal
-          </button>
-          {isDateMode && (
-            <span className="text-xs text-slate-500 font-semibold">{humanDateKey(dateFilter)}</span>
-          )}
-          {isDateMode && grouped.otherDatesCount > 0 && (
-            <span className="text-xs text-slate-400">
-              {grouped.otherDatesCount} misi di tanggal lain disembunyikan
-            </span>
-          )}
-        </div>
-        {grouped.pending.length === 0 ? (
-          <div className="text-sm text-slate-400 py-3">
-            {isDateMode ? `Tidak ada tugas aktif untuk ${humanDateKey(dateFilter)}.` : "Tidak ada tugas aktif."}
-          </div>
-        ) : (<>
-        <div className="text-[11px] text-slate-400 px-1 pb-1 flex items-center gap-1">
-          ⠿ Tahan ikon titik-titik lalu geser untuk mengubah urutan misi{savingOrder ? " · menyimpan…" : ""}
-        </div>
-        <div className="flex flex-wrap items-center gap-2 px-1 pb-2">
-          <label className="flex items-center gap-2 cursor-pointer select-none text-xs font-semibold text-slate-600">
-            <input
-              type="checkbox"
-              className="w-4 h-4 accent-indigo-600"
-              checked={selectedIds.length > 0 && selectedIds.length === (localOrder || grouped.pending).length}
-              // Indeterminate is the honest state for a partial selection —
-              // without it a half-ticked list looks fully unselected.
-              ref={(el) => { if (el) el.indeterminate = selectedIds.length > 0 && selectedIds.length < (localOrder || grouped.pending).length; }}
-              onChange={(e) =>
-                setSelectedIds(e.target.checked ? (localOrder || grouped.pending).map((x) => x.id) : [])
-              }
-            />
-            Pilih semua
-          </label>
-          {selectedIds.length > 0 && (
-            <>
-              <span className="text-xs text-slate-500">{selectedIds.length} dipilih</span>
-              <button
-                onClick={bulkDelete}
-                disabled={bulkDeleting}
-                className="press-btn inline-flex items-center gap-1 bg-red-500 hover:bg-red-600 text-white font-semibold px-3 py-1.5 rounded-lg text-xs disabled:opacity-60"
-              >
-                <Trash2 className="w-3.5 h-3.5" strokeWidth={2.5} />
-                {bulkDeleting ? "Menghapus…" : `Hapus ${selectedIds.length} tugas`}
-              </button>
-              <button
-                onClick={() => setSelectedIds([])}
-                className="press-btn text-xs text-slate-500 underline px-1"
-              >
-                Batal pilih
-              </button>
-            </>
-          )}
-        </div>
-        {(localOrder || grouped.pending).map((t) => (
-          <div
-            key={t.id}
-            data-task-row={t.id}
-            className={`rounded-2xl transition-all ${dragId === t.id ? "opacity-50 scale-[0.99]" : ""} ${
-              overId === t.id && dragId !== t.id ? "ring-2 ring-indigo-300" : ""
-            } ${savingOrder ? "pointer-events-none" : ""}`}
-          >
-          <TaskRow task={t} childName={rowName(t)} currentDateFilter={dateFilter}>
-            <input
-              type="checkbox"
-              checked={selectedIds.includes(t.id)}
-              onChange={() => toggleSelected(t.id)}
-              onClick={(e) => e.stopPropagation()}
-              className="w-4 h-4 accent-indigo-600 mr-0.5"
-              title="Pilih untuk dihapus massal"
-            />
-            <button
-              onPointerDown={(e) => beginDrag(e, t)}
-              className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 cursor-grab active:cursor-grabbing select-none"
-              style={{ touchAction: "none" }}
-              title="Tahan dan geser untuk mengubah urutan"
-              aria-label="Ubah urutan"
-            >
-              <GripVertical className="w-4 h-4" strokeWidth={2.5} />
-            </button>
-            {editBtn(t)}
-            <button onClick={() => miss(t)} data-testid={`${TEST_IDS.parent.missTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-red-50 text-red-500" title="Tandai terlewat">
-              <AlertTriangle className="w-4 h-4" strokeWidth={2.5} />
-            </button>
-            <button onClick={() => onApplyConsequence(t)} className="press-btn p-1.5 rounded-lg hover:bg-slate-100 text-slate-500" title="Terapkan konsekuensi">
-              <ShieldAlert className="w-4 h-4" strokeWidth={2.5} />
-            </button>
-            <button onClick={() => del(t)} data-testid={`${TEST_IDS.parent.deleteTaskBtn}-${t.id}`} className="press-btn p-1.5 rounded-lg hover:bg-red-50 text-red-500" title="Hapus tugas">
-              <Trash2 className="w-4 h-4" strokeWidth={2.5} />
-            </button>
-          </TaskRow>
-          </div>
-        ))}
-        </>)}
-      </Section>
-
-      {/* "Selesai" section intentionally removed from the Tugas menu — completed
-          tasks (with start/finish times + duration) live in Monitor Harian to
-          avoid showing the same list in two places. */}
-
-      {grouped.missed.length > 0 && (
-        <Section title="❌ Terlewat" count={grouped.missed.length}>
-          {grouped.missed.slice(0, 10).map((t) => (
-            <TaskRow key={t.id} task={t} childName={rowName(t)} dim>
-              {editBtn(t)}
-              <span className="text-sm text-red-500">−{t.penalty_points || 0} poin</span>
-              <button
-                onClick={() => undoMiss(t)}
-                title="Batalkan status terlewat (penalti dikembalikan, misi aktif lagi)"
-                className="press-btn inline-flex items-center gap-1 bg-white border border-amber-200 text-amber-600 font-semibold px-2.5 py-1 rounded-lg text-xs"
-              >
-                <Undo2 className="w-3.5 h-3.5" /> Batalkan
-              </button>
-            </TaskRow>
-          ))}
-        </Section>
-      )}
-    </div>
-  );
-}
-
-function Section({ title, count, pointsTotal, children }) {
-  return (
-    <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
-      <div className="px-5 py-3 border-b border-slate-100 flex items-center justify-between">
-        <h4 className="font-parent font-bold text-slate-900">{title}</h4>
-        <div className="flex items-center gap-2">
-          {typeof pointsTotal === "number" && pointsTotal !== 0 && (
-            <span className="inline-flex items-center gap-1 text-xs font-bold text-amber-600 bg-amber-50 rounded-full px-2 py-0.5">
-              <Star className="w-3 h-3" strokeWidth={2.5} /> {pointsTotal} poin
-            </span>
-          )}
-          {typeof count === "number" && <span className="text-sm text-slate-400">{count}</span>}
-        </div>
-      </div>
-      <div className="divide-y divide-slate-100">{children}</div>
-    </div>
-  );
-}
-
-function TaskRow({ task, childName, children, dim = false, currentDateFilter = null }) {
-  // When the parent is already looking at one specific day, repeating that
-  // same date on every single row is just noise — only show the date chip
-  // when it's NOT the day currently being viewed (i.e. useful information),
-  // or always in "Semua Tanggal" mode where every row could be a different day.
-  const showDateChip = task.date_key && (currentDateFilter === "all" || task.date_key !== currentDateFilter);
-  const isOverdue = task.date_key && task.date_key < todayKey();
-
-  const Chip = ({ children: c, tone = "slate", title }) => (
-    <span
-      title={title}
-      className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full ${
-        tone === "red" ? "bg-red-50 text-red-600" :
-        tone === "green" ? "bg-green-50 text-green-600" :
-        tone === "indigo" ? "bg-indigo-50 text-indigo-600" :
-        tone === "amber" ? "bg-amber-50 text-amber-600" :
-        "bg-slate-100 text-slate-500"
-      }`}
-    >
-      {c}
-    </span>
-  );
-
-  return (
-    <div className={`p-3.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 ${dim ? "opacity-60" : ""}`} data-testid={`${TEST_IDS.parent.taskItem}-${task.id}`}>
-      {task.order != null && (
-        <div className="w-7 h-7 rounded-full bg-indigo-100 text-indigo-600 font-bold text-xs flex items-center justify-center shrink-0" title="Urutan misi">
-          {task.order}
-        </div>
-      )}
-      <div className="flex-1 min-w-0">
-        <div className="font-parent font-semibold text-slate-900 truncate flex items-center gap-1.5">
-          {task.title}
-          {task._groupKidIds && task._groupKidIds.length > 1 && (
-            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-600 shrink-0" title="Tugas bersama — klik tab anak untuk edit khusus">
-              👥
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-1.5 flex-wrap mt-1">
-          <span className="text-xs text-slate-400">{childName}</span>
-          <Chip tone="green">+{task.points}</Chip>
-          {task.penalty_points > 0 && <Chip tone="red" title={`Penalti jika terlewat: ${task.penalty_points}`}>−{task.penalty_points}</Chip>}
-          {showDateChip && (
-            <Chip tone={isOverdue ? "red" : task.date_key === todayKey() ? "green" : "slate"}>
-              📅 {humanDateKey(task.date_key)}
-            </Chip>
-          )}
-          {task.due_time && <Chip tone="indigo" title="Batas waktu">🕒 {task.due_time}</Chip>}
-          {task.duration_minutes && <Chip title="Durasi">⏱️ {task.duration_minutes}m</Chip>}
-          {task.recurrence !== "none" && <Chip title={task.recurrence === "daily" ? "Berulang harian" : "Berulang mingguan"}>{task.recurrence === "daily" ? "🔁 harian" : "🔁 mingguan"}</Chip>}
-          {task.status === "skipped" && <Chip tone="amber">dilewati</Chip>}
-          {task.early_bonus_awarded > 0 && <Chip tone="green" title="Bonus selesai lebih cepat">⚡ +{task.early_bonus_awarded} cepat</Chip>}
-        </div>
-        {/* Start/finish timestamps — lets a parent sanity-check whether the kid
-            actually spent time on a task vs. instantly tapping through. */}
-        {(task.timer_started_at || task.completed_at) && (
-          <div className="flex items-center gap-2 flex-wrap mt-1 text-[11px] text-slate-400">
-            {task.timer_started_at && (
-              <span title="Waktu anak menekan Mulai">▶️ Mulai {fmtClock(task.timer_started_at)}</span>
-            )}
-            {task.completed_at && (
-              <span title="Waktu anak menekan Selesai">✅ Selesai {fmtClock(task.completed_at)}</span>
-            )}
-            {task.timer_started_at && task.completed_at && (
-              <span className="text-slate-500 font-semibold" title="Lama pengerjaan">
-                ⏳ {fmtDuration(task.timer_started_at, task.completed_at)}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-1.5 flex-wrap shrink-0">{children}</div>
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────
-function RewardsView({ rewards, redemptions, kids, selectedChildId, onAdd, onEdit, onRefresh }) {
-  const del = async (r) => {
-    try { await api.delete(`/rewards/${r.id}`); toast.success("Reward deleted"); onRefresh(); }
-    catch (e) { toast.error(formatApiError(e)); }
-  };
-  const fulfill = async (r) => {
-    try { await api.post(`/redemptions/${r.id}/fulfill`); toast.success("Ditandai sudah diberikan"); onRefresh(); }
-    catch (e) { toast.error(formatApiError(e)); }
-  };
-  const cancelRedemption = async (r) => {
-    if (!window.confirm(`Batalkan penukaran "${r.reward_name}"? ${r.cost_points} poin akan dikembalikan ke Tabungan anak.`)) return;
-    try { await api.post(`/redemptions/${r.id}/cancel`); toast.success("Dibatalkan, tabungan dikembalikan"); onRefresh(); }
-    catch (e) { toast.error(formatApiError(e)); }
-  };
-  const filteredRedemptions = selectedChildId
-    ? redemptions.filter((r) => r.child_id === selectedChildId)
-    : redemptions;
-
-  return (
-    <div className="space-y-6">
-      <div className="flex justify-end">
-        <button onClick={onAdd} data-testid={TEST_IDS.parent.addRewardBtn} className={btnPrimary}>
-          <Plus className="w-4 h-4" strokeWidth={2.5} /> New reward
-        </button>
-      </div>
-
-      <RewardSuggestionsReview kids={kids} onRewardCreated={onRefresh} />
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <h3 className="font-parent font-bold text-lg text-slate-900 mb-4">Reward store</h3>
-        {rewards.length === 0 ? (
-          <div className="text-sm text-slate-400 text-center py-8">No rewards yet. Create one to motivate your kids!</div>
-        ) : (
-          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {rewards.map((r) => (
-              <div key={r.id} data-testid={`${TEST_IDS.parent.rewardItem}-${r.id}`} className="border border-slate-200 rounded-xl p-4">
-                <div className="flex items-start gap-3 mb-3">
-                  {r.image ? (
-                    <img src={r.image} alt={r.name} className="w-10 h-10 rounded-xl object-cover flex-shrink-0 border border-slate-200" />
-                  ) : (
-                    <div className="w-10 h-10 rounded-xl bg-[#FF9D23]/15 flex items-center justify-center flex-shrink-0">
-                      <Gift className="w-5 h-5 text-[#FF9D23]" strokeWidth={2.5} />
-                    </div>
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <div className="font-semibold text-slate-900 truncate">{r.name}</div>
-                    <div className="text-xs text-slate-500 truncate">{r.description}</div>
-                  </div>
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-1 text-sm">
-                    <Star className="w-4 h-4 text-[#FF9D23]" strokeWidth={2.5} />
-                    <span className="font-bold">{r.cost_points}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button onClick={() => onEdit(r)} data-testid={`edit-reward-btn-${r.id}`} className={btnGhost} title="Edit hadiah">
-                      <Pencil className="w-4 h-4" strokeWidth={2.5} />
-                    </button>
-                    <button onClick={() => del(r)} data-testid={`${TEST_IDS.parent.deleteRewardBtn}-${r.id}`} className={btnDanger}>
-                      <Trash2 className="w-4 h-4" strokeWidth={2.5} />
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <h3 className="font-parent font-bold text-lg text-slate-900 mb-4">Redemption requests</h3>
-        {filteredRedemptions.length === 0 ? (
-          <div className="text-sm text-slate-400 text-center py-6">No requests yet.</div>
-        ) : (
-          <div className="divide-y divide-slate-100">
-            {filteredRedemptions.map((r) => {
-              const child = kids.find((c) => c.id === r.child_id);
-              return (
-                <div key={r.id} className="py-3 flex items-center gap-3">
-                  <div className="flex-1 min-w-0">
-                    <div className="font-semibold text-slate-900">{r.reward_name}</div>
-                    <div className="text-xs text-slate-500">
-                      {child?.name || "—"} · {r.cost_points} pts · {new Date(r.created_at).toLocaleString()}
-                    </div>
-                  </div>
-                  {r.status === "pending" ? (
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button onClick={() => fulfill(r)} data-testid={`${TEST_IDS.parent.fulfillRedemptionBtn}-${r.id}`} className="press-btn inline-flex items-center gap-1 bg-[#34D399] hover:bg-[#22c583] text-white font-semibold px-3 py-1.5 rounded-lg text-sm">
-                        <CheckCircle2 className="w-4 h-4" strokeWidth={2.5} /> Diberikan
-                      </button>
-                      <button onClick={() => cancelRedemption(r)} className="press-btn inline-flex items-center gap-1 border-2 border-slate-200 text-slate-500 hover:bg-slate-50 font-semibold px-2.5 py-1.5 rounded-lg text-sm" title="Batalkan & kembalikan tabungan">
-                        <XCircle className="w-4 h-4" strokeWidth={2.5} />
-                      </button>
-                    </div>
-                  ) : r.status === "cancelled" ? (
-                    <span className="text-xs text-slate-400 font-semibold shrink-0">Dibatalkan</span>
-                  ) : (
-                    <span className="text-xs text-[#34D399] font-semibold shrink-0">Diberikan</span>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────
-function ConsequencesView({ consequences, kids, onAdd, onEdit, onRefresh, onApply }) {
-  const del = async (c) => {
-    try { await api.delete(`/consequences/${c.id}`); toast.success("Deleted"); onRefresh(); }
-    catch (e) { toast.error(formatApiError(e)); }
-  };
-
-  return (
-    <div className="space-y-6">
-      <div className="flex justify-end">
-        <button onClick={onAdd} data-testid={TEST_IDS.parent.addConsequenceBtn} className={btnPrimary}>
-          <Plus className="w-4 h-4" strokeWidth={2.5} /> New consequence
-        </button>
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        {consequences.length === 0 ? (
-          <div className="text-sm text-slate-400 text-center py-8">No consequences configured. Add ones that fit your family.</div>
-        ) : (
-          <div className="grid sm:grid-cols-2 gap-4">
-            {consequences.map((c) => (
-              <div key={c.id} data-testid={`${TEST_IDS.parent.consequenceItem}-${c.id}`} className="border border-slate-200 rounded-xl p-4">
-                <div className="flex items-start gap-3 mb-3">
-                  <div className="w-10 h-10 rounded-xl bg-[#FF5C5C]/15 flex items-center justify-center flex-shrink-0">
-                    <ShieldAlert className="w-5 h-5 text-[#FF5C5C]" strokeWidth={2.5} />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-semibold text-slate-900">{c.name}</div>
-                    <div className="text-xs text-slate-500">{c.description}</div>
-                    {c.points_deducted > 0 && (
-                      <div className="text-xs text-red-500 font-semibold mt-1">−{c.points_deducted} pts</div>
-                    )}
-                  </div>
-                </div>
-                <div className="flex items-center justify-between">
-                  <button
-                    onClick={() => onApply(c)}
-                    disabled={kids.length === 0}
-                    data-testid={`${TEST_IDS.parent.applyConsequenceBtn}-${c.id}`}
-                    className="press-btn inline-flex items-center gap-1 bg-[#FF5C5C] disabled:bg-slate-200 text-white font-semibold px-3 py-1.5 rounded-lg text-sm"
-                  >
-                    Terapkan
-                  </button>
-                  <div className="flex items-center gap-2">
-                    <button onClick={() => onEdit(c)} data-testid={`edit-cons-btn-${c.id}`} className={btnGhost} title="Edit konsekuensi">
-                      <Pencil className="w-4 h-4" strokeWidth={2.5} />
-                    </button>
-                    <button onClick={() => del(c)} className={btnDanger}>
-                      <Trash2 className="w-4 h-4" strokeWidth={2.5} />
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────
-function SettingsView({ kids, onAdd, onRefresh }) {
-  const { user } = useAuth();
-
-  const delChild = async (c) => {
-    if (!window.confirm(`Hapus ${c.name}? Ini menghapus semua tugas dan riwayatnya.`)) return;
-    try { await api.delete(`/children/${c.id}`); toast.success("Anak dihapus"); onRefresh(); }
-    catch (e) { toast.error(formatApiError(e)); }
-  };
-
-  // Repairs a wallet whose three buckets no longer add up to the balance —
-  // older resets zeroed the points but left the buckets behind.
-  // Manual correction. Rules can't cover everything — a bug cost points, or
-  // something happened worth rewarding that no mission covers.
-  const adjustPoints = async (c) => {
-    const raw = window.prompt(
-      `Tambah atau kurangi poin ${c.name}?\n\nIsi angka positif untuk menambah (mis. 50), atau negatif untuk mengurangi (mis. -30).`
-    );
-    if (raw === null) return;
-    const delta = parseInt(String(raw).trim(), 10);
-    if (!Number.isFinite(delta) || delta === 0) {
-      toast.error("Isi angka selain nol ya");
-      return;
-    }
-    const reason = window.prompt("Alasannya apa? (tercatat di Log Aktivitas)") ?? "";
-    try {
-      const { data } = await api.post(`/children/${c.id}/adjust-points`, {
-        points: delta, reason: reason.trim(),
-      });
-      toast.success(
-        `${c.name}: ${data.delta > 0 ? "+" : ""}${data.delta} poin — sekarang ${data.after}`
-      );
-      onRefresh();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    }
-  };
-
-  const rebalanceBuckets = async (c) => {
-    if (!window.confirm(
-      `Perbaiki ChikyBank ${c.name}?\n\nKetiga kantong (Tabungan/Belanja/Sedekah) akan dihitung ulang dari poin saat ini sesuai persentase yang kamu atur.\n\nJumlah poinnya sendiri tidak berubah.`
-    )) return;
-    try {
-      const { data } = await api.post(`/children/${c.id}/rebalance-buckets`);
-      toast.success(`ChikyBank ${c.name} diperbaiki — total ${data.points} poin`);
-      onRefresh();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    }
-  };
-
-  const resetPoints = async (c) => {
-    if (!window.confirm(
-      `Reset poin ${c.name} ke nol?\n\nIni mengembalikan poin, total poin, streak, misi selesai, dan makanan pet ke 0, serta menghapus riwayat penukaran & konsekuensi anak ini.\n\nTugas, passcode, avatar, dan pet TIDAK dihapus. Cocok untuk membersihkan data testing.`
-    )) return;
-    try { await api.post(`/children/${c.id}/reset-points`); toast.success(`Poin ${c.name} sudah direset`); onRefresh(); }
-    catch (e) { toast.error(formatApiError(e)); }
-  };
-
-  const resetPet = async (c) => {
-    if (!window.confirm(
-      `Reset peliharaan ${c.name}?\n\nIni menghapus peliharaan yang sedang dipelihara (beserta pakan & aksesorinya) dan membuka layar pilih peliharaan baru — tanpa harus menunggu peliharaan lama "pergi" dulu.\n\nPoin, streak, dan level TIDAK terpengaruh.`
-    )) return;
-    try { await api.post(`/children/${c.id}/reset-pet`); toast.success(`Peliharaan ${c.name} sudah direset`); onRefresh(); }
-    catch (e) { toast.error(formatApiError(e)); }
-  };
-
-  const resetAllPoints = async () => {
-    if (kids.length === 0) return;
-    if (!window.confirm(
-      `Reset poin SEMUA anak ke nol?\n\nSemua scoreboard (poin, streak, riwayat penukaran & konsekuensi) akan dikosongkan. Tugas & profil tetap aman.\n\nLanjutkan?`
-    )) return;
-    try {
-      const { data } = await api.post(`/children/reset-all-points`);
-      toast.success(`Poin ${data.count} anak sudah direset`);
-      onRefresh();
-    } catch (e) { toast.error(formatApiError(e)); }
-  };
-
-  return (
-    <div className="space-y-6">
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <h3 className="font-parent font-bold text-lg text-slate-900 mb-1">Account</h3>
-        <div className="text-sm text-slate-500">
-          Signed in as <span className="font-semibold text-slate-700">{user?.name}</span> ({user?.role})
-        </div>
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <div className="flex justify-between items-center mb-4 flex-wrap gap-2">
-          <h3 className="font-parent font-bold text-lg text-slate-900">Anak</h3>
-          <div className="flex items-center gap-2">
-            {kids.length > 0 && (
-              <button
-                onClick={resetAllPoints}
-                className="press-btn inline-flex items-center gap-1.5 border-2 border-amber-300 text-amber-700 hover:bg-amber-50 font-semibold px-3 py-1.5 rounded-lg text-sm"
-                title="Reset poin semua anak ke nol"
-                data-testid="reset-all-points-btn"
-              >
-                <RotateCcw className="w-4 h-4" strokeWidth={2.5} /> Reset poin semua
-              </button>
-            )}
-            <button onClick={onAdd} className={btnPrimary} data-testid={TEST_IDS.parent.addChildBtn}>
-              <Plus className="w-4 h-4" strokeWidth={2.5} /> Tambah anak
-            </button>
-          </div>
-        </div>
-        {kids.length === 0 ? (
-          <div className="text-sm text-slate-400 text-center py-6">Belum ada anak.</div>
-        ) : (
-          <div className="divide-y divide-slate-100">
-            {kids.map((c) => (
-              <div key={c.id} className="py-3 flex items-center gap-3 flex-wrap">
-                <div className="w-10 h-10 rounded-xl flex items-center justify-center text-xl" style={{ background: c.avatar_color }}>{c.avatar_emoji}</div>
-                <div className="flex-1 min-w-0">
-                  <div className="font-semibold text-slate-900 flex items-center gap-2 flex-wrap">
-                    {c.name}
-                    {c.mbti && (
-                      <span
-                        className="text-xs font-bold px-2 py-0.5 rounded-full text-white"
-                        style={{ background: PERSONALITY_PROFILES[c.mbti]?.color || "#94A3B8" }}
-                        title={PERSONALITY_PROFILES[c.mbti]?.nickname || c.mbti}
-                      >
-                        {c.mbti}
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-xs text-slate-500">
-                    {c.age ? `Umur ${c.age} · ` : ""}{c.points} poin · {c.lifetime_points || 0} total
-                    {c.mbti && PERSONALITY_PROFILES[c.mbti] && ` · ${PERSONALITY_PROFILES[c.mbti].nickname}`}
-                  </div>
-                </div>
-                <select
-                  value={c.mbti || ""}
-                  onChange={async (e) => {
-                    try {
-                      await api.patch(`/children/${c.id}`, { mbti: e.target.value || null });
-                      toast.success(`Kepribadian ${c.name} diperbarui`);
-                      onRefresh();
-                    } catch (err) { toast.error(formatApiError(err)); }
-                  }}
-                  className="text-xs px-2 py-1.5 rounded-lg border border-slate-200 focus:border-indigo-500 focus:outline-none"
-                  title="Ubah tipe kepribadian"
-                >
-                  <option value="">MBTI —</option>
-                  {ALL_MBTI.map((t) => (
-                    <option key={t} value={t}>{t}</option>
-                  ))}
-                </select>
-                <select
-                  value={c.quest_theme || ""}
-                  onChange={async (e) => {
-                    try {
-                      await api.patch(`/children/${c.id}`, { quest_theme: e.target.value || null });
-                      toast.success(`Tema misi ${c.name} diperbarui`);
-                      onRefresh();
-                    } catch (err) { toast.error(formatApiError(err)); }
-                  }}
-                  className="text-xs px-2 py-1.5 rounded-lg border border-slate-200 focus:border-amber-500 focus:outline-none"
-                  title="Ubah tema petualangan"
-                >
-                  <option value="">Tema misi —</option>
-                  {QUEST_THEME_LIST.map((t) => (
-                    <option key={t.key} value={t.key}>{t.emoji} {t.label}</option>
-                  ))}
-                </select>
-                <button
-                  onClick={() => resetPoints(c)}
-                  className="press-btn inline-flex items-center justify-center border-2 border-amber-300 text-amber-700 hover:bg-amber-50 p-2 rounded-lg"
-                  title="Reset poin anak ini ke nol"
-                  data-testid={`reset-points-btn-${c.id}`}
-                >
-                  <RotateCcw className="w-4 h-4" strokeWidth={2.5} />
-                </button>
-                <button
-                  onClick={() => adjustPoints(c)}
-                  className="press-btn inline-flex items-center justify-center border-2 border-indigo-300 text-indigo-700 hover:bg-indigo-50 p-2 rounded-lg"
-                  title="Tambah atau kurangi poin anak ini secara manual"
-                >
-                  <Plus className="w-4 h-4" strokeWidth={2.5} />
-                </button>
-                <button
-                  onClick={() => rebalanceBuckets(c)}
-                  className="press-btn inline-flex items-center justify-center border-2 border-emerald-300 text-emerald-700 hover:bg-emerald-50 p-2 rounded-lg"
-                  title="Perbaiki ChikyBank: hitung ulang kantong dari poin saat ini"
-                >
-                  <Scale className="w-4 h-4" strokeWidth={2.5} />
-                </button>
-                <button
-                  onClick={() => resetPet(c)}
-                  className="press-btn inline-flex items-center justify-center border-2 border-sky-300 text-sky-700 hover:bg-sky-50 p-2 rounded-lg"
-                  title="Reset peliharaan virtual anak ini"
-                  data-testid={`reset-pet-btn-${c.id}`}
-                >
-                  <PawPrint className="w-4 h-4" strokeWidth={2.5} />
-                </button>
-                <button onClick={() => delChild(c)} className={btnDanger}>
-                  <Trash2 className="w-4 h-4" strokeWidth={2.5} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <ProfileEditor />
-      </div>
-
-      {/* Stage 2 & 3: New Features */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <ConfigMenu />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <LabelEditor />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <ViewLinksManager />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <LevelConfigEditor />
-      </div>
-
-      <PetResetRequestsReview onChanged={onRefresh} />
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <PetConfigEditor />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <MemberPasscodeManager />
-      </div>
-
-      {/* Stage 4: Achievements & Push Notifications */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <Achievements />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <PushNotificationManager />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <DaySegmentsConfig onChanged={onRefresh} />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <SegmentStartsConfig kids={kids} onChanged={onRefresh} />
-      </div>
-
-
-      <div className="bg-white rounded-2xl border-2 border-violet-100 p-6">
-        <ExamPeriodConfig kids={kids} onChanged={onRefresh} />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <LateReasonsConfig kids={kids} onChanged={onRefresh} />
-      </div>
-
-      <div className="bg-white rounded-2xl border-2 border-red-100 p-6">
-        <PunishmentConfig onChanged={onRefresh} />
-      </div>
-
-
-
-
-      <div className="bg-white rounded-2xl border-2 border-red-100 p-6">
-        <MaintenanceModeCard />
-      </div>
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────────────────
-function ChildFormModal({ open, onClose, onSaved }) {
-  const [name, setName] = useState("");
-  const [age, setAge] = useState("");
-  const [color, setColor] = useState(AVATAR_COLORS[0]);
-  const [emoji, setEmoji] = useState(AVATAR_EMOJIS[0]);
-  const [mbti, setMbti] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  const reset = () => { setName(""); setAge(""); setColor(AVATAR_COLORS[0]); setEmoji(AVATAR_EMOJIS[0]); setMbti(""); };
-
-  const submit = async () => {
-    if (!name.trim()) return toast.error("Nama wajib diisi");
-    setSaving(true);
-    try {
-      await api.post("/children", {
-        name: name.trim(),
-        age: age ? parseInt(age) : null,
-        avatar_color: color,
-        avatar_emoji: emoji,
-        mbti: mbti || null,
-      });
-      toast.success(`${name} ditambahkan!`);
-      reset();
-      onSaved();
-      onClose();
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <Modal open={open} onClose={onClose} title="Tambah anak">
-      <div className="space-y-4">
-        <div>
-          <label className={labelClass}>Nama</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Adskhan" data-testid="child-name-input" />
-        </div>
-        <div>
-          <label className={labelClass}>Umur (opsional)</label>
-          <input type="number" min="1" max="25" value={age} onChange={(e) => setAge(e.target.value)} className={inputClass} data-testid="child-age-input" />
-        </div>
-        <div>
-          <label className={labelClass}>Tipe Kepribadian (MBTI, opsional)</label>
-          <select value={mbti} onChange={(e) => setMbti(e.target.value)} className={inputClass}>
-            <option value="">— Pilih tipe —</option>
-            {ALL_MBTI.map((t) => (
-              <option key={t} value={t}>
-                {t}{PERSONALITY_PROFILES[t] ? ` · ${PERSONALITY_PROFILES[t].nickname}` : ""}
-              </option>
-            ))}
-          </select>
-          <p className="text-xs text-slate-400 mt-1">
-            Membantu aplikasi menyarankan gaya tugas & pesan motivasi yang cocok untuk anak.
-          </p>
-        </div>
-        <div>
-          <label className={labelClass}>Warna avatar</label>
-          <div className="flex gap-2 flex-wrap">
-            {AVATAR_COLORS.map((c) => (
-              <button
-                key={c}
-                onClick={() => setColor(c)}
-                className={`w-10 h-10 rounded-full border-2 transition-transform ${color === c ? "border-slate-900 scale-110" : "border-transparent"}`}
-                style={{ background: c }}
-                data-testid={`avatar-color-${c}`}
-              />
-            ))}
-          </div>
-        </div>
-        <div>
-          <label className={labelClass}>Avatar</label>
-          <div className="flex gap-2 flex-wrap">
-            {AVATAR_EMOJIS.map((e) => (
-              <button
-                key={e}
-                onClick={() => setEmoji(e)}
-                className={`w-10 h-10 rounded-xl border-2 text-xl transition-colors ${emoji === e ? "border-[#6366F1] bg-[#EEF2FF]" : "border-slate-200"}`}
-              >
-                {e}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Batal</button>
-          <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="child-submit-btn">
-            {saving ? "Menyimpan…" : "Tambah anak"}
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, editTask }) {
-  const isDuplicate = editTask && editTask._isDuplicate;
-  const isEdit = !!editTask && !isDuplicate;
-  const [title, setTitle] = useState("");
-  const [desc, setDesc] = useState("");
-  const [points, setPoints] = useState(10);
-  const [penalty, setPenalty] = useState(0);
-  const [dateKey, setDateKey] = useState(todayKey());
-  const [scheduleMode, setScheduleMode] = useState("weekdays"); // "weekdays" default | "date"
-  const [weekdays, setWeekdays] = useState([new Date().getDay() === 0 ? 6 : new Date().getDay() - 1]); // default = today's weekday (Mon=0..Sun=6)
-  const [segmentId, setSegmentId] = useState("");
-  const [segments, setSegments] = useState([]);
-  const [isBonus, setIsBonus] = useState(false);
-  const [photoRequired, setPhotoRequired] = useState(false);
-  const [isCoop, setIsCoop] = useState(false);
-  const [togetherBonusEnabled, setTogetherBonusEnabled] = useState(false);
-  const [togetherBonusPoints, setTogetherBonusPoints] = useState(10);
-  const [recurrence, setRecurrence] = useState("none");
-  const [order, setOrder] = useState("");
-  const [taskStyle, setTaskStyle] = useState("");
-  const [showIdeaBank, setShowIdeaBank] = useState(false);
-  const [ideaStyleFilter, setIdeaStyleFilter] = useState("all");
-  // Selected kid ids: [] means "everyone" (broadcast). Edit mode is always the task's own child.
-  const [selectedKidIds, setSelectedKidIds] = useState(
-    defaultChildId ? [defaultChildId] : []
-  );
-  const [saving, setSaving] = useState(false);
-
-  // Sections carry the clock now, so the form offers "which part of the day"
-  // instead of a per-task time.
-  useEffect(() => {
-    if (!open) return;
-    api.get("/config")
-      .then(({ data }) => setSegments(data.day_segments || []))
-      .catch(() => setSegments([]));
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    if (editTask && !isDuplicate) {
-      setSelectedKidIds([editTask.child_id]);
-      setTitle(editTask.title || "");
-      setDesc(editTask.description || "");
-      setPoints(editTask.points ?? 10);
-      setPenalty(editTask.penalty_points ?? 0);
-      setDateKey(editTask.date_key || todayKey());
-      setScheduleMode("date"); // editing is always a single existing date
-      setWeekdays([]);
-      setSegmentId(editTask.segment_id || "");
-      setIsBonus(!!editTask.is_bonus);
-      setPhotoRequired(!!editTask.photo_required);
-      setIsCoop(!!editTask.is_coop);
-      setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
-      setTogetherBonusPoints(editTask.together_bonus_points || 10);
-      setRecurrence(editTask.recurrence || "none");
-      setOrder(editTask.order ? String(editTask.order) : "");
-      setTaskStyle(editTask.task_style || "");
-    } else if (isDuplicate) {
-      // Pre-fill from source task but as NEW — allow changing kid/schedule
-      setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
-      setTitle(editTask.title || "");
-      setDesc(editTask.description || "");
-      setPoints(editTask.points ?? 10);
-      setPenalty(editTask.penalty_points ?? 0);
-      setDateKey(todayKey());
-      setScheduleMode("weekdays");
-      const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
-      setWeekdays([todayWd]);
-      setSegmentId(editTask.segment_id || "");
-      setIsBonus(!!editTask.is_bonus);
-      setPhotoRequired(!!editTask.photo_required);
-      setIsCoop(false);
-      setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
-      setTogetherBonusPoints(editTask.together_bonus_points || 10);
-      setRecurrence(editTask.recurrence || "none");
-      setOrder(""); // fresh order
-      setTaskStyle(editTask.task_style || "");
-    } else {
-      setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
-      setTitle(""); setDesc(""); setPoints(10); setPenalty(0);
-      setDateKey(todayKey());
-      setScheduleMode("weekdays");
-      const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
-      setWeekdays([todayWd]);
-      setSegmentId("");
-      setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
-      setTogetherBonusEnabled(false); setTogetherBonusPoints(10);
-      setRecurrence("none"); setOrder(""); setTaskStyle("");
-    }
-  }, [open, defaultChildId, editTask, isDuplicate]);
-
-  const toggleKid = (id) => {
-    setSelectedKidIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
-  };
-
-  const isBroadcast = selectedKidIds.length === 0;
-  const isSingle = selectedKidIds.length === 1;
-
-  const toggleWeekday = (d) => {
-    setWeekdays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d]));
-  };
-
-  const submit = async () => {
-    if (!title.trim()) return toast.error("Judul tugas wajib diisi");
-    if (!isEdit && scheduleMode === "weekdays" && weekdays.length === 0) {
-      return toast.error("Pilih minimal satu hari");
-    }
-    if (!isEdit && isCoop && selectedKidIds.length < 2) {
-      return toast.error("Misi bersama butuh minimal 2 anak dipilih (bukan Semua/1 anak)");
-    }
-    if (togetherBonusEnabled && (!togetherBonusPoints || Number(togetherBonusPoints) < 1)) {
-      return toast.error("Tentukan poin bonus untuk opsi 'dilakukan bersama'");
-    }
-    setSaving(true);
-    try {
-      const useWeekdays = !isEdit && scheduleMode === "weekdays";
-      const body = {
-        title: title.trim(),
-        description: desc,
-        points: Number(points) || 0,
-        penalty_points: Number(penalty) || 0,
-        date_key: useWeekdays ? null : (dateKey || null),
-        weekdays: useWeekdays ? weekdays : null,
-        segment_id: segmentId || null,
-        // Per-mission timing is retired: saving a mission clears whatever an
-        // older version stored, so nothing hidden keeps influencing the clock.
-        max_snooze_minutes: null,
-        min_duration_minutes: null,
-        rush_message: null,
-        overtime_allowed: false,
-        overtime_bonus_points: null,
-        duration_minutes: null,
-        is_bonus: isCoop ? true : isBonus,
-        photo_required: photoRequired,
-        coop: !isEdit && isCoop,
-        together_bonus_enabled: togetherBonusEnabled,
-        together_bonus_points: togetherBonusEnabled ? Number(togetherBonusPoints) : null,
-        // Rutin (weekday) mode auto-repeats weekly so the task comes back each
-        // week on the same day. Non-rutin uses the chosen recurrence dropdown.
-        recurrence: useWeekdays ? "weekly" : recurrence,
-        order: order ? Number(order) : null,
-        task_style: taskStyle || null,
-      };
-      if (isEdit) {
-        await api.patch(`/tasks/${editTask.id}`, body);
-        toast.success("Tugas diperbarui");
-      } else if (isCoop) {
-        await api.post("/tasks", { ...body, target_children: selectedKidIds });
-        toast.success(`Misi bersama dibuat untuk ${selectedKidIds.length} anak 🤝`);
-      } else {
-        // Broadcast: send empty target_children (or all kid ids). Backend treats empty as "all".
-        if (isBroadcast) {
-          await api.post("/tasks", { ...body, target_children: [] });
-          toast.success(`Tugas dibuat untuk semua anak (${kids.length})`);
-        } else if (isSingle) {
-          await api.post("/tasks", { ...body, child_id: selectedKidIds[0] });
-          toast.success("Tugas dibuat");
-        } else {
-          await api.post("/tasks", { ...body, target_children: selectedKidIds });
-          toast.success(`Tugas dibuat untuk ${selectedKidIds.length} anak`);
-        }
-      }
-      onSaved();
-      onClose();
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <Modal open={open} onClose={onClose} title={isEdit ? "Edit tugas" : isDuplicate ? "Duplikat tugas" : "Tugas baru"}>
-      <div className="space-y-4">
-        {!isEdit && (
-          <div>
-            <button
-              type="button"
-              onClick={() => setShowIdeaBank((v) => !v)}
-              className="press-btn inline-flex items-center gap-1.5 text-xs font-bold text-amber-600 bg-amber-50 hover:bg-amber-100 px-3 py-1.5 rounded-full"
-            >
-              💡 {showIdeaBank ? "Sembunyikan Ide Misi" : "Cari Ide Misi"}
-            </button>
-            {showIdeaBank && (
-              <div className="mt-2 bg-slate-50 rounded-xl p-3 border border-slate-200">
-                <div className="flex gap-1.5 flex-wrap mb-2">
-                  {[{ key: "all", label: "Semua" }, ...Object.entries(TASK_STYLES).map(([key, s]) => ({ key, label: `${s.emoji} ${s.label}` }))].map((opt) => (
-                    <button
-                      key={opt.key}
-                      type="button"
-                      onClick={() => setIdeaStyleFilter(opt.key)}
-                      className={`px-2 py-1 rounded-full text-[11px] font-semibold ${ideaStyleFilter === opt.key ? "bg-indigo-500 text-white" : "bg-white text-slate-500 border border-slate-200"}`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="max-h-48 overflow-y-auto space-y-1">
-                  {filterTaskIdeas({
-                    age: kids.find((k) => k.id === selectedKidIds[0])?.age,
-                    style: ideaStyleFilter,
-                  }).map((idea, i) => (
-                    <button
-                      key={i}
-                      type="button"
-                      onClick={() => {
-                        setTitle(idea.title);
-                        setPoints(idea.points);
-                        setTaskStyle(idea.style);
-                        setShowIdeaBank(false);
-                        toast.success(`"${idea.title}" dipakai — sesuaikan detail lain kalau perlu`);
-                      }}
-                      className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-white text-sm text-slate-700 flex items-center gap-2"
-                    >
-                      <span>{idea.emoji}</span> {idea.title}
-                      <span className="ml-auto text-xs text-amber-600 font-bold">+{idea.points}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-        <div>
-          <label className={labelClass}>Tugas</label>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputClass} placeholder="Rapikan tempat tidur" data-testid="task-title-input" />
-        </div>
-        <div>
-          <label className={labelClass}>Deskripsi (opsional)</label>
-          <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} />
-        </div>
-        {/* Kid selection */}
-        <div>
-          <label className={labelClass}>Untuk anak</label>
-          {isEdit ? (
-            <div className="text-sm text-slate-500 bg-slate-50 rounded-xl px-3 py-2 border border-slate-200">
-              {kids.find((k) => k.id === selectedKidIds[0])?.name || "—"}
-              <span className="text-xs text-slate-400 ml-2">(tidak bisa diubah saat edit)</span>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {!isCoop && (
-                <button
-                  type="button"
-                  onClick={() => setSelectedKidIds([])}
-                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
-                    isBroadcast ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-                  }`}
-                >
-                  <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-                    isBroadcast ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
-                  }`}>
-                    {isBroadcast && <span className="text-white text-xs">✓</span>}
-                  </div>
-                  <span className="font-semibold text-slate-800">🌟 Semua anak (broadcast)</span>
-                  <span className="text-xs text-slate-500 ml-auto">1 tugas untuk tiap anak</span>
-                </button>
-              )}
-              <div className="grid grid-cols-2 gap-2">
-                {kids.map((c) => {
-                  const checked = selectedKidIds.includes(c.id);
-                  return (
-                    <button
-                      key={c.id}
-                      type="button"
-                      onClick={() => toggleKid(c.id)}
-                      className={`flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
-                        checked ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-                      }`}
-                    >
-                      <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-                        checked ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
-                      }`}>
-                        {checked && <span className="text-white text-xs">✓</span>}
-                      </div>
-                      <div className="w-6 h-6 rounded-lg flex items-center justify-center text-sm" style={{ background: c.avatar_color }}>
-                        {c.avatar_emoji}
-                      </div>
-                      <span className="font-semibold text-slate-800 text-sm truncate">{c.name}</span>
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="text-xs text-slate-400">
-                {isCoop
-                  ? selectedKidIds.length < 2
-                    ? "Pilih minimal 2 anak untuk misi bersama."
-                    : `Misi bersama untuk ${selectedKidIds.length} anak — poin dibagi otomatis saat disetujui.`
-                  : isBroadcast
-                  ? `Akan dibuat 1 tugas untuk masing-masing dari ${kids.length} anak.`
-                  : selectedKidIds.length === 0
-                  ? "Pilih setidaknya satu anak, atau pilih 'Semua anak'."
-                  : `Akan dibuat untuk ${selectedKidIds.length} anak.`}
-              </p>
-            </div>
-          )}
-        </div>
-
-        {/* Schedule: specific date OR weekdays */}
-        <div>
-          <label className={labelClass}>📅 Jadwal misi</label>
-          {isEdit ? (
-            /* Editing an existing occurrence: the date is what it is. Showing
-               a date picker here contradicted the rest of the app, where a
-               routine is defined by weekday + section rather than a calendar
-               date — so it's stated as plain information instead. Scheduling
-               changes are made through the section, order and repeat fields. */
-            <div className="px-4 py-2.5 rounded-xl bg-slate-50 border-2 border-slate-100">
-              <div className="text-sm font-semibold text-slate-700">{humanDateKey(dateKey)}</div>
-              <p className="text-xs text-slate-500 mt-0.5">
-                {recurrence !== "none" ? (
-                  <>Misi <span className="font-semibold text-indigo-600">{recurrence === "daily" ? "harian" : "mingguan"}</span> — otomatis berulang, jadi tanggalnya tidak perlu diatur di sini.</>
-                ) : (
-                  <>Misi sekali jalan pada hari ini. Untuk memindahkannya, hapus lalu buat ulang di hari yang kamu mau.</>
-                )}
-              </p>
-            </div>
-          ) : (
-            <>
-              <div className="flex gap-2 mb-2">
-                <button
-                  type="button"
-                  onClick={() => setScheduleMode("weekdays")}
-                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
-                    scheduleMode === "weekdays" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                  }`}
-                >
-                  🔁 Rutin (per hari)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setScheduleMode("date")}
-                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
-                    scheduleMode === "date" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                  }`}
-                >
-                  🗓️ Non-rutin (tanggal)
-                </button>
-              </div>
-              {scheduleMode === "date" ? (
-                <div>
-                  <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
-                  <p className="text-xs text-slate-400 mt-1.5">
-                    Untuk aktivitas tidak rutin / anomali — misal ada acara khusus di tanggal tertentu.
-                  </p>
-                </div>
-              ) : (
-                <div>
-                  <div className="grid grid-cols-7 gap-1">
-                    {[["Sen", 0], ["Sel", 1], ["Rab", 2], ["Kam", 3], ["Jum", 4], ["Sab", 5], ["Min", 6]].map(([label, d]) => (
-                      <button
-                        key={d}
-                        type="button"
-                        onClick={() => toggleWeekday(d)}
-                        className={`py-2 rounded-xl border-2 text-xs font-bold transition-colors ${
-                          weekdays.includes(d) ? "border-indigo-500 bg-indigo-500 text-white" : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                        }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                  <p className="text-xs text-slate-400 mt-1.5">
-                    Misi rutin diulang tiap minggu di hari terpilih. Tiap hari bisa punya misi berbeda.
-                  </p>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-
-        {/* Repeat — only for non-rutin (date) mode; rutin auto-repeats weekly */}
-        {(isEdit || scheduleMode === "date") && (
-          <div>
-            <label className={labelClass}>Ulangi</label>
-            <select value={recurrence} onChange={(e) => setRecurrence(e.target.value)} className={inputClass}>
-              <option value="none">Sekali</option>
-              <option value="daily">Harian</option>
-              <option value="weekly">Mingguan</option>
-            </select>
-          </div>
-        )}
-
-        <div className="grid grid-cols-3 gap-3">
-          <div>
-            <label className={labelClass}>Poin</label>
-            <input type="number" min="0" value={points} onChange={(e) => setPoints(e.target.value)} className={inputClass} data-testid="task-points-input" />
-          </div>
-          <div>
-            <label className={labelClass}>Penalti</label>
-            <input type="number" min="0" value={penalty} onChange={(e) => setPenalty(e.target.value)} className={inputClass} />
-          </div>
-          <div>
-            <label className={labelClass}>Urutan (opsional)</label>
-            <input type="number" min="1" value={order} onChange={(e) => setOrder(e.target.value)} className={inputClass} placeholder="Auto" />
-          </div>
-        </div>
-
-        {/* Bonus toggle */}
-        <button
-          type="button"
-          onClick={() => setIsBonus(!isBonus)}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
-            isBonus ? "border-amber-400 bg-amber-50" : "border-slate-200 hover:bg-slate-50"
-          }`}
-        >
-          <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-            isBonus ? "bg-amber-500 border-amber-500" : "border-slate-300"
-          }`}>
-            {isBonus && <span className="text-white text-xs">✓</span>}
-          </div>
-          <div className="flex-1 text-left">
-            <div className="font-semibold text-slate-800 text-sm">✨ Tugas Bonus</div>
-            <div className="text-xs text-slate-500">Tidak wajib, tidak menghalangi urutan misi. Poinnya jadi ekstra.</div>
-          </div>
-        </button>
-
-        {/* Photo verification toggle */}
-        <button
-          type="button"
-          onClick={() => setPhotoRequired(!photoRequired)}
-          className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
-            photoRequired ? "border-purple-400 bg-purple-50" : "border-slate-200 hover:bg-slate-50"
-          }`}
-        >
-          <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-            photoRequired ? "bg-purple-500 border-purple-500" : "border-slate-300"
-          }`}>
-            {photoRequired && <span className="text-white text-xs">✓</span>}
-          </div>
-          <div className="flex-1 text-left">
-            <div className="font-semibold text-slate-800 text-sm">📷 Butuh Foto Bukti</div>
-            <div className="text-xs text-slate-500">Anak harus lampirkan foto sebelum bisa menandai selesai.</div>
-          </div>
-        </button>
-
-        {/* Co-op quest toggle — only offered when creating (not editing), since
-            an existing task's coop-ness can't be changed after the fact. */}
-        {!isEdit && !togetherBonusEnabled && (
-          <button
-            type="button"
-            onClick={() => setIsCoop(!isCoop)}
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
-              isCoop ? "border-teal-400 bg-teal-50" : "border-slate-200 hover:bg-slate-50"
-            }`}
-          >
-            <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-              isCoop ? "bg-teal-500 border-teal-500" : "border-slate-300"
-            }`}>
-              {isCoop && <span className="text-white text-xs">✓</span>}
-            </div>
-            <div className="flex-1 text-left">
-              <div className="font-semibold text-slate-800 text-sm">🤝 Misi Bersama (Co-op)</div>
-              <div className="text-xs text-slate-500">
-                SATU tugas dipakai berdua — siapa saja bisa menandai selesai, poin dibagi otomatis. Pilih minimal 2 anak di atas.
-              </div>
-            </div>
-          </button>
-        )}
-        {isEdit && editTask?.is_coop && (
-          <div className="text-xs text-teal-600 bg-teal-50 border border-teal-200 rounded-xl px-3 py-2">
-            🤝 Ini misi bersama — poin akan dibagi ke semua peserta saat disetujui.
-          </div>
-        )}
-
-        {/* "Bonus dilakukan bersama" — simpler alternative to co-op: task stays
-            individual (one copy per kid via broadcast), but the kid answers a
-            yes/no question on completion and gets an extra bonus if yes. Can
-            be toggled anytime (create or edit), unlike co-op. */}
-        {!isCoop && (
-          <div>
-            <button
-              type="button"
-              onClick={() => setTogetherBonusEnabled(!togetherBonusEnabled)}
-              className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${
-                togetherBonusEnabled ? "border-pink-400 bg-pink-50" : "border-slate-200 hover:bg-slate-50"
-              }`}
-            >
-              <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-                togetherBonusEnabled ? "bg-pink-500 border-pink-500" : "border-slate-300"
-              }`}>
-                {togetherBonusEnabled && <span className="text-white text-xs">✓</span>}
-              </div>
-              <div className="flex-1 text-left">
-                <div className="font-semibold text-slate-800 text-sm">🎁 Bonus Jika Dilakukan Bersama</div>
-                <div className="text-xs text-slate-500">
-                  Tugas tetap individu (mis. Sholat Subuh) — tapi kalau dilakukan bareng saudara, anak dapat poin bonus ekstra. Anak akan ditanya "dilakukan bersama?" saat menandai selesai.
-                </div>
-              </div>
-            </button>
-            {togetherBonusEnabled && (
-              <div className="mt-2 pl-8">
-                <label className={labelClass}>Poin bonus jika bersama</label>
-                <input
-                  type="number" min="1" max="1000" value={togetherBonusPoints}
-                  onChange={(e) => setTogetherBonusPoints(e.target.value.replace(/\D/g, ""))}
-                  className={`${inputClass} max-w-[140px]`}
-                />
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Missions no longer carry their own timing — a section's start and
-            end are the only clock. All that's left to choose is which section. */}
-        <div className="grid grid-cols-1 gap-3 bg-slate-50 rounded-xl p-3 border border-slate-100">
-          <div>
-            <label className={labelClass}>🕒 Bagian hari</label>
-            <select
-              value={segmentId}
-              onChange={(e) => setSegmentId(e.target.value)}
-              className={inputClass}
-            >
-              <option value="">Kapan saja (tanpa bagian)</option>
-              {segments.map((sg) => (
-                <option key={sg.id} value={sg.id}>
-                  {sg.emoji ? `${sg.emoji} ` : ""}{sg.label} ({sg.start_time}–{sg.end_time})
-                </option>
-              ))}
-            </select>
-            <p className="text-xs text-slate-400 mt-1">
-              Jam diambil dari bagiannya — tugas cukup diatur urutannya di dalam bagian itu.
-              Rentang di atas adalah jam umum keluarga; kalau seorang anak punya jam mulai
-              sendiri (diatur di Pengaturan → Jam Mulai per Anak), jam itulah yang berlaku untuknya.
-            </p>
-          </div>
-        </div>
-
-        <div>
-          <label className={labelClass}>Gaya tugas (opsional)</label>
-          <select value={taskStyle} onChange={(e) => setTaskStyle(e.target.value)} className={inputClass}>
-            <option value="">— Otomatis sesuai kepribadian anak —</option>
-            {Object.entries(TASK_STYLES).map(([key, s]) => (
-              <option key={key} value={key}>{s.emoji} {s.label} — {s.desc}</option>
-            ))}
-          </select>
-          <p className="text-xs text-slate-400 mt-1">
-            Kalau dikosongkan, gaya dipilih otomatis dari tipe kepribadian anak (mis. INTJ-T → Tantangan, ENFJ-T → Membantu).
-          </p>
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Batal</button>
-          <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="task-submit-btn">
-            {saving ? "Menyimpan…" : isEdit ? "Simpan perubahan" : "Buat tugas"}
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function RewardFormModal({ open, onClose, onSaved, editReward }) {
-  const isEdit = !!editReward;
-  const [name, setName] = useState("");
-  const [desc, setDesc] = useState("");
-  const [cost, setCost] = useState(50);
-  const [image, setImage] = useState("");
-  const [processing, setProcessing] = useState(false);
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    if (isEdit) {
-      setName(editReward.name || "");
-      setDesc(editReward.description || "");
-      setCost(editReward.cost_points ?? 50);
-      setImage(editReward.image || "");
-    } else {
-      setName(""); setDesc(""); setCost(50); setImage("");
-    }
-  }, [open, isEdit, editReward]);
-
-  const pickImage = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // allow re-picking the same file
-    if (!file) return;
-    setProcessing(true);
-    try {
-      const dataUrl = await fileToDownscaledDataUrl(file, { maxDim: 640, quality: 0.8 });
-      setImage(dataUrl);
-    } catch (err) {
-      toast.error(err.message || "Gagal memproses gambar");
-    } finally {
-      setProcessing(false);
-    }
-  };
-
-  const submit = async () => {
-    if (!name.trim()) return toast.error("Nama hadiah wajib diisi");
-    if (!cost || Number(cost) < 1) return toast.error("Harga minimal 1 poin");
-    setSaving(true);
-    try {
-      // image: send even when "" so an edit can clear it.
-      const body = { name: name.trim(), description: desc, cost_points: Number(cost) || 1, image };
-      if (isEdit) {
-        await api.patch(`/rewards/${editReward.id}`, body);
-        toast.success("Hadiah diperbarui");
-      } else {
-        await api.post("/rewards", body);
-        toast.success("Hadiah ditambahkan");
-      }
-      onSaved(); onClose();
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <Modal open={open} onClose={onClose} title={isEdit ? "Edit hadiah" : "Hadiah baru"}>
-      <div className="space-y-4">
-        <div>
-          <label className={labelClass}>Nama hadiah</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Nonton 30 menit" data-testid="reward-name-input" />
-        </div>
-        <div>
-          <label className={labelClass}>Deskripsi (opsional)</label>
-          <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} />
-        </div>
-
-        {/* Reward image — makes the shop far more enticing for kids */}
-        <div>
-          <label className={labelClass}>Gambar hadiah (opsional)</label>
-          {image ? (
-            <div className="relative inline-block">
-              <img src={image} alt="Pratinjau hadiah" className="w-32 h-32 object-cover rounded-2xl border-2 border-slate-200" />
-              <button
-                type="button"
-                onClick={() => setImage("")}
-                className="absolute -top-2 -right-2 bg-red-500 hover:bg-red-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-sm"
-                title="Hapus gambar"
-              >
-                ×
-              </button>
-            </div>
-          ) : (
-            <label className="flex flex-col items-center justify-center w-32 h-32 rounded-2xl border-2 border-dashed border-slate-300 hover:border-indigo-400 hover:bg-indigo-50 cursor-pointer transition-colors">
-              {processing ? (
-                <span className="text-xs text-slate-500">Memproses…</span>
-              ) : (
-                <>
-                  <ImagePlus className="w-7 h-7 text-slate-400 mb-1" strokeWidth={2} />
-                  <span className="text-xs text-slate-500">Upload gambar</span>
-                </>
-              )}
-              <input type="file" accept="image/*" onChange={pickImage} className="hidden" disabled={processing} />
-            </label>
-          )}
-          <p className="text-xs text-slate-400 mt-1">Gambar otomatis diperkecil agar ringan.</p>
-        </div>
-
-        <div>
-          <label className={labelClass}>Harga (poin) — diambil dari Tabungan anak</label>
-          <input type="number" min="1" value={cost} onChange={(e) => setCost(e.target.value)} className={inputClass} data-testid="reward-cost-input" />
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Batal</button>
-          <button onClick={submit} disabled={saving || processing} className={btnPrimary} data-testid="reward-submit-btn">
-            {saving ? "Menyimpan…" : (isEdit ? "Simpan perubahan" : "Tambah hadiah")}
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function ConsequenceFormModal({ open, onClose, onSaved, editConsequence }) {
-  const isEdit = !!editConsequence;
-  const [name, setName] = useState("");
-  const [desc, setDesc] = useState("");
-  const [deduct, setDeduct] = useState(10);
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    if (!open) return;
-    if (isEdit) {
-      setName(editConsequence.name || "");
-      setDesc(editConsequence.description || "");
-      setDeduct(editConsequence.points_deducted ?? 0);
-    } else {
-      setName(""); setDesc(""); setDeduct(10);
-    }
-  }, [open, isEdit, editConsequence]);
-
-  const submit = async () => {
-    if (!name.trim()) return toast.error("Nama konsekuensi wajib diisi");
-    setSaving(true);
-    try {
-      const body = { name: name.trim(), description: desc, points_deducted: Number(deduct) || 0 };
-      if (isEdit) {
-        await api.patch(`/consequences/${editConsequence.id}`, body);
-        toast.success("Konsekuensi diperbarui");
-      } else {
-        await api.post("/consequences", body);
-        toast.success("Konsekuensi ditambahkan");
-      }
-      onSaved(); onClose();
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <Modal open={open} onClose={onClose} title={isEdit ? "Edit konsekuensi" : "Konsekuensi baru"}>
-      <div className="space-y-4">
-        <div>
-          <label className={labelClass}>Konsekuensi</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputClass} placeholder="Kurangi waktu main" data-testid="cons-name-input" />
-        </div>
-        <div>
-          <label className={labelClass}>Deskripsi</label>
-          <textarea value={desc} onChange={(e) => setDesc(e.target.value)} className={inputClass} rows={2} placeholder="Tidak nonton TV malam ini" />
-        </div>
-        <div>
-          <label className={labelClass}>Poin dikurangi</label>
-          <input type="number" min="0" value={deduct} onChange={(e) => setDeduct(e.target.value)} className={inputClass} data-testid="cons-deduct-input" />
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Batal</button>
-          <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="cons-submit-btn">
-            {saving ? "Menyimpan…" : (isEdit ? "Simpan perubahan" : "Tambah")}
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function ApplyConsequenceModal({ open, onClose, consequences, kids, preselect, selectedChildId, onSaved }) {
-  const [consId, setConsId] = useState("");
-  const [childId, setChildId] = useState("");
-  const [notes, setNotes] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    if (open) {
-      setConsId(preselect?.consequence?.id || "");
-      setChildId(preselect?.task?.child_id || selectedChildId || (kids[0] && kids[0].id) || "");
-      setNotes("");
-    }
-  }, [open, preselect, kids, selectedChildId]);
-
-  const submit = async () => {
-    if (!consId || !childId) return toast.error("Pick child and consequence");
-    setSaving(true);
-    try {
-      await api.post("/consequences/apply", { consequence_id: consId, child_id: childId, notes, task_id: preselect?.task?.id || null });
-      toast.success("Consequence applied");
-      onSaved(); onClose();
-    } catch (e) { toast.error(formatApiError(e)); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <Modal open={open} onClose={onClose} title="Apply consequence">
-      <div className="space-y-4">
-        <div>
-          <label className={labelClass}>Child</label>
-          <select value={childId} onChange={(e) => setChildId(e.target.value)} className={inputClass}>
-            <option value="">— Select —</option>
-            {kids.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className={labelClass}>Consequence</label>
-          <select value={consId} onChange={(e) => setConsId(e.target.value)} className={inputClass}>
-            <option value="">— Select —</option>
-            {consequences.map((c) => <option key={c.id} value={c.id}>{c.name} {c.points_deducted ? `(−${c.points_deducted})` : ""}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className={labelClass}>Notes (optional)</label>
-          <textarea value={notes} onChange={(e) => setNotes(e.target.value)} className={inputClass} rows={2} />
-        </div>
-        <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Cancel</button>
-          <button onClick={submit} disabled={saving} className={btnPrimary} data-testid="apply-cons-submit-btn">
-            {saving ? "Saving…" : "Apply"}
-          </button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function TemplateModal({ open, onClose, kids, onSaved }) {
-  const [templates, setTemplates] = useState([]);
-  const [loadingTemplates, setLoadingTemplates] = useState(true);
-  const [selectedTemplate, setSelectedTemplate] = useState(null);
-  const [selectedKidIds, setSelectedKidIds] = useState([]); // [] = semua anak
-  const [dateKey, setDateKey] = useState(todayKey());
-  const [saving, setSaving] = useState(false);
-  const [showManager, setShowManager] = useState(false);
-
-  const loadTemplates = useCallback(() => {
-    setLoadingTemplates(true);
-    api.get("/routine-templates")
-      .then(({ data }) => setTemplates(data))
-      .catch((e) => toast.error(formatApiError(e)))
-      .finally(() => setLoadingTemplates(false));
-  }, []);
-
-  useEffect(() => {
-    if (open) {
-      setSelectedTemplate(null);
-      setSelectedKidIds([]);
-      setDateKey(todayKey());
-      loadTemplates();
-    }
-  }, [open, loadTemplates]);
-
-  const toggleKid = (id) => {
-    setSelectedKidIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
-  };
-
-  const isBroadcast = selectedKidIds.length === 0;
-
-  const apply = async () => {
-    if (!selectedTemplate) return toast.error("Pilih template dulu");
-    setSaving(true);
-    try {
-      // Create each template task in order via the existing endpoint. Sequential
-      // so per-child quest order stays deterministic.
-      for (const t of selectedTemplate.tasks) {
-        const body = {
-          title: t.title,
-          description: "",
-          points: t.points,
-          penalty_points: 0,
-          date_key: dateKey,
-          due_time: t.due_time || null,
-          duration_minutes: t.duration_minutes || null,
-          is_bonus: false,
-          recurrence: "none",
-          order: null,
-          task_style: t.task_style || null,
-        };
-        if (isBroadcast) {
-          await api.post("/tasks", { ...body, target_children: [] });
-        } else if (selectedKidIds.length === 1) {
-          await api.post("/tasks", { ...body, child_id: selectedKidIds[0] });
-        } else {
-          await api.post("/tasks", { ...body, target_children: selectedKidIds });
-        }
-      }
-      const target = isBroadcast ? `semua anak (${kids.length})` : `${selectedKidIds.length} anak`;
-      toast.success(`${selectedTemplate.label} dibuat untuk ${target} — ${selectedTemplate.tasks.length} misi 🎉`);
-      onSaved();
-      onClose();
-    } catch (e) {
-      toast.error(formatApiError(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <Modal open={open} onClose={onClose} title="Buat dari Template Rutinitas">
-      <div className="space-y-4">
-        <div className="flex justify-end">
-          <button
-            type="button"
-            onClick={() => setShowManager(true)}
-            className="press-btn inline-flex items-center gap-1 text-xs font-bold text-indigo-500 bg-indigo-50 hover:bg-indigo-100 px-2.5 py-1.5 rounded-full"
-          >
-            <Settings className="w-3.5 h-3.5" /> Kelola Template
-          </button>
-        </div>
-
-        {loadingTemplates ? (
-          <div className="text-center text-slate-400 text-sm py-6">Memuat template…</div>
-        ) : templates.length === 0 ? (
-          <div className="text-center text-slate-400 text-sm py-6">Belum ada template. Klik "Kelola Template" untuk buat satu.</div>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {templates.map((tpl) => {
-              const active = selectedTemplate?.id === tpl.id;
-              return (
-                <button
-                  key={tpl.id}
-                  type="button"
-                  onClick={() => setSelectedTemplate(tpl)}
-                  className={`text-left rounded-2xl border-2 p-3 transition-colors ${
-                    active ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-                  }`}
-                >
-                  <div className="font-semibold text-slate-900 text-sm">
-                    {tpl.emoji} {tpl.label}
-                  </div>
-                  <div className="text-xs text-slate-500 mt-0.5">{tpl.desc}</div>
-                  <div className="text-xs text-indigo-500 font-semibold mt-1">
-                    {tpl.tasks.length} misi · {tpl.tasks.reduce((s, t) => s + t.points, 0)} poin total
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        )}
-
-        {selectedTemplate && (
-          <div className="bg-slate-50 rounded-xl p-3 border border-slate-100">
-            <div className="text-xs font-bold text-slate-500 uppercase mb-2">Isi template</div>
-            <div className="space-y-1">
-              {selectedTemplate.tasks.map((t, i) => (
-                <div key={i} className="text-sm text-slate-700 flex items-center gap-2 flex-wrap">
-                  <span className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-600 text-xs font-bold flex items-center justify-center shrink-0">{i + 1}</span>
-                  <span className="flex-1 min-w-0 truncate">{t.title}</span>
-                  <span className="text-xs text-slate-400 shrink-0">
-                    +{t.points}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        <div>
-          <label className={labelClass}>Untuk anak</label>
-          <div className="space-y-2">
-            <button
-              type="button"
-              onClick={() => setSelectedKidIds([])}
-              className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
-                isBroadcast ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-              }`}
-            >
-              <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-                isBroadcast ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
-              }`}>
-                {isBroadcast && <span className="text-white text-xs">✓</span>}
-              </div>
-              <span className="font-semibold text-slate-800 text-sm">🌟 Semua anak</span>
-            </button>
-            <div className="grid grid-cols-2 gap-2">
-              {kids.map((c) => {
-                const checked = selectedKidIds.includes(c.id);
-                return (
-                  <button
-                    key={c.id}
-                    type="button"
-                    onClick={() => toggleKid(c.id)}
-                    className={`flex items-center gap-2 px-3 py-2 rounded-xl border-2 transition-colors ${
-                      checked ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-                    }`}
-                  >
-                    <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
-                      checked ? "bg-indigo-500 border-indigo-500" : "border-slate-300"
-                    }`}>
-                      {checked && <span className="text-white text-xs">✓</span>}
-                    </div>
-                    <div className="w-6 h-6 rounded-lg flex items-center justify-center text-sm" style={{ background: c.avatar_color }}>
-                      {c.avatar_emoji}
-                    </div>
-                    <span className="font-semibold text-slate-800 text-sm truncate">{c.name}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <label className={labelClass}>📅 Tanggal misi</label>
-          <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
-        </div>
-
-        <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className={btnGhost}>Batal</button>
-          <button onClick={apply} disabled={saving || !selectedTemplate} className={btnPrimary}>
-            {saving ? "Membuat…" : "Buat Misi"}
-          </button>
-        </div>
-      </div>
-
-      {showManager && (
-        <TemplateManagerModal
-          templates={templates}
-          onClose={() => setShowManager(false)}
-          onChanged={loadTemplates}
-        />
-      )}
-    </Modal>
   );
 }

@@ -3,6 +3,8 @@ import { useParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Rocket, Trophy, Flame, Star, Sparkles } from "lucide-react";
 import api from "@/lib/api";
+import MemoriesCollage from "@/components/MemoriesCollage";
+import PageSkeleton from "@/components/PageSkeleton";
 
 export default function GrandparentView() {
   const { token } = useParams();
@@ -18,11 +20,7 @@ export default function GrandparentView() {
   }, [token]);
 
   if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-orange-50 to-white">
-        <div className="text-slate-400">Memuat…</div>
-      </div>
-    );
+    return <PageSkeleton />;
   }
 
   if (error) {
@@ -110,6 +108,8 @@ export default function GrandparentView() {
             )}
           </motion.div>
         ))}
+
+        <MemoriesCollage viewToken={token} title="Kenangan Bulan Ini" />
 
         <div className="text-center text-xs text-slate-300 pt-4">My Lil Famz 🚀</div>
       </div>

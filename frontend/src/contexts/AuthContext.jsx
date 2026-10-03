@@ -1,10 +1,12 @@
 import { createContext, useContext, useEffect, useState, useCallback } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import api from "@/lib/api";
 import { cacheGet, cacheSet, cacheClear } from "@/lib/localCache";
 
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
+  const queryClient = useQueryClient();
   // Start from whoever was signed in last time, so the app can render straight
   // away instead of holding a blank "Memuat…" while /auth/me travels to a
   // possibly-sleeping server. The real check still runs below and corrects
@@ -63,9 +65,10 @@ export function AuthProvider({ children }) {
   }, []);
 
   useEffect(() => {
+    // Only the session check runs at start-up. The member list (with photos)
+    // is the login screen's business, and it fetches its own.
     fetchMe();
-    fetchMembers();
-  }, [fetchMe, fetchMembers]);
+  }, [fetchMe]);
 
   useEffect(() => {
     // Any in-flight request elsewhere in the app hitting a 503 lockout should
@@ -81,6 +84,7 @@ export function AuthProvider({ children }) {
     if (data.token) localStorage.setItem("cq_token", data.token);
     // A new sign-in starts clean, then seeds its own identity.
     cacheClear();
+    queryClient.clear();
     cacheSet("auth:me", data);
     setUser(data);
     return data;
@@ -96,6 +100,7 @@ export function AuthProvider({ children }) {
     // Wipe every cached screen, not just the token: the next person to sign in
     // on this device must never glimpse the previous one's data.
     cacheClear();
+    queryClient.clear();
     setUser(false);
   };
 

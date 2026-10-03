@@ -273,3 +273,29 @@ body {
         radial-gradient(620px 460px at 12% 92%, rgba(58, 208, 255, 0.18), transparent 60%),
         linear-gradient(160deg, #17103f, #0e0926);
 }
+
+/* ---- Skeleton & lightweight motion (CSS only, no JS animation cost) ---- */
+.skeleton-block {
+    background: linear-gradient(90deg, rgba(148, 163, 184, 0.18) 25%, rgba(148, 163, 184, 0.32) 37%, rgba(148, 163, 184, 0.18) 63%);
+    background-size: 400% 100%;
+    animation: skeleton-shimmer 1.4s ease infinite;
+}
+@keyframes skeleton-shimmer {
+    0% { background-position: 100% 50%; }
+    100% { background-position: 0 50%; }
+}
+.animate-fade-in { animation: fade-in 0.35s ease both; }
+@keyframes fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.pet-wake { display: inline-block; animation: pet-wake 1.6s ease-in-out infinite; }
+@keyframes pet-wake { 0%, 100% { transform: rotate(-6deg); } 50% { transform: rotate(6deg) scale(1.06); } }
+
+/* Tactile feedback for checks, level-ups and streaks */
+.pop-check { animation: pop-check 0.38s cubic-bezier(.34, 1.56, .64, 1) both; }
+@keyframes pop-check { 0% { transform: scale(0.6); } 100% { transform: scale(1); } }
+
+@media (prefers-reduced-motion: reduce) {
+    .skeleton-block, .pet-wake, .animate-fade-in, .pop-check { animation: none !important; }
+}
+.float-gain { animation: float-gain 1.6s ease-out both; pointer-events: none; }
+@keyframes float-gain { 0% { opacity: 0; transform: translateY(8px) scale(.8); } 15% { opacity: 1; transform: translateY(0) scale(1.1); } 100% { opacity: 0; transform: translateY(-28px) scale(1); } }
+@media (prefers-reduced-motion: reduce) { .float-gain { animation: none !important; } }

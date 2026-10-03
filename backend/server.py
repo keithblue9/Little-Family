@@ -193,6 +193,31 @@ async def _enforce_maintenance_mode(member_id: str):
     raise HTTPException(status_code=503, detail=message)
 
 
+# Every authenticated request used to re-read the member document — one extra
+# round trip to the database on every single API call. Members change rarely
+# (profile edits, passcode changes), and every write below clears this cache.
+_MEMBER_CACHE: dict = {}
+_MEMBER_TTL_SECONDS = 60.0
+
+
+def _invalidate_member_cache():
+    _MEMBER_CACHE.clear()
+
+
+async def _get_member_cached(member_id: str):
+    import time as _t
+    now = _t.monotonic()
+    hit = _MEMBER_CACHE.get(member_id)
+    if hit and now - hit[0] < _MEMBER_TTL_SECONDS:
+        return dict(hit[1])
+    member = await db.members.find_one({"id": member_id}, {"_id": 0, "passcode_hash": 0, "passcode_plain": 0})
+    if member:
+        _MEMBER_CACHE[member_id] = (now, member)
+    else:
+        _MEMBER_CACHE.pop(member_id, None)
+    return dict(member) if member else None
+
+
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
     if not token:
@@ -205,7 +230,7 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token type")
-        member = await db.members.find_one({"id": payload["sub"]}, {"_id": 0, "passcode_hash": 0, "passcode_plain": 0})
+        member = await _get_member_cached(payload["sub"])
         if not member:
             raise HTTPException(status_code=401, detail="Member not found")
         await _enforce_maintenance_mode(member["id"])
@@ -551,6 +576,9 @@ class ChildUpdate(BaseModel):
     sound_theme: Optional[Literal["ding", "fanfare", "chime", "drum"]] = None
     pet_type: Optional[PET_TYPE] = None
     pet_equipped: Optional[List[str]] = None
+    # Big-button, one-mission-at-a-time screen with spoken instructions for
+    # children who can't read the checklist comfortably yet.
+    simple_mode: Optional[bool] = None
     _check_pet_equipped = field_validator("pet_equipped")(classmethod(lambda cls, v: _validate_pet_accessories(v)))
 
 
@@ -1046,6 +1074,7 @@ async def set_member_passcode(member_id: str, payload: MemberPasscodeInput, user
         {"id": member_id},
         {"$set": _passcode_set_fields(member["role"], payload.passcode, False)},
     )
+    _invalidate_member_cache()
     await log_activity(FAMILY_ID, member_id if member["role"] == "child" else None, "passcode_updated", {"member_name": member["name"]})
     return {"success": True}
 
@@ -1059,6 +1088,7 @@ async def reset_member_passcode(member_id: str, user: dict = Depends(require_par
         {"id": member_id},
         {"$set": _passcode_set_fields(member["role"], DEFAULT_PASSCODE, True)},
     )
+    _invalidate_member_cache()
     await log_activity(FAMILY_ID, member_id if member["role"] == "child" else None, "passcode_reset", {"member_name": member["name"]})
     return {"success": True, "default_passcode": DEFAULT_PASSCODE}
 
@@ -1094,6 +1124,7 @@ async def change_own_passcode(payload: SelfPasscodeInput, user: dict = Depends(g
         {"id": user["id"]},
         {"$set": _passcode_set_fields(member["role"], payload.new_passcode, False)},
     )
+    _invalidate_member_cache()
     await log_activity(FAMILY_ID, user["id"] if member["role"] == "child" else None, "passcode_updated", {"member_name": member["name"], "by": "self"})
     return {"success": True}
 
@@ -1125,6 +1156,7 @@ async def update_own_profile(payload: SelfProfileInput, user: dict = Depends(get
 
     if updates:
         await db.members.update_one({"id": user["id"]}, {"$set": updates})
+        _invalidate_member_cache()
         # Children have a mirrored row used by tasks/points logic.
         await db.children.update_one({"id": user["id"]}, {"$set": updates})
         # Picking a new pet resolves any lingering reset request for this kid.
@@ -1495,7 +1527,8 @@ async def _challenge_progress(ch: dict) -> dict:
             {"child_id": {"$in": ch["participant_ids"]}},
             {"is_coop": True, "coop_participants": {"$in": ch["participant_ids"]}},
         ],
-    }, {"_id": 0}).to_list(5000)
+    }, {"_id": 0, "child_id": 1, "is_coop": 1, "coop_participants": 1, "points": 1,
+        "coop_points_split": 1, "together_bonus_awarded": 1, "early_bonus_awarded": 1}).to_list(None)
     earned = 0
     for t in tasks:
         if t.get("is_coop"):
@@ -1669,12 +1702,14 @@ async def family_weekly_report(user: dict = Depends(require_parent)):
     week_ago = (now - timedelta(days=6)).strftime("%Y-%m-%d")
 
     kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(100)
+    # One read for the whole family's week, split per child in memory.
+    _week = await db.tasks.find({
+        "parent_id": FAMILY_ID, "date_key": {"$gte": week_ago, "$lte": today},
+    }, {"_id": 0, **{f: 0 for f in ("completion_photo_url", "encouragement_voice_url")}}).to_list(None)
     report = []
     for k in kids:
-        tasks = await db.tasks.find({
-            "date_key": {"$gte": week_ago, "$lte": today},
-            "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
-        }, {"_id": 0}).to_list(2000)
+        tasks = [t for t in _week if t.get("child_id") == k["id"]
+                 or (t.get("is_coop") and k["id"] in (t.get("coop_participants") or []))]
 
         approved = [t for t in tasks if t.get("status") == "approved"]
         completed = [t for t in tasks if t.get("status") in ("completed", "approved")]
@@ -1821,7 +1856,7 @@ async def list_children(user: dict = Depends(get_current_user)):
     config = await get_config_cached()
     for c in children:
         c["pet_is_dead"] = _pet_is_dead(c, config)
-    return children
+    return _with_media_refs("child", children)
 
 
 @api.post("/children")
@@ -1870,6 +1905,7 @@ async def create_child(payload: ChildInput, user: dict = Depends(require_parent)
         "theme_preference": "clean",
         "created_at": now_iso(),
     })
+    _invalidate_member_cache()
 
     await log_activity(FAMILY_ID, doc["id"], "child_created", {"name": payload.name})
     return doc
@@ -1893,6 +1929,7 @@ async def update_child(child_id: str, payload: ChildUpdate, user: dict = Depends
     if updates:
         await db.children.update_one({"id": child_id}, {"$set": updates})
         await db.members.update_one({"id": child_id}, {"$set": updates})
+        _invalidate_member_cache()
     updated = await db.children.find_one({"id": child_id}, {"_id": 0})
     return updated
 
@@ -2012,6 +2049,7 @@ async def _clear_child_pet(child_id: str):
         {"id": child_id},
         {"$set": {"pet_type": None, "pet_equipped": []}},
     )
+    _invalidate_member_cache()
 
 
 @api.post("/children/{child_id}/reset-pet")
@@ -2116,6 +2154,7 @@ async def delete_child(child_id: str, user: dict = Depends(require_parent)):
     await get_child_or_404(FAMILY_ID, child_id)
     await db.children.delete_one({"id": child_id})
     await db.members.delete_one({"id": child_id, "role": "child"})
+    _invalidate_member_cache()
     await db.tasks.delete_many({"child_id": child_id})
     await db.badges.delete_many({"child_id": child_id})
     await db.redemptions.delete_many({"child_id": child_id})
@@ -2129,18 +2168,42 @@ async def list_tasks(
     child_id: Optional[str] = None,
     status_filter: Optional[str] = None,
     date_key: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    include_open: bool = False,
     user: dict = Depends(get_current_user),
 ):
-    # The parent's task list waits for the sweep: they open it to review the
-    # schedule, so it must be complete and correct. The child's timeline is the
-    # one that can't afford to wait, and that path schedules it instead.
-    await _maybe_materialize_recurring()
+    # The parent's list makes sure today and tomorrow are built (cheap once
+    # warm — see _ensure_days_ready); further days are built when opened.
+    await _ensure_days_ready()
     query = {"parent_id": FAMILY_ID}
+    # A date window keeps the payload proportional to what's on screen instead
+    # of the family's whole history. include_open also returns anything still
+    # waiting on a parent (completed / held) from outside the window, so an old
+    # approval can never silently drop off the list.
+    sd = validate_date_key(start_date) if start_date else None
+    ed = validate_date_key(end_date) if end_date else None
+    if (start_date and not sd) or (end_date and not ed):
+        raise HTTPException(status_code=422, detail="Rentang tanggal tidak valid")
+    if sd or ed:
+        rng: dict = {}
+        if sd:
+            rng["$gte"] = sd
+        if ed:
+            rng["$lte"] = ed
+        if include_open:
+            query["$and"] = [{"$or": [
+                {"date_key": rng}, {"date_key": None},
+                {"status": "completed"}, {"hold_status": "pending"},
+            ]}]
+        else:
+            query["date_key"] = rng
     if child_id:
         # Match either "this is their individual task" OR "this is a co-op task
         # they're one of the participants in" (co-op tasks store child_id as
         # just the primary owner, so a plain child_id match alone would miss them).
-        query["$or"] = [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}]
+        query.setdefault("$and", []).append(
+            {"$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}]})
     if status_filter:
         query["status"] = status_filter
     if date_key:
@@ -2151,9 +2214,27 @@ async def list_tasks(
         "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0, "_undo_feed_earned": 0, "_undo_miss_penalty": 0,
         "_undo_free_prev_available": 0, "_undo_free_prev_week": 0,
     }
-    tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(2000)
+    tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(10000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
-    return tasks
+    return _with_media_refs("task", tasks)
+
+
+@api.post("/days/{date_key}/prepare")
+async def prepare_day(date_key: str, user: dict = Depends(require_parent)):
+    """Build one upcoming day now (default template + repeating series), so a
+    parent planning ahead sees and can edit it. Days are otherwise built only
+    when they become today/tomorrow. Idempotent."""
+    dk = validate_date_key(date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    today = _today_key()
+    limit = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=62)).strftime("%Y-%m-%d")
+    if dk < today:
+        return {"date_key": dk, "created": 0, "past": True}
+    if dk > limit:
+        raise HTTPException(status_code=422, detail="Maksimal 62 hari ke depan")
+    created = await _ensure_days_ready([dk])
+    return {"date_key": dk, "created": created}
 
 
 def validate_date_key(value):
@@ -2278,6 +2359,18 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
     else:
         date_keys = [validate_date_key(payload.date_key) or _today_key()]
 
+    # Build those days from the routine BEFORE adding to them: a hand-made
+    # mission on a not-yet-built day would otherwise make the default template
+    # think the day was already set up and skip it.
+    _today_ct = _today_key()
+    _limit_ct = (datetime.strptime(_today_ct, "%Y-%m-%d") + timedelta(days=62)).strftime("%Y-%m-%d")
+    _prep = [d for d in date_keys if d and _today_ct <= d <= _limit_ct]
+    if _prep:
+        await _ensure_days_ready(_prep)
+    if payload.recurrence != "none":
+        # A new series: tomorrow needs its occurrence on the next read.
+        _invalidate_days_ready()
+
     multi = len(targets) > 1 or len(date_keys) > 1
     broadcast_id = new_id() if multi else None
 
@@ -2318,6 +2411,7 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
 
 @api.patch("/tasks/{task_id}")
 async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(require_parent)):
+    _invalidate_days_ready()
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -2371,15 +2465,17 @@ async def child_day_progress(
     dk = validate_date_key(date_key) or _today_key()
     await _ensure_day_built(dk)
     # Keep repeating series alive on the kid's side too — they're often the
-    # first to open the app on a new day. Scheduled, never awaited: the child
-    # should not wait on schedule maintenance to see today's missions.
-    _schedule_materialize()
-
-    tasks = await db.tasks.find(
-        {"parent_id": FAMILY_ID, "date_key": dk,
-         "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}]},
-        {"_id": 0},
-    ).to_list(500)
+    # first to open the app on a new day. Normally a background nudge; only an
+    # EMPTY near day is built inline, because a serverless host may freeze the
+    # process before a background task finishes and the child would see nothing.
+    _dp_q = {"parent_id": FAMILY_ID, "date_key": dk,
+             "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}]}
+    tasks = await db.tasks.find(_dp_q, {"_id": 0}).to_list(500)
+    if not tasks and dk in _near_days():
+        if await _ensure_days_ready([dk], trust_marker=False):
+            tasks = await db.tasks.find(_dp_q, {"_id": 0}).to_list(500)
+    else:
+        _schedule_materialize()
     # Parked "off" tasks (parent declared this an off day) are invisible to the
     # quest line — they can't be started, missed, or penalized.
     tasks = [t for t in tasks if t.get("status") != "off"]
@@ -2536,7 +2632,7 @@ async def child_day_progress(
         "family_combo": combo_award,
         "active_punishment": active_punishment,
         "segments": effective_segments,
-        "tasks": _tasks_with_availability,
+        "tasks": _with_media_refs("task", _tasks_with_availability),
         "perfect_day": perfect_day,
         "perfect_day_claimed": bool(perfect_claim),
     }
@@ -3528,6 +3624,7 @@ async def reject_exam_period(exam_id: str, payload: ExamRejectInput = ExamReject
 
 @api.post("/day-templates")
 async def create_day_template(payload: DayTemplateInput, user: dict = Depends(require_parent)):
+    _invalidate_days_ready()
     if payload.is_default:
         await db.day_templates.update_many({"parent_id": FAMILY_ID}, {"$set": {"is_default": False}})
     doc = {
@@ -3545,13 +3642,22 @@ async def create_day_template(payload: DayTemplateInput, user: dict = Depends(re
 @api.get("/day-templates")
 async def list_day_templates(user: dict = Depends(get_current_user)):
     templates = await db.day_templates.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", 1).to_list(50)
+    # One read for every template's slot count instead of one count per template.
+    counts: dict = {}
+    if templates:
+        for row in await db.template_tasks.find(
+            {"parent_id": FAMILY_ID, "template_id": {"$in": [t["id"] for t in templates]}},
+            {"_id": 0, "template_id": 1},
+        ).to_list(None):
+            counts[row["template_id"]] = counts.get(row["template_id"], 0) + 1
     for t in templates:
-        t["task_count"] = await db.template_tasks.count_documents({"parent_id": FAMILY_ID, "template_id": t["id"]})
+        t["task_count"] = counts.get(t["id"], 0)
     return templates
 
 
 @api.patch("/day-templates/{template_id}")
 async def update_day_template(template_id: str, payload: DayTemplateInput, user: dict = Depends(require_parent)):
+    _invalidate_days_ready()
     existing = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
     if not existing:
         raise HTTPException(status_code=404, detail="Template tidak ditemukan")
@@ -3569,6 +3675,7 @@ async def delete_day_template(template_id: str, user: dict = Depends(require_par
     """Removes the template, its slots, and any future dates pointing at it.
     Missions already generated onto real days are left alone — they may already
     have been worked on."""
+    _invalidate_days_ready()
     doc = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
     if not doc:
         raise HTTPException(status_code=404, detail="Template tidak ditemukan")
@@ -3600,6 +3707,7 @@ async def duplicate_day_template(template_id: str, user: dict = Depends(require_
 
 @api.post("/template-tasks")
 async def create_template_task(payload: TemplateTaskInput, user: dict = Depends(require_parent)):
+    _invalidate_days_ready()
     tpl = await db.day_templates.find_one({"id": payload.template_id, "parent_id": FAMILY_ID})
     if not tpl:
         raise HTTPException(status_code=404, detail="Template tidak ditemukan")
@@ -3641,6 +3749,7 @@ async def list_template_tasks(template_id: str, weekday: Optional[int] = None, u
 
 @api.patch("/template-tasks/{slot_id}")
 async def update_template_task(slot_id: str, payload: TemplateTaskUpdate, user: dict = Depends(require_parent)):
+    _invalidate_days_ready()
     existing = await db.template_tasks.find_one({"id": slot_id, "parent_id": FAMILY_ID})
     if not existing:
         raise HTTPException(status_code=404, detail="Slot template tidak ditemukan")
@@ -3660,6 +3769,7 @@ async def update_template_task(slot_id: str, payload: TemplateTaskUpdate, user: 
 
 @api.delete("/template-tasks/{slot_id}")
 async def delete_template_task(slot_id: str, user: dict = Depends(require_parent)):
+    _invalidate_days_ready()
     res = await db.template_tasks.delete_one({"id": slot_id, "parent_id": FAMILY_ID})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Slot template tidak ditemukan")
@@ -4115,6 +4225,7 @@ async def _invalidate_days(start: str, end: Optional[str] = None, include_today:
     """Forget built days so they rebuild from the current routine/exceptions.
     Only untouched routine activities are removed, never anything a child has
     started or ticked, and never a section already in progress."""
+    _invalidate_days_ready()  # the routine/exceptions changed: re-check near days
     today = _today_key()
     lo = start if start > today else (today if include_today else
                                       (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d"))
@@ -4570,10 +4681,17 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
     grace = _seg_grace(config)
     segments = sorted(await _get_day_segments(), key=lambda x: _hhmm_to_min(x["start_time"]))
 
-    tasks = await db.tasks.find({
+    _sd_q = {
         "parent_id": FAMILY_ID, "date_key": dk, "status": {"$ne": "off"},
         "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
-    }, {"_id": 0}).to_list(1000)
+    }
+    tasks = await db.tasks.find(_sd_q, {"_id": 0}).to_list(1000)
+    if not tasks and dk in _near_days():
+        # Same reasoning as day-progress: an empty near day is built inline.
+        if await _ensure_days_ready([dk], trust_marker=False):
+            tasks = await db.tasks.find(_sd_q, {"_id": 0}).to_list(1000)
+    else:
+        _schedule_materialize()
     sessions = {
         s["segment_id"]: s for s in await db.segment_sessions.find(
             {"parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk}, {"_id": 0}
@@ -4627,6 +4745,10 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                 "duration_minutes": a.get("duration_minutes"),
                 "checked": bool(a.get("checked")) or a.get("status") in ("completed", "approved"),
                 "status": a.get("status"),
+                "photo_required": bool(a.get("photo_required")),
+                # Photos as cacheable media URLs, never inline base64.
+                "before_photo_url": _media_ref("task", a["id"], "before_photo_url", a.get("before_photo_url")),
+                "completion_photo_url": _media_ref("task", a["id"], "completion_photo_url", a.get("completion_photo_url")),
             } for a in acts],
             "required_count": len(required),
             "checked_required": sum(1 for a in required if a.get("checked") or a.get("status") in ("completed", "approved")),
@@ -4765,6 +4887,15 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
             status_code=409,
             detail=f"Masih ada {len(open_required)} aktivitas yang belum dicentang",
         )
+    # A mission the parent marked "photo required" needs its after-photo
+    # before the section can be closed.
+    missing_photo = [a for a in acts if a.get("photo_required") and a.get("checked")
+                     and a.get("status") in ("pending", "rejected") and not a.get("completion_photo_url")]
+    if missing_photo:
+        raise HTTPException(
+            status_code=422,
+            detail="Lampirkan foto sesudah untuk: " + ", ".join(a["title"] for a in missing_photo[:3]),
+        )
 
     timing = _segment_timing(seg, child, dk, _seg_grace(config))
     # During a declared exam period, studying is expected to run late, so
@@ -4840,6 +4971,7 @@ async def create_off_day(payload: OffDayInput, user: dict = Depends(require_pare
     from the kids' quest line), recurrence skips over the range when spawning,
     and streak continuity bridges across it. Deleting the off-day restores the
     parked tasks."""
+    _invalidate_days_ready()
     start = validate_date_key(payload.start_date)
     if not start:
         raise HTTPException(status_code=422, detail="Tanggal mulai tidak valid (YYYY-MM-DD)")
@@ -4905,6 +5037,7 @@ async def list_off_days(user: dict = Depends(get_current_user)):
 @api.delete("/off-days/{off_day_id}")
 async def delete_off_day(off_day_id: str, user: dict = Depends(require_parent)):
     """Un-declare an off day: parked tasks return to pending, exactly as before."""
+    _invalidate_days_ready()
     doc = await db.off_days.find_one({"id": off_day_id, "parent_id": FAMILY_ID})
     if not doc:
         raise HTTPException(status_code=404, detail="Hari libur tidak ditemukan")
@@ -5038,9 +5171,9 @@ async def _run_reminder_sweep() -> dict:
     two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     pending_total = 0
     for coll in (db.charity_requests, db.late_exceptions, db.pet_reset_requests):
-        pending_total += len(await coll.find({"status": "pending", "created_at": {"$lt": two_hours_ago}}).to_list(200))
-    pending_total += len(await db.redemptions.find({"status": "pending", "created_at": {"$lt": two_hours_ago}}).to_list(200))
-    pending_total += len(await db.money_redemptions.find({"status": "pending", "created_at": {"$lt": two_hours_ago}}).to_list(200))
+        pending_total += min(200, await coll.count_documents({"status": "pending", "created_at": {"$lt": two_hours_ago}}))
+    pending_total += min(200, await db.redemptions.count_documents({"status": "pending", "created_at": {"$lt": two_hours_ago}}))
+    pending_total += min(200, await db.money_redemptions.count_documents({"status": "pending", "created_at": {"$lt": two_hours_ago}}))
     if pending_total > 0:
         nudge_marker = f"parent-pending:{today}:{now.hour // 3}"
         if not await db.reminder_log.find_one({"key": nudge_marker}):
@@ -6261,7 +6394,43 @@ def _clone_series_instance(template: dict, date_key: str) -> dict:
     }
 
 
-async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] = None) -> int:
+_SERIES_LIGHT_FIELDS = {
+    "_id": 0, "id": 1, "title": 1, "recurrence": 1, "is_coop": 1, "coop_participants": 1,
+    "child_id": 1, "due_time": 1, "segment_id": 1, "is_bonus": 1, "date_key": 1,
+}
+
+
+async def _fully_off_days(start: str, end: str) -> set:
+    """Every date in [start, end] that is off for the WHOLE day, from one query.
+
+    Same rule as _is_off_day, but asking once for the window instead of once per
+    series per day — the old per-day probe was the materializer's N+1.
+    """
+    rows = await db.off_days.find(
+        {"parent_id": FAMILY_ID, "end_date": {"$gte": start}, "start_date": {"$lte": end}},
+        {"_id": 0},
+    ).to_list(500)
+    out: set = set()
+    if not rows:
+        return out
+    cursor = datetime.strptime(start, "%Y-%m-%d")
+    last = datetime.strptime(end, "%Y-%m-%d")
+    while cursor <= last:
+        dk = cursor.strftime("%Y-%m-%d")
+        for off in rows:
+            if not (off["start_date"] <= dk <= off["end_date"]):
+                continue
+            starts_mid = off.get("start_segment_id") and off["start_date"] == dk
+            ends_mid = off.get("end_segment_id") and off["end_date"] == dk
+            if not starts_mid and not ends_mid:
+                out.add(dk)
+                break
+        cursor += timedelta(days=1)
+    return out
+
+
+async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] = None,
+                                 only_days: Optional[List[str]] = None) -> int:
     """Make sure every repeating series has its upcoming occurrences on the
     calendar, WITHOUT waiting for the previous one to be approved.
 
@@ -6271,37 +6440,106 @@ async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] 
 
     Idempotent: never creates a duplicate for a day that already has one,
     never backfills the past, and skips declared off days.
+
+    `only_days` limits the work to specific dates (the lazy path builds just
+    today and tomorrow). Series are found in two steps — a light scan of the
+    identifying fields, then the full document of only the newest occurrence
+    of each series — so the cost no longer grows with the whole task history.
     """
     config = await get_config_cached()
     if config.get("vacation_mode"):
         return 0
 
     today = _today_key()
-    start = from_date or today
-    if start < today:
-        start = today
-    horizon = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    if only_days:
+        wanted = sorted({d for d in only_days if d and d >= today})
+        if not wanted:
+            return 0
+        start, horizon = wanted[0], wanted[-1]
+        wanted_set = set(wanted)
+    else:
+        start = from_date or today
+        if start < today:
+            start = today
+        horizon = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+        wanted_set = None
 
-    recurring = await db.tasks.find(
+    light = await db.tasks.find(
         {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}},
-        {"_id": 0},
-    ).to_list(5000)
-    if not recurring:
+        _SERIES_LIGHT_FIELDS,
+    ).to_list(None)
+    if not light:
         return 0
 
-    latest: dict = {}
+    latest_id: dict = {}
+    latest_dk: dict = {}
     existing_days: dict = {}
-    for t in recurring:
-        key = _series_key(t)
+    by_series: dict = {}
+    for t in light:
         dk = t.get("date_key")
         if not dk:
             continue
+        key = _series_key(t)
         existing_days.setdefault(key, set()).add(dk)
-        if key not in latest or dk > latest[key].get("date_key", ""):
-            latest[key] = t
+        by_series.setdefault(key, []).append((dk, t["id"]))
+        if key not in latest_dk or dk > latest_dk[key]:
+            latest_dk[key] = dk
+            latest_id[key] = t["id"]
+
+    if wanted_set is not None:
+        # Lazy path: a wanted day belongs to a series when an occurrence exists
+        # on or before it on the series' rhythm; its definition is the NEAREST
+        # earlier occurrence. Unlike stepping forward from the newest copy, this
+        # also fills gaps — so future days can be left unbuilt (or compacted)
+        # and still come back exactly as they would have been.
+        plan: list = []
+        for key, occ in by_series.items():
+            occ.sort()
+            have = existing_days[key]
+            for dk in sorted(wanted_set):
+                if dk in have:
+                    continue
+                prior = [o for o in occ if o[0] <= dk]
+                if not prior:
+                    continue
+                anchor_dk, anchor_id = prior[-1]
+                step = 1 if key[1] == "daily" else 7
+                gap = (datetime.strptime(dk, "%Y-%m-%d") - datetime.strptime(anchor_dk, "%Y-%m-%d")).days
+                if gap % step:
+                    continue
+                plan.append((dk, anchor_id, key))
+        if not plan:
+            return 0
+        anchors = {
+            d["id"]: d for d in await db.tasks.find(
+                {"parent_id": FAMILY_ID, "id": {"$in": list({a for _, a, _ in plan})}}, {"_id": 0},
+            ).to_list(None)
+        }
+        off = await _fully_off_days(start, horizon)
+        docs = []
+        for dk, anchor_id, key in plan:
+            tpl_doc = anchors.get(anchor_id)
+            if not tpl_doc or dk in off or dk in existing_days[key]:
+                continue
+            docs.append(_clone_series_instance(tpl_doc, dk))
+            existing_days[key].add(dk)
+        if docs:
+            await db.tasks.insert_many(docs)
+        return len(docs)
+
+    full = {
+        d["id"]: d for d in await db.tasks.find(
+            {"parent_id": FAMILY_ID, "id": {"$in": list(latest_id.values())}}, {"_id": 0},
+        ).to_list(None)
+    }
+    off = await _fully_off_days(start, horizon)
 
     created = 0
-    for key, template in latest.items():
+    pending_docs: list = []
+    for key, tid in latest_id.items():
+        template = full.get(tid)
+        if not template:
+            continue
         step = 1 if template.get("recurrence") == "daily" else 7
         try:
             cursor = datetime.strptime(template.get("date_key"), "%Y-%m-%d")
@@ -6312,15 +6550,17 @@ async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] 
         have = existing_days.get(key, set())
         while cursor.strftime("%Y-%m-%d") <= horizon:
             dk = cursor.strftime("%Y-%m-%d")
-            if dk not in have and not await _is_off_day(dk):
-                await db.tasks.insert_one(_clone_series_instance(template, dk))
+            if (wanted_set is None or dk in wanted_set) and dk not in have and dk not in off:
+                pending_docs.append(_clone_series_instance(template, dk))
                 have.add(dk)
                 created += 1
             cursor += timedelta(days=step)
+    if pending_docs:
+        await db.tasks.insert_many(pending_docs)
     return created
 
 
-async def _fill_days_from_default_template(days_ahead: int = 14) -> int:
+async def _fill_days_from_default_template(days_ahead: int = 14, only_days: Optional[List[str]] = None) -> int:
     """Build any upcoming day that has no template assigned from the default one.
 
     Without this a parent would have to paste the ordinary weekday template onto
@@ -6334,8 +6574,13 @@ async def _fill_days_from_default_template(days_ahead: int = 14) -> int:
         return 0
     today = _today_key()
     created = 0
-    window = [(datetime.strptime(today, "%Y-%m-%d") + timedelta(days=o)).strftime("%Y-%m-%d")
-              for o in range(days_ahead + 1)]
+    if only_days:
+        window = sorted({d for d in only_days if d and d >= today})
+    else:
+        window = [(datetime.strptime(today, "%Y-%m-%d") + timedelta(days=o)).strftime("%Y-%m-%d")
+                  for o in range(days_ahead + 1)]
+    if not window:
+        return 0
 
     # Ask about the whole window at once. Probing day by day meant ~45 round
     # trips before a single mission was written — on a remote database that is
@@ -6343,30 +6588,17 @@ async def _fill_days_from_default_template(days_ahead: int = 14) -> int:
     assigned = {
         d["date_key"] for d in await db.template_assignments.find(
             {"parent_id": FAMILY_ID, "date_key": {"$in": window}}, {"_id": 0, "date_key": 1}
-        ).to_list(200)
+        ).to_list(400)
     }
     have_tasks = {
         t["date_key"] for t in await db.tasks.find(
             {"parent_id": FAMILY_ID, "date_key": {"$in": window}}, {"_id": 0, "date_key": 1}
-        ).to_list(20000)
+        ).to_list(None)
     }
-    off_rows = await db.off_days.find(
-        {"parent_id": FAMILY_ID, "end_date": {"$gte": window[0]}, "start_date": {"$lte": window[-1]}},
-        {"_id": 0},
-    ).to_list(200)
-
-    def _fully_off(dk: str) -> bool:
-        for off in off_rows:
-            if not (off["start_date"] <= dk <= off["end_date"]):
-                continue
-            starts_mid = off.get("start_segment_id") and off["start_date"] == dk
-            ends_mid = off.get("end_segment_id") and off["end_date"] == dk
-            if not starts_mid and not ends_mid:
-                return True
-        return False
+    off = await _fully_off_days(window[0], window[-1])
 
     for dk in window:
-        if dk in assigned or dk in have_tasks or _fully_off(dk):
+        if dk in assigned or dk in have_tasks or dk in off:
             continue
         res = await _apply_template_to_date(default_tpl["id"], dk, replace_existing=False)
         if res["created"]:
@@ -6381,39 +6613,100 @@ async def _fill_days_from_default_template(days_ahead: int = 14) -> int:
     return created
 
 
-def _schedule_materialize():
-    """Kick the schedule sweep off WITHOUT making the caller wait for it.
+# ---- Lazy day preparation -------------------------------------------------
+# The schedule used to be pre-built a fortnight ahead by a sweep that ran on
+# reads. Now only the days somebody is about to look at are built — today and
+# tomorrow by default, or one specific date a parent opens — and the work is
+# remembered per container (and per family in the database) so a warm request
+# pays nothing for it.
+_DAYS_READY_TTL = 600.0
+_DAYS_READY: dict = {"at": {}, "dirty": False}
 
-    Even throttled to once every ten minutes, the unlucky request that triggered
-    the sweep had to sit through building a fortnight of missions before it
-    could answer — so roughly every ten minutes one child would hit a page that
-    took seconds to load, for no reason they could see. Nothing on screen
-    depends on the sweep having finished, so it belongs off the request path.
-    """
+
+def _invalidate_days_ready():
+    """Something that shapes a day changed (a repeating task, a template, an
+    off day, vacation mode): rebuild the near days on the next request."""
+    _DAYS_READY["at"].clear()
+    _DAYS_READY["dirty"] = True
+
+
+def _near_days() -> List[str]:
+    today = _today_key()
+    tomorrow = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    return [today, tomorrow]
+
+
+async def _ensure_days_ready(days: Optional[List[str]] = None, force: bool = False,
+                             trust_marker: bool = True) -> int:
+    """Build the given days (default: today + tomorrow) from the default
+    template and the repeating series, at most once per TTL. Idempotent."""
+    import time as _t
+    near = _near_days()
+    days = sorted({d for d in (days or near) if d and d >= near[0]})
+    if not days:
+        return 0
+    is_near = set(days) <= set(near)
+    now_m = _t.monotonic()
+    if not force and not _DAYS_READY["dirty"]:
+        due = [d for d in days if now_m - _DAYS_READY["at"].get(d, -1e12) > _DAYS_READY_TTL]
+        if not due:
+            return 0
+        if is_near and trust_marker:
+            # Another container may have just done it: honour the family-wide
+            # marker (read from the cached config — no extra round trip).
+            last = (await get_config_cached()).get("last_materialize_at")
+            if last and isinstance(last, str):
+                try:
+                    age = (datetime.now(timezone.utc) - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds()
+                    if 0 <= age < _DAYS_READY_TTL:
+                        for d in due:
+                            _DAYS_READY["at"][d] = now_m
+                        return 0
+                except Exception:
+                    pass
+    else:
+        due = days
+    # Mark before working so concurrent requests in this container don't pile
+    # onto the same build. (No asyncio.Lock: serverless hosts can resume the
+    # process under a different event loop, which a module-level lock survives
+    # badly.)
+    for d in due:
+        _DAYS_READY["at"][d] = now_m
+    _DAYS_READY["dirty"] = False
     try:
-        task = asyncio.create_task(_maybe_materialize_recurring())
+        created = 0
+        # The weekly routine is the schedule. Its builder is idempotent per
+        # slot and remembers each built day, so it is safe to call for any day.
+        for d in due:
+            created += await _ensure_day_built(d)
+        # The old default template is superseded once the routine took over
+        # (its slots were migrated); building from it too would double days.
+        if not await db.app_meta.find_one({"_id": "routine_migrated"}, {"_id": 1}):
+            created += await _fill_days_from_default_template(only_days=due)
+        created += await _materialize_recurring(only_days=due)
+    except Exception:
+        for d in due:
+            _DAYS_READY["at"].pop(d, None)
+        raise
+    if is_near:
+        await _write_config({"$set": {"last_materialize_at": datetime.now(timezone.utc).isoformat()}})
+    return created
+
+
+def _schedule_materialize():
+    """Fire-and-forget variant for paths that must not wait. Serverless hosts
+    may freeze a process right after the response, so the paths a child sees
+    first await _ensure_days_ready instead; this stays as a best-effort nudge."""
+    try:
+        task = asyncio.create_task(_ensure_days_ready())
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     except RuntimeError:
-        pass  # no running loop (e.g. during import) — the cron path still covers it
+        pass
 
 
 async def _maybe_materialize_recurring():
-    """Cheap throttled wrapper: at most one sweep every 10 minutes family-wide,
-    so the schedule self-heals in the background."""
-    now = datetime.now(timezone.utc)
-    marker = await db.app_config.find_one({"parent_id": FAMILY_ID}, {"_id": 0, "last_materialize_at": 1})
-    last = (marker or {}).get("last_materialize_at")
-    if last:
-        try:
-            if (now - datetime.fromisoformat(last.replace("Z", "+00:00"))).total_seconds() < 600:
-                return 0
-        except Exception:
-            pass
-    await _write_config({"$set": {"last_materialize_at": now.isoformat()}},
-        upsert=True,
-    )
-    filled = await _fill_days_from_default_template()
-    return (await _materialize_recurring()) + filled
+    """Kept for callers of the old name: builds today + tomorrow only."""
+    return await _ensure_days_ready()
 
 
 class BulkTaskImportInput(BaseModel):
@@ -6657,6 +6950,201 @@ async def restart_schedule(payload: RestartScheduleInput, user: dict = Depends(r
         "archive_batch": batch_id,
     }
 
+
+# ---- Stage 3: compact the pre-built schedule -------------------------------
+# Older versions built every routine a fortnight ahead, so the collection holds
+# many untouched copies of future days. Now that days are built lazily, those
+# copies are pure weight. This removes only what would be rebuilt IDENTICALLY:
+# a future day is cleared only if every mission on it is an untouched copy of
+# its template slot or its repeating series, and a series is thinned only if
+# none of its future copies has to stay. Everything removed is archived first
+# and can be put back with /tasks/undo-restart.
+_SERIES_DEF_FIELDS = (
+    "title", "description", "points", "penalty_points", "is_bonus", "due_time", "segment_id",
+    "duration_minutes", "icon", "order", "task_style", "photo_required", "max_snooze_minutes",
+    "min_duration_minutes", "rush_message", "overtime_allowed", "overtime_bonus_points",
+    "together_bonus_enabled", "together_bonus_points", "child_id", "is_coop", "coop_participants",
+    "recurrence",
+)
+_SLOT_FIELDS = (
+    ("title", "title", None), ("description", "description", ""), ("points", "points", 10),
+    ("penalty_points", "penalty_points", 0), ("duration_minutes", "duration_minutes", None),
+    ("segment_id", "segment_id", None), ("is_bonus", "is_bonus", False),
+    ("photo_required", "photo_required", False), ("task_style", "task_style", None),
+    ("max_snooze_minutes", "max_snooze_minutes", None),
+    ("min_duration_minutes", "min_duration_minutes", None), ("rush_message", "rush_message", None),
+    ("overtime_allowed", "overtime_allowed", False),
+    ("overtime_bonus_points", "overtime_bonus_points", None),
+    ("together_bonus_enabled", "together_bonus_enabled", False),
+    ("together_bonus_points", "together_bonus_points", None),
+)
+
+
+def _norm(v):
+    """Compare definitions loosely: list order and ""/None don't matter."""
+    if isinstance(v, (list, tuple)):
+        return tuple(sorted(str(x) for x in v)) or None
+    if v is False or (isinstance(v, str) and v == ""):
+        return None
+    return v
+
+
+def _untouched(t: dict) -> bool:
+    return (t.get("status") == "pending" and not t.get("timer_started_at")
+            and not t.get("completed_at") and not t.get("hold_status")
+            and not t.get("completion_photo_url") and not t.get("late_ack")
+            and not t.get("off_day_id"))
+
+
+@api.post("/maintenance/compact-schedule")
+async def compact_schedule(dry_run: bool = True, user: dict = Depends(require_parent)):
+    config = await get_config_cached()
+    if config.get("vacation_mode"):
+        raise HTTPException(status_code=409, detail="Matikan mode liburan dulu — saat liburan jadwal tidak dibangun ulang")
+    near = _near_days()
+    tomorrow = near[1]
+    future = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "date_key": {"$gt": tomorrow}}, {"_id": 0},
+    ).to_list(None)
+    if not future:
+        return {"dry_run": dry_run, "removable_tasks": 0, "days": [], "removed": 0}
+
+    default_tpl = await db.day_templates.find_one({"parent_id": FAMILY_ID, "is_default": True}, {"_id": 0})
+    future_days = sorted({t["date_key"] for t in future})
+    assignments = {
+        a["date_key"]: a for a in await db.template_assignments.find(
+            {"parent_id": FAMILY_ID, "date_key": {"$in": future_days}}, {"_id": 0},
+        ).to_list(None)
+    }
+    slots = {}
+    if default_tpl:
+        slots = {s["id"]: s for s in await db.template_tasks.find(
+            {"parent_id": FAMILY_ID, "template_id": default_tpl["id"]}, {"_id": 0}).to_list(None)}
+    kids = [k["id"] for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(100)]
+    expected_per_weekday: dict = {}
+    for s_ in slots.values():
+        n = 1 if s_.get("child_id") else len(kids)
+        expected_per_weekday[s_["weekday"]] = expected_per_weekday.get(s_["weekday"], 0) + n
+
+    # Series anchors: the newest occurrence on or before tomorrow.
+    recurring_all = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}, "date_key": {"$lte": tomorrow}},
+        _SERIES_LIGHT_FIELDS,
+    ).to_list(None)
+    anchor_id: dict = {}
+    anchor_dk: dict = {}
+    for t in recurring_all:
+        if not t.get("date_key"):
+            continue
+        k = _series_key(t)
+        if k not in anchor_dk or t["date_key"] > anchor_dk[k]:
+            anchor_dk[k], anchor_id[k] = t["date_key"], t["id"]
+    anchors = {}
+    if anchor_id:
+        full = {d["id"]: d for d in await db.tasks.find(
+            {"parent_id": FAMILY_ID, "id": {"$in": list(anchor_id.values())}}, {"_id": 0}).to_list(None)}
+        anchors = {k: full.get(i) for k, i in anchor_id.items() if full.get(i)}
+
+    def template_copy_ok(t: dict) -> bool:
+        if not default_tpl or t.get("from_template_id") != default_tpl["id"]:
+            return False
+        a = assignments.get(t["date_key"])
+        if not a or a.get("assigned_by") != "otomatis" or a.get("template_id") != default_tpl["id"]:
+            return False
+        s_ = slots.get(t.get("from_template_slot_id"))
+        if not s_:
+            return False
+        if (t.get("order") or 1) != (s_.get("order") or 1):
+            return False
+        return all(_norm(t.get(tf)) == _norm(s_.get(sf, dflt)) for tf, sf, dflt in _SLOT_FIELDS)
+
+    def is_series(t: dict) -> bool:
+        return t.get("recurrence") in ("daily", "weekly") and not t.get("from_template_id")
+
+    def same_def(a: dict, b: dict) -> bool:
+        return all(_norm(a.get(f)) == _norm(b.get(f)) for f in _SERIES_DEF_FIELDS)
+
+    ok = {t["id"]: (_untouched(t) and (template_copy_ok(t) or (is_series(t) and _series_key(t) in anchors)))
+          for t in future}
+    by_day: dict = {}
+    for t in future:
+        by_day.setdefault(t["date_key"], []).append(t)
+    by_series: dict = {}
+    for t in future:
+        if is_series(t):
+            by_series.setdefault(_series_key(t), []).append(t)
+    for rows in by_series.values():
+        rows.sort(key=lambda r: r["date_key"])
+
+    def series_pass(keep_day) -> bool:
+        """A series copy may go only if it matches the nearest copy that STAYS
+        before it — exactly what the lazy builder will clone in its place."""
+        moved = False
+        for key, rows in by_series.items():
+            current = anchors.get(key)
+            for r in rows:
+                if not keep_day(r):
+                    if current is None or not same_def(r, current):
+                        ok[r["id"]] = False
+                        moved = True
+                        current = r
+                else:
+                    current = r
+        return moved
+
+    # Fixed point: a day goes only if ALL its missions go.
+    changed = True
+    while changed:
+        changed = False
+        for dk, rows in by_day.items():
+            if any(not ok[r["id"]] for r in rows) and any(ok[r["id"]] for r in rows):
+                for r in rows:
+                    if ok[r["id"]]:
+                        ok[r["id"]] = False
+                        changed = True
+        if series_pass(lambda r: not ok[r["id"]]):
+            changed = True
+    # A template day must also be complete, or the rebuild would add back a
+    # slot the parent had removed by hand.
+    final_days = []
+    for dk, rows in by_day.items():
+        if not all(ok[r["id"]] for r in rows):
+            continue
+        tpl_rows = [r for r in rows if r.get("from_template_id")]
+        if tpl_rows:
+            wd = datetime.strptime(dk, "%Y-%m-%d").weekday()
+            if len(tpl_rows) != expected_per_weekday.get(wd, -1):
+                continue
+        final_days.append(dk)
+    # Dropping an incomplete template day keeps its missions, which can change
+    # the "nearest kept copy" of a series for later days: settle that too.
+    final_set = set(final_days)
+    while True:
+        for r in future:
+            if r["date_key"] not in final_set:
+                ok[r["id"]] = False
+        if not series_pass(lambda r: not ok[r["id"]]):
+            break
+        final_set = {dk for dk in final_set if all(ok[r["id"]] for r in by_day[dk])}
+    final_days = sorted(final_set)
+    doomed = [t for dk in final_days for t in by_day[dk]]
+
+    if dry_run or not doomed:
+        return {"dry_run": dry_run, "removable_tasks": len(doomed), "days": final_days, "removed": 0}
+
+    batch_id = new_id()
+    await db.tasks_archive.insert_many([
+        {"archive_batch": batch_id, "archived_at": now_iso(), "parent_id": FAMILY_ID,
+         "reason": "compact", "task": t}
+        for t in doomed
+    ])
+    res = await db.tasks.delete_many({"parent_id": FAMILY_ID, "id": {"$in": [t["id"] for t in doomed]}})
+    await db.template_assignments.delete_many(
+        {"parent_id": FAMILY_ID, "date_key": {"$in": final_days}, "assigned_by": "otomatis"})
+    _invalidate_days_ready()
+    await log_activity(FAMILY_ID, None, "schedule_compacted", {"removed": res.deleted_count, "days": len(final_days)})
+    return {"dry_run": False, "removable_tasks": len(doomed), "days": final_days,
+            "removed": res.deleted_count, "archive_batch": batch_id}
 
 @api.get("/tasks/restart-archives")
 async def list_restart_archives(user: dict = Depends(require_parent)):
@@ -7267,6 +7755,7 @@ _DEFAULT_PET_FEED_THRESHOLDS = [3, 8, 15]
 
 @api.post("/config")
 async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_parent)):
+    _invalidate_days_ready()
     config_doc = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if config_doc:
         update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
@@ -7413,6 +7902,9 @@ async def warmup():
     ok = True
     try:
         await db.app_config.find_one({"parent_id": FAMILY_ID}, {"_id": 1})
+        # While we're here, have today and tomorrow ready before anyone looks
+        # (a no-op when another tick or request already built them).
+        await _ensure_days_ready()
     except Exception:
         ok = False
     return {"ok": ok, "at": now_iso(), "version": _deployed_version()}
@@ -7453,7 +7945,12 @@ async def toggle_maintenance(payload: MaintenanceToggleInput, user: dict = Depen
 
 
 @api.get("/config")
-async def get_app_config(user: dict = Depends(get_current_user)):
+async def get_app_config(user: dict = Depends(get_current_user), lite: bool = False):
+    if lite:
+        # Labels/language/goals only — without the uploaded background image,
+        # which can be hundreds of KB and is only shown on the login screen.
+        full = await get_app_config(user, False)
+        return {k: v for k, v in full.items() if k not in _HEAVY_CONFIG_FIELDS and k != "_id"}
     config = await db.app_config.find_one({"parent_id": FAMILY_ID})
     if not config:
         return {
@@ -7678,7 +8175,7 @@ async def delete_routine_template(template_id: str, user: dict = Depends(require
 async def list_rewards(user: dict = Depends(get_current_user)):
     rewards = await db.rewards.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(200)
     rewards.sort(key=lambda r: r.get("cost_points", 0))
-    return rewards
+    return _with_media_refs("reward", rewards)
 
 
 @api.post("/rewards")
@@ -7711,6 +8208,8 @@ async def update_reward(reward_id: str, payload: RewardUpdate, user: dict = Depe
     # skipped when None (unset). exclude_unset lets us tell "sent empty" apart
     # from "not sent at all".
     raw = payload.model_dump(exclude_unset=True)
+    if isinstance(raw.get("image"), str) and raw["image"].startswith(MEDIA_PREFIX):
+        raw.pop("image")  # the form echoed back the served URL: image unchanged
     updates = {k: v for k, v in raw.items() if v is not None}
     if updates:
         await db.rewards.update_one({"id": reward_id}, {"$set": updates})
@@ -7923,12 +8422,17 @@ async def list_wishlist(child_id: Optional[str] = None, user: dict = Depends(get
     # (no dependency on messy historical data).
     expected_daily_savings = daily_goal * save_pct / total_pct
 
+    # Two batched reads instead of two per wishlist item.
+    _rw = {r["id"]: r for r in await db.rewards.find(
+        {"parent_id": FAMILY_ID, "id": {"$in": list({i["reward_id"] for i in items})}}, {"_id": 0}).to_list(None)} if items else {}
+    _ch = {c["id"]: c for c in await db.children.find(
+        {"parent_id": FAMILY_ID, "id": {"$in": list({i["child_id"] for i in items})}}, {"_id": 0}).to_list(None)} if items else {}
     out = []
     for item in items:
-        reward = await db.rewards.find_one({"id": item["reward_id"], "parent_id": FAMILY_ID}, {"_id": 0})
+        reward = _rw.get(item["reward_id"])
         if not reward:
             continue  # reward was deleted since being wishlisted; skip silently
-        child = await db.children.find_one({"id": item["child_id"], "parent_id": FAMILY_ID}, {"_id": 0})
+        child = _ch.get(item["child_id"])
         # Rewards are bought from Tabungan (savings), so progress is measured
         # against the savings bucket, not the headline points total.
         savings = child.get("chiky_save", 0) if child else 0
@@ -8076,6 +8580,341 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
     }
 
 
+
+# ---- Media: images out of the JSON payloads ---------------------------------
+# Uploaded pictures are stored as data URLs inside their documents. Sending them
+# inline meant every list of children, rewards or tasks dragged hundreds of KB
+# of base64 along — on every load. Authenticated lists now carry a short URL
+# instead; the image itself is served once and then cached by the browser
+# (the ?v= tag changes whenever the picture does).
+import hashlib as _hashlib  # noqa: E402
+import base64 as _base64  # noqa: E402
+from fastapi.responses import Response as _RawResponse  # noqa: E402
+
+MEDIA_PREFIX = "/api/media/"
+_MEDIA_SOURCES = {
+    "child": ("children", {"profile_photo_url"}),
+    "reward": ("rewards", {"image"}),
+    "task": ("tasks", {"completion_photo_url", "before_photo_url"}),
+}
+
+
+def _media_ref(kind: str, doc_id: str, field: str, value):
+    if not isinstance(value, str) or not value.startswith("data:") or not doc_id:
+        return value
+    tag = _hashlib.sha1((str(len(value)) + value[:64] + value[-64:]).encode()).hexdigest()[:12]
+    return f"{MEDIA_PREFIX}{kind}/{doc_id}/{field}?v={tag}&s={_media_sig(kind, doc_id, field, tag)}"
+
+
+def _media_sig(kind: str, doc_id: str, field: str, tag: str) -> str:
+    """A capability for ONE version of ONE picture. <img> tags can't send the
+    Authorization header (and some private-mode browsers drop cookies), so the
+    URL itself carries proof that an authenticated response handed it out."""
+    import hmac as _hmac
+    msg = f"{kind}:{doc_id}:{field}:{tag}".encode()
+    return _hmac.new(get_jwt_secret().encode(), msg, _hashlib.sha256).hexdigest()[:24]
+
+
+def _with_media_refs(kind: str, docs):
+    fields = _MEDIA_SOURCES[kind][1]
+    single = isinstance(docs, dict)
+    for d in ([docs] if single else docs or []):
+        if not isinstance(d, dict):
+            continue
+        for f in fields:
+            if f in d:
+                d[f] = _media_ref(kind, d.get("id"), f, d[f])
+    return docs
+
+
+@api.get("/media/{kind}/{doc_id}/{field}")
+async def get_media(kind: str, doc_id: str, field: str, v: str = "", s: str = ""):
+    import hmac as _hmac
+    src = _MEDIA_SOURCES.get(kind)
+    if not src or field not in src[1]:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not v or not s or not _hmac.compare_digest(s, _media_sig(kind, doc_id, field, v)):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    coll, _ = src
+    doc = await db[coll].find_one({"id": doc_id, "parent_id": FAMILY_ID}, {"_id": 0, field: 1})
+    value = (doc or {}).get(field)
+    if not isinstance(value, str) or not value.startswith("data:") or "," not in value:
+        raise HTTPException(status_code=404, detail="Not found")
+    if _media_ref(kind, doc_id, field, value).split("?v=", 1)[1].split("&", 1)[0] != v:
+        raise HTTPException(status_code=404, detail="Gambar sudah diganti")
+    header, b64 = value.split(",", 1)
+    mime = header[5:].split(";")[0] or "application/octet-stream"
+    if not (mime.startswith("image/") or mime.startswith("audio/")):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        raw = _base64.b64decode(b64) if ";base64" in header else b64.encode()
+    except Exception:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _RawResponse(content=raw, media_type=mime, headers={
+        "Cache-Control": "private, max-age=31536000, immutable",
+    })
+
+# ---- Family Mission: one shared weekly goal --------------------------------
+# Every child's approved points this week count toward ONE family target, with
+# a shared reward. Cooperation instead of competition, and it resets itself
+# every week — nothing for a parent to recreate.
+class FamilyMissionInput(BaseModel):
+    enabled: bool = True
+    title: str = Field(default="Misi Keluarga", min_length=1, max_length=60)
+    target_points: int = Field(default=300, ge=10, le=100000)
+    reward: str = Field(default="", max_length=120)
+    emoji: str = Field(default="🏰", max_length=8)
+
+
+def _week_bounds(today: str) -> tuple:
+    d = datetime.strptime(today, "%Y-%m-%d")
+    start = d - timedelta(days=d.weekday())
+    return start.strftime("%Y-%m-%d"), (start + timedelta(days=6)).strftime("%Y-%m-%d")
+
+
+@api.get("/family-mission")
+async def get_family_mission(user: dict = Depends(get_current_user)):
+    config = await get_config_cached()
+    fm = config.get("family_mission") or {}
+    today = _today_key()
+    start, end = _week_bounds(today)
+    base = {
+        "enabled": bool(fm.get("enabled")), "title": fm.get("title") or "Misi Keluarga",
+        "target_points": int(fm.get("target_points") or 300), "reward": fm.get("reward") or "",
+        "emoji": fm.get("emoji") or "🏰", "week_start": start, "week_end": end,
+    }
+    if not base["enabled"]:
+        return {**base, "earned_points": 0, "percent": 0, "goal_met": False, "contributions": []}
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1, "name": 1,
+                                                             "avatar_emoji": 1, "avatar_color": 1}).to_list(50)
+    rows = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "status": "approved", "date_key": {"$gte": start, "$lte": end}},
+        {"_id": 0, "child_id": 1, "is_coop": 1, "coop_participants": 1, "points": 1},
+    ).to_list(None)
+    per_kid = {k["id"]: 0 for k in kids}
+    for t in rows:
+        for kid_id in per_kid:
+            per_kid[kid_id] += _child_share_of_task(t, kid_id) if (
+                t.get("is_coop") or t.get("child_id") == kid_id) else 0
+    earned = sum(per_kid.values())
+    target = base["target_points"]
+    days_left = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days + 1
+    return {
+        **base,
+        "earned_points": earned,
+        "percent": min(100, int(earned * 100 / target)) if target else 100,
+        "goal_met": earned >= target,
+        "days_left": days_left,
+        "per_day_needed": max(0, -(-(target - earned) // days_left)) if days_left > 0 else 0,
+        "contributions": [{**k, "points": per_kid[k["id"]]} for k in kids],
+    }
+
+
+@api.put("/family-mission")
+async def set_family_mission(payload: FamilyMissionInput, user: dict = Depends(require_parent)):
+    await _write_config({"$set": {"family_mission": payload.model_dump()}})
+    return await get_family_mission(user)
+
+
+# ---- Before/after photos ----------------------------------------------------
+class TaskPhotoInput(BaseModel):
+    kind: Literal["before", "after"]
+    photo_url: str = Field(min_length=1)
+
+    @field_validator("photo_url")
+    @classmethod
+    def _check_photo(cls, v):
+        if not v.startswith("data:image/"):
+            raise ValueError("Foto harus berupa gambar")
+        if len(v) > 2_000_000:
+            raise ValueError("Foto terlalu besar (maks ~1.4MB)")
+        return v
+
+
+@api.post("/tasks/{task_id}/photo")
+async def attach_task_photo(task_id: str, payload: TaskPhotoInput, user: dict = Depends(get_current_user)):
+    """A child attaches a 'before' or 'after' picture to a mission (e.g. a room
+    before and after tidying). Parents see them side by side when reviewing."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    owners = task.get("coop_participants") or [task.get("child_id")]
+    if user["role"] == "child" and user["id"] not in owners:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    if task.get("status") in ("approved", "skipped", "off"):
+        raise HTTPException(status_code=409, detail="Misi ini sudah ditutup")
+    field = "before_photo_url" if payload.kind == "before" else "completion_photo_url"
+    await db.tasks.update_one({"id": task_id}, {"$set": {field: payload.photo_url, f"{field}_at": now_iso()}})
+    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
+    return _with_media_refs("task", updated)
+
+
+# ---- Adaptive schedule suggestions -------------------------------------------
+@api.get("/schedule/suggestions")
+async def schedule_suggestions(days: int = 28, user: dict = Depends(require_parent)):
+    """Looks at the last few weeks per child and mission and suggests small
+    adjustments: a mission that keeps being missed may be too hard, too long or
+    in the wrong part of the day; one that is always done might deserve a step
+    up. Suggestions only — nothing changes until a parent applies one."""
+    days = max(7, min(days, 90))
+    today = _today_key()
+    since = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "date_key": {"$gte": since, "$lt": today},
+         "status": {"$in": ["approved", "completed", "missed", "pending", "rejected", "skipped"]},
+         "is_bonus": {"$ne": True}},
+        {"_id": 0, "child_id": 1, "title": 1, "status": 1, "points": 1, "segment_id": 1,
+         "from_template_slot_id": 1, "checked": 1, "date_key": 1},
+    ).to_list(None)
+    kids = {k["id"]: k for k in await db.children.find(
+        {"parent_id": FAMILY_ID}, {"_id": 0, "id": 1, "name": 1, "avatar_emoji": 1}).to_list(50)}
+    stats: dict = {}
+    for t in rows:
+        key = (t.get("child_id"), t.get("title"))
+        st = stats.setdefault(key, {"done": 0, "total": 0, "points": t.get("points", 0),
+                                    "slot_id": t.get("from_template_slot_id"), "segment_id": t.get("segment_id")})
+        st["total"] += 1
+        if t.get("status") in ("approved", "completed") or t.get("checked"):
+            st["done"] += 1
+        if t.get("from_template_slot_id"):
+            st["slot_id"] = t["from_template_slot_id"]
+    out = []
+    for (child_id, title), st in stats.items():
+        if child_id not in kids or st["total"] < 6:
+            continue
+        rate = st["done"] / st["total"]
+        base = {"child_id": child_id, "child_name": kids[child_id]["name"],
+                "avatar_emoji": kids[child_id].get("avatar_emoji"), "title": title,
+                "done": st["done"], "total": st["total"], "rate": round(rate * 100),
+                "points": st["points"], "slot_id": st["slot_id"]}
+        if rate < 0.5:
+            new_pts = max(1, round(st["points"] * 1.25))
+            out.append({**base, "kind": "struggling", "severity": 2 if rate < 0.3 else 1,
+                        "message": f"{title} baru selesai {st['done']} dari {st['total']} kali. "
+                                   "Mungkin terlalu berat, terlalu lama, atau jamnya kurang pas — coba bicarakan, "
+                                   "pindahkan ke bagian hari lain, atau naikkan sedikit poinnya sebagai penyemangat.",
+                        "action": {"type": "set_points", "points": new_pts} if st["slot_id"] else None})
+        elif rate >= 0.95 and st["total"] >= 10:
+            out.append({**base, "kind": "mastered", "severity": 0,
+                        "message": f"{title} hampir selalu beres ({st['done']}/{st['total']}). "
+                                   "Sudah jadi kebiasaan! Bisa diganti tantangan baru, atau jadikan misi bonus.",
+                        "action": {"type": "make_bonus"} if st["slot_id"] else None})
+    out.sort(key=lambda x: (-x["severity"], x["rate"]))
+    return {"since": since, "until": today, "suggestions": out[:20]}
+
+
+class SuggestionApplyInput(BaseModel):
+    slot_id: str
+    type: Literal["set_points", "make_bonus"]
+    points: Optional[int] = Field(default=None, ge=1, le=10000)
+
+
+@api.post("/schedule/suggestions/apply")
+async def apply_schedule_suggestion(payload: SuggestionApplyInput, user: dict = Depends(require_parent)):
+    """Applies a suggestion to the routine (template slot) going forward."""
+    slot = await db.template_tasks.find_one({"id": payload.slot_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not slot:
+        raise HTTPException(status_code=404, detail="Slot rutinitas tidak ditemukan")
+    update = {"points": payload.points} if payload.type == "set_points" else {"is_bonus": True}
+    if payload.type == "set_points" and not payload.points:
+        raise HTTPException(status_code=422, detail="Poin baru wajib diisi")
+    await db.template_tasks.update_one({"id": payload.slot_id}, {"$set": update})
+    _invalidate_days_ready()
+    await log_activity(FAMILY_ID, slot.get("child_id"), "suggestion_applied",
+                       {"title": slot.get("title"), **update})
+    return await db.template_tasks.find_one({"id": payload.slot_id}, {"_id": 0})
+
+
+# ---- Memories: this month's photos, as a collage ------------------------------
+async def _memories(month: str, child_ids: Optional[List[str]] = None) -> dict:
+    if not re.match(r"^\d{4}-\d{2}$", month or ""):
+        raise HTTPException(status_code=422, detail="Bulan tidak valid (YYYY-MM)")
+    q = {"parent_id": FAMILY_ID, "date_key": {"$gte": f"{month}-01", "$lte": f"{month}-31"},
+         "status": {"$in": ["approved", "completed"]},
+         "$or": [{"completion_photo_url": {"$nin": [None, ""]}}, {"before_photo_url": {"$nin": [None, ""]}}]}
+    if child_ids:
+        q["child_id"] = {"$in": child_ids}
+    rows = await db.tasks.find(q, {"_id": 0, "id": 1, "title": 1, "date_key": 1, "child_id": 1,
+                                   "completion_photo_url": 1, "before_photo_url": 1}).sort("date_key", 1).to_list(200)
+    kids = {k["id"]: k for k in await db.children.find(
+        {"parent_id": FAMILY_ID}, {"_id": 0, "id": 1, "name": 1, "avatar_emoji": 1, "avatar_color": 1}).to_list(50)}
+    badges = await db.badges.count_documents({"earned_at": {"$gte": f"{month}-01", "$lte": f"{month}-31T23:59:59"},
+                                              **({"child_id": {"$in": child_ids}} if child_ids else {})})
+    photos = []
+    for t in _with_media_refs("task", rows):
+        k = kids.get(t.get("child_id"), {})
+        photos.append({"id": t["id"], "title": t["title"], "date_key": t["date_key"],
+                       "child_name": k.get("name"), "avatar_emoji": k.get("avatar_emoji"),
+                       "after": t.get("completion_photo_url"), "before": t.get("before_photo_url")})
+    return {"month": month, "photos": photos, "badges_earned": badges}
+
+
+@api.get("/memories")
+async def list_memories(month: Optional[str] = None, child_id: Optional[str] = None,
+                        user: dict = Depends(get_current_user)):
+    month = month or _today_key()[:7]
+    ids = [child_id] if child_id else None
+    if user["role"] == "child":
+        ids = [user["id"]]
+    return await _memories(month, ids)
+
+
+@api.get("/public/view/{token}/memories")
+async def public_memories(token: str, month: Optional[str] = None):
+    """The same collage for a grandparent's view link (only its children)."""
+    link = await db.view_links.find_one({"token": token}, {"_id": 0})
+    if not link or link.get("revoked"):
+        raise HTTPException(status_code=404, detail="Link tidak ditemukan atau sudah dicabut")
+    return await _memories(month or _today_key()[:7], link.get("child_ids") or None)
+
+# ---- Bootstrap: one round trip per screen ---------------------------------
+# A parent's dashboard used to open with six parallel requests, each paying its
+# own auth check and (on a cold container) its own wait. One request that runs
+# the same reads concurrently on the server answers in the time of the slowest.
+@api.get("/parent/bootstrap")
+async def parent_bootstrap(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(require_parent),
+):
+    today = _today_key()
+    base = datetime.strptime(today, "%Y-%m-%d")
+    sd = start_date or (base - timedelta(days=14)).strftime("%Y-%m-%d")
+    ed = end_date or (base + timedelta(days=14)).strftime("%Y-%m-%d")
+    # Build today/tomorrow first so the concurrent reads below see them.
+    await _ensure_days_ready()
+    children, tasks, rewards, consequences, redemptions, stats = await asyncio.gather(
+        list_children(user),
+        list_tasks(None, None, None, sd, ed, True, user),
+        list_rewards(user),
+        list_consequences(user),
+        list_redemptions(None, user),
+        dashboard_stats(user),
+    )
+    return {
+        "children": children, "tasks": tasks, "rewards": rewards,
+        "consequences": consequences, "redemptions": redemptions, "stats": stats,
+        "window": {"start_date": sd, "end_date": ed}, "today": today,
+    }
+
+
+# Large uploaded images never belong in a child's start-up payload; screens that
+# show them (login background) fetch them separately.
+_HEAVY_CONFIG_FIELDS = ("slideshow_background_image",)
+
+
+@api.get("/kid/{child_id}/bootstrap")
+async def kid_bootstrap(child_id: str, user: dict = Depends(get_current_user)):
+    if user["role"] == "child" and user["id"] != child_id:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    child = {k: v for k, v in child.items() if k != "_id"}
+    config, _ = await asyncio.gather(get_app_config(user, False), _ensure_days_ready())
+    child["pet_is_dead"] = _pet_is_dead(child, await get_config_cached())
+    _with_media_refs("child", child)
+    config = {k: v for k, v in (config or {}).items() if k not in _HEAVY_CONFIG_FIELDS and k != "_id"}
+    return {"child": child, "config": config, "today": _today_key()}
+
 @api.get("/push/vapid-public-key")
 async def get_vapid_public_key():
     """Public: the VAPID public key browsers need to create a push subscription.
@@ -8187,6 +9026,13 @@ async def cron_send_reminders(request: Request):
     auth_header = request.headers.get("authorization", "")
     if not expected or auth_header != f"Bearer {expected}":
         raise HTTPException(status_code=403, detail="Invalid or missing cron secret")
+
+    # The same 15-minute tick keeps today and tomorrow built, so the schedule
+    # is ready before anyone opens the app (no sweep on the request path).
+    try:
+        await _ensure_days_ready(force=True)
+    except Exception as e:  # noqa: BLE001 — reminders must still go out
+        logger.warning(f"cron day prep failed: {e}")
 
     now = _now_local()
     today = now.strftime("%Y-%m-%d")
@@ -8504,6 +9350,7 @@ async def seed_default_family():
             "passcode_is_default": True,
             "created_at": ts,
         })
+        _invalidate_member_cache()
 
     for c in children:
         await db.members.insert_one({
@@ -8514,6 +9361,7 @@ async def seed_default_family():
             "theme_preference": "clean",
             "created_at": ts,
         })
+        _invalidate_member_cache()
         # Mirror into children collection so existing task/reward/points logic works unchanged.
         await db.children.insert_one({
             "id": c["id"],
@@ -8561,6 +9409,7 @@ async def migrate_existing_data():
         {"role": "child", "passcode_is_default": True, "passcode_plain": {"$exists": False}},
         {"$set": {"passcode_plain": DEFAULT_PASSCODE}},
     )
+    _invalidate_member_cache()
     # 2. Tasks created before the treasure-hunt update get sequential order
     #    per child based on creation time.
     async for child in db.children.find({}, {"id": 1}):
@@ -8576,6 +9425,7 @@ async def migrate_existing_data():
     #    Syila was briefly seeded as ESFJ-T; correct her to ENFJ-T.
     await db.children.update_many({"name": "Syila", "mbti": "ESFJ-T"}, {"$set": {"mbti": "ENFJ-T"}})
     await db.members.update_many({"name": "Syila", "role": "child", "mbti": "ESFJ-T"}, {"$set": {"mbti": "ENFJ-T"}})
+    _invalidate_member_cache()
 
     mbti_by_name = {"Adskhan": "INTJ-T", "Syila": "ENFJ-T"}
     for name, mbti in mbti_by_name.items():
@@ -8587,6 +9437,7 @@ async def migrate_existing_data():
             {"name": name, "role": "child", "$or": [{"mbti": {"$exists": False}}, {"mbti": None}]},
             {"$set": {"mbti": mbti}},
         )
+        _invalidate_member_cache()
 
     # 4. Ensure new task fields exist on older tasks.
     await db.tasks.update_many(
@@ -8817,6 +9668,11 @@ async def ensure_initialized(request: Request, call_next):
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     return await call_next(request)
 
+
+# JSON lists (tasks, activity, stats) compress 70–90%; on a phone connection
+# that is most of the wait. Small responses are left alone.
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,

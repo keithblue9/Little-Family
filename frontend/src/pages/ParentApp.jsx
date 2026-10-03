@@ -63,15 +63,12 @@ import LevelConfigEditor from "@/components/LevelConfigEditor";
 import PetConfigEditor from "@/components/PetConfigEditor";
 import PetResetRequestsReview from "@/components/PetResetRequestsReview";
 import MaintenanceModeCard from "@/components/MaintenanceModeCard";
-import OffDayManager from "@/components/OffDayManager";
-import RestartScheduleCard from "@/components/RestartScheduleCard";
-import RestoreWeeklyPlanCard from "@/components/RestoreWeeklyPlanCard";
 import LateReasonsConfig from "@/components/LateReasonsConfig";
 import PunishmentConfig from "@/components/PunishmentConfig";
 import DaySegmentsConfig from "@/components/DaySegmentsConfig";
 import SegmentStartsConfig from "@/components/SegmentStartsConfig";
 import ExamPeriodConfig from "@/components/ExamPeriodConfig";
-import DayTemplateManager from "@/components/DayTemplateManager";
+import RoutineManager from "@/components/RoutineManager";
 import HoldRequestsReview from "@/components/HoldRequestsReview";
 import HonestyInsightCard from "@/components/HonestyInsightCard";
 import ActivityLogCard from "@/components/ActivityLogCard";
@@ -333,6 +330,15 @@ export default function ParentApp() {
           {view === "tasks" && (
             <div className="space-y-4">
               <HoldRequestsReview onChanged={load} />
+              {/* The weekly routine is the schedule now; per-date missions are
+                  generated from it. The old per-date list stays reachable for
+                  one-off corrections, folded away so it doesn't compete. */}
+              <RoutineManager kids={children} onChanged={load} />
+              <details className="bg-white rounded-2xl border border-slate-200">
+                <summary className="cursor-pointer px-5 py-3 text-sm font-semibold text-slate-600 select-none">
+                  🛠️ Koreksi tugas per tanggal (lanjutan)
+                </summary>
+                <div className="p-3 pt-0">
               <TasksView
                 kids={children}
                 tasks={filteredTasks}
@@ -349,6 +355,8 @@ export default function ParentApp() {
                 onApplyConsequence={(task) => setApplyConsModal({ task })}
                 onAddChild={() => setChildModal(true)}
               />
+                </div>
+              </details>
             </div>
           )}
           {view === "rewards" && (
@@ -1531,9 +1539,6 @@ function SettingsView({ kids, onAdd, onRefresh }) {
         <SegmentStartsConfig kids={kids} onChanged={onRefresh} />
       </div>
 
-      <div className="bg-white rounded-2xl border-2 border-indigo-100 p-6">
-        <DayTemplateManager kids={kids} onChanged={onRefresh} />
-      </div>
 
       <div className="bg-white rounded-2xl border-2 border-violet-100 p-6">
         <ExamPeriodConfig kids={kids} onChanged={onRefresh} />
@@ -1547,17 +1552,8 @@ function SettingsView({ kids, onAdd, onRefresh }) {
         <PunishmentConfig onChanged={onRefresh} />
       </div>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <OffDayManager />
-      </div>
 
-      <div className="bg-white rounded-2xl border-2 border-emerald-100 p-6">
-        <RestoreWeeklyPlanCard onChanged={onRefresh} />
-      </div>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <RestartScheduleCard onChanged={onRefresh} />
-      </div>
 
       <div className="bg-white rounded-2xl border-2 border-red-100 p-6">
         <MaintenanceModeCard />

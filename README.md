@@ -61,6 +61,13 @@ Buka http://localhost:3000.
 - **Offline anak**: Mulai, centang, dan Selesai tetap jalan tanpa internet, diantrikan
   berurutan dan dikirim saat online. Mulai/Selesai membawa `happened_at` (jam asli
   ditekan, maks. 12 jam ke belakang) sehingga tidak dianggap terlambat.
+- **Satu jam per bagian, bukan per tugas.** Tugas tidak punya jam/timer sendiri; durasi
+  hanya informasi. Batasnya adalah jam selesai bagian (bisa diatur per anak per hari).
+  Bagian yang lewat jam tanpa selesai dilaporkan ke orang tua ("Perlu keputusanmu" di
+  Monitor Harian) — tidak ada hukuman otomatis.
+- **Tulis ringkasan**: aktivitas bisa mewajibkan anak menulis ringkasan (min. N kata,
+  bisa lewat suara) sebelum bisa dicentang; orang tua menilai 👍 / tulis ulang.
+- **Salin rutinitas antar anak**: per aktivitas, per hari, atau seminggu penuh.
 - **Keep-warm**: workflow `.github/workflows/keep-warm.yml` memanggil `/api/warmup` tiap
   5 menit. Isi secret `APP_URL` di GitHub agar aktif.
 

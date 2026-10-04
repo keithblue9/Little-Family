@@ -17,6 +17,9 @@ const ACTION_META = {
   segment_finished: { icon: "🏁", label: "Menyelesaikan bagian" },
   section_reviewed: { icon: "📋", label: "Bagian lewat jam diputuskan" },
   task_missed: { icon: "❌", label: "Misi dicatat terlewat" },
+  summary_written: { icon: "📝", label: "Menulis ringkasan" },
+  summary_reviewed: { icon: "👀", label: "Ringkasan dibaca" },
+  routine_copied_to_child: { icon: "⧉", label: "Rutinitas disalin ke anak lain" },
   // Older entries from before sections replaced per-mission timing.
   task_started: { icon: "▶️", label: "Memulai misi" },
   task_completed: { icon: "✅", label: "Menyelesaikan misi" },
@@ -48,6 +51,8 @@ function describe(item) {
     extra = d.segment + (d.reason ? ` · "${d.reason}"` : "") + (d.late ? " · terlambat" : "")
       + (d.activities != null ? ` · ${d.activities} tugas` : "");
   }
+  if (item.action === "summary_written") extra = `${d.title} · ${d.words} kata${d.pasted ? " · ada yang ditempel" : ""}`;
+  if (item.action === "summary_reviewed") extra = `${d.title} · ${d.verdict === "good" ? "👍" : "tulis ulang"}`;
   if (item.action === "section_reviewed") {
     extra = `${d.segment} · ${d.action === "miss" ? `${d.missed} dicatat terlewat` : "dibiarkan"}`;
   }

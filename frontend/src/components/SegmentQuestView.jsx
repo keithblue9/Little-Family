@@ -7,6 +7,7 @@ import { cacheGet, cacheSet } from "@/lib/localCache";
 import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
 import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
+import SummaryBox from "@/components/SummaryBox";
 import { withLiveClock } from "@/lib/segmentClock";
 import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
 
@@ -24,6 +25,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(null);          // segment id currently acting
   const [reasonFor, setReasonFor] = useState(null); // { segment, action }
+  const [summaryFor, setSummaryFor] = useState(null); // activity id being written
 
   const [clock, setClock] = useState(0);            // re-derives locked/late from the device clock
   useEffect(() => {
@@ -153,6 +155,8 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     });
 
   const toggle = async (seg, act) => {
+    // A summary mission is ticked by writing the summary, not by tapping.
+    if (!act.checked && act.summary_required) { setSummaryFor(act.id); return; }
     const next = !act.checked;
     patchActivity(seg.id, act.id, next);
     if (next) haptic();
@@ -165,6 +169,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       }
     } catch (e) {
       patchActivity(seg.id, act.id, !next);
+      if (e?.response?.data?.detail === "SUMMARY_REQUIRED") { setSummaryFor(act.id); return; }
       await onFail(e, seg, "check");
     }
   };
@@ -323,6 +328,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                       a.checked ? "text-slate-500 line-through" : "text-slate-800"}`}>
                       {a.title}
                       {a.is_bonus && <span className="ml-1.5 text-[10px] text-amber-600 font-bold">BONUS</span>}
+                      {a.summary_required && !a.checked && <span className="ml-1.5 text-[10px] text-indigo-600 font-bold">📝 TULIS</span>}
                     </span>
                     {a.duration_minutes ? (
                       <span className="text-[11px] text-slate-500 shrink-0" title="Perkiraan lama mengerjakan">
@@ -331,6 +337,30 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                     ) : null}
                     <span className="text-[11px] font-bold text-indigo-600 shrink-0">+{a.points}</span>
                   </button>
+                  {a.summary_required && summaryFor === a.id && running && (
+                    <SummaryBox activity={a} onCancel={() => setSummaryFor(null)}
+                      onSaved={(txt) => {
+                        setSummaryFor(null);
+                        setData((d) => {
+                          const nd = d && { ...d, segments: d.segments.map((s2) => s2.id !== seg.id ? s2 : {
+                            ...s2,
+                            activities: s2.activities.map((x) => x.id === a.id
+                              ? { ...x, checked: true, summary_text: txt, summary_review: null, summary_note: null } : x),
+                            checked_required: s2.activities.filter((x) => !x.is_bonus && (x.id === a.id || x.checked)).length,
+                          }) };
+                          if (nd && cacheKey) cacheSet(cacheKey, nd);
+                          return nd;
+                        });
+                        haptic();
+                      }} />
+                  )}
+                  {a.summary_required && summaryFor !== a.id && (a.summary_text || a.summary_note) && (
+                    <div className="ml-9 text-xs text-slate-500 bg-slate-50 rounded-xl px-3 py-2">
+                      {a.summary_text && <div className="italic line-clamp-2">📝 “{a.summary_text}”</div>}
+                      {a.summary_review === "good" && <div className="text-emerald-600 font-semibold mt-0.5">👍 Dibaca Abi/Ummi</div>}
+                      {a.summary_note && <div className="text-amber-700 mt-0.5">💬 {a.summary_note}</div>}
+                    </div>
+                  )}
                   {(a.photo_required || a.before_photo_url || a.completion_photo_url) && (
                     <PhotoRow activity={a} canEdit={running && a.status !== "approved"}
                               onSaved={(patch) => patchPhoto(seg.id, a.id, patch)} />

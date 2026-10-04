@@ -536,6 +536,15 @@ class ChildUpdate(BaseModel):
 
 
 
+# Written summaries ("tulis apa yang sudah kamu pelajari"): a mission can ask
+# the child to put what they did into their own words before it counts.
+SUMMARY_MIN_WORDS_DEFAULT = 15
+SUMMARY_MIN_WORDS_FLOOR = 3
+SUMMARY_MIN_WORDS_CAP = 300
+SUMMARY_MAX_CHARS = 5000
+_SUMMARY_FIELDS = ("summary_required", "summary_prompt", "summary_min_words")
+
+
 class TaskInput(BaseModel):
     # Assignment: pick 1 kid, several kids, or leave empty = broadcast to ALL kids.
     # `child_id` is kept for backward compatibility (equivalent to target_children=[child_id]).
@@ -558,6 +567,9 @@ class TaskInput(BaseModel):
     order: Optional[int] = Field(default=None, ge=1)
     task_style: Optional[TASK_STYLE] = None
     photo_required: bool = False  # kid must attach a photo to mark this complete
+    summary_required: bool = False  # kid must write a short summary before ticking it
+    summary_prompt: Optional[str] = Field(default=None, max_length=200)
+    summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
     coop: bool = False  # true = a single shared task worked on together by target_children,
                          # not one copy per kid; points split evenly among participants on approval
     # "Bonus jika bersama": a SIMPLER alternative to full co-op — the task
@@ -594,6 +606,9 @@ class TaskUpdate(BaseModel):
     order: Optional[int] = Field(default=None, ge=1)
     task_style: Optional[TASK_STYLE] = None
     photo_required: Optional[bool] = None
+    summary_required: Optional[bool] = None
+    summary_prompt: Optional[str] = Field(default=None, max_length=200)
+    summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
     together_bonus_enabled: Optional[bool] = None
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
     # These were missing, so editing a task silently discarded them and the
@@ -2065,6 +2080,9 @@ async def _build_task_doc(
         "order": order,
         "task_style": task_style,
         "photo_required": payload.photo_required,
+        "summary_required": payload.summary_required,
+        "summary_prompt": (payload.summary_prompt or "").strip() or None,
+        "summary_min_words": payload.summary_min_words,
         "completion_photo_url": None,
         "is_coop": False,
         "coop_participants": [],
@@ -2178,7 +2196,7 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
     # Fields the parent is allowed to explicitly clear (set back to empty).
     # Sending null for these means "clear it" (back to Kapan Saja / the family
     # default), as opposed to "leave it alone" — which is what omitting does.
-    clearable = {"duration_minutes", "task_style", "segment_id"}
+    clearable = {"duration_minutes", "task_style", "segment_id", "summary_prompt", "summary_min_words"}
     raw = payload.model_dump(exclude_unset=True)
 
     updates = {}
@@ -2935,6 +2953,10 @@ class RoutineSlotInput(BaseModel):
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=600)
     points: int = Field(default=10, ge=0, le=10000)
     is_bonus: bool = False
+    # The child must write what they did/learned before it can be ticked.
+    summary_required: bool = False
+    summary_prompt: Optional[str] = Field(default=None, max_length=200)
+    summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
 
 
 class RoutineSlotUpdate(BaseModel):
@@ -2944,6 +2966,9 @@ class RoutineSlotUpdate(BaseModel):
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=600)
     points: Optional[int] = Field(default=None, ge=0, le=10000)
     is_bonus: Optional[bool] = None
+    summary_required: Optional[bool] = None
+    summary_prompt: Optional[str] = Field(default=None, max_length=200)
+    summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
 
 
 class RoutineMoveInput(BaseModel):
@@ -3057,9 +3082,10 @@ async def _ensure_day_built(dk: str) -> int:
                     "points": sl.get("points", 10), "penalty_points": 0,
                     "duration_minutes": sl.get("duration_minutes"),
                     "segment_id": sl.get("segment_id"), "order": sl.get("order") or 1,
-                    "is_bonus": bool(sl.get("is_bonus")), "date_key": dk, "due_time": None,
+                    "is_bonus": bool(sl.get("is_bonus")), "date_key": dk,
                     "recurrence": "none", "status": "pending", "created_at": now_iso(),
                     "from_routine_slot_id": sl["id"], "from_routine": True,
+                    **{f: sl.get(f) for f in _SUMMARY_FIELDS},
                 })
         if docs:
             await db.tasks.insert_many(docs)
@@ -3261,7 +3287,7 @@ async def _cleanup_legacy_schedule() -> Optional[dict]:
 
 def _slot_out(sl: dict) -> dict:
     return {k: sl.get(k) for k in ("id", "weekday", "segment_id", "child_id", "title",
-                                   "duration_minutes", "points", "is_bonus", "order")}
+                                   "duration_minutes", "points", "is_bonus", "order", *_SUMMARY_FIELDS)}
 
 
 @api.get("/routine")
@@ -3295,6 +3321,9 @@ async def add_routine_slot(payload: RoutineSlotInput, user: dict = Depends(requi
                "segment_id": payload.segment_id, "child_id": payload.child_id,
                "title": payload.title.strip(), "duration_minutes": payload.duration_minutes,
                "points": payload.points, "is_bonus": payload.is_bonus,
+               "summary_required": payload.summary_required,
+               "summary_prompt": (payload.summary_prompt or "").strip() or None,
+               "summary_min_words": payload.summary_min_words,
                "order": await _next_order(tpl["id"], wd, payload.segment_id), "created_at": now_iso()}
         await db.template_tasks.insert_one(doc)
         made.append(_slot_out(doc))
@@ -3309,7 +3338,10 @@ async def edit_routine_slot(slot_id: str, payload: RoutineSlotUpdate, user: dict
     if not sl:
         raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
     raw = payload.model_dump(exclude_unset=True)
-    upd = {k: v for k, v in raw.items() if v is not None or k in ("segment_id", "child_id", "duration_minutes")}
+    upd = {k: v for k, v in raw.items()
+           if v is not None or k in ("segment_id", "child_id", "duration_minutes", "summary_prompt", "summary_min_words")}
+    if "summary_prompt" in upd:
+        upd["summary_prompt"] = (upd["summary_prompt"] or "").strip() or None
     if "title" in upd:
         upd["title"] = upd["title"].strip()
     await _check_segment_and_child(upd.get("segment_id"), upd.get("child_id"))
@@ -3369,6 +3401,73 @@ async def copy_routine_day(payload: RoutineCopyInput, user: dict = Depends(requi
             copied += 1
     await _invalidate_days(_today_key(), include_today=False)
     return {"success": True, "copied": copied, "to_weekdays": targets}
+
+
+class RoutineCopyChildInput(BaseModel):
+    from_child_id: str
+    to_child_ids: List[str] = Field(min_length=1, max_length=20)
+    weekdays: Optional[List[int]] = None     # default: every day
+    segment_id: Optional[str] = None         # default: every section ("__anytime__" = Kapan Saja)
+    slot_ids: Optional[List[str]] = None     # copy just these activities
+    # "add": keep what the other child already has, skip same-named ones;
+    # "replace": the other child's own activities in that scope are replaced.
+    mode: Literal["add", "replace"] = "add"
+
+
+@api.post("/routine/copy-child")
+async def copy_routine_to_child(payload: RoutineCopyChildInput, user: dict = Depends(require_parent)):
+    """Copy one child's own routine activities to a sibling, so a parent
+    doesn't type the same list twice. Activities meant for every child are
+    already shared and are not copied."""
+    await get_child_or_404(FAMILY_ID, payload.from_child_id)
+    targets = [t for t in dict.fromkeys(payload.to_child_ids) if t != payload.from_child_id]
+    if not targets:
+        raise HTTPException(status_code=422, detail="Pilih anak tujuan yang berbeda")
+    for t in targets:
+        await get_child_or_404(FAMILY_ID, t)
+    if payload.weekdays is not None and any(w < 0 or w > 6 for w in payload.weekdays):
+        raise HTTPException(status_code=422, detail="Hari tidak valid")
+    tpl = await _routine_template()
+    q: dict = {"parent_id": FAMILY_ID, "template_id": tpl["id"], "child_id": payload.from_child_id}
+    if payload.weekdays is not None:
+        q["weekday"] = {"$in": sorted(set(payload.weekdays))}
+    if payload.segment_id:
+        q["segment_id"] = None if payload.segment_id == ANYTIME_SEGMENT_ID else payload.segment_id
+    if payload.slot_ids is not None:
+        q["id"] = {"$in": payload.slot_ids}
+    src = await db.template_tasks.find(q, {"_id": 0}).to_list(2000)
+    if not src:
+        raise HTTPException(status_code=404, detail="Tidak ada aktivitas khusus anak ini untuk disalin")
+    src.sort(key=lambda x: (x["weekday"], str(x.get("segment_id")), x.get("order") or 0))
+    scopes = {(x["weekday"], x.get("segment_id")) for x in src}
+    copied = skipped = removed = 0
+    for cid in targets:
+        if payload.mode == "replace" and payload.slot_ids is None:
+            for wd, seg in scopes:
+                res = await db.template_tasks.delete_many({"parent_id": FAMILY_ID, "template_id": tpl["id"],
+                                                           "child_id": cid, "weekday": wd, "segment_id": seg})
+                removed += res.deleted_count
+        have = {(x["weekday"], x.get("segment_id"), (x.get("title") or "").strip().lower())
+                for x in await db.template_tasks.find(
+                    {"parent_id": FAMILY_ID, "template_id": tpl["id"],
+                     "$or": [{"child_id": cid}, {"child_id": None}]},
+                    {"_id": 0, "weekday": 1, "segment_id": 1, "title": 1}).to_list(5000)}
+        for sl in src:
+            key = (sl["weekday"], sl.get("segment_id"), (sl.get("title") or "").strip().lower())
+            if key in have:
+                skipped += 1
+                continue
+            await db.template_tasks.insert_one({
+                **{k: v for k, v in sl.items() if k != "_id"}, "id": new_id(), "child_id": cid,
+                "order": await _next_order(tpl["id"], sl["weekday"], sl.get("segment_id")),
+                "created_at": now_iso(), "copied_from_slot_id": sl["id"],
+            })
+            have.add(key)
+            copied += 1
+    await _invalidate_days(_today_key(), include_today=False)
+    await log_activity(FAMILY_ID, payload.from_child_id, "routine_copied_to_child",
+                       {"to": targets, "copied": copied, "skipped": skipped, "removed": removed})
+    return {"success": True, "copied": copied, "skipped": skipped, "removed": removed}
 
 
 @api.post("/routine/apply-today")
@@ -3441,7 +3540,7 @@ async def add_routine_extra(payload: RoutineExtraInput, user: dict = Depends(req
             docs.append({"id": new_id(), "parent_id": FAMILY_ID, "child_id": cid, "title": payload.title.strip(),
                          "description": "", "points": payload.points, "penalty_points": 0,
                          "duration_minutes": payload.duration_minutes, "segment_id": payload.segment_id,
-                         "order": 999, "is_bonus": False, "date_key": dk, "due_time": None,
+                         "order": 999, "is_bonus": False, "date_key": dk,
                          "recurrence": "none", "status": "pending", "created_at": now_iso(),
                          "extra_group_id": gid, "extra_child_id": payload.child_id, "extra_note": payload.note.strip()})
     if docs:
@@ -3690,6 +3789,12 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                 "checked": bool(a.get("checked")) or a.get("status") in ("completed", "approved"),
                 "status": a.get("status"),
                 "photo_required": bool(a.get("photo_required")),
+                "summary_required": bool(a.get("summary_required")),
+                "summary_prompt": a.get("summary_prompt"),
+                "summary_min_words": int(a.get("summary_min_words") or SUMMARY_MIN_WORDS_DEFAULT),
+                "summary_text": a.get("summary_text"),
+                "summary_review": a.get("summary_review"),
+                "summary_note": a.get("summary_note"),
                 # Photos as cacheable media URLs, never inline base64.
                 "before_photo_url": _media_ref("task", a["id"], "before_photo_url", a.get("before_photo_url")),
                 "completion_photo_url": _media_ref("task", a["id"], "completion_photo_url", a.get("completion_photo_url")),
@@ -3790,6 +3895,9 @@ async def check_activity(task_id: str, payload: ActivityCheckInput, user: dict =
     if seg_id != ANYTIME_SEGMENT_ID and not any(s["id"] == seg_id for s in await _get_day_segments()):
         seg_id = ANYTIME_SEGMENT_ID
     await _require_running_session(child_id, task["date_key"], seg_id)
+    if payload.checked and task.get("summary_required") and not task.get("summary_text"):
+        # The tick comes from writing the summary (POST /tasks/{id}/summary).
+        raise HTTPException(status_code=422, detail="SUMMARY_REQUIRED")
     await db.tasks.update_one({"id": task_id}, {"$set": {
         "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
     }})
@@ -3804,12 +3912,99 @@ async def check_all_activities(payload: SegmentCheckAllInput, user: dict = Depen
         raise HTTPException(status_code=422, detail="Tanggal tidak valid")
     await _require_running_session(payload.child_id, dk, payload.segment_id)
     ids = [t["id"] for t in await _segment_tasks(payload.child_id, dk, payload.segment_id)
-           if t.get("status") in ("pending", "rejected")]
+           if t.get("status") in ("pending", "rejected")
+           and not (payload.checked and t.get("summary_required") and not t.get("summary_text"))]
     if ids:
         await db.tasks.update_many({"id": {"$in": ids}}, {"$set": {
             "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
         }})
     return {"success": True, "updated": len(ids)}
+
+
+class SummaryInput(BaseModel):
+    text: str = Field(min_length=1, max_length=SUMMARY_MAX_CHARS)
+    # Hints from the phone, shown to the parent: was any of it pasted in,
+    # and how long was spent writing it.
+    pasted: bool = False
+    typing_seconds: Optional[int] = Field(default=None, ge=0, le=86400)
+
+
+def _summary_words(text: str) -> list:
+    return re.findall(r"[0-9A-Za-zÀ-ÿ]+", text.lower())
+
+
+@api.post("/tasks/{task_id}/summary")
+async def write_task_summary(task_id: str, payload: SummaryInput, user: dict = Depends(get_current_user)):
+    """The child writes what they did or learned; a written summary is what
+    ticks a summary mission. Checked for length and for not just repeating
+    the same words, so a quick 'aaa aaa aaa' doesn't count."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    owners = task.get("coop_participants") or [task.get("child_id")]
+    if user["role"] == "child" and user["id"] not in owners:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    if not task.get("summary_required"):
+        raise HTTPException(status_code=400, detail="Misi ini tidak memakai ringkasan")
+    if task.get("status") not in ("pending", "rejected"):
+        raise HTTPException(status_code=409, detail="Misi ini sudah ditutup")
+    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
+    seg_id = task.get("segment_id") or ANYTIME_SEGMENT_ID
+    await _refresh_segments_cache()
+    if seg_id != ANYTIME_SEGMENT_ID and not any(s["id"] == seg_id for s in await _get_day_segments()):
+        seg_id = ANYTIME_SEGMENT_ID
+    await _require_running_session(child_id, task["date_key"], seg_id)
+    text = payload.text.strip()
+    words = _summary_words(text)
+    need = int(task.get("summary_min_words") or SUMMARY_MIN_WORDS_DEFAULT)
+    if len(words) < need:
+        raise HTTPException(status_code=422, detail=f"Ringkasannya kurang panjang: {len(words)} dari {need} kata")
+    if len(words) >= 8 and len(set(words)) / len(words) < 0.35:
+        raise HTTPException(status_code=422, detail="Tulis dengan kalimatmu sendiri ya, jangan diulang-ulang")
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "summary_text": text, "summary_words": len(words), "summary_at": now_iso(),
+        "summary_pasted": bool(payload.pasted), "summary_typing_seconds": payload.typing_seconds,
+        "summary_review": None, "summary_note": None,
+        "checked": True, "checked_at": now_iso(),
+    }})
+    await log_activity(FAMILY_ID, child_id, "summary_written",
+                       {"title": task.get("title"), "words": len(words), "pasted": bool(payload.pasted)})
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+class SummaryReviewInput(BaseModel):
+    verdict: Literal["good", "redo"]
+    note: str = Field(default="", max_length=300)
+
+
+@api.post("/tasks/{task_id}/summary-review")
+async def review_task_summary(task_id: str, payload: SummaryReviewInput, user: dict = Depends(require_parent)):
+    """A parent reads the summary: 👍, or 'tulis ulang'. While the section is
+    still open, 'tulis ulang' unticks the mission so the child rewrites it."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    if not task.get("summary_text"):
+        raise HTTPException(status_code=400, detail="Belum ada ringkasan untuk dinilai")
+    upd = {"summary_review": payload.verdict, "summary_note": payload.note.strip() or None,
+           "summary_reviewed_at": now_iso()}
+    reopened = False
+    if payload.verdict == "redo" and task.get("status") in ("pending", "rejected"):
+        upd.update({"checked": False, "checked_at": None, "summary_text": None})
+        upd["summary_previous"] = task.get("summary_text")
+        reopened = True
+    await db.tasks.update_one({"id": task_id}, {"$set": upd})
+    owner = task.get("child_id")
+    await log_activity(FAMILY_ID, owner, "summary_reviewed",
+                       {"title": task.get("title"), "verdict": payload.verdict})
+    if payload.verdict == "redo" or payload.note.strip():
+        await send_push_to(
+            {"role": "child", "member_id": owner},
+            title="Tentang ringkasanmu 📝" if payload.verdict == "redo" else "Ringkasanmu sudah dibaca 👍",
+            body=payload.note.strip() or ("Tulis ulang ya, lebih lengkap lagi." if reopened else "Bagus!"),
+            url=f"/kid/{owner}",
+        )
+    return {"success": True, "reopened": reopened, "task": await db.tasks.find_one({"id": task_id}, {"_id": 0})}
 
 
 @api.post("/segment-sessions/finish")
@@ -3825,6 +4020,14 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
     sess = await _require_running_session(payload.child_id, dk, payload.segment_id)
 
     acts = await _segment_tasks(payload.child_id, dk, payload.segment_id)
+    # A summary mission is ticked by writing it, so name it explicitly.
+    missing_summary = [a for a in acts if a.get("summary_required") and not a.get("is_bonus")
+                       and a.get("status") in ("pending", "rejected") and not a.get("summary_text")]
+    if missing_summary:
+        raise HTTPException(
+            status_code=422,
+            detail="Tulis ringkasan dulu untuk: " + ", ".join(a["title"] for a in missing_summary[:3]),
+        )
     open_required = [a for a in acts if not a.get("is_bonus")
                      and a.get("status") in ("pending", "rejected") and not a.get("checked")]
     if open_required:
@@ -5439,6 +5642,7 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             _validate_day_segments(incoming["day_segments"])
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
         await db.app_config.insert_one(config)
+        _invalidate_config_cache()  # the cached defaults must not outlive the first save
     await log_activity(FAMILY_ID, None, "config_updated", {"changes": payload.model_dump()})
     return {"success": True}
 

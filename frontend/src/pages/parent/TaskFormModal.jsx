@@ -18,6 +18,9 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
   const [segments, setSegments] = useState([]);
   const [isBonus, setIsBonus] = useState(false);
   const [photoRequired, setPhotoRequired] = useState(false);
+  const [summaryRequired, setSummaryRequired] = useState(false);
+  const [summaryPrompt, setSummaryPrompt] = useState("");
+  const [summaryMinWords, setSummaryMinWords] = useState(15);
   const [isCoop, setIsCoop] = useState(false);
   const [togetherBonusEnabled, setTogetherBonusEnabled] = useState(false);
   const [togetherBonusPoints, setTogetherBonusPoints] = useState(10);
@@ -52,6 +55,9 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setSegmentId(editTask.segment_id || "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
+      setSummaryRequired(!!editTask.summary_required);
+      setSummaryPrompt(editTask.summary_prompt || "");
+      setSummaryMinWords(editTask.summary_min_words || 15);
       setIsCoop(!!editTask.is_coop);
       setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
       setTogetherBonusPoints(editTask.together_bonus_points || 10);
@@ -68,6 +74,9 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setSegmentId(editTask.segment_id || "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
+      setSummaryRequired(!!editTask.summary_required);
+      setSummaryPrompt(editTask.summary_prompt || "");
+      setSummaryMinWords(editTask.summary_min_words || 15);
       setIsCoop(false);
       setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
       setTogetherBonusPoints(editTask.together_bonus_points || 10);
@@ -79,6 +88,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setDateKey(todayKey());
       setSegmentId("");
       setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
+      setSummaryRequired(false); setSummaryPrompt(""); setSummaryMinWords(15);
       setTogetherBonusEnabled(false); setTogetherBonusPoints(10);
       setOrder(""); setTaskStyle("");
     }
@@ -112,6 +122,9 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
         segment_id: segmentId || null,
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
+        summary_required: summaryRequired,
+        summary_prompt: summaryRequired ? (summaryPrompt.trim() || null) : null,
+        summary_min_words: summaryRequired ? Math.min(300, Math.max(3, Number(summaryMinWords) || 15)) : null,
         coop: !isEdit && isCoop,
         together_bonus_enabled: togetherBonusEnabled,
         together_bonus_points: togetherBonusEnabled ? Number(togetherBonusPoints) : null,
@@ -343,6 +356,34 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
             <div className="text-xs text-slate-500">Anak harus lampirkan foto sebelum bisa menandai selesai.</div>
           </div>
         </button>
+
+        {/* Written summary: the child writes what they did/learned before
+            the mission can be ticked. */}
+        <div className={`rounded-xl border-2 transition-colors ${summaryRequired ? "border-indigo-400 bg-indigo-50" : "border-slate-200"}`}>
+          <button type="button" onClick={() => setSummaryRequired(!summaryRequired)}
+            className="w-full flex items-center gap-3 px-4 py-3 hover:bg-slate-50/50 rounded-xl">
+            <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+              summaryRequired ? "bg-indigo-500 border-indigo-500" : "border-slate-300"}`}>
+              {summaryRequired && <span className="text-white text-xs">✓</span>}
+            </div>
+            <div className="flex-1 text-left">
+              <div className="font-semibold text-slate-800 text-sm">📝 Anak menulis ringkasan</div>
+              <div className="text-xs text-slate-500">Misal setelah belajar: anak menulis apa yang sudah dibaca. Baru bisa dicentang setelah ditulis.</div>
+            </div>
+          </button>
+          {summaryRequired && (
+            <div className="px-4 pb-3 grid grid-cols-[1fr_auto] gap-2">
+              <input value={summaryPrompt} onChange={(e) => setSummaryPrompt(e.target.value.slice(0, 200))}
+                placeholder="Pertanyaan, mis. Apa 3 hal yang kamu pelajari?" className={inputClass} />
+              <label className="flex items-center gap-1 text-xs text-slate-500">
+                min
+                <input type="number" min="3" max="300" value={summaryMinWords}
+                  onChange={(e) => setSummaryMinWords(e.target.value)} className={`${inputClass} w-20`} />
+                kata
+              </label>
+            </div>
+          )}
+        </div>
 
         {/* Co-op quest toggle — only offered when creating (not editing), since
             an existing task's coop-ness can't be changed after the fact. */}

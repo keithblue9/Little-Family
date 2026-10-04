@@ -64,6 +64,20 @@ with TestClient(server.app, base_url="https://testserver") as c:
     first_seg = next(iter(SEG.values()))
     TODAY, TOMORROW = day(0), day(1)
 
+    # ---------------- Regression: a family's very first settings save ----------------
+    saved_cfg = run(server.db.app_config.find_one({"parent_id": "family-default"}, {"_id": 0}))
+    run(server.db.app_config.delete_many({}))
+    server._invalidate_config_cache()
+    run(server.get_config_cached())                     # cache the "no settings yet" state
+    c.post("/api/config", json={"day_segments": [{"label": "Uji", "start_time": "00:00", "end_time": "23:59"}]})
+    uji = next(x["id"] for x in c.get("/api/config").json()["day_segments"] if x["label"] == "Uji")
+    r = c.post("/api/routine/slots", json={"weekdays": [0], "segment_id": uji, "title": "Cek", "points": 1})
+    check("config: a first-ever save is visible at once", r.status_code == 200, r.text[:150])
+    run(server.db.app_config.delete_many({}))
+    run(server.db.app_config.insert_one(saved_cfg))
+    server._invalidate_config_cache()
+    run(server.db.template_tasks.delete_many({}))
+
     # ---------------- Routine: only near days are built ----------------
     reset_schedule()
     add_routine(c, "Rapikan kasur", 10, first_seg)
@@ -429,6 +443,140 @@ with TestClient(server.app, base_url="https://testserver") as c:
     after = [t for t in c.get(f"/api/tasks?date_key={TOMORROW}").json() if t["title"] == "Rutin pagi"]
     check("routine: an edit is visible without waiting", after and all(t["points"] == 21 for t in after),
           str([t["points"] for t in after]))
+
+    # ---------------- Copy one child's routine to a sibling ----------------
+    reset_schedule()
+    sib = next(k for k in kids if k["id"] != adskhan["id"])
+    segs_all = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    add_routine(c, "Bangun pagi", 10, segs_all[0], weekdays=[0, 1], child_id=adskhan["id"])
+    add_routine(c, "Sholat Subuh", 10, segs_all[0], weekdays=[0], child_id=adskhan["id"])
+    add_routine(c, "Les piano", 15, segs_all[1], weekdays=[0], child_id=adskhan["id"])
+    add_routine(c, "Sarapan", 5, segs_all[0], weekdays=[0])                      # every child: not copied
+    add_routine(c, "Sholat Subuh", 10, segs_all[0], weekdays=[0], child_id=sib["id"])  # sibling already has it
+
+    def mine(cid, wd=None):
+        rows = [x for x in c.get("/api/routine").json()["slots"] if x["child_id"] == cid]
+        return sorted((x["weekday"], x["title"]) for x in rows if wd is None or x["weekday"] == wd)
+
+    r = c.post("/api/routine/copy-child", json={"from_child_id": adskhan["id"], "to_child_ids": [sib["id"]],
+                                                "weekdays": [0], "segment_id": segs_all[0]})
+    check("copy-child: one day + one section", r.status_code == 200 and r.json()["copied"] == 1
+          and r.json()["skipped"] == 1, r.text[:200])
+    check("copy-child: only that scope was copied", mine(sib["id"]) == [(0, "Bangun pagi"), (0, "Sholat Subuh")],
+          str(mine(sib["id"])))
+    r = c.post("/api/routine/copy-child", json={"from_child_id": adskhan["id"], "to_child_ids": [sib["id"]]})
+    check("copy-child: whole week adds the rest, never doubles",
+          r.status_code == 200 and mine(sib["id"]) == [(0, "Bangun pagi"), (0, "Les piano"), (0, "Sholat Subuh"),
+                                                       (1, "Bangun pagi")], str(mine(sib["id"])))
+    check("copy-child: shared activities stay shared",
+          len([x for x in c.get("/api/routine").json()["slots"] if x["title"] == "Sarapan"]) == 1)
+    one = next(x for x in c.get("/api/routine").json()["slots"]
+               if x["child_id"] == adskhan["id"] and x["title"] == "Les piano")
+    c.patch(f"/api/routine/slots/{one['id']}", json={"points": 30})
+    run(server.db.template_tasks.delete_many({"child_id": sib["id"], "title": "Les piano"}))
+    r = c.post("/api/routine/copy-child", json={"from_child_id": adskhan["id"], "to_child_ids": [sib["id"]],
+                                                "slot_ids": [one["id"]]})
+    piano = [x for x in c.get("/api/routine").json()["slots"] if x["child_id"] == sib["id"] and x["title"] == "Les piano"]
+    check("copy-child: a single activity, with its points", r.status_code == 200 and len(piano) == 1
+          and piano[0]["points"] == 30, str(piano))
+    add_routine(c, "Punya adik sendiri", 3, segs_all[0], weekdays=[1], child_id=sib["id"])
+    r = c.post("/api/routine/copy-child", json={"from_child_id": adskhan["id"], "to_child_ids": [sib["id"]],
+                                                "weekdays": [1], "mode": "replace"})
+    check("copy-child: replace swaps the sibling's own list for that day",
+          r.status_code == 200 and mine(sib["id"], 1) == [(1, "Bangun pagi")] and r.json()["removed"] >= 1,
+          str(mine(sib["id"], 1)))
+    check("copy-child: the source is untouched",
+          mine(adskhan["id"]) == [(0, "Bangun pagi"), (0, "Les piano"), (0, "Sholat Subuh"), (1, "Bangun pagi")])
+    check("copy-child: copying to oneself → 422", c.post("/api/routine/copy-child", json={
+        "from_child_id": adskhan["id"], "to_child_ids": [adskhan["id"]]}).status_code == 422)
+    check("copy-child: nothing to copy → 404", c.post("/api/routine/copy-child", json={
+        "from_child_id": adskhan["id"], "to_child_ids": [sib["id"]], "weekdays": [5]}).status_code == 404)
+    check("copy-child: unknown child → 404", c.post("/api/routine/copy-child", json={
+        "from_child_id": adskhan["id"], "to_child_ids": ["nope"]}).status_code == 404)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    check("copy-child: kids cannot copy", c.post("/api/routine/copy-child", json={
+        "from_child_id": adskhan["id"], "to_child_ids": [sib["id"]]}).status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # ---------------- Written summary missions ----------------
+    reset_schedule()
+    sm = add_routine(c, "Belajar IPA", 15, first_seg, weekdays=list(range(7)), child_id=adskhan["id"])
+    slot_ids = [x["id"] for x in sm["created"]]
+    r = c.patch(f"/api/routine/slots/{slot_ids[0]}", json={"summary_required": True, "summary_min_words": 5,
+                                                          "summary_prompt": "Apa yang kamu pelajari?"})
+    check("summary: routine activity can require one", r.status_code == 200 and r.json()["summary_required"] is True
+          and r.json()["summary_min_words"] == 5, r.text[:200])
+    for sid in slot_ids[1:]:
+        c.patch(f"/api/routine/slots/{sid}", json={"summary_required": True, "summary_min_words": 5,
+                                                  "summary_prompt": "Apa yang kamu pelajari?"})
+    c.post("/api/routine/apply-today")
+    t_sum = next(t for t in c.get(f"/api/tasks?date_key={TODAY}").json() if t["title"] == "Belajar IPA")
+    check("summary: the day's mission carries it", t_sum.get("summary_required") is True
+          and t_sum.get("summary_prompt") == "Apa yang kamu pelajari?", str({k: t_sum.get(k) for k in t_sum if "summary" in k}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    sd = c.get(f"/api/children/{adskhan['id']}/segments-day").json()
+    sseg = next(x for x in sd["segments"] if any(a["id"] == t_sum["id"] for a in x["activities"]))
+    sact = next(a for a in sseg["activities"] if a["id"] == t_sum["id"])
+    check("summary: the checklist knows it needs writing",
+          sact["summary_required"] is True and sact["summary_min_words"] == 5 and sact["summary_text"] is None)
+    sb = {"child_id": adskhan["id"], "date_key": TODAY, "segment_id": sseg["id"]}
+    reason = (sd.get("late_reasons") or [{}])[0].get("id")
+    r = c.post("/api/tasks/" + t_sum["id"] + "/summary", json={"text": "Aku belajar tentang tumbuhan hijau"})
+    check("summary: not before the section starts", r.status_code == 409, str(r.status_code))
+    rs = c.post("/api/segment-sessions/start", json=sb)
+    if rs.status_code == 409:
+        c.post("/api/segment-sessions/start", json={**sb, "late_reason_id": reason})
+    r = c.post(f"/api/tasks/{t_sum['id']}/check", json={"checked": True})
+    check("summary: a plain tick is refused", r.status_code == 422 and "SUMMARY_REQUIRED" in r.text, r.text[:120])
+    c.post("/api/segment-sessions/check-all", json={**sb, "checked": True})
+    check("summary: 'centang semua' skips it",
+          run(server.db.tasks.find_one({"id": t_sum["id"]})).get("checked") is not True)
+    r = c.post("/api/segment-sessions/finish", json={**sb, "late_reason_id": reason})
+    check("summary: the section can't finish without it", r.status_code == 422 and "ringkasan" in r.text.lower(),
+          r.text[:150])
+    r = c.post(f"/api/tasks/{t_sum['id']}/summary", json={"text": "belajar ipa"})
+    check("summary: too short is refused with the count", r.status_code == 422 and "2 dari 5" in r.text, r.text[:150])
+    r = c.post(f"/api/tasks/{t_sum['id']}/summary", json={"text": "aaa aaa aaa aaa aaa aaa aaa aaa aaa aaa"})
+    check("summary: repeating one word is refused", r.status_code == 422, r.text[:150])
+    r = c.post(f"/api/tasks/{t_sum['id']}/summary", json={
+        "text": "Aku belajar fotosintesis. Daun memakai cahaya matahari untuk membuat makanan.",
+        "pasted": True, "typing_seconds": 40})
+    check("summary: a real summary ticks the mission", r.status_code == 200 and r.json()["checked"] is True
+          and r.json()["summary_words"] >= 5, r.text[:200])
+    check("summary: paste hint kept for the parent", r.json().get("summary_pasted") is True)
+    other = next(k for k in kids if k["id"] != adskhan["id"])
+    c.post("/api/auth/login", json={"member_id": other["id"], "passcode": "123456"})
+    check("summary: a sibling can't write it", c.post(f"/api/tasks/{t_sum['id']}/summary",
+          json={"text": "ini bukan punyaku sama sekali ya"}).status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{t_sum['id']}/summary-review", json={"verdict": "redo", "note": "Ceritakan contohnya"})
+    check("summary: parent can ask for a rewrite", r.status_code == 200 and r.json()["reopened"] is True, r.text[:150])
+    t_after = run(server.db.tasks.find_one({"id": t_sum["id"]}))
+    check("summary: rewrite unticks it and keeps the old one",
+          t_after["checked"] is False and t_after["summary_text"] is None and t_after["summary_previous"])
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    sd2 = c.get(f"/api/children/{adskhan['id']}/segments-day").json()
+    a2 = next(a for x in sd2["segments"] for a in x["activities"] if a["id"] == t_sum["id"])
+    check("summary: the child sees the parent's note", a2["summary_note"] == "Ceritakan contohnya"
+          and a2["summary_review"] == "redo")
+    c.post(f"/api/tasks/{t_sum['id']}/summary", json={
+        "text": "Fotosintesis contohnya daun mangga di halaman yang hijau karena klorofil."})
+    r = c.post("/api/segment-sessions/finish", json={**sb, "late_reason_id": reason})
+    check("summary: with it written the section finishes", r.status_code == 200, r.text[:150])
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{t_sum['id']}/summary-review", json={"verdict": "good"})
+    check("summary: 👍 after the section closed just records it",
+          r.status_code == 200 and r.json()["reopened"] is False
+          and run(server.db.tasks.find_one({"id": t_sum["id"]}))["summary_review"] == "good")
+    one_off = c.post("/api/tasks", json={"title": "Baca buku", "points": 5, "date_key": TODAY,
+                                         "target_children": [adskhan["id"]], "summary_required": True,
+                                         "summary_min_words": 4}).json()
+    check("summary: one-off missions can ask for one too", one_off.get("summary_required") is True
+          and one_off.get("summary_min_words") == 4)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    check("summary: kids cannot review", c.post(f"/api/tasks/{t_sum['id']}/summary-review",
+          json={"verdict": "good"}).status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
     # ---------------- Offline replay: start/finish keep their real time ----------------
     UTC = dt.timezone.utc

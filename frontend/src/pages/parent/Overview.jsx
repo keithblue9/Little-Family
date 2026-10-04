@@ -7,10 +7,14 @@ const Leaderboard = lazy(() => import("@/components/Leaderboard"));
 const WeeklyReport = lazy(() => import("@/components/WeeklyReport"));
 const FamilyChallenges = lazy(() => import("@/components/FamilyChallenges"));
 const FamilyMissionCard = lazy(() => import("@/components/FamilyMissionCard"));
+const ParentInbox = lazy(() => import("@/components/ParentInbox"));
 
-export function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNavigate }) {
+export function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNavigate, onInboxCount }) {
   return (
     <div className="space-y-6">
+      {/* What needs a parent comes first; everything else is context. */}
+      <Suspense fallback={null}><ParentInbox onNavigate={onNavigate} onCount={onInboxCount} /></Suspense>
+
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Anak" value={stats?.children_count ?? "—"} icon={Users} color="#6366F1" onClick={() => onNavigate("settings")} />
         <StatCard label="Menunggu cek" value={stats?.pending_approval ?? "—"} sub="Tugas menunggumu" icon={Clock} color="#FF9D23" onClick={() => onNavigate("tasks")} />
@@ -71,18 +75,19 @@ export function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, o
         </div>
       </div>
 
-      {/* Merged: Leaderboard */}
+      {/* The rest is good to have but rarely urgent — folded away. */}
       {kids.length > 0 && (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200">
-          <Leaderboard />
-        </div>
+        <details className="bg-white rounded-2xl border border-slate-200 group">
+          <summary className="cursor-pointer px-5 py-3 text-sm font-semibold text-slate-600 select-none">
+            🏆 Peringkat, tantangan & laporan mingguan
+          </summary>
+          <div className="p-4 pt-0 space-y-6">
+            <Leaderboard />
+            <FamilyChallenges kids={kids} />
+            <WeeklyReport />
+          </div>
+        </details>
       )}
-
-      {/* Family challenges */}
-      {kids.length > 0 && <FamilyChallenges kids={kids} />}
-
-      {/* Merged: Weekly report */}
-      {kids.length > 0 && <WeeklyReport />}
     </div>
   );
 }

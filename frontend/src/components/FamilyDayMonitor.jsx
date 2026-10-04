@@ -9,6 +9,7 @@ import BeforeAfter from "@/components/BeforeAfter";
 import MonthHeatmap from "@/components/MonthHeatmap";
 import GrowthTrail from "@/components/GrowthTrail";
 import OverdueSectionsCard from "@/components/OverdueSectionsCard";
+import { correctTask, trustTone } from "@/lib/honesty";
 
 const statusLabel = {
   pending: { icon: Clock, label: "Belum", color: "text-slate-400" },
@@ -23,6 +24,10 @@ export default function FamilyDayMonitor() {
   const [dateKey, setDateKey] = useState(todayKey());
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [segments, setSegments] = useState([]);
+  useEffect(() => {
+    api.get("/config").then((r) => setSegments(r.data?.day_segments || [])).catch(() => {});
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -35,6 +40,10 @@ export default function FamilyDayMonitor() {
   }, [dateKey]);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    window.addEventListener("app:parent-refresh", load);
+    return () => window.removeEventListener("app:parent-refresh", load);
+  }, [load]);
 
   const isToday = dateKey === todayKey();
 
@@ -76,7 +85,7 @@ export default function FamilyDayMonitor() {
         <>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {data.children.map((entry) => (
-              <ChildDayCard key={entry.child.id} entry={entry} onChanged={load} />
+              <ChildDayCard key={entry.child.id} entry={entry} onChanged={load} segments={segments} />
             ))}
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -95,8 +104,13 @@ export default function FamilyDayMonitor() {
   );
 }
 
-function ChildDayCard({ entry, onChanged }) {
+function ChildDayCard({ entry, onChanged, segments = [] }) {
   const child = entry.child;
+  const [honesty, setHonesty] = useState(null);
+  useEffect(() => {
+    api.get(`/children/${child.id}/honesty`).then((r) => setHonesty(r.data)).catch(() => {});
+  }, [child.id, entry]);
+  const tone = honesty ? trustTone(honesty.trust_score) : null;
   const theme = QUEST_THEMES[pickQuestTheme(child)] || QUEST_THEMES.ocean;
 
   const required = (entry.tasks || []).filter((t) => !t.is_bonus).sort((a, b) => (a.order || 0) - (b.order || 0));
@@ -127,6 +141,23 @@ function ChildDayCard({ entry, onChanged }) {
           <div className="text-4xl">{theme.goalIcon}</div>
         </div>
       </div>
+
+      {honesty && (
+        <div className="px-4 py-2 border-b border-slate-100 flex items-center gap-2 flex-wrap text-xs">
+          <span className={`font-semibold rounded-full px-2 py-0.5 ${tone.cls}`} title="Skor kepercayaan (0–100)">
+            🤝 {honesty.trust_score} · {tone.label}
+          </span>
+          {honesty.probation_until && (
+            <span className="font-semibold rounded-full px-2 py-0.5 text-sky-700 bg-sky-50">
+              👀 Pengawasan s/d {honesty.probation_until.slice(5)}
+            </span>
+          )}
+          {honesty.strikes > 0 && (
+            <span className="text-slate-500">Koreksi 14 hari: {honesty.strikes}</span>
+          )}
+          {honesty.honest_admits > 0 && <span className="text-emerald-600">🙏 Jujur mengaku {honesty.honest_admits}×</span>}
+        </div>
+      )}
 
       {/* Goal progress bar */}
       <div className={`p-4 border-b border-slate-100 ${entry.goal_met ? "bg-green-50" : "bg-white"}`}>
@@ -161,8 +192,17 @@ function ChildDayCard({ entry, onChanged }) {
           <div className="text-sm text-slate-400 text-center py-3">Tidak ada misi di hari ini.</div>
         ) : (
           <>
-            {required.map((t) => (
-              <TaskRow key={t.id} task={t} onChanged={onChanged} />
+            {groupBySection(required, segments).map((g) => (
+              <div key={g.id} className="space-y-1.5">
+                {g.label && (
+                  <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wide pt-1">
+                    {g.emoji} {g.label} {g.time && <span className="font-normal normal-case text-slate-400">· {g.time}</span>}
+                  </div>
+                )}
+                {g.tasks.map((t) => (
+                  <TaskRow key={t.id} task={t} onChanged={onChanged} strikes={honesty?.strikes} />
+                ))}
+              </div>
             ))}
             {bonus.length > 0 && (
               <div className="mt-3 pt-3 border-t border-slate-100">
@@ -170,7 +210,7 @@ function ChildDayCard({ entry, onChanged }) {
                   <Sparkles className="w-3 h-3" /> Bonus
                 </div>
                 {bonus.map((t) => (
-                  <TaskRow key={t.id} task={t} bonus onChanged={onChanged} />
+                  <TaskRow key={t.id} task={t} bonus onChanged={onChanged} strikes={honesty?.strikes} />
                 ))}
               </div>
             )}
@@ -181,18 +221,30 @@ function ChildDayCard({ entry, onChanged }) {
   );
 }
 
+// Missions under their section headers, in the day's order; "Kapan Saja" last.
+function groupBySection(tasks, segments) {
+  if (!segments.length) return [{ id: "all", tasks }];
+  const groups = segments.map((sg) => ({
+    id: sg.id, label: sg.label, emoji: sg.emoji, time: sg.start_time ? `${sg.start_time}–${sg.end_time}` : "", tasks: [] }));
+  const rest = { id: "anytime", label: "Kapan Saja", emoji: "✨", time: "", tasks: [] };
+  for (const t of tasks) (groups.find((g) => g.id === t.segment_id) || rest).tasks.push(t);
+  return [...groups, rest].filter((g) => g.tasks.length);
+}
+
 function fmtClock(iso) {
   if (!iso) return "";
   try {
     return new Date(iso).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
   } catch { return ""; }
 }
-function TaskRow({ task, bonus, onChanged }) {
+function TaskRow({ task, bonus, onChanged, strikes }) {
   const s = statusLabel[task.status] || statusLabel.pending;
   const Icon = s.icon;
   const isDone = task.status === "approved" || task.status === "completed" || task.status === "skipped";
   const hasPhoto = task.before_photo_url || task.completion_photo_url;
   const [showPhoto, setShowPhoto] = useState(false);
+  const canCorrect = !task.correction_redo && (task.checked || task.status === "completed" || task.status === "approved");
+  const stepsDone = (task.steps_done || []).filter(Boolean).length;
 
   return (
     <div className="space-y-1.5">
@@ -217,6 +269,14 @@ function TaskRow({ task, bonus, onChanged }) {
           {task.is_coop && <span className="text-teal-600 font-bold">🤝 Bersama</span>}
           {task.duration_minutes && <span>· ±{task.duration_minutes}m</span>}
           {task.checked_at && <span title="Waktu anak mencentang">· ✔️ {fmtClock(task.checked_at)}</span>}
+          {task.correction_redo && (
+            <span className="text-amber-600 font-semibold">· 🔁 {task.redo_claimed_at ? "anak bilang sudah dibetulkan" : "sedang dibetulkan"}</span>
+          )}
+          {task.honest_admit && <span className="text-emerald-600 font-semibold">· 🙏 anak jujur: belum</span>}
+          {task.reading_page && (
+            <span className="text-sky-600">· 📖 {task.reading_book} hal. {task.reading_from_page ? `${task.reading_from_page}→` : ""}{task.reading_page}</span>
+          )}
+          {(task.steps || []).length > 0 && <span>· ☑️ {stepsDone}/{task.steps.length}</span>}
         </div>
       </div>
       {hasPhoto && (
@@ -229,6 +289,13 @@ function TaskRow({ task, bonus, onChanged }) {
         <Star className="w-3 h-3 fill-amber-500 text-amber-500" />
         {task.points}
       </div>
+      {canCorrect && (
+        <button onClick={async () => { if (await correctTask(task, strikes)) onChanged?.(); }}
+                title="Dicentang tapi ternyata tidak dikerjakan"
+                className="press-btn shrink-0 px-2 py-1 rounded-lg text-[11px] font-semibold border border-rose-200 text-rose-600 hover:bg-rose-50">
+          Tidak dikerjakan
+        </button>
+      )}
     </div>
     {showPhoto && hasPhoto && (
       <BeforeAfter before={task.before_photo_url} after={task.completion_photo_url} alt={task.title} />

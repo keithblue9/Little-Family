@@ -1,4 +1,4 @@
-import { lazy } from "react";
+import { lazy, useState } from "react";
 import { Plus, Trash2, RotateCcw, PawPrint, Scale } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -24,6 +24,7 @@ const PunishmentConfig = lazy(() => import("@/components/PunishmentConfig"));
 const DaySegmentsConfig = lazy(() => import("@/components/DaySegmentsConfig"));
 const SegmentStartsConfig = lazy(() => import("@/components/SegmentStartsConfig"));
 const ExamPeriodConfig = lazy(() => import("@/components/ExamPeriodConfig"));
+const HonestyConfig = lazy(() => import("@/components/HonestyConfig"));
 
 export function SettingsView({ kids, onAdd, onRefresh }) {
   const { user } = useAuth();
@@ -243,73 +244,66 @@ export function SettingsView({ kids, onAdd, onRefresh }) {
         )}
       </div>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <ProfileEditor />
-      </div>
+      <Group id="family" title="👨‍👩‍👧 Keluarga & akses" hint="Profil, passcode, tautan untuk kakek-nenek">
+        <Box><ProfileEditor /></Box>
+        <Box><MemberPasscodeManager /></Box>
+        <Box><ViewLinksManager /></Box>
+      </Group>
 
-      {/* Stage 2 & 3: New Features */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <ConfigMenu />
-      </div>
+      <Group id="schedule" title="🕒 Jadwal & bagian hari" hint="Bagian hari, jam pribadi anak, masa ujian, alasan terlambat">
+        <Box><DaySegmentsConfig onChanged={onRefresh} /></Box>
+        <Box><SegmentStartsConfig kids={kids} onChanged={onRefresh} /></Box>
+        <Box className="border-2 border-violet-100"><ExamPeriodConfig kids={kids} onChanged={onRefresh} /></Box>
+        <Box><LateReasonsConfig kids={kids} onChanged={onRefresh} /></Box>
+      </Group>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <LabelEditor />
-      </div>
+      <Group id="honesty" title="🤝 Kejujuran & hukuman" hint="Koreksi bertingkat, cek kejutan, Kartu Hukuman">
+        <Box><HonestyConfig /></Box>
+        <Box className="border-2 border-red-100"><PunishmentConfig onChanged={onRefresh} /></Box>
+      </Group>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <ViewLinksManager />
-      </div>
+      <Group id="points" title="⭐ Poin, level & hewan" hint="Aturan poin, level, lencana, peliharaan">
+        <Box><ConfigMenu /></Box>
+        <Box><LevelConfigEditor /></Box>
+        <Box><Achievements /></Box>
+        <PetResetRequestsReview onChanged={onRefresh} />
+        <Box><PetConfigEditor /></Box>
+      </Group>
 
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <LevelConfigEditor />
-      </div>
+      <Group id="app" title="🔔 Notifikasi & tampilan" hint="Notifikasi HP, ganti nama menu/label">
+        <Box><PushNotificationManager /></Box>
+        <Box><LabelEditor /></Box>
+      </Group>
 
-      <PetResetRequestsReview onChanged={onRefresh} />
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <PetConfigEditor />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <MemberPasscodeManager />
-      </div>
-
-      {/* Stage 4: Achievements & Push Notifications */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <Achievements />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <PushNotificationManager />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <DaySegmentsConfig onChanged={onRefresh} />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <SegmentStartsConfig kids={kids} onChanged={onRefresh} />
-      </div>
-
-
-      <div className="bg-white rounded-2xl border-2 border-violet-100 p-6">
-        <ExamPeriodConfig kids={kids} onChanged={onRefresh} />
-      </div>
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <LateReasonsConfig kids={kids} onChanged={onRefresh} />
-      </div>
-
-      <div className="bg-white rounded-2xl border-2 border-red-100 p-6">
-        <PunishmentConfig onChanged={onRefresh} />
-      </div>
-
-
-
-
-      <div className="bg-white rounded-2xl border-2 border-red-100 p-6">
-        <MaintenanceModeCard />
-      </div>
+      <Group id="advanced" title="🛠️ Lanjutan" hint="Mode perawatan">
+        <Box className="border-2 border-red-100"><MaintenanceModeCard /></Box>
+      </Group>
     </div>
+  );
+}
+
+
+function Box({ children, className = "border border-slate-200" }) {
+  return <div className={`bg-white rounded-2xl p-6 ${className}`}>{children}</div>;
+}
+
+// One settings group, folded by default; the last one opened is remembered.
+function Group({ id, title, hint, children }) {
+  const [open, setOpen] = useState(() => {
+    try { return localStorage.getItem("settings:open") === id; } catch { return false; }
+  });
+  const toggle = (e) => {
+    const v = e.currentTarget.open;
+    setOpen(v);
+    try { if (v) localStorage.setItem("settings:open", id); } catch { /* ignore */ }
+  };
+  return (
+    <details open={open} onToggle={toggle} className="bg-slate-50 rounded-2xl border border-slate-200">
+      <summary className="cursor-pointer select-none px-5 py-4 flex items-center gap-2">
+        <span className="font-parent font-bold text-slate-900">{title}</span>
+        <span className="text-xs text-slate-500 hidden sm:inline">· {hint}</span>
+      </summary>
+      {open && <div className="px-3 pb-3 space-y-4">{children}</div>}
+    </details>
   );
 }

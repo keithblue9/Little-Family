@@ -14,6 +14,8 @@ import { TEST_IDS } from "@/constants/testIds/app";
 import { useAuth } from "@/contexts/AuthContext";
 import VirtualPetMascot from "@/components/VirtualPetMascot";
 import SegmentQuestView from "@/components/SegmentQuestView";
+import HonestyPanel from "@/components/HonestyPanel";
+const BestDayCard = lazy(() => import("@/components/BestDayCard"));
 import { personalityMeta } from "@/lib/personality";
 import { pickQuestTheme } from "@/lib/questThemes";
 import { computeLevel } from "@/lib/levels";
@@ -399,6 +401,8 @@ export default function KidHome() {
                 </motion.div>
               )}
 
+              <HonestyPanel child={child} big={child.simple_mode && !fullView} />
+
               {child.simple_mode && !fullView ? (
                 <SimpleQuestView
                   child={child}
@@ -577,6 +581,7 @@ export default function KidHome() {
               <KidChallenges />
               <StickerBook childId={childId} />
               <Achievements childId={childId} />
+              <Suspense fallback={null}><BestDayCard childId={childId} /></Suspense>
               <GrowthTrail childId={childId} childName={child.name} />
               <MemoriesCollage childId={childId} title="Kenanganku" />
             </motion.div>

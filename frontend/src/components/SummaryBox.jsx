@@ -23,6 +23,9 @@ export default function SummaryBox({ activity, onSaved, onCancel, big = false })
   const recog = useRef(null);
   const need = activity.summary_min_words || 15;
   const words = countWords(text);
+  // A mission with questions is a small quiz: one short answer per question.
+  const questions = activity.summary_questions || [];
+  const [answers, setAnswers] = useState(() => questions.map(() => ""));
 
   const SpeechRec = typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
 
@@ -49,17 +52,22 @@ export default function SummaryBox({ activity, onSaved, onCancel, big = false })
   };
 
   const submit = async () => {
-    if (words < need) { toast(`Tulis minimal ${need} kata ya (baru ${words}) ✍️`); return; }
+    if (questions.length) {
+      if (answers.some((a) => countWords(a) < 3)) { toast("Jawab semua pertanyaannya ya, masing-masing minimal 3 kata ✍️"); return; }
+    } else if (words < need) { toast(`Tulis minimal ${need} kata ya (baru ${words}) ✍️`); return; }
     setBusy(true);
     try {
       const body = {
-        text: text.trim(), pasted: pasted.current,
+        text: questions.length ? "" : text.trim(), pasted: pasted.current,
+        ...(questions.length ? { answers: answers.map((a) => a.trim()) } : {}),
         typing_seconds: startedAt.current ? Math.round((Date.now() - startedAt.current) / 1000) : null,
       };
       const r = await sendOrQueue(`/tasks/${activity.id}/summary`, body, `summary:${activity.id}`);
       if (r?.queued) toast("Tersimpan di HP — dikirim saat internet kembali 📶", { duration: 3000 });
       else toast.success("Ringkasan tersimpan ✨");
-      onSaved?.(text.trim());
+      onSaved?.(questions.length
+        ? questions.map((q, i) => `${q}\n→ ${answers[i].trim()}`).join("\n")
+        : text.trim());
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -75,20 +83,37 @@ export default function SummaryBox({ activity, onSaved, onCancel, big = false })
       {activity.summary_review === "redo" && activity.summary_note && (
         <div className="text-xs text-amber-800 bg-amber-50 rounded-xl px-3 py-2">💬 {activity.summary_note}</div>
       )}
-      <textarea
-        value={text}
-        onChange={(e) => { touch(); setText(e.target.value); }}
-        onPaste={() => { pasted.current = true; }}
-        rows={big ? 5 : 4}
-        maxLength={5000}
-        placeholder="Pakai kalimatmu sendiri…"
-        className={`w-full rounded-xl border-2 border-indigo-100 bg-white px-3 py-2 focus:border-indigo-400 focus:outline-none ${big ? "text-lg" : "text-sm"}`}
-      />
+      {questions.length > 0 ? (
+        <div className="space-y-2">
+          {questions.map((q, i) => (
+            <label key={i} className="block">
+              <span className={`block font-semibold text-indigo-900 mb-1 ${big ? "text-base" : "text-xs"}`}>{i + 1}. {q}</span>
+              <textarea value={answers[i] || ""} rows={2} maxLength={1500}
+                onChange={(e) => { touch(); const v = e.target.value; setAnswers((a) => a.map((x, k) => (k === i ? v : x))); }}
+                onPaste={() => { pasted.current = true; }}
+                placeholder="Jawabanmu…"
+                className={`w-full rounded-xl border-2 border-indigo-100 bg-white px-3 py-2 focus:border-indigo-400 focus:outline-none ${big ? "text-lg" : "text-sm"}`} />
+            </label>
+          ))}
+        </div>
+      ) : (
+        <textarea
+          value={text}
+          onChange={(e) => { touch(); setText(e.target.value); }}
+          onPaste={() => { pasted.current = true; }}
+          rows={big ? 5 : 4}
+          maxLength={5000}
+          placeholder="Pakai kalimatmu sendiri…"
+          className={`w-full rounded-xl border-2 border-indigo-100 bg-white px-3 py-2 focus:border-indigo-400 focus:outline-none ${big ? "text-lg" : "text-sm"}`}
+        />
+      )}
       <div className="flex items-center gap-2 flex-wrap">
-        <span className={`text-xs font-semibold ${words >= need ? "text-emerald-600" : "text-slate-500"}`}>
-          {words}/{need} kata
-        </span>
-        {SpeechRec && (
+        {questions.length === 0 && (
+          <span className={`text-xs font-semibold ${words >= need ? "text-emerald-600" : "text-slate-500"}`}>
+            {words}/{need} kata
+          </span>
+        )}
+        {SpeechRec && questions.length === 0 && (
           <button type="button" onClick={toggleMic}
             className={`press-btn inline-flex items-center gap-1 px-3 py-1.5 rounded-xl text-xs font-bold border-2 ${
               listening ? "border-red-300 bg-red-50 text-red-600" : "border-slate-200 bg-white text-slate-600"}`}>

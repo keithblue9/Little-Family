@@ -223,6 +223,7 @@ function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMo
   const [dur, setDur] = useState("");
   const [pts, setPts] = useState("10");
   const [who, setWho] = useState(childId || "");
+  const [openProof, setOpenProof] = useState(null); // slot whose proof options are open
   useEffect(() => { setWho(childId || ""); }, [childId]); // new activities go to the picked child
   const window_ = segment.start_time ? toMin(segment.end_time) - toMin(segment.start_time) : null;
   const total = slots.reduce((n, s) => n + (s.duration_minutes || 0), 0);
@@ -273,9 +274,9 @@ function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMo
               <option value="">Semua anak</option>
               {kids.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
             </select>
-            <button onClick={() => onPatch(s, { summary_required: !s.summary_required })}
-              className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border ${s.summary_required ? "bg-indigo-100 border-indigo-300 text-indigo-700" : "border-slate-200 text-slate-400 bg-white"}`}
-              title="Anak harus menulis ringkasan sebelum bisa mencentang">📝</button>
+            <button onClick={() => setOpenProof((v) => v === s.id ? null : s.id)}
+              className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border ${proofIcons(s) ? "bg-indigo-100 border-indigo-300 text-indigo-700" : "border-slate-200 text-slate-400 bg-white"}`}
+              title="Bukti: ringkasan, kuis, foto, halaman buku, checklist kecil">{proofIcons(s) || "Bukti"} ▾</button>
             <button onClick={() => onPatch(s, { is_bonus: !s.is_bonus })}
               className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border ${s.is_bonus ? "bg-amber-100 border-amber-300 text-amber-700" : "border-slate-200 text-slate-400 bg-white"}`}
               title="Bonus = tidak wajib dicentang">Bonus</button>
@@ -295,21 +296,7 @@ function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMo
             <button onClick={() => onRemove(s)} disabled={busy} className="p-1.5 rounded-lg text-red-500 hover:bg-red-50" aria-label="Hapus">
               <Trash2 className="w-4 h-4" />
             </button>
-            {s.summary_required && (
-              <div className="basis-full flex flex-wrap items-center gap-1.5 pl-6">
-                <span className="text-[11px] text-indigo-700 font-semibold">📝 Pertanyaan:</span>
-                <input defaultValue={s.summary_prompt || ""} key={`q${s.id}${s.summary_prompt}`}
-                  placeholder="Apa yang sudah kamu pelajari?"
-                  onBlur={(e) => { const v = e.target.value.trim(); if (v !== (s.summary_prompt || "")) onPatch(s, { summary_prompt: v || null }); }}
-                  className="flex-1 min-w-[10rem] px-2 py-1 rounded-lg border border-indigo-100 text-xs bg-white" />
-                <label className="flex items-center gap-1 text-[11px] text-slate-500">min
-                  <input defaultValue={s.summary_min_words || 15} key={`w${s.id}${s.summary_min_words}`} inputMode="numeric"
-                    onBlur={(e) => { const n = Math.min(300, Math.max(3, parseInt(e.target.value.replace(/\D/g, "") || "15", 10)));
-                      if (n !== (s.summary_min_words || 15)) onPatch(s, { summary_min_words: n }); }}
-                    className="w-12 px-1 py-1 rounded-lg border border-indigo-100 text-xs text-center bg-white" />kata
-                </label>
-              </div>
-            )}
+            {openProof === s.id && <ProofEditor slot={s} onPatch={onPatch} />}
           </div>
         ))}
       </div>
@@ -511,6 +498,87 @@ function ExceptionsPanel({ kids, segments, onChanged }) {
             <button onClick={() => setKind(null)} className="press-btn border-2 border-slate-200 text-slate-600 font-semibold px-4 py-2 rounded-xl text-sm">Batal</button>
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+
+const proofIcons = (s) => [
+  s.summary_required && ((s.summary_questions || []).length ? "❓" : "📝"),
+  (s.photo_required || s.before_photo_required) && "📷",
+  s.reading && "📖",
+  (s.steps || []).length > 0 && "☑️",
+].filter(Boolean).join("");
+
+/**
+ * How a child shows a mission was really done — pick any mix. Each choice
+ * travels to every day built from this routine.
+ */
+function ProofEditor({ slot: s, onPatch }) {
+  const chip = (on) => `press-btn px-2.5 py-1.5 rounded-lg text-[11px] font-bold border ${
+    on ? "bg-indigo-500 border-indigo-500 text-white" : "border-slate-200 text-slate-600 bg-white"}`;
+  const lines = (v) => v.split("\n").map((x) => x.trim()).filter(Boolean);
+  const quiz = (s.summary_questions || []).length > 0;
+  return (
+    <div className="basis-full ml-6 mt-1 rounded-xl border border-indigo-100 bg-white p-2.5 space-y-2.5">
+      <div className="text-[11px] text-slate-500">Bukti yang diminta (boleh lebih dari satu):</div>
+      <div className="flex flex-wrap gap-1.5">
+        <button className={chip(s.summary_required && !quiz)}
+          onClick={() => onPatch(s, s.summary_required && !quiz ? { summary_required: false } : { summary_required: true, summary_questions: [] })}>
+          📝 Tulis ringkasan</button>
+        <button className={chip(s.summary_required && quiz)}
+          onClick={() => onPatch(s, s.summary_required && quiz
+            ? { summary_required: false, summary_questions: [] }
+            : { summary_required: true, summary_questions: quiz ? s.summary_questions : ["Apa yang kamu pelajari hari ini?"] })}>
+          ❓ Jawab kuis</button>
+        <button className={chip(s.photo_required)} onClick={() => onPatch(s, { photo_required: !s.photo_required })}>📷 Foto sesudah</button>
+        <button className={chip(s.before_photo_required)} onClick={() => onPatch(s, { before_photo_required: !s.before_photo_required })}>📷 Foto sebelum</button>
+        <button className={chip(s.reading)} onClick={() => onPatch(s, { reading: !s.reading })}>📖 Halaman buku</button>
+        <button className={chip((s.steps || []).length > 0)}
+          onClick={() => onPatch(s, { steps: (s.steps || []).length ? [] : ["Langkah 1", "Langkah 2"] })}>☑️ Checklist kecil</button>
+      </div>
+
+      {s.summary_required && !quiz && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] text-indigo-700 font-semibold">📝 Pertanyaan:</span>
+          <input defaultValue={s.summary_prompt || ""} key={`q${s.id}${s.summary_prompt}`}
+            placeholder="Apa yang sudah kamu pelajari?"
+            onBlur={(e) => { const v = e.target.value.trim(); if (v !== (s.summary_prompt || "")) onPatch(s, { summary_prompt: v || null }); }}
+            className="flex-1 min-w-[10rem] px-2 py-1 rounded-lg border border-indigo-100 text-xs bg-white" />
+          <label className="flex items-center gap-1 text-[11px] text-slate-500">min
+            <input defaultValue={s.summary_min_words || 15} key={`w${s.id}${s.summary_min_words}`} inputMode="numeric"
+              onBlur={(e) => { const n = Math.min(300, Math.max(3, parseInt(e.target.value.replace(/\D/g, "") || "15", 10)));
+                if (n !== (s.summary_min_words || 15)) onPatch(s, { summary_min_words: n }); }}
+              className="w-12 px-1 py-1 rounded-lg border border-indigo-100 text-xs text-center bg-white" />kata
+          </label>
+        </div>
+      )}
+      {s.summary_required && quiz && (
+        <label className="block">
+          <span className="text-[11px] text-indigo-700 font-semibold">❓ Pertanyaan kuis — satu per baris, maks 3 (tiap jawaban min 3 kata)</span>
+          <textarea rows={3} defaultValue={(s.summary_questions || []).join("\n")} key={`z${s.id}${(s.summary_questions || []).join("|")}`}
+            onBlur={(e) => { const v = lines(e.target.value).slice(0, 3);
+              if (v.join("|") !== (s.summary_questions || []).join("|")) onPatch(s, v.length ? { summary_questions: v } : { summary_required: false, summary_questions: [] }); }}
+            className="mt-1 w-full px-2 py-1.5 rounded-lg border border-indigo-100 text-xs bg-white" />
+        </label>
+      )}
+      {s.reading && (
+        <label className="flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] text-sky-700 font-semibold">📖 Judul buku (kosongkan = anak menulis sendiri):</span>
+          <input defaultValue={s.reading_book || ""} key={`b${s.id}${s.reading_book}`} maxLength={120}
+            onBlur={(e) => { const v = e.target.value.trim(); if (v !== (s.reading_book || "")) onPatch(s, { reading_book: v || null }); }}
+            className="flex-1 min-w-[10rem] px-2 py-1 rounded-lg border border-sky-100 text-xs bg-white" />
+        </label>
+      )}
+      {(s.steps || []).length > 0 && (
+        <label className="block">
+          <span className="text-[11px] text-slate-700 font-semibold">☑️ Isi checklist — satu per baris, maks 10</span>
+          <textarea rows={3} defaultValue={(s.steps || []).join("\n")} key={`s${s.id}${(s.steps || []).join("|")}`}
+            onBlur={(e) => { const v = lines(e.target.value).slice(0, 10);
+              if (v.join("|") !== (s.steps || []).join("|")) onPatch(s, { steps: v }); }}
+            className="mt-1 w-full px-2 py-1.5 rounded-lg border border-slate-200 text-xs bg-white" />
+        </label>
       )}
     </div>
   );

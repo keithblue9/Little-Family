@@ -1,4 +1,4 @@
-// 10 cute pet options, each with its own emoji across 4 growth stages
+// 16 cute pet options, each with its own emoji across 4 growth stages
 // (Telur → Bayi → Remaja → Dewasa), tied to the same level system used for
 // points (lifetime_points), so the pet visually grows alongside a kid's
 // permanent progress.
@@ -14,6 +14,12 @@ export const PET_CATALOG = [
   { key: "panda", name: "Panda", stages: ["🥚", "🐼", "🐼", "🐼"] },
   { key: "fox", name: "Rubah", stages: ["🥚", "🦊", "🦊", "🦊"] },
   { key: "turtle", name: "Kura-kura", stages: ["🥚", "🐢", "🐢", "🐢"] },
+  { key: "koala", name: "Koala", stages: ["🥚", "🐨", "🐨", "🐨"] },
+  { key: "elephant", name: "Gajah", stages: ["🥚", "🐘", "🐘", "🐘"] },
+  { key: "spider", name: "Laba-laba", stages: ["🥚", "🕷️", "🕷️", "🕷️"] },
+  { key: "penguin", name: "Penguin", stages: ["🥚", "🐧", "🐧", "🐧"] },
+  { key: "frog", name: "Katak", stages: ["🥚", "🐸", "🐸", "🐸"] },
+  { key: "monkey", name: "Monyet", stages: ["🥚", "🐵", "🐒", "🐒"] },
 ];
 
 const DEFAULT_STAGE_NAMES = ["Telur", "Bayi", "Remaja", "Dewasa"];

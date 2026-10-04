@@ -89,7 +89,7 @@ export default function PetManagerCard({ child, onChanged, petStageNames, petFee
             disabled={saving}
             className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl bg-slate-50 hover:bg-indigo-50 border-2 border-slate-100 hover:border-indigo-300 disabled:opacity-50"
           >
-            <PetSprite petType={p.key} stageIndex={3} size={40} />
+            <PetSprite petType={p.key} stageIndex={3} size={40} animated={false} />
             <span className="text-[10px] font-bold text-slate-600">{p.name}</span>
           </button>
         ))}

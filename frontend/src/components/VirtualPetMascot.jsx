@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { computeLevel } from "@/lib/levels";
 import { PET_CATALOG, petAppearanceByFeed, computeFoodTier, TAP_REACTIONS, ACCESSORY_CATALOG, isAccessoryUnlocked } from "@/lib/pets";
 import PetSprite from "@/components/PetSprite";
+import { playPetSound, soundOn, setSoundOn } from "@/lib/petSound";
+import { todayKey } from "@/lib/dates";
 
 /**
  * Mood is a gentle, non-punitive signal: it reflects whether the kid has been
@@ -37,6 +39,32 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
   const [feedBurst, setFeedBurst] = useState(false);
   const [showAccessories, setShowAccessories] = useState(false);
   const [savingAccessory, setSavingAccessory] = useState(false);
+  // How the pet looks right now: its everyday mood (from the child's day and the
+  // time of day) unless something just happened — a tap, a meal, waking up.
+  const [temp, setTemp] = useState(null);       // { mood, action }
+  const [sound, setSound] = useState(soundOn);
+  const tapTimes = useRef([]);
+  const lastVoice = useRef(0);
+  const tempTimer = useRef(null);
+  const express = (mood, action = "", ms = 1600) => {
+    clearTimeout(tempTimer.current);
+    setTemp({ mood, action });
+    tempTimer.current = setTimeout(() => setTemp(null), ms);
+  };
+  const speak = (mood) => {
+    const now = Date.now();
+    if (now - lastVoice.current < 700) return;   // no machine-gun squeaks
+    lastVoice.current = now;
+    playPetSound(child.pet_type, mood);
+  };
+  useEffect(() => () => clearTimeout(tempTimer.current), []);
+  // First look of the morning: just woke up, stretching.
+  useEffect(() => {
+    if (phase?.key !== "morning" || !child?.id || !child.pet_type) return;
+    const k = `pet:woke:${child.id}:${todayKey()}`;
+    try { if (localStorage.getItem(k)) return; localStorage.setItem(k, "1"); } catch { return; }
+    express("wake", "stretch", 4200);
+  }, [phase?.key, child?.id, child?.pet_type]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const levelInfo = computeLevel(child.lifetime_points || 0, levelTitles);
   const foodTier = computeFoodTier(child.feed_lifetime || 0);
@@ -85,9 +113,14 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
   const handleTap = () => {
     if (isDead) return;
     const id = Date.now() + Math.random();
-    const emoji = TAP_REACTIONS[Math.floor(Math.random() * TAP_REACTIONS.length)];
+    const now = Date.now();
+    tapTimes.current = [...tapTimes.current.filter((t) => now - t < 3500), now];
+    const annoyed = tapTimes.current.length >= 6;   // poked too much → a little cross
+    const emoji = annoyed ? "💢" : TAP_REACTIONS[Math.floor(Math.random() * TAP_REACTIONS.length)];
     setTaps((prev) => [...prev, { id, emoji }]);
     setTimeout(() => setTaps((prev) => prev.filter((t) => t.id !== id)), 1000);
+    if (annoyed) { express("angry", "shake", 2200); speak("angry"); tapTimes.current = []; }
+    else { express("happy", Math.random() < 0.5 ? "hop" : "wiggle", 1400); speak("happy"); }
     if (navigator.vibrate) navigator.vibrate(15);
   };
 
@@ -100,6 +133,8 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
     try {
       await api.post(`/children/${child.id}/feed-pet`);
       setFeedBurst(true);
+      express("eating", "", 1500);
+      setTimeout(() => { express("love", "bounce", 1800); speak("love"); }, 1500);
       if (navigator.vibrate) navigator.vibrate([20, 20, 20]);
       setTimeout(() => setFeedBurst(false), 1200);
       toast.success(`${foodTier.emoji} Nyam nyam! Peliharaanmu senang~`);
@@ -149,7 +184,7 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
               disabled={saving}
               className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl bg-white/70 hover:bg-white border-2 border-white/50 hover:border-indigo-300 disabled:opacity-50"
             >
-              <PetSprite petType={p.key} stageIndex={3} size={44} />
+              <PetSprite petType={p.key} stageIndex={3} size={44} animated={false} />
               <span className="text-[10px] font-bold text-slate-700">{p.name}</span>
             </button>
           ))}
@@ -192,7 +227,7 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
               disabled={saving}
               className="press-btn flex flex-col items-center gap-1 p-2 rounded-2xl bg-white/70 hover:bg-white border-2 border-white/50 hover:border-indigo-300 disabled:opacity-50"
             >
-              <PetSprite petType={p.key} stageIndex={3} size={44} />
+              <PetSprite petType={p.key} stageIndex={3} size={44} animated={false} />
               <span className="text-[10px] font-bold text-slate-700">{p.name}</span>
             </button>
           ))}
@@ -215,6 +250,9 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
         ring: (MOOD_RING[serverMood.key] || MOOD_RING.calm)[0], glow: (MOOD_RING[serverMood.key] || MOOD_RING.calm)[1] }
     : moodFor(child);
   const night = phase?.key === "night";
+  const base = night ? "sleepy"
+    : { sad: "sad", hungry: "hungry", thirsty: "sad", bored: "bored", ecstatic: "happy", happy: "happy" }[serverMood?.key] || "neutral";
+  const expression = temp?.mood || base;
   // The pet is drawn as a real SVG creature (PetSprite) that physically grows
   // each stage. Size scales up baby→adult so growth is unmistakable.
   const SPRITE_SIZE_BY_STAGE = [58, 54, 66, 76];
@@ -241,7 +279,8 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
             whileTap={{ scale: 1.15, rotate: [0, -8, 8, 0] }}
             className={`relative w-24 h-24 rounded-full bg-white/40 flex items-center justify-center ring-4 ${mood.ring} shadow-lg ${mood.glow}`}
           >
-            <PetSprite petType={child.pet_type} stageIndex={appearance.stageIndex} size={SPRITE_SIZE_BY_STAGE[appearance.stageIndex]} />
+            <PetSprite petType={child.pet_type} stageIndex={appearance.stageIndex} size={SPRITE_SIZE_BY_STAGE[appearance.stageIndex]}
+                       mood={expression} action={temp?.action || ""} />
             <span className="absolute -bottom-1 -right-1 text-xl">{night ? "😴" : mood.face}</span>
             {night && (
               <motion.span animate={{ y: [0, -10], opacity: [1, 0] }} transition={{ duration: 2, repeat: Infinity }}
@@ -310,6 +349,13 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
             className="press-btn inline-flex items-center gap-1.5 bg-amber-400 hover:bg-amber-500 disabled:bg-slate-200 disabled:text-slate-400 text-white font-fun font-bold px-3 py-1.5 rounded-xl text-xs"
           >
             {foodTier.emoji} Beri Makan ({FEED_COST} pakan)
+          </button>
+          <button
+            onClick={() => { const on = !sound; setSound(on); setSoundOn(on); if (on) playPetSound(child.pet_type, "happy"); }}
+            title={sound ? "Matikan suara hewan" : "Nyalakan suara hewan"} aria-label={sound ? "Matikan suara hewan" : "Nyalakan suara hewan"}
+            className="press-btn ml-2 inline-flex items-center bg-white/70 border-2 border-white/50 hover:bg-white text-slate-700 font-fun font-bold px-2.5 py-1.5 rounded-xl text-xs"
+          >
+            {sound ? "🔊" : "🔇"}
           </button>
           <button
             onClick={() => setShowAccessories((v) => !v)}

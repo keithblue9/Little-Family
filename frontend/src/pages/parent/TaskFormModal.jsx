@@ -20,6 +20,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
   const [photoRequired, setPhotoRequired] = useState(false);
   const [summaryRequired, setSummaryRequired] = useState(false);
   const [timed, setTimed] = useState(false);
+  const [timerMin, setTimerMin] = useState("");
   const [summaryPrompt, setSummaryPrompt] = useState("");
   const [summaryMinWords, setSummaryMinWords] = useState(15);
   const [isCoop, setIsCoop] = useState(false);
@@ -58,6 +59,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setPhotoRequired(!!editTask.photo_required);
       setSummaryRequired(!!editTask.summary_required);
       setTimed(!!editTask.timed);
+      setTimerMin(editTask.timer_min_minutes ? String(editTask.timer_min_minutes) : "");
       setSummaryPrompt(editTask.summary_prompt || "");
       setSummaryMinWords(editTask.summary_min_words || 15);
       setIsCoop(!!editTask.is_coop);
@@ -78,6 +80,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setPhotoRequired(!!editTask.photo_required);
       setSummaryRequired(!!editTask.summary_required);
       setTimed(!!editTask.timed);
+      setTimerMin(editTask.timer_min_minutes ? String(editTask.timer_min_minutes) : "");
       setSummaryPrompt(editTask.summary_prompt || "");
       setSummaryMinWords(editTask.summary_min_words || 15);
       setIsCoop(false);
@@ -126,6 +129,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
         timed,
+        timer_min_minutes: timed ? (Math.min(600, parseInt(timerMin || "0", 10)) || 0) : 0,
         summary_required: summaryRequired,
         summary_prompt: summaryRequired ? (summaryPrompt.trim() || null) : null,
         summary_min_words: summaryRequired ? Math.min(300, Math.max(3, Number(summaryMinWords) || 15)) : null,
@@ -371,6 +375,13 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
             <div className="text-xs text-slate-500">Anak menekan Mulai lalu Selesai; lamanya dicatat. Cocok untuk sarapan atau belajar.</div>
           </div>
         </button>
+        {timed && (
+          <label className="flex items-center gap-2 px-4 -mt-1 text-sm text-slate-600">
+            Selesai baru aktif setelah minimal
+            <input value={timerMin} onChange={(e) => setTimerMin(e.target.value.replace(/\D/g, "").slice(0, 3))} inputMode="numeric" placeholder="0"
+              className="w-16 px-2 py-1.5 rounded-lg border-2 border-slate-200 text-center" /> menit
+          </label>
+        )}
 
         {/* Written summary: the child writes what they did/learned before
             the mission can be ticked. */}

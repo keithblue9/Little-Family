@@ -731,6 +731,18 @@ function ProofEditor({ slot: s, onPatch }) {
           onClick={() => onPatch(s, { steps: (s.steps || []).length ? [] : ["Langkah 1", "Langkah 2"] })}>☑️ Checklist kecil</button>
       </div>
 
+      {s.timed && (
+        <label className="flex flex-wrap items-center gap-1.5">
+          <span className="text-[11px] text-indigo-700 font-semibold">⏱ Tombol Selesai baru aktif setelah minimal</span>
+          <input defaultValue={s.timer_min_minutes || ""} key={`m${s.id}${s.timer_min_minutes}`} inputMode="numeric" placeholder="0"
+            onBlur={(e) => { const n = Math.min(600, parseInt(e.target.value.replace(/\D/g, "") || "0", 10)); if (n !== (s.timer_min_minutes || 0)) onPatch(s, { timer_min_minutes: n }); }}
+            className="w-14 px-1 py-1 rounded-lg border border-indigo-100 text-xs text-center bg-white" />
+          <span className="text-[11px] text-slate-500">menit{s.duration_minutes ? ` (target ${s.duration_minutes} mnt)` : " — isi ⏱ lama di baris agar ada target"}</span>
+          {s.timer_min_minutes > 0 && s.duration_minutes > 0 && s.timer_min_minutes > s.duration_minutes && (
+            <span className="text-[11px] text-amber-600 font-semibold">minimal melebihi target</span>
+          )}
+        </label>
+      )}
       {s.summary_required && !quiz && (
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-[11px] text-indigo-700 font-semibold">📝 Pertanyaan:</span>

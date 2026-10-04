@@ -500,7 +500,8 @@ MBTI_TYPES = Literal[
 TASK_STYLE = Literal["challenge", "helper", "creative", "routine", "learning", "social"]
 
 # 10 cute pet options for the Tamagotchi-style virtual pet system.
-PET_TYPE = Literal["chicken", "bird", "rabbit", "cat", "dragon", "hedgehog", "squirrel", "panda", "fox", "turtle"]
+PET_TYPE = Literal["chicken", "bird", "rabbit", "cat", "dragon", "hedgehog", "squirrel", "panda", "fox", "turtle",
+                  "koala", "elephant", "spider", "penguin", "frog", "monkey"]
 
 # Cosmetic accessories a kid can equip on their pet — purely for delight, no
 # economy impact, so validation here is light (known keys + a sane count cap)
@@ -565,6 +566,7 @@ _PROOF_FIELDS = _SUMMARY_FIELDS + (
     "reading_book",            # optional fixed book title
     "steps",                   # a small checklist inside the mission
     "timed",                   # a stopwatch: the child taps Mulai, then Selesai
+    "timer_min_minutes",       # …and Selesai only works after this many minutes
 )
 MAX_STEPS = 10
 MAX_QUESTIONS = 3
@@ -600,6 +602,7 @@ class TaskInput(BaseModel):
     reading: bool = False
     reading_book: Optional[str] = Field(default=None, max_length=120)
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
+    timer_min_minutes: Optional[int] = Field(default=None, ge=0, le=600)  # Selesai only works after this many minutes
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     coop: bool = False  # true = a single shared task worked on together by target_children,
                          # not one copy per kid; points split evenly among participants on approval
@@ -645,6 +648,7 @@ class TaskUpdate(BaseModel):
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
+    timer_min_minutes: Optional[int] = Field(default=None, ge=0, le=600)  # Selesai only works after this many minutes
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     together_bonus_enabled: Optional[bool] = None
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
@@ -2139,6 +2143,7 @@ async def _build_task_doc(
         "reading": payload.reading,
         "reading_book": (payload.reading_book or "").strip() or None,
         "timed": bool(payload.timed),
+        "timer_min_minutes": payload.timer_min_minutes or None,
         "steps": _clean_list(payload.steps),
         "completion_photo_url": None,
         "is_coop": False,
@@ -3046,6 +3051,7 @@ class RoutineSlotInput(BaseModel):
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
+    timer_min_minutes: Optional[int] = Field(default=None, ge=0, le=600)  # Selesai only works after this many minutes
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
@@ -3065,6 +3071,7 @@ class RoutineSlotUpdate(BaseModel):
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
+    timer_min_minutes: Optional[int] = Field(default=None, ge=0, le=600)  # Selesai only works after this many minutes
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
@@ -3436,6 +3443,7 @@ async def add_routine_slot(payload: RoutineSlotInput, user: dict = Depends(requi
                "reading": bool(payload.reading),
                "reading_book": (payload.reading_book or "").strip() or None,
         "timed": bool(payload.timed),
+        "timer_min_minutes": payload.timer_min_minutes or None,
                "steps": _clean_list(payload.steps),
                "order": await _next_order(tpl["id"], wd, payload.segment_id), "created_at": now_iso()}
         await db.template_tasks.insert_one(doc)
@@ -4009,7 +4017,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                 "reading_page": a.get("reading_page"), "reading_last": (child.get("reading_log") or {}).get(
                     (a.get("reading_book") or "").strip().lower()) if a.get("reading") else None,
                 "steps": a.get("steps") or [], "steps_done": a.get("steps_done") or [],
-                "timed": bool(a.get("timed")), "timer_started_at": a.get("timer_started_at"),
+                "timed": bool(a.get("timed")), "timer_min_minutes": a.get("timer_min_minutes"), "timer_started_at": a.get("timer_started_at"),
                 "timer_ended_at": a.get("timer_ended_at"), "timer_seconds": a.get("timer_seconds"),
                 # Photos as cacheable media URLs, never inline base64.
                 "before_photo_url": _media_ref("task", a["id"], "before_photo_url", a.get("before_photo_url")),
@@ -4325,6 +4333,10 @@ async def stop_task_timer(task_id: str, user: dict = Depends(get_current_user)):
         return {"id": task_id, "timer_seconds": task.get("timer_seconds"), "already": True}
     started = _hours_since(task["timer_started_at"])
     secs = min(TIMER_MAX_SECONDS, max(1, round((started or 0) * 3600)))
+    need = int(task.get("timer_min_minutes") or 0) * 60
+    if need and secs < need:
+        # Server time decides, so a changed phone clock can't skip the minimum.
+        raise HTTPException(status_code=422, detail=f"TIMER_TOO_SHORT:{need - secs}")
     at = now_iso()
     await db.tasks.update_one({"id": task_id}, {"$set": {
         "timer_ended_at": at, "timer_seconds": secs, "checked": True, "checked_at": at}})
@@ -4860,6 +4872,18 @@ async def _run_reminder_sweep() -> dict:
                 )
                 await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
                 sent["overdue_sections"] += 1
+
+    # A stopwatch still running long after it should have ended: probably forgotten.
+    sent["timer_nudges"] = 0
+    for t in await db.tasks.find({"parent_id": FAMILY_ID, "date_key": today, "timed": True,
+                                  "timer_started_at": {"$nin": [None, ""]}, "timer_ended_at": None,
+                                  "timer_nudged": {"$ne": True}}, {"_id": 0}).to_list(200):
+        limit_h = ((t.get("duration_minutes") or 30) + 15) / 60
+        if (_hours_since(t["timer_started_at"]) or 0) >= limit_h:
+            await db.tasks.update_one({"id": t["id"]}, {"$set": {"timer_nudged": True}})
+            await send_push_to({"role": "child", "member_id": t["child_id"]}, title=f"Timer {t['title']} masih jalan ⏱",
+                               body="Sudah selesai? Tekan Selesai ya.", url=f"/kid/{t['child_id']}")
+            sent["timer_nudges"] += 1
 
     expired = await _sweep_overdue_punishments()
     sent["punishments_expired"] = expired

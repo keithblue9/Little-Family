@@ -1256,6 +1256,33 @@ with TestClient(server.app, base_url="https://testserver") as c:
     check("timer: the checklist carries it", act["timed"] and act["timer_seconds"] and act["checked"], str(act)[:200])
     r = c.post("/api/segment-sessions/finish", json=tb)
     check("timer: the section finishes once it is done", r.status_code == 200 and r.json()["awarded"] == 2, r.text[:200])
+    # a minimum time before Selesai works
+    r = c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    t_min = c.post("/api/tasks", json={"title": "Belajar", "points": 10, "date_key": TODAY, "duration_minutes": 30,
+                                       "timed": True, "timer_min_minutes": 10, "target_children": [adskhan["id"]]}).json()
+    check("timer-min: the mission remembers the minimum", t_min.get("timer_min_minutes") == 10, str(t_min.get("timer_min_minutes")))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    c.post("/api/segment-sessions/reopen", json=tb)   # (parent-only; harmless if refused)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/segment-sessions/reopen", json=tb)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{t_min['id']}/timer/start")
+    r = c.post(f"/api/tasks/{t_min['id']}/timer/stop")
+    check("timer-min: stopping too early is refused with the time left", r.status_code == 422 and "TIMER_TOO_SHORT:" in r.text, r.text[:120])
+    left = int(r.json()["detail"].split(":")[1]) if r.status_code == 422 else 0
+    check("timer-min: the remaining time is about the full minimum", 590 <= left <= 600, str(left))
+    check("timer-min: it is still running", run(server.db.tasks.find_one({"id": t_min["id"]})).get("timer_ended_at") is None)
+    run(server.db.tasks.update_one({"id": t_min["id"]}, {"$set": {"timer_started_at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=9)).isoformat()}}))
+    check("timer-min: 9 of 10 minutes is still too early", c.post(f"/api/tasks/{t_min['id']}/timer/stop").status_code == 422)
+    run(server.db.tasks.update_one({"id": t_min["id"]}, {"$set": {"timer_started_at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10, seconds=5)).isoformat()}}))
+    r = c.post(f"/api/tasks/{t_min['id']}/timer/stop")
+    check("timer-min: after the minimum, Selesai works", r.status_code == 200 and r.json()["checked"] is True, r.text[:120])
+    # a forgotten stopwatch gets one gentle nudge from the sweep
+    run(server.db.tasks.update_one({"id": t_sar["id"]}, {"$set": {"timer_started_at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=3)).isoformat(),
+                                                                  "timer_ended_at": None, "timer_nudged": False, "status": "pending"}}))
+    sw = run(server._run_reminder_sweep())
+    check("timer: the sweep nudges a forgotten stopwatch once", sw.get("timer_nudges") == 1 and run(server._run_reminder_sweep()).get("timer_nudges") == 0, str(sw))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     # unticking starts it over
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/segment-sessions/reopen", json=tb)
@@ -1284,6 +1311,11 @@ with TestClient(server.app, base_url="https://testserver") as c:
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
     check("honesty-summary: parents only", c.get("/api/family/honesty-summary").status_code == 403)
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # ---------------- New pet species ----------------
+    for sp in ("koala", "elephant", "spider", "penguin", "frog", "monkey"):
+        check(f"pet species: {sp} is accepted", c.patch(f"/api/children/{syila_k['id']}", json={"pet_type": sp}).status_code == 200)
+    check("pet species: an unknown one is still refused", c.patch(f"/api/children/{syila_k['id']}", json={"pet_type": "unicorn"}).status_code == 422)
 
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})

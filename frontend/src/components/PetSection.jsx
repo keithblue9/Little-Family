@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import api from "@/lib/api";
 import VirtualPetMascot from "@/components/VirtualPetMascot";
 import PetWorld from "@/components/PetWorld";
+import PetGreeter from "@/components/PetGreeter";
 
 /**
  * The pet card plus everything around it, sharing one pet state so the mood,
@@ -30,6 +31,7 @@ export default function PetSection({ child, onChanged, ...rest }) {
       <VirtualPetMascot child={child} onChanged={changed} {...rest}
         serverMood={live ? state.mood : undefined} phase={live ? state.phase : undefined}
         pathIcon={live ? state.path_icon : undefined} pathLabel={live ? state.path_label : undefined} />
+      {live && <PetGreeter child={child} state={state} />}
       {state && <PetWorld child={child} state={state} reload={reload} onChanged={onChanged} />}
     </>
   );

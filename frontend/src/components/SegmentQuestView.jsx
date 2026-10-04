@@ -8,6 +8,7 @@ import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
 import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
 import SummaryBox from "@/components/SummaryBox";
+import { StepsList, ReadingForm, AdmitButton } from "@/components/MissionExtras";
 import { withLiveClock } from "@/lib/segmentClock";
 import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
 
@@ -26,6 +27,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
   const [busy, setBusy] = useState(null);          // segment id currently acting
   const [reasonFor, setReasonFor] = useState(null); // { segment, action }
   const [summaryFor, setSummaryFor] = useState(null); // activity id being written
+  const [readingFor, setReadingFor] = useState(null); // activity id noting its page
 
   const [clock, setClock] = useState(0);            // re-derives locked/late from the device clock
   useEffect(() => {
@@ -112,8 +114,14 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       toast.success(
         r.no_points
           ? `${seg.label} selesai — kali ini tanpa poin.`
-          : `${seg.label} selesai! 🎉`
+          : r.section_streak > 1
+            ? `${seg.label} selesai! 🎉 🔥 ${r.section_streak} hari berturut-turut tepat waktu`
+            : `${seg.label} selesai! 🎉`
       );
+      if (r.spot_check) {
+        toast(`📸 Cek kejutan! Kirim foto "${r.spot_check.title}" ya.`, { duration: 6000 });
+      }
+      window.dispatchEvent(new Event("app:honesty-refresh"));
       await load();
     } catch (e) {
       if (isNetworkError(e)) { queueOffline("finish", payload); haptic([20, 40, 20]); onCelebrate?.(); }
@@ -129,6 +137,21 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     setData((d) => { if (d && cacheKey) cacheSet(cacheKey, d); return d; });
     toast("Tersimpan di HP — dikirim otomatis saat internet kembali 📶", { duration: 3000 });
   };
+
+  // Any change to one activity (steps, page, photo); keeps the count honest.
+  const patchAct = (segId, actId, patch) =>
+    setData((d) => {
+      const nd = d && {
+        ...d,
+        segments: d.segments.map((s) => {
+          if (s.id !== segId) return s;
+          const activities = s.activities.map((a) => a.id === actId ? { ...a, ...patch } : a);
+          return { ...s, activities, checked_required: activities.filter((a) => !a.is_bonus && a.checked).length };
+        }),
+      };
+      if (nd && cacheKey) cacheSet(cacheKey, nd);
+      return nd;
+    });
 
   const patchPhoto = (segId, actId, patch) =>
     setData((d) => d && {
@@ -157,6 +180,8 @@ export default function SegmentQuestView({ child, onCelebrate }) {
   const toggle = async (seg, act) => {
     // A summary mission is ticked by writing the summary, not by tapping.
     if (!act.checked && act.summary_required) { setSummaryFor(act.id); return; }
+    if (!act.checked && act.reading) { setReadingFor(act.id); return; }
+    if (!act.checked && (act.steps || []).length) { toast("Centang daftar kecilnya satu per satu ya ☑️"); return; }
     const next = !act.checked;
     patchActivity(seg.id, act.id, next);
     if (next) haptic();
@@ -169,7 +194,9 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       }
     } catch (e) {
       patchActivity(seg.id, act.id, !next);
-      if (e?.response?.data?.detail === "SUMMARY_REQUIRED") { setSummaryFor(act.id); return; }
+      const detail = e?.response?.data?.detail;
+      if (detail === "SUMMARY_REQUIRED") { setSummaryFor(act.id); return; }
+      if (detail === "READING_REQUIRED") { setReadingFor(act.id); return; }
       await onFail(e, seg, "check");
     }
   };
@@ -185,8 +212,13 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       }
       load();
     };
+    const onDay = () => load();
     window.addEventListener("app:offline-flushed", onFlushed);
-    return () => window.removeEventListener("app:offline-flushed", onFlushed);
+    window.addEventListener("app:day-refresh", onDay);
+    return () => {
+      window.removeEventListener("app:offline-flushed", onFlushed);
+      window.removeEventListener("app:day-refresh", onDay);
+    };
   }, [load]);
 
   const toggleAll = async (seg, checked) => {
@@ -258,6 +290,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       )}
 
       {view?.segments.map((seg) => {
+        const canAdmit = dateKey >= shiftDateKey(todayKey(), -1) && dateKey <= todayKey();
         const allDone = seg.required_count > 0 && seg.checked_required >= seg.required_count;
         const anyUnticked = seg.activities.some((a) => !a.checked);
         const running = seg.status === "in_progress";
@@ -270,7 +303,13 @@ export default function SegmentQuestView({ child, onCelebrate }) {
             <div className="flex items-start gap-2 mb-3">
               <div className="text-2xl leading-none">{seg.emoji || "🕒"}</div>
               <div className="flex-1 min-w-0">
-                <div className="font-fun font-bold text-slate-900 text-lg leading-tight">{seg.label}</div>
+                <div className="font-fun font-bold text-slate-900 text-lg leading-tight flex items-center gap-1.5">
+                  {seg.label}
+                  {seg.streak > 1 && (
+                    <span className="text-[11px] font-bold text-orange-600 bg-orange-50 rounded-full px-2 py-0.5"
+                          title="Hari berturut-turut selesai tepat waktu">🔥 {seg.streak}</span>
+                  )}
+                </div>
                 {seg.start_time && (
                   <div className="text-xs text-slate-500 flex items-center gap-1">
                     <Clock className="w-3 h-3" /> {seg.start_time} – {seg.end_time}
@@ -328,7 +367,14 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                       a.checked ? "text-slate-500 line-through" : "text-slate-800"}`}>
                       {a.title}
                       {a.is_bonus && <span className="ml-1.5 text-[10px] text-amber-600 font-bold">BONUS</span>}
-                      {a.summary_required && !a.checked && <span className="ml-1.5 text-[10px] text-indigo-600 font-bold">📝 TULIS</span>}
+                      {a.summary_required && !a.checked && <span className="ml-1.5 text-[10px] text-indigo-600 font-bold">{(a.summary_questions || []).length ? "❓ KUIS" : "📝 TULIS"}</span>}
+                      {a.reading && !a.checked && <span className="ml-1.5 text-[10px] text-sky-600 font-bold">📖 HALAMAN</span>}
+                      {a.reading && a.checked && a.reading_page && <span className="ml-1.5 text-[10px] text-sky-600 font-bold">📖 hal. {a.reading_page}</span>}
+                      {(a.steps || []).length > 0 && (
+                        <span className="ml-1.5 text-[10px] text-slate-500 font-bold">
+                          ☑️ {(a.steps_done || []).filter(Boolean).length}/{a.steps.length}
+                        </span>
+                      )}
                     </span>
                     {a.duration_minutes ? (
                       <span className="text-[11px] text-slate-500 shrink-0" title="Perkiraan lama mengerjakan">
@@ -361,7 +407,19 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                       {a.summary_note && <div className="text-amber-700 mt-0.5">💬 {a.summary_note}</div>}
                     </div>
                   )}
-                  {(a.photo_required || a.before_photo_url || a.completion_photo_url) && (
+                  {(a.steps || []).length > 0 && (running || a.checked) && (
+                    <StepsList activity={a} canEdit={running} onChange={(patch) => patchAct(seg.id, a.id, patch)} />
+                  )}
+                  {a.reading && readingFor === a.id && running && (
+                    <ReadingForm activity={a} onCancel={() => setReadingFor(null)}
+                      onSaved={(patch) => { setReadingFor(null); patchAct(seg.id, a.id, patch); }} />
+                  )}
+                  {a.checked && canAdmit && (
+                    <div className="pl-9">
+                      <AdmitButton activity={a} onDone={() => { load(); window.dispatchEvent(new Event("app:honesty-refresh")); }} />
+                    </div>
+                  )}
+                  {(a.photo_required || a.before_photo_required || a.before_photo_url || a.completion_photo_url) && (
                     <PhotoRow activity={a} canEdit={running && a.status !== "approved"}
                               onSaved={(patch) => patchPhoto(seg.id, a.id, patch)} />
                   )}
@@ -470,7 +528,7 @@ function PhotoRow({ activity, canEdit, onSaved }) {
   );
   return (
     <div className="flex gap-2 pl-9">
-      {slot("before", "Foto sebelum", activity.before_photo_url)}
+      {slot("before", activity.before_photo_required ? "Foto sebelum (wajib)" : "Foto sebelum", activity.before_photo_url)}
       {slot("after", activity.photo_required ? "Foto sesudah (wajib)" : "Foto sesudah", activity.completion_photo_url)}
     </div>
   );

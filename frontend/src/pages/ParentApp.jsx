@@ -34,6 +34,8 @@ const CommandPalette = lazy(() => import("@/components/CommandPalette"));
 const HonestyInsightCard = lazy(() => import("@/components/HonestyInsightCard"));
 const ActivityLogCard = lazy(() => import("@/components/ActivityLogCard"));
 const RoutineManager = lazy(() => import("@/components/RoutineManager"));
+const RoutineExtras = lazy(() => import("@/components/RoutineExtras"));
+const HonestyWeeklyCard = lazy(() => import("@/components/HonestyWeeklyCard"));
 
 // Start downloading a tab's code the moment a finger or cursor reaches it.
 const VIEW_PREFETCH = {
@@ -53,7 +55,7 @@ const BOTTOM_NAV = ["overview", "tasks", "monitor", "money"];
 const BOTTOM_LABELS = { overview: "Beranda", tasks: "Tugas", monitor: "Monitor", money: "Uang" };
 
 const NAV = [
-  { key: "overview", label: "Overview", icon: Home },
+  { key: "overview", label: "Beranda", icon: Home },
   { key: "monitor", label: "Monitor Harian", icon: Clock, testId: "tab-monitor" },
   { key: "tasks", label: "Tugas", icon: ListChecks, testId: TEST_IDS.parent.tabTasks },
   { key: "rewards", label: "Hadiah", icon: Gift, testId: TEST_IDS.parent.tabRewards },
@@ -74,6 +76,17 @@ export default function ParentApp() {
     analytics: "nav.analytics", settings: "nav.settings",
   };
   const [view, setView] = useState("overview");
+  const [inboxCount, setInboxCount] = useState(0);
+  // The "Perlu perhatian" count stays fresh on every screen, not just Beranda.
+  useEffect(() => {
+    let alive = true;
+    const pull = () => api.get("/parent/inbox", { fresh: true })
+      .then((r) => { if (alive) setInboxCount(r.data?.total || 0); }).catch(() => {});
+    pull();
+    const t = setInterval(() => { if (!document.hidden) pull(); }, 120000);
+    window.addEventListener("app:parent-refresh", pull);
+    return () => { alive = false; clearInterval(t); window.removeEventListener("app:parent-refresh", pull); };
+  }, []);
   const viewTitle = (() => {
     const key = navLabelKey[view];
     return (key && t(key)) || NAV.find((x) => x.key === view)?.label || view;
@@ -225,6 +238,11 @@ export default function ParentApp() {
               >
                 <n.icon className="w-4 h-4 shrink-0" strokeWidth={2.5} />
                 <span className={sidebarCollapsed ? "md:hidden" : ""}>{lbl}</span>
+                {n.key === "overview" && inboxCount > 0 && (
+                  <span className={`ml-auto min-w-[1.25rem] h-5 px-1.5 rounded-full bg-indigo-600 text-white text-[11px] leading-5 text-center ${sidebarCollapsed ? "md:hidden" : ""}`}>
+                    {inboxCount}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -320,7 +338,7 @@ export default function ParentApp() {
           )}
 
           {view === "overview" && (
-            <Overview stats={stats} kids={children} tasks={tasks} pendingRedemptions={pendingRedemptions} onAddChild={() => setChildModal(true)} onNavigate={setView} />
+            <Overview stats={stats} kids={children} tasks={tasks} pendingRedemptions={pendingRedemptions} onAddChild={() => setChildModal(true)} onNavigate={setView} onInboxCount={setInboxCount} />
           )}
           {view === "monitor" && (
             <div className="space-y-4">
@@ -343,6 +361,7 @@ export default function ParentApp() {
                   generated from it. The old per-date list stays reachable for
                   one-off corrections, folded away so it doesn't compete. */}
               <RoutineManager kids={children} childId={selectedChildId || null} onChanged={load} />
+              <RoutineExtras onChanged={load} />
               <details className="bg-white rounded-2xl border border-slate-200">
                 <summary className="cursor-pointer px-5 py-3 text-sm font-semibold text-slate-600 select-none">
                   🛠️ Koreksi tugas per tanggal (lanjutan)
@@ -402,6 +421,7 @@ export default function ParentApp() {
           {/* Stage 4: Analytics */}
           {view === "analytics" && (
             <div className="space-y-6">
+              <HonestyWeeklyCard />
               <AnalyticsDashboard />
             </div>
           )}
@@ -428,6 +448,11 @@ export default function ParentApp() {
                       className={`press-btn relative flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl text-[11px] font-semibold ${active ? "text-indigo-600" : "text-slate-500"}`}>
                 <n.icon className="w-5 h-5" strokeWidth={2.5} />
                 {BOTTOM_LABELS[key]}
+                {key === "overview" && inboxCount > 0 && (
+                  <span className="absolute top-0 right-1 min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-indigo-600 text-white text-[10px] leading-[1.1rem]">
+                    {inboxCount}
+                  </span>
+                )}
                 {key === "tasks" && (stats?.pending_approval || 0) > 0 && (
                   <span className="absolute top-0 right-1 min-w-[1.1rem] h-[1.1rem] px-1 rounded-full bg-orange-500 text-white text-[10px] leading-[1.1rem]">
                     {stats.pending_approval}

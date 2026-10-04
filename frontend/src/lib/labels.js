@@ -12,7 +12,7 @@ export const DEFAULT_LABELS = {
   "login.button": "Masuk",
 
   // Parent nav
-  "nav.overview": "Overview",
+  "nav.overview": "Beranda",
   "nav.monitor": "Monitor Harian",
   "nav.tasks": "Tugas",
   "nav.rewards": "Hadiah",
@@ -72,7 +72,7 @@ export const EN_LABELS = {
   "login.passcode_prompt": "Enter passcode",
   "login.button": "Log In",
 
-  "nav.overview": "Overview",
+  "nav.overview": "Home",
   "nav.monitor": "Daily Monitor",
   "nav.tasks": "Tasks",
   "nav.rewards": "Rewards",

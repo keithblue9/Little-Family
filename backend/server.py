@@ -4084,7 +4084,7 @@ async def write_task_summary(task_id: str, payload: SummaryInput, user: dict = D
     if not text:
         raise HTTPException(status_code=422, detail="Ringkasannya masih kosong")
     need = int(task.get("summary_min_words") or SUMMARY_MIN_WORDS_DEFAULT)
-    if len(words) < need:
+    if not questions and len(words) < need:  # a quiz is judged per answer above
         raise HTTPException(status_code=422, detail=f"Ringkasannya kurang panjang: {len(words)} dari {need} kata")
     if len(words) >= 8 and len(set(words)) / len(words) < 0.35:
         raise HTTPException(status_code=422, detail="Tulis dengan kalimatmu sendiri ya, jangan diulang-ulang")

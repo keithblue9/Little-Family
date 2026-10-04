@@ -7,6 +7,7 @@ import { todayKey } from "@/lib/dates";
 import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
 import SummaryBox from "@/components/SummaryBox";
+import { StepsList, ReadingForm } from "@/components/MissionExtras";
 import { withLiveClock } from "@/lib/segmentClock";
 
 function speak(text) {
@@ -48,8 +49,13 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
     const onFlushed = () => load();
+    const onDay = () => load();
     window.addEventListener("app:offline-flushed", onFlushed);
-    return () => window.removeEventListener("app:offline-flushed", onFlushed);
+    window.addEventListener("app:day-refresh", onDay);
+    return () => {
+      window.removeEventListener("app:offline-flushed", onFlushed);
+      window.removeEventListener("app:day-refresh", onDay);
+    };
   }, [load]);
   useEffect(() => {
     const t = setInterval(() => { if (!document.hidden) load(); }, 60000);
@@ -158,8 +164,10 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
     const done = () => { haptic([20, 40, 20]); onCelebrate?.(); setStatus(segId, "done"); };
     try {
       if (pendingCount() > 0) { done(); queueOffline("finish", payload); return; }
-      await api.post("/segment-sessions/finish", payload);
+      const { data: r } = await api.post("/segment-sessions/finish", payload);
       done();
+      if (r?.spot_check) speak(`Cek kejutan! Kirim foto ${r.spot_check.title} ya.`);
+      window.dispatchEvent(new Event("app:honesty-refresh"));
       await load();
     } catch (e) {
       if (isNetworkError(e)) { done(); queueOffline("finish", payload); }
@@ -214,7 +222,32 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
                     className="press-btn w-16 h-16 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center">
               <Volume2 className="w-8 h-8" />
             </button>
-            {nextAct.summary_required ? (
+            {(nextAct.steps || []).length > 0 ? (
+              <div className="w-full text-left">
+                <StepsList big activity={nextAct} canEdit onChange={(patch) => {
+                  setData((d) => {
+                    const nd = d && { ...d, segments: d.segments.map((sg) => sg.id !== current.id ? sg : {
+                      ...sg, activities: sg.activities.map((x) => x.id === nextAct.id ? { ...x, ...patch } : x),
+                    }) };
+                    if (nd) cacheSet(cacheKey, nd);
+                    return nd;
+                  });
+                }} />
+              </div>
+            ) : nextAct.reading ? (
+              <div className="w-full text-left">
+                <ReadingForm big activity={nextAct} onSaved={(patch) => {
+                  haptic();
+                  setData((d) => {
+                    const nd = d && { ...d, segments: d.segments.map((sg) => sg.id !== current.id ? sg : {
+                      ...sg, activities: sg.activities.map((x) => x.id === nextAct.id ? { ...x, ...patch } : x),
+                    }) };
+                    if (nd) cacheSet(cacheKey, nd);
+                    return nd;
+                  });
+                }} />
+              </div>
+            ) : nextAct.summary_required ? (
               <div className="w-full text-left">
                 <SummaryBox big activity={nextAct} onSaved={(txt) => {
                   haptic();

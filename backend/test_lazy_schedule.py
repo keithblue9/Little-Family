@@ -766,6 +766,150 @@ with TestClient(server.app, base_url="https://testserver") as c:
     check("weekly: parents only", c.get("/api/family/honesty-weekly").status_code == 403)
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # ---------------- Proof types: steps, reading, quiz, photos from the routine ----------------
+    reset_schedule()
+    run(server.db.children.update_many({}, {"$set": {"reading_log": {}, "section_streaks": {}, "best_section_streak": 0,
+                                                     "probation_until": None}}))
+    A = server.ANYTIME_SEGMENT_ID
+    sl = c.post("/api/routine/slots", json={"weekdays": list(range(7)), "segment_id": None, "child_id": adskhan["id"],
+                                            "title": "Siapkan tas", "points": 5,
+                                            "steps": ["Buku", " ", "Pensil", "Botol minum"]}).json()["created"]
+    check("proof: steps are cleaned and stored on the routine", sl[0]["steps"] == ["Buku", "Pensil", "Botol minum"], str(sl[0]))
+    c.post("/api/routine/slots", json={"weekdays": list(range(7)), "segment_id": None, "child_id": adskhan["id"],
+                                       "title": "Membaca", "points": 5, "reading": True})
+    c.post("/api/routine/slots", json={"weekdays": list(range(7)), "segment_id": None, "child_id": adskhan["id"],
+                                       "title": "Kuis IPA", "points": 5, "summary_required": True, "summary_min_words": 3,
+                                       "summary_questions": ["Apa itu fotosintesis?", "Contoh tumbuhannya?"]})
+    c.post("/api/routine/slots", json={"weekdays": list(range(7)), "segment_id": None, "child_id": adskhan["id"],
+                                       "title": "Rapikan meja", "points": 5, "photo_required": True,
+                                       "before_photo_required": True})
+    c.post("/api/routine/apply-today")
+    today_tasks = {t["title"]: t for t in c.get(f"/api/tasks?date_key={TODAY}&child_id={adskhan['id']}").json()}
+    check("proof: the day's missions carry them",
+          today_tasks["Siapkan tas"]["steps"] and today_tasks["Membaca"]["reading"] is True
+          and len(today_tasks["Kuis IPA"]["summary_questions"]) == 2 and today_tasks["Rapikan meja"]["photo_required"]
+          and today_tasks["Rapikan meja"]["before_photo_required"], str({k: v.get("steps") for k, v in today_tasks.items()}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    ab = {"child_id": adskhan["id"], "date_key": TODAY, "segment_id": A}
+    run(server.db.segment_sessions.delete_many({"child_id": adskhan["id"]}))
+    c.post("/api/segment-sessions/start", json=ab)
+    tas, baca, kuis, meja = (today_tasks[n]["id"] for n in ("Siapkan tas", "Membaca", "Kuis IPA", "Rapikan meja"))
+    r = c.post(f"/api/tasks/{tas}/check", json={"checked": True})
+    check("steps: a plain tick is refused", r.status_code == 422 and "STEPS_REQUIRED" in r.text, r.text[:120])
+    for i in range(3):
+        r = c.post(f"/api/tasks/{tas}/steps", json={"index": i, "done": True})
+    check("steps: ticking every item ticks the mission", r.status_code == 200 and r.json()["checked"] is True, r.text[:150])
+    r = c.post(f"/api/tasks/{tas}/steps", json={"index": 1, "done": False})
+    check("steps: unticking an item unticks the mission", r.json()["checked"] is False)
+    c.post(f"/api/tasks/{tas}/steps", json={"index": 1, "done": True})
+    check("steps: an unknown item → 404", c.post(f"/api/tasks/{tas}/steps", json={"index": 7}).status_code == 404)
+    r = c.post(f"/api/tasks/{baca}/check", json={"checked": True})
+    check("reading: a plain tick is refused", r.status_code == 422 and "READING_REQUIRED" in r.text)
+    check("reading: needs a book title", c.post(f"/api/tasks/{baca}/reading", json={"page": 12}).status_code == 422)
+    r = c.post(f"/api/tasks/{baca}/reading", json={"page": 12, "book": "Si Kancil"})
+    check("reading: noting the page ticks it", r.status_code == 200 and r.json()["checked"] and r.json()["reading_page"] == 12,
+          r.text[:150])
+    r = c.post(f"/api/tasks/{kuis}/summary", json={"answers": ["tumbuhan membuat makanan"]})
+    check("quiz: every question needs an answer", r.status_code == 422, r.text[:120])
+    r = c.post(f"/api/tasks/{kuis}/summary", json={"answers": ["tumbuhan membuat makanan sendiri", "daun mangga hijau"]})
+    check("quiz: answers become the summary", r.status_code == 200 and "→ tumbuhan" in r.json()["summary_text"]
+          and r.json()["checked"], r.text[:150])
+    r = c.post("/api/segment-sessions/finish", json=ab)
+    check("photo: an after-photo is still required", r.status_code in (409, 422), r.text[:120])
+    c.post(f"/api/tasks/{meja}/check", json={"checked": True})
+    c.post(f"/api/tasks/{meja}/photo", json={"kind": "after", "photo_url": img})
+    r = c.post("/api/segment-sessions/finish", json=ab)
+    check("proof: with everything in, the section finishes", r.status_code == 200, r.text[:150])
+    # the reading log can't go backwards in the same book
+    r2 = c.post("/api/tasks", json={"title": "x", "points": 1, "date_key": TODAY, "target_children": [adskhan["id"]]})
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    nb = c.post("/api/tasks", json={"title": "Membaca lagi", "points": 3, "date_key": day(1), "reading": True,
+                                    "target_children": [adskhan["id"]]}).json()
+    run(server.db.tasks.update_one({"id": nb["id"]}, {"$set": {"date_key": TODAY, "segment_id": None}}))
+    run(server.db.segment_sessions.update_many({"child_id": adskhan["id"]}, {"$set": {"completed_at": None}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{nb['id']}/reading", json={"page": 10, "book": "si kancil"})
+    check("reading: can't go backwards in the same book", r.status_code == 422 and "12" in r.text, r.text[:150])
+    r = c.post(f"/api/tasks/{nb['id']}/reading", json={"page": 3, "book": "Kancil 2", "new_book": True})
+    check("reading: a new book starts fresh", r.status_code == 200, r.text[:150])
+    rd = c.get(f"/api/children/{adskhan['id']}/reading").json()
+    check("reading: progress per book is kept", {b["book"]: b["page"] for b in rd["books"]} == {"Si Kancil": 12, "Kancil 2": 3},
+          str(rd["books"]))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
+    # ---------------- Routine presets ----------------
+    r = c.post("/api/routine/presets", json={"name": "Hari Sekolah", "emoji": "🏫"})
+    check("preset: the routine can be saved", r.status_code == 200 and r.json()["slot_count"] == 4 * 7, r.text[:150])
+    school = r.json()["id"]
+    run(server.db.template_tasks.delete_many({"title": {"$in": ["Membaca", "Kuis IPA"]}}))
+    r = c.post(f"/api/routine/presets/{school}/apply")
+    check("preset: applying brings it back", r.status_code == 200 and r.json()["slots"] == 28, r.text[:150])
+    presets = c.get("/api/routine/presets").json()
+    check("preset: what was there is kept as a backup", any(p["auto"] and p["slot_count"] == 14 for p in presets),
+          str([(p["name"], p["slot_count"]) for p in presets]))
+    check("preset: unknown → 404", c.post("/api/routine/presets/nope/apply").status_code == 404)
+    c.delete(f"/api/routine/presets/{school}")
+    check("preset: can be deleted", all(p["id"] != school for p in c.get("/api/routine/presets").json()))
+
+    # ---------------- Relaxed days ----------------
+    segs_now = c.get("/api/config").json()["day_segments"]
+    sg0 = segs_now[0]
+    wd_t = str(dt.datetime.strptime(TODAY, "%Y-%m-%d").weekday())
+    st0 = server._hhmm_to_min(sg0["start_time"])
+    c.put(f"/api/children/{adskhan['id']}/segment-starts",
+          json={"starts": {}, "ends": {sg0["id"]: {wd_t: server._fmt_min(st0 + 1)}}})
+    kid_doc = run(server.db.children.find_one({"id": adskhan["id"]}))
+    check("relaxed: a personal finish applies on a normal day", server._effective_segment_end(sg0, kid_doc, TODAY) == st0 + 1)
+    r = c.post("/api/relaxed-days", json={"start_date": TODAY, "note": "Libur sekolah"})
+    check("relaxed: a range can be declared", r.status_code == 200, r.text[:150])
+    run(server._refresh_segments_cache())
+    check("relaxed: personal times are set aside", server._effective_segment_end(sg0, kid_doc, TODAY)
+          == server._hhmm_to_min(sg0["end_time"]))
+    tm = server._segment_timing(sg0, kid_doc, TODAY, 0)
+    check("relaxed: nobody is late", not tm["late_start"] and not tm["late_finish"], str(tm))
+    check("relaxed: no overdue alerts", run(server._overdue_sections(TODAY)) == [])
+    c.delete(f"/api/relaxed-days/{r.json()['id']}")
+    run(server._refresh_segments_cache())
+    check("relaxed: removing it restores the personal finish",
+          server._effective_segment_end(sg0, kid_doc, TODAY) == st0 + 1)
+    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {}, "ends": {}})
+
+    # ---------------- Per-section streak ----------------
+    kid_doc = run(server.db.children.find_one({"id": adskhan["id"]}))
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"section_streaks": {
+        "pagi-x": {"count": 6, "last_date": day(-1)}}, "best_section_streak": 6}}))
+    kid_doc = run(server.db.children.find_one({"id": adskhan["id"]}))
+    n = run(server._bump_section_streak(kid_doc, "pagi-x", TODAY, on_time=True))
+    check("streak: on time the day after grows it", n == 7, str(n))
+    check("streak: 7 in a row earns 'Tepat Waktu'",
+          run(server.db.badges.count_documents({"child_id": adskhan["id"], "key": "on_time_7"})) == 1)
+    kid_doc = run(server.db.children.find_one({"id": adskhan["id"]}))
+    check("streak: late resets it", run(server._bump_section_streak(kid_doc, "pagi-x", TODAY, on_time=False)) == 0)
+    kid_doc = run(server.db.children.find_one({"id": adskhan["id"]}))
+    check("streak: a gap starts over", run(server._bump_section_streak(
+        {**kid_doc, "section_streaks": {"pagi-x": {"count": 4, "last_date": day(-3)}}}, "pagi-x", TODAY, True)) == 1)
+
+    # ---------------- The child picks today's bonus ----------------
+    run(server.db.bonus_options.delete_many({}))
+    o = c.post("/api/bonus-options", json={"title": "Bantu siram tanaman", "points": 5, "emoji": "🪴"}).json()
+    c.post("/api/bonus-options", json={"title": "Baca 1 cerita untuk adik", "points": 5})
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    lst = c.get("/api/bonus-options").json()
+    check("bonus: the child sees the choices", len(lst["options"]) == 2 and lst["picked_today"] is None)
+    r = c.post(f"/api/kid/{adskhan['id']}/pick-bonus", json={"option_id": o["id"]})
+    check("bonus: picking adds a bonus mission today", r.status_code == 200 and r.json()["is_bonus"] is True
+          and r.json()["date_key"] == TODAY, r.text[:150])
+    check("bonus: only one a day", c.post(f"/api/kid/{adskhan['id']}/pick-bonus",
+          json={"option_id": o["id"]}).status_code == 409)
+    check("bonus: kids can't add choices", c.post("/api/bonus-options", json={"title": "x"}).status_code == 403)
+
+    # ---------------- Best day of the week ----------------
+    bd = c.get(f"/api/children/{adskhan['id']}/best-day").json()
+    check("best-day: picks a day with work done", bd["best"] and bd["best"]["done"] >= 1, str(bd)[:200])
+    other = next(k for k in kids if k["id"] != adskhan["id"])
+    check("best-day: not a sibling's", c.get(f"/api/children/{other['id']}/best-day").status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+
     # ---------------- Offline replay: start/finish keep their real time ----------------
     UTC = dt.timezone.utc
     now_utc = dt.datetime.now(UTC)

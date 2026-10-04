@@ -553,6 +553,18 @@ SUMMARY_MIN_WORDS_FLOOR = 3
 SUMMARY_MIN_WORDS_CAP = 300
 SUMMARY_MAX_CHARS = 5000
 _SUMMARY_FIELDS = ("summary_required", "summary_prompt", "summary_min_words")
+# Other kinds of proof a mission can ask for. All of them travel from the
+# routine onto each day's missions unchanged.
+_PROOF_FIELDS = _SUMMARY_FIELDS + (
+    "summary_questions",       # up to 3 questions, each answered separately (a small quiz)
+    "photo_required",          # an "after" photo before it can be ticked
+    "before_photo_required",   # …and a "before" one too
+    "reading",                 # a reading mission: the child notes the page they reached
+    "reading_book",            # optional fixed book title
+    "steps",                   # a small checklist inside the mission
+)
+MAX_STEPS = 10
+MAX_QUESTIONS = 3
 
 
 class TaskInput(BaseModel):
@@ -580,6 +592,11 @@ class TaskInput(BaseModel):
     summary_required: bool = False  # kid must write a short summary before ticking it
     summary_prompt: Optional[str] = Field(default=None, max_length=200)
     summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
+    summary_questions: Optional[List[str]] = Field(default=None, max_length=MAX_QUESTIONS)
+    before_photo_required: bool = False
+    reading: bool = False
+    reading_book: Optional[str] = Field(default=None, max_length=120)
+    steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     coop: bool = False  # true = a single shared task worked on together by target_children,
                          # not one copy per kid; points split evenly among participants on approval
     # "Bonus jika bersama": a SIMPLER alternative to full co-op — the task
@@ -619,6 +636,11 @@ class TaskUpdate(BaseModel):
     summary_required: Optional[bool] = None
     summary_prompt: Optional[str] = Field(default=None, max_length=200)
     summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
+    summary_questions: Optional[List[str]] = Field(default=None, max_length=MAX_QUESTIONS)
+    before_photo_required: Optional[bool] = None
+    reading: Optional[bool] = None
+    reading_book: Optional[str] = Field(default=None, max_length=120)
+    steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     together_bonus_enabled: Optional[bool] = None
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
     # These were missing, so editing a task silently discarded them and the
@@ -2104,6 +2126,11 @@ async def _build_task_doc(
         "summary_required": payload.summary_required,
         "summary_prompt": (payload.summary_prompt or "").strip() or None,
         "summary_min_words": payload.summary_min_words,
+        "summary_questions": _clean_list(payload.summary_questions),
+        "before_photo_required": payload.before_photo_required,
+        "reading": payload.reading,
+        "reading_book": (payload.reading_book or "").strip() or None,
+        "steps": _clean_list(payload.steps),
         "completion_photo_url": None,
         "is_coop": False,
         "coop_participants": [],
@@ -2217,7 +2244,8 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
     # Fields the parent is allowed to explicitly clear (set back to empty).
     # Sending null for these means "clear it" (back to Kapan Saja / the family
     # default), as opposed to "leave it alone" — which is what omitting does.
-    clearable = {"duration_minutes", "task_style", "segment_id", "summary_prompt", "summary_min_words"}
+    clearable = {"duration_minutes", "task_style", "segment_id", "summary_prompt", "summary_min_words",
+                 "summary_questions", "reading_book", "steps"}
     raw = payload.model_dump(exclude_unset=True)
 
     updates = {}
@@ -2230,6 +2258,11 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
     # Editing a member of a broadcast group forks it: this child's copy becomes
     # independent (loses broadcast_id) so the parent can customize just this one
     # while the siblings stay as they were. Matches the requested template behavior.
+    for f in ("summary_questions", "steps"):
+        if f in updates:
+            updates[f] = _clean_list(updates[f])
+    if "steps" in updates:
+        updates["steps_done"] = [False] * len(updates["steps"] or [])
     if updates and task.get("broadcast_id"):
         updates["broadcast_id"] = None
 
@@ -2574,14 +2607,24 @@ def _segment_for_task(task: dict, segments: list) -> Optional[dict]:
 
 
 
+# "Hari santai" ranges (school holidays and the like), refreshed alongside the
+# section cache so the sync timing helpers can consult them.
+_RELAXED_CACHE: dict = {"ranges": []}
+
+
+def _is_relaxed(date_key: Optional[str]) -> bool:
+    return bool(date_key) and any(r["start_date"] <= date_key <= r["end_date"] for r in _RELAXED_CACHE["ranges"])
+
+
 def _effective_segment_start(segment: dict, child: Optional[dict], date_key: Optional[str]) -> int:
     """Minutes-into-day when THIS child's section begins on THIS date.
 
     Falls back to the section's shared start whenever the child has no override
-    for that weekday, so partial configuration is always safe.
+    for that weekday, so partial configuration is always safe. On a relaxed day
+    personal times are set aside and the shared ones apply.
     """
     base = _hhmm_to_min(segment["start_time"])
-    if not child or not date_key:
+    if not child or not date_key or _is_relaxed(date_key):
         return base
     overrides = (child.get("segment_starts") or {}).get(segment.get("id")) or {}
     try:
@@ -2603,7 +2646,7 @@ def _effective_segment_end(segment: dict, child: Optional[dict], date_key: Optio
     A personal finish is never later than the shared end nor before the
     child's start that day."""
     base = _hhmm_to_min(segment["end_time"])
-    if not child or not date_key:
+    if not child or not date_key or _is_relaxed(date_key):
         return base
     overrides = (child.get("segment_ends") or {}).get(segment.get("id")) or {}
     try:
@@ -2966,6 +3009,12 @@ async def export_weekly_xlsx(
 # Durations are informational only: they tell the child roughly how long each
 # activity should take; the section's start and end are the only clock.
 
+def _clean_list(items: Optional[List[str]]) -> Optional[List[str]]:
+    """Trim, drop blanks, keep order; None when nothing is left."""
+    out = [str(x).strip()[:120] for x in (items or []) if str(x).strip()]
+    return out or None
+
+
 class RoutineSlotInput(BaseModel):
     weekdays: List[int] = Field(min_length=1, max_length=7)
     segment_id: Optional[str] = None          # None = Kapan Saja
@@ -2978,6 +3027,12 @@ class RoutineSlotInput(BaseModel):
     summary_required: bool = False
     summary_prompt: Optional[str] = Field(default=None, max_length=200)
     summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
+    summary_questions: Optional[List[str]] = Field(default=None, max_length=MAX_QUESTIONS)
+    photo_required: Optional[bool] = None
+    before_photo_required: Optional[bool] = None
+    reading: Optional[bool] = None
+    reading_book: Optional[str] = Field(default=None, max_length=120)
+    steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
 class RoutineSlotUpdate(BaseModel):
@@ -2990,6 +3045,12 @@ class RoutineSlotUpdate(BaseModel):
     summary_required: Optional[bool] = None
     summary_prompt: Optional[str] = Field(default=None, max_length=200)
     summary_min_words: Optional[int] = Field(default=None, ge=SUMMARY_MIN_WORDS_FLOOR, le=SUMMARY_MIN_WORDS_CAP)
+    summary_questions: Optional[List[str]] = Field(default=None, max_length=MAX_QUESTIONS)
+    photo_required: Optional[bool] = None
+    before_photo_required: Optional[bool] = None
+    reading: Optional[bool] = None
+    reading_book: Optional[str] = Field(default=None, max_length=120)
+    steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
 class RoutineMoveInput(BaseModel):
@@ -3106,7 +3167,7 @@ async def _ensure_day_built(dk: str) -> int:
                     "is_bonus": bool(sl.get("is_bonus")), "date_key": dk,
                     "recurrence": "none", "status": "pending", "created_at": now_iso(),
                     "from_routine_slot_id": sl["id"], "from_routine": True,
-                    **{f: sl.get(f) for f in _SUMMARY_FIELDS},
+                    **{f: sl.get(f) for f in _PROOF_FIELDS},
                 })
         if docs:
             await db.tasks.insert_many(docs)
@@ -3308,7 +3369,7 @@ async def _cleanup_legacy_schedule() -> Optional[dict]:
 
 def _slot_out(sl: dict) -> dict:
     return {k: sl.get(k) for k in ("id", "weekday", "segment_id", "child_id", "title",
-                                   "duration_minutes", "points", "is_bonus", "order", *_SUMMARY_FIELDS)}
+                                   "duration_minutes", "points", "is_bonus", "order", *_PROOF_FIELDS)}
 
 
 @api.get("/routine")
@@ -3345,6 +3406,12 @@ async def add_routine_slot(payload: RoutineSlotInput, user: dict = Depends(requi
                "summary_required": payload.summary_required,
                "summary_prompt": (payload.summary_prompt or "").strip() or None,
                "summary_min_words": payload.summary_min_words,
+               "summary_questions": _clean_list(payload.summary_questions),
+               "photo_required": bool(payload.photo_required),
+               "before_photo_required": bool(payload.before_photo_required),
+               "reading": bool(payload.reading),
+               "reading_book": (payload.reading_book or "").strip() or None,
+               "steps": _clean_list(payload.steps),
                "order": await _next_order(tpl["id"], wd, payload.segment_id), "created_at": now_iso()}
         await db.template_tasks.insert_one(doc)
         made.append(_slot_out(doc))
@@ -3360,9 +3427,15 @@ async def edit_routine_slot(slot_id: str, payload: RoutineSlotUpdate, user: dict
         raise HTTPException(status_code=404, detail="Aktivitas tidak ditemukan")
     raw = payload.model_dump(exclude_unset=True)
     upd = {k: v for k, v in raw.items()
-           if v is not None or k in ("segment_id", "child_id", "duration_minutes", "summary_prompt", "summary_min_words")}
+           if v is not None or k in ("segment_id", "child_id", "duration_minutes", "summary_prompt", "summary_min_words",
+                                     "summary_questions", "reading_book", "steps")}
     if "summary_prompt" in upd:
         upd["summary_prompt"] = (upd["summary_prompt"] or "").strip() or None
+    for f in ("summary_questions", "steps"):
+        if f in upd:
+            upd[f] = _clean_list(upd[f])
+    if "reading_book" in upd:
+        upd["reading_book"] = (upd["reading_book"] or "").strip() or None
     if "title" in upd:
         upd["title"] = upd["title"].strip()
     await _check_segment_and_child(upd.get("segment_id"), upd.get("child_id"))
@@ -3668,8 +3741,11 @@ def _segment_timing(seg: Optional[dict], child: Optional[dict], dk: str, grace: 
     if dk > today:
         return {"locked": True, "late_start": False, "late_finish": False}
     if dk < today:
-        return {"locked": False, "late_start": True, "late_finish": True}
+        relaxed = _is_relaxed(dk)
+        return {"locked": False, "late_start": not relaxed, "late_finish": not relaxed}
     now = _now_minutes(at)
+    if _is_relaxed(dk):  # a relaxed day: sections open as usual, nobody is late
+        return {"locked": now < start_min, "late_start": False, "late_finish": False}
     return {
         "locked": now < start_min,
         "late_start": now > start_min + max(0, grace),
@@ -3807,6 +3883,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
             "finish_late": bool(sess.get("finish_late")),
             "late_reason_label": sess.get("late_reason_label"),
             "no_points": bool(sess.get("no_points")),
+            "streak": int(((child.get("section_streaks") or {}).get(sid) or {}).get("count") or 0),
             "activities": [{
                 "id": a["id"], "title": a["title"], "description": a.get("description", ""),
                 "points": a.get("points", 0), "is_bonus": bool(a.get("is_bonus")),
@@ -3820,6 +3897,13 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                 "summary_text": a.get("summary_text"),
                 "summary_review": a.get("summary_review"),
                 "summary_note": a.get("summary_note"),
+                "summary_questions": a.get("summary_questions") or [],
+                "summary_answers": a.get("summary_answers") or [],
+                "before_photo_required": bool(a.get("before_photo_required")),
+                "reading": bool(a.get("reading")), "reading_book": a.get("reading_book"),
+                "reading_page": a.get("reading_page"), "reading_last": (child.get("reading_log") or {}).get(
+                    (a.get("reading_book") or "").strip().lower()) if a.get("reading") else None,
+                "steps": a.get("steps") or [], "steps_done": a.get("steps_done") or [],
                 # Photos as cacheable media URLs, never inline base64.
                 "before_photo_url": _media_ref("task", a["id"], "before_photo_url", a.get("before_photo_url")),
                 "completion_photo_url": _media_ref("task", a["id"], "completion_photo_url", a.get("completion_photo_url")),
@@ -3923,6 +4007,10 @@ async def check_activity(task_id: str, payload: ActivityCheckInput, user: dict =
     if payload.checked and task.get("summary_required") and not task.get("summary_text"):
         # The tick comes from writing the summary (POST /tasks/{id}/summary).
         raise HTTPException(status_code=422, detail="SUMMARY_REQUIRED")
+    if payload.checked and task.get("reading") and not task.get("reading_page"):
+        raise HTTPException(status_code=422, detail="READING_REQUIRED")
+    if payload.checked and task.get("steps") and not _steps_complete(task):
+        raise HTTPException(status_code=422, detail="STEPS_REQUIRED")
     await db.tasks.update_one({"id": task_id}, {"$set": {
         "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
     }})
@@ -3938,7 +4026,9 @@ async def check_all_activities(payload: SegmentCheckAllInput, user: dict = Depen
     await _require_running_session(payload.child_id, dk, payload.segment_id)
     ids = [t["id"] for t in await _segment_tasks(payload.child_id, dk, payload.segment_id)
            if t.get("status") in ("pending", "rejected")
-           and not (payload.checked and t.get("summary_required") and not t.get("summary_text"))]
+           and not (payload.checked and t.get("summary_required") and not t.get("summary_text"))
+           and not (payload.checked and t.get("reading") and not t.get("reading_page"))
+           and not (payload.checked and t.get("steps") and not _steps_complete(t))]
     if ids:
         await db.tasks.update_many({"id": {"$in": ids}}, {"$set": {
             "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
@@ -3947,7 +4037,9 @@ async def check_all_activities(payload: SegmentCheckAllInput, user: dict = Depen
 
 
 class SummaryInput(BaseModel):
-    text: str = Field(min_length=1, max_length=SUMMARY_MAX_CHARS)
+    text: str = Field(default="", max_length=SUMMARY_MAX_CHARS)
+    # When the mission has questions (a small quiz), one answer per question.
+    answers: Optional[List[str]] = Field(default=None, max_length=MAX_QUESTIONS)
     # Hints from the phone, shown to the parent: was any of it pasted in,
     # and how long was spent writing it.
     pasted: bool = False
@@ -3979,8 +4071,18 @@ async def write_task_summary(task_id: str, payload: SummaryInput, user: dict = D
     if seg_id != ANYTIME_SEGMENT_ID and not any(s["id"] == seg_id for s in await _get_day_segments()):
         seg_id = ANYTIME_SEGMENT_ID
     await _require_running_session(child_id, task["date_key"], seg_id)
-    text = payload.text.strip()
-    words = _summary_words(text)
+    questions = task.get("summary_questions") or []
+    answers = [a.strip() for a in (payload.answers or [])]
+    if questions:
+        if len(answers) != len(questions) or any(len(_summary_words(a)) < 3 for a in answers):
+            raise HTTPException(status_code=422, detail="Jawab semua pertanyaannya ya, masing-masing minimal 3 kata")
+        text = "\n".join(f"{q}\n→ {a}" for q, a in zip(questions, answers))
+        words = _summary_words(" ".join(answers))
+    else:
+        text = payload.text.strip()
+        words = _summary_words(text)
+    if not text:
+        raise HTTPException(status_code=422, detail="Ringkasannya masih kosong")
     need = int(task.get("summary_min_words") or SUMMARY_MIN_WORDS_DEFAULT)
     if len(words) < need:
         raise HTTPException(status_code=422, detail=f"Ringkasannya kurang panjang: {len(words)} dari {need} kata")
@@ -3988,6 +4090,7 @@ async def write_task_summary(task_id: str, payload: SummaryInput, user: dict = D
         raise HTTPException(status_code=422, detail="Tulis dengan kalimatmu sendiri ya, jangan diulang-ulang")
     await db.tasks.update_one({"id": task_id}, {"$set": {
         "summary_text": text, "summary_words": len(words), "summary_at": now_iso(),
+        "summary_answers": answers if questions else None,
         "summary_pasted": bool(payload.pasted), "summary_typing_seconds": payload.typing_seconds,
         "summary_review": None, "summary_note": None,
         "checked": True, "checked_at": now_iso(),
@@ -4032,6 +4135,93 @@ async def review_task_summary(task_id: str, payload: SummaryReviewInput, user: d
     return {"success": True, "reopened": reopened, "task": await db.tasks.find_one({"id": task_id}, {"_id": 0})}
 
 
+def _steps_complete(task: dict) -> bool:
+    steps = task.get("steps") or []
+    done = task.get("steps_done") or []
+    return bool(steps) and len(done) >= len(steps) and all(done[:len(steps)])
+
+
+async def _running_task_for(task_id: str, user: dict) -> tuple:
+    """A mission the caller may work on right now: theirs, open, and its
+    section started."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    child_id = _task_owner(task, user)
+    if task.get("status") not in ("pending", "rejected"):
+        raise HTTPException(status_code=409, detail="Misi ini sudah ditutup")
+    seg_id = task.get("segment_id") or ANYTIME_SEGMENT_ID
+    await _refresh_segments_cache()
+    if seg_id != ANYTIME_SEGMENT_ID and not any(s["id"] == seg_id for s in await _get_day_segments()):
+        seg_id = ANYTIME_SEGMENT_ID
+    await _require_running_session(child_id, task["date_key"], seg_id)
+    return task, child_id
+
+
+class StepInput(BaseModel):
+    index: int = Field(ge=0, lt=MAX_STEPS)
+    done: bool = True
+
+
+@api.post("/tasks/{task_id}/steps")
+async def tick_task_step(task_id: str, payload: StepInput, user: dict = Depends(get_current_user)):
+    """One item of a mission's small checklist (e.g. tas sekolah: buku,
+    pensil, botol). The mission ticks itself once every item is done."""
+    task, _ = await _running_task_for(task_id, user)
+    steps = task.get("steps") or []
+    if payload.index >= len(steps):
+        raise HTTPException(status_code=404, detail="Langkah tidak ditemukan")
+    done = list(task.get("steps_done") or [])
+    done += [False] * (len(steps) - len(done))
+    done[payload.index] = payload.done
+    complete = all(done[:len(steps)])
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "steps_done": done, "checked": complete, "checked_at": now_iso() if complete else None}})
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+class ReadingInput(BaseModel):
+    page: int = Field(ge=1, le=5000)
+    book: Optional[str] = Field(default=None, max_length=120)
+    new_book: bool = False  # starting a different book — earlier pages don't apply
+
+
+@api.post("/tasks/{task_id}/reading")
+async def log_reading(task_id: str, payload: ReadingInput, user: dict = Depends(get_current_user)):
+    """A reading mission: the child notes the page they reached. It can't go
+    backwards in the same book, which makes 'read' something you can see."""
+    task, child_id = await _running_task_for(task_id, user)
+    if not task.get("reading"):
+        raise HTTPException(status_code=400, detail="Misi ini bukan misi membaca")
+    book = (task.get("reading_book") or payload.book or "").strip()
+    if not book:
+        raise HTTPException(status_code=422, detail="Tulis judul bukunya dulu")
+    key = book.lower()
+    child = await db.children.find_one({"id": child_id}, {"_id": 0, "reading_log": 1})
+    log = dict((child or {}).get("reading_log") or {})
+    prev = (log.get(key) or {}).get("page")
+    if prev and payload.page <= prev and not payload.new_book:
+        raise HTTPException(status_code=422, detail=f"Terakhir kamu sampai halaman {prev} — halamannya harus lebih jauh")
+    log[key] = {"book": book, "page": payload.page, "at": now_iso()}
+    await db.children.update_one({"id": child_id}, {"$set": {"reading_log": log}})
+    await db.reading_history.insert_one({"parent_id": FAMILY_ID, "child_id": child_id, "book": book,
+                                         "from_page": None if payload.new_book else prev, "page": payload.page,
+                                         "date_key": task.get("date_key"), "task_id": task_id, "at": now_iso()})
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "reading_book": book, "reading_page": payload.page,
+        "reading_from_page": None if payload.new_book else prev,
+        "checked": True, "checked_at": now_iso()}})
+    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
+
+
+@api.get("/children/{child_id}/reading")
+async def child_reading(child_id: str, user: dict = Depends(get_current_user)):
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    hist = await db.reading_history.find({"child_id": child_id}, {"_id": 0}).sort("at", -1).to_list(60)
+    books = sorted((child.get("reading_log") or {}).values(), key=lambda b: b.get("at") or "", reverse=True)
+    return {"books": books, "history": hist}
+
+
 @api.post("/segment-sessions/finish")
 async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_current_user)):
     _assert_can_act(user, payload.child_id)
@@ -4045,6 +4235,14 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
     sess = await _require_running_session(payload.child_id, dk, payload.segment_id)
 
     acts = await _segment_tasks(payload.child_id, dk, payload.segment_id)
+    missing_proof = [a for a in acts if not a.get("is_bonus") and a.get("status") in ("pending", "rejected")
+                     and ((a.get("reading") and not a.get("reading_page"))
+                          or (a.get("steps") and not _steps_complete(a)))]
+    if missing_proof:
+        raise HTTPException(
+            status_code=422,
+            detail="Lengkapi dulu: " + ", ".join(a["title"] for a in missing_proof[:3]),
+        )
     # A summary mission is ticked by writing it, so name it explicitly.
     missing_summary = [a for a in acts if a.get("summary_required") and not a.get("is_bonus")
                        and a.get("status") in ("pending", "rejected") and not a.get("summary_text")]
@@ -4133,10 +4331,12 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
             body=f"{len(to_award)} tugas dicentang" + (" · terlambat" if finish_update["finish_late"] else ""),
             url="/parent",
         )
+    streak = await _bump_section_streak(child, payload.segment_id, dk,
+                                        on_time=not (finish_update["finish_late"] or sess.get("start_late")))
     spot = await _maybe_spot_check(child, dk, (seg or {}).get("label", "Kapan Saja"), acts, config)
     return {"success": True, "completed": len(to_award), "awarded": awarded,
             "finish_late": finish_update["finish_late"], "no_points": no_points,
-            "on_watch": on_watch, "spot_check": spot}
+            "on_watch": on_watch, "spot_check": spot, "section_streak": streak}
 
 
 @api.post("/segment-sessions/reopen")
@@ -4366,6 +4566,9 @@ async def _overdue_sections(dk: Optional[str] = None) -> list:
     today = _today_key()
     now_min = _now_minutes()
     rows = []
+    await _refresh_segments_cache()
+    if _is_relaxed(dk):
+        return []
     for r in await _sections_status(dk):
         if r["finished"] or r["reviewed"]:
             continue
@@ -4451,7 +4654,8 @@ async def _run_reminder_sweep() -> dict:
     for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50):
         await _refresh_trust(k["id"])
 
-    for r in await _sections_status(today):
+    await _refresh_segments_cache()
+    for r in ([] if _is_relaxed(today) else await _sections_status(today)):
         if r["finished"] or r["reviewed"]:
             continue
         lead = r["end_min"] - now_min
@@ -4682,6 +4886,11 @@ def _invalidate_config_cache():
 
 async def _refresh_segments_cache():
     _SEGMENTS_CACHE["segments"] = await _get_day_segments()
+    import time as _t
+    if _t.monotonic() - _RELAXED_CACHE.get("at", -1e9) > 30:
+        _RELAXED_CACHE["ranges"] = await db.relaxed_days.find(
+            {"parent_id": FAMILY_ID}, {"_id": 0, "start_date": 1, "end_date": 1}).to_list(200)
+        _RELAXED_CACHE["at"] = _t.monotonic()
 
 
 
@@ -6952,6 +7161,241 @@ async def honesty_weekly(user: dict = Depends(require_parent)):
             "admits": admits, "corrections": corrections, "note": note,
         })
     return {"since": since, "until": today, "children": out}
+
+
+# ---- Routine presets ("Hari sekolah", "Libur sekolah", "Ujian") -----------
+class RoutinePresetInput(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    emoji: str = Field(default="", max_length=8)
+
+
+_PRESET_SLOT_KEYS = ("weekday", "segment_id", "child_id", "title", "duration_minutes", "points", "is_bonus",
+                     "order", *_PROOF_FIELDS)
+
+
+async def _routine_snapshot() -> list:
+    tpl = await _routine_template()
+    rows = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": tpl["id"]}, {"_id": 0}).to_list(5000)
+    return [{k: r.get(k) for k in _PRESET_SLOT_KEYS} for r in rows]
+
+
+@api.get("/routine/presets")
+async def list_routine_presets(user: dict = Depends(require_parent)):
+    rows = await db.routine_presets.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return [{**{k: v for k, v in r.items() if k != "slots"}, "slot_count": len(r.get("slots") or [])} for r in rows]
+
+
+@api.post("/routine/presets")
+async def save_routine_preset(payload: RoutinePresetInput, user: dict = Depends(require_parent)):
+    """Save the whole weekly routine as it is now under a name, to switch back
+    to it later with one tap."""
+    slots = await _routine_snapshot()
+    if not slots:
+        raise HTTPException(status_code=400, detail="Rutinitas masih kosong — isi dulu sebelum disimpan")
+    doc = {"id": new_id(), "parent_id": FAMILY_ID, "name": payload.name.strip(), "emoji": payload.emoji.strip(),
+           "slots": slots, "created_at": now_iso(), "auto": False}
+    await db.routine_presets.insert_one(dict(doc))
+    return {k: v for k, v in doc.items() if k != "slots"} | {"slot_count": len(slots)}
+
+
+@api.post("/routine/presets/{preset_id}/apply")
+async def apply_routine_preset(preset_id: str, user: dict = Depends(require_parent)):
+    """Switch the weekly routine to a saved one. What was there is kept as an
+    automatic backup preset first, so switching is never a loss."""
+    preset = await db.routine_presets.find_one({"id": preset_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not preset:
+        raise HTTPException(status_code=404, detail="Jadwal tersimpan tidak ditemukan")
+    current = await _routine_snapshot()
+    if current:
+        await db.routine_presets.insert_one({
+            "id": new_id(), "parent_id": FAMILY_ID, "name": f"Cadangan {_today_key()}", "emoji": "💾",
+            "slots": current, "created_at": now_iso(), "auto": True})
+        autos = await db.routine_presets.find({"parent_id": FAMILY_ID, "auto": True}, {"_id": 0, "id": 1}).sort(
+            "created_at", -1).to_list(100)
+        if len(autos) > 5:
+            await db.routine_presets.delete_many({"id": {"$in": [a["id"] for a in autos[5:]]}})
+    tpl = await _routine_template()
+    await db.template_tasks.delete_many({"parent_id": FAMILY_ID, "template_id": tpl["id"]})
+    kids = {k["id"] for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)}
+    docs = [{**sl, "id": new_id(), "parent_id": FAMILY_ID, "template_id": tpl["id"], "created_at": now_iso()}
+            for sl in preset.get("slots") or [] if not sl.get("child_id") or sl["child_id"] in kids]
+    if docs:
+        await db.template_tasks.insert_many(docs)
+    await _invalidate_days(_today_key(), include_today=False)
+    await log_activity(FAMILY_ID, None, "routine_preset_applied", {"name": preset.get("name"), "slots": len(docs)})
+    return {"success": True, "slots": len(docs)}
+
+
+@api.delete("/routine/presets/{preset_id}")
+async def delete_routine_preset(preset_id: str, user: dict = Depends(require_parent)):
+    await db.routine_presets.delete_one({"id": preset_id, "parent_id": FAMILY_ID})
+    return {"success": True}
+
+
+# ---- Relaxed days ("hari santai") -------------------------------------------
+class RelaxedDayInput(BaseModel):
+    start_date: str
+    end_date: Optional[str] = None
+    note: str = Field(default="", max_length=100)
+
+
+@api.get("/relaxed-days")
+async def list_relaxed_days(user: dict = Depends(get_current_user)):
+    return await db.relaxed_days.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("start_date", -1).to_list(50)
+
+
+@api.post("/relaxed-days")
+async def add_relaxed_days(payload: RelaxedDayInput, user: dict = Depends(require_parent)):
+    """School holidays and the like: the routine still runs, but personal
+    start/finish times are set aside and nobody is late."""
+    days = _date_span(payload.start_date, payload.end_date)
+    doc = {"id": new_id(), "parent_id": FAMILY_ID, "start_date": days[0], "end_date": days[-1],
+           "note": payload.note.strip(), "created_at": now_iso()}
+    await db.relaxed_days.insert_one(dict(doc))
+    _RELAXED_CACHE["at"] = -1e9
+    return doc
+
+
+@api.delete("/relaxed-days/{relaxed_id}")
+async def delete_relaxed_days(relaxed_id: str, user: dict = Depends(require_parent)):
+    await db.relaxed_days.delete_one({"id": relaxed_id, "parent_id": FAMILY_ID})
+    _RELAXED_CACHE["at"] = -1e9
+    return {"success": True}
+
+
+# ---- Per-section streaks -----------------------------------------------------
+async def _bump_section_streak(child: dict, seg_id: str, dk: str, on_time: bool) -> int:
+    """Consecutive days a section was finished on time ('Pagi tepat waktu 5
+    hari'). A late finish resets it; a skipped day starts it over."""
+    streaks = dict(child.get("section_streaks") or {})
+    cur = streaks.get(seg_id) or {}
+    if not on_time:
+        count = 0
+    else:
+        last = cur.get("last_date")
+        prev_day = (datetime.strptime(dk, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        if last == dk:
+            count = int(cur.get("count") or 0)
+        elif last == prev_day or (last and await _days_all_off_between(last, dk)):
+            count = int(cur.get("count") or 0) + 1
+        else:
+            count = 1
+    streaks[seg_id] = {"count": count, "last_date": dk}
+    best = max(int(child.get("best_section_streak") or 0), count)
+    await db.children.update_one({"id": child["id"]}, {"$set": {"section_streaks": streaks,
+                                                                 "best_section_streak": best}})
+    if count and count % 7 == 0:
+        await award_badges(FAMILY_ID, child["id"])
+    return count
+
+
+async def _days_all_off_between(last: str, dk: str) -> bool:
+    d = datetime.strptime(last, "%Y-%m-%d") + timedelta(days=1)
+    end = datetime.strptime(dk, "%Y-%m-%d")
+    while d < end:
+        if not await _is_off_day(d.strftime("%Y-%m-%d")):
+            return False
+        d += timedelta(days=1)
+    return True
+
+
+# ---- The child picks one bonus mission a day --------------------------------
+class BonusOptionInput(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    points: int = Field(default=5, ge=0, le=1000)
+    emoji: str = Field(default="", max_length=8)
+
+
+@api.get("/bonus-options")
+async def list_bonus_options(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    rows = await db.bonus_options.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", 1).to_list(50)
+    cid = user["id"] if user["role"] == "child" else child_id
+    picked = None
+    if cid:
+        picked = await db.tasks.find_one({"parent_id": FAMILY_ID, "child_id": cid, "date_key": _today_key(),
+                                          "from_bonus_option": {"$exists": True}}, {"_id": 0, "id": 1, "title": 1})
+    return {"options": rows, "picked_today": picked}
+
+
+@api.post("/bonus-options")
+async def add_bonus_option(payload: BonusOptionInput, user: dict = Depends(require_parent)):
+    doc = {"id": new_id(), "parent_id": FAMILY_ID, "title": payload.title.strip(), "points": payload.points,
+           "emoji": payload.emoji.strip(), "created_at": now_iso()}
+    await db.bonus_options.insert_one(dict(doc))
+    return doc
+
+
+@api.delete("/bonus-options/{option_id}")
+async def delete_bonus_option(option_id: str, user: dict = Depends(require_parent)):
+    await db.bonus_options.delete_one({"id": option_id, "parent_id": FAMILY_ID})
+    return {"success": True}
+
+
+class BonusPickInput(BaseModel):
+    option_id: str
+
+
+@api.post("/kid/{child_id}/pick-bonus")
+async def pick_bonus(child_id: str, payload: BonusPickInput, user: dict = Depends(get_current_user)):
+    """One bonus mission a day, chosen by the child from the parent's list —
+    it lands in 'Kapan Saja' for today."""
+    _assert_can_act(user, child_id)
+    opt = await db.bonus_options.find_one({"id": payload.option_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not opt:
+        raise HTTPException(status_code=404, detail="Pilihan bonus tidak ditemukan")
+    today = _today_key()
+    if await db.tasks.find_one({"parent_id": FAMILY_ID, "child_id": child_id, "date_key": today,
+                                "from_bonus_option": {"$exists": True}}):
+        raise HTTPException(status_code=409, detail="Hari ini kamu sudah memilih bonus")
+    doc = {"id": new_id(), "parent_id": FAMILY_ID, "child_id": child_id, "title": opt["title"],
+           "description": "", "points": opt["points"], "penalty_points": 0, "is_bonus": True,
+           "segment_id": None, "date_key": today, "recurrence": "none", "status": "pending", "order": 999,
+           "created_at": now_iso(), "from_bonus_option": opt["id"]}
+    await db.tasks.insert_one(dict(doc))
+    await log_activity(FAMILY_ID, child_id, "bonus_picked", {"title": opt["title"]})
+    return doc
+
+
+# ---- "Hari terbaik minggu ini" ------------------------------------------------
+@api.get("/children/{child_id}/best-day")
+async def best_day_of_week(child_id: str, user: dict = Depends(get_current_user)):
+    """The child's best day of the last seven: most of the list done, on time,
+    with whatever photos and summaries came with it — a little story to share."""
+    if user["role"] == "child" and user["id"] != child_id:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    await get_child_or_404(FAMILY_ID, child_id)
+    today = _today_key()
+    since = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+    rows = await db.tasks.find({"parent_id": FAMILY_ID, "child_id": child_id, "date_key": {"$gt": since, "$lte": today},
+                                "status": {"$ne": "off"}}, {"_id": 0}).to_list(2000)
+    sess = await db.segment_sessions.find({"child_id": child_id, "date_key": {"$gt": since}}, {"_id": 0}).to_list(500)
+    days: dict = {}
+    for t in rows:
+        d = days.setdefault(t["date_key"], {"required": 0, "done": 0, "points": 0, "photos": [], "summaries": []})
+        if not t.get("is_bonus"):
+            d["required"] += 1
+        if t.get("status") in ("approved", "completed"):
+            d["done"] += 0 if t.get("is_bonus") else 1
+            d["points"] += int(t.get("points") or 0) if t.get("status") == "approved" and not t.get("late_no_points") else 0
+            if t.get("completion_photo_url"):
+                d["photos"].append(_media_ref("task", t["id"], "completion_photo_url", t["completion_photo_url"]))
+            if t.get("summary_text"):
+                d["summaries"].append({"title": t["title"], "text": t["summary_text"][:200]})
+    for se in sess:
+        d = days.get(se["date_key"])
+        if d is not None and se.get("completed_at"):
+            d["on_time"] = d.get("on_time", 0) + (0 if se.get("start_late") or se.get("finish_late") else 1)
+    if not days:
+        return {"best": None}
+    def score(item):
+        dk, d = item
+        ratio = d["done"] / d["required"] if d["required"] else 0
+        return (ratio, d.get("on_time", 0), d["points"], len(d["photos"]))
+    dk, d = max(days.items(), key=score)
+    if not d["done"]:
+        return {"best": None}
+    return {"best": {"date_key": dk, "done": d["done"], "required": d["required"], "points": d["points"],
+                     "on_time_sections": d.get("on_time", 0), "photos": d["photos"][:6], "summaries": d["summaries"][:3]}}
 
 
 # ---- Media: images out of the JSON payloads ---------------------------------

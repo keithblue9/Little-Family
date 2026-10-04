@@ -34,10 +34,23 @@ def day(offset):
 
 
 def reset_schedule():
-    for coll in ("tasks", "day_templates", "template_tasks", "template_assignments", "off_days", "tasks_archive"):
+    for coll in ("tasks", "day_templates", "template_tasks", "off_days", "day_builds", "segment_sessions"):
         run(getattr(server.db, coll).delete_many({}))
     server._invalidate_days_ready()
     server._invalidate_config_cache()
+
+
+def add_routine(c, title, points, segment_id, weekdays=None, child_id=None):
+    r = c.post("/api/routine/slots", json={"weekdays": weekdays if weekdays is not None else list(range(7)),
+                                           "segment_id": segment_id, "title": title, "points": points,
+                                           "child_id": child_id})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+# These tests start from a family that already runs on the weekly routine.
+run(server.db.app_meta.update_one({"_id": "routine_migrated"}, {"$set": {"at": "test"}}, upsert=True))
+run(server.db.app_meta.update_one({"_id": "legacy_cleanup_v1"}, {"$set": {"at": "test"}}, upsert=True))
 
 
 with TestClient(server.app, base_url="https://testserver") as c:
@@ -51,15 +64,12 @@ with TestClient(server.app, base_url="https://testserver") as c:
     first_seg = next(iter(SEG.values()))
     TODAY, TOMORROW = day(0), day(1)
 
-    # ---------------- Default template: only near days are built ----------------
+    # ---------------- Routine: only near days are built ----------------
     reset_schedule()
-    tpl = c.post("/api/day-templates", json={"name": "Hari Biasa", "is_default": True}).json()
-    for wd in range(7):
-        c.post("/api/template-tasks", json={"template_id": tpl["id"], "weekday": wd,
-                                            "segment_id": first_seg, "title": "Rapikan kasur", "points": 10})
+    add_routine(c, "Rapikan kasur", 10, first_seg)
     rows = c.get("/api/tasks").json()
     dates = sorted({t["date_key"] for t in rows})
-    check("lazy: today is built from the default template", TODAY in dates, str(dates))
+    check("lazy: today is built from the routine", TODAY in dates, str(dates))
     check("lazy: tomorrow is built too", TOMORROW in dates, str(dates))
     check("lazy: nothing beyond tomorrow is pre-built", all(d <= TOMORROW for d in dates), str(dates))
     check("lazy: one copy per child per day", len([t for t in rows if t["date_key"] == TODAY]) == len(kids),
@@ -103,11 +113,9 @@ with TestClient(server.app, base_url="https://testserver") as c:
 
     # ---------------- Kid paths build an empty near day inline ----------------
     reset_schedule()
-    tpl = c.post("/api/day-templates", json={"name": "Hari Biasa", "is_default": True}).json()
-    for wd in range(7):
-        c.post("/api/template-tasks", json={"template_id": tpl["id"], "weekday": wd,
-                                            "segment_id": first_seg, "title": "Sikat gigi", "points": 5})
+    add_routine(c, "Sikat gigi", 5, first_seg)
     run(server.db.tasks.delete_many({}))
+    run(server.db.day_builds.delete_many({}))
     server._invalidate_days_ready()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
     r = c.get(f"/api/children/{adskhan['id']}/segments-day")
@@ -118,26 +126,83 @@ with TestClient(server.app, base_url="https://testserver") as c:
     check("kid: day-progress sees today's mission", r.status_code == 200 and "Sikat gigi" in str(r.json()))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
-    # ---------------- Repeating series only fill near days on read ----------------
+    # ---------------- Vacation mode pauses the routine ----------------
     reset_schedule()
-    c.post("/api/tasks", json={"title": "Siram tanaman", "points": 5, "date_key": day(-3),
-                               "target_children": [adskhan["id"]], "recurrence": "daily"})
-    rows = [t for t in c.get("/api/tasks").json() if t["title"] == "Siram tanaman"]
-    got = sorted(t["date_key"] for t in rows)
-    check("series: today and tomorrow appear on read", TODAY in got and TOMORROW in got, str(got))
-    check("series: no fortnight pre-built", max(got) == TOMORROW, str(got))
-    check("series: no past backfill", day(-2) not in got and day(-1) not in got, str(got))
-    r = c.post("/api/tasks/materialize-recurring?days_ahead=5")
-    check("series: manual refresh still fills ahead", r.json()["created"] >= 4, r.text[:120])
-
-    # Vacation mode pauses series
-    reset_schedule()
+    add_routine(c, "Libur", 5, first_seg)
+    run(server.db.tasks.delete_many({}))
+    run(server.db.day_builds.delete_many({}))
     c.post("/api/config", json={"vacation_mode": True})
-    c.post("/api/tasks", json={"title": "Libur", "points": 5, "date_key": day(-2),
-                               "target_children": [adskhan["id"]], "recurrence": "daily"})
-    got = [t for t in c.get("/api/tasks").json() if t["title"] == "Libur"]
-    check("series: vacation mode builds nothing", len(got) == 1, str(len(got)))
+    c.post(f"/api/days/{day(4)}/prepare")
+    check("vacation: no new days are built", run(server.db.tasks.count_documents({"title": "Libur"})) == 0)
     c.post("/api/config", json={"vacation_mode": False})
+    c.post(f"/api/days/{day(4)}/prepare")
+    check("vacation: building resumes when it ends",
+          run(server.db.tasks.count_documents({"title": "Libur", "date_key": day(4)})) == len(kids))
+
+    # ---------------- One-time cleanup of the old schedule ----------------
+    reset_schedule()
+    run(server.db.app_meta.delete_many({"_id": {"$in": ["routine_migrated", "legacy_cleanup_v1"]}}))
+    server._ROUTINE_MIGRATED["done"] = False
+    run(server.db.legacy_archive.delete_many({}))
+    old_tpl = {"id": "old-tpl", "parent_id": "family-default", "name": "Hari Biasa", "is_default": True}
+    run(server.db.day_templates.insert_one(dict(old_tpl)))
+    run(server.db.template_tasks.insert_one({"id": "old-slot", "parent_id": "family-default", "template_id": "old-tpl",
+                                             "weekday": 0, "segment_id": first_seg, "title": "Slot lama", "points": 4}))
+    run(server.db.template_assignments.insert_one({"parent_id": "family-default", "date_key": day(2),
+                                                   "template_id": "old-tpl"}))
+    run(server.db.routine_templates.insert_one({"id": "bundle", "parent_id": "family-default", "label": "Paket"}))
+    run(server.db.tasks.insert_many([
+        {"id": "leg-series", "parent_id": "family-default", "child_id": adskhan["id"], "title": "Siram tanaman",
+         "points": 5, "date_key": day(-1), "recurrence": "daily", "status": "approved"},
+        {"id": "leg-future", "parent_id": "family-default", "child_id": adskhan["id"], "title": "Siram tanaman",
+         "points": 5, "date_key": day(3), "recurrence": "daily", "status": "pending"},
+        {"id": "leg-open", "parent_id": "family-default", "child_id": adskhan["id"], "title": "Tugas jam",
+         "points": 5, "date_key": TODAY, "status": "pending", "due_time": "07:00", "min_duration_minutes": 10,
+         "snooze_count": 1, "timer_started_at": None},
+    ]))
+    run(server._write_config({"$set": {"min_gap_seconds": 60, "snooze_options_minutes": [5]}}))
+    c.get("/api/tasks")
+    meta = run(server.db.app_meta.find_one({"_id": "legacy_cleanup_v1"}))
+    check("cleanup: runs once on the next read", meta is not None, str(meta))
+    slots = c.get("/api/routine").json()["slots"]
+    check("cleanup: old repeating mission became a routine activity",
+          any(x["title"] == "Siram tanaman" for x in slots), str([x["title"] for x in slots]))
+    check("cleanup: old template slot became a routine activity",
+          any(x["title"] == "Slot lama" for x in slots), str([x["title"] for x in slots]))
+    check("cleanup: old templates and assignments are gone",
+          run(server.db.day_templates.count_documents({"id": "old-tpl"})) == 0
+          and run(server.db.template_assignments.count_documents({})) == 0
+          and run(server.db.routine_templates.count_documents({})) == 0)
+    check("cleanup: everything removed is archived",
+          run(server.db.legacy_archive.count_documents({"kind": "day_template"})) == 1
+          and run(server.db.legacy_archive.count_documents({"kind": "template_assignment"})) == 1)
+    check("cleanup: untouched future copies of old series are removed",
+          run(server.db.tasks.count_documents({"id": "leg-future"})) == 0)
+    check("cleanup: history is kept", run(server.db.tasks.count_documents({"id": "leg-series"})) == 1)
+    leg = run(server.db.tasks.find_one({"id": "leg-open"}))
+    check("cleanup: open missions lose their per-mission clock",
+          leg and "due_time" not in leg and "min_duration_minutes" not in leg and "snooze_count" not in leg, str(leg))
+    check("cleanup: nothing repeats the old way any more",
+          run(server.db.tasks.count_documents({"recurrence": {"$in": ["daily", "weekly"]}})) == 0)
+    cfg = c.get("/api/config").json()
+    check("cleanup: old pacing settings are gone", "min_gap_seconds" not in cfg and "snooze_options_minutes" not in cfg,
+          str([k for k in cfg if "snooze" in k or "gap" in k]))
+    n_arch = run(server.db.legacy_archive.count_documents({}))
+    server._ROUTINE_MIGRATED["done"] = False
+    c.get("/api/tasks")
+    check("cleanup: never runs twice", run(server.db.legacy_archive.count_documents({})) == n_arch)
+
+    # ---------------- Old endpoints are gone ----------------
+    for method, path in [("post", "/api/tasks/x/start"), ("post", "/api/tasks/x/complete"),
+                         ("post", "/api/tasks/x/snooze"), ("post", "/api/tasks/x/skip"),
+                         ("post", "/api/tasks/x/late-reason"), ("post", "/api/tasks/x/hold-request"),
+                         ("get", "/api/hold-requests"), ("get", "/api/late-exceptions"),
+                         ("get", "/api/day-templates"), ("get", "/api/template-tasks"),
+                         ("post", "/api/tasks/materialize-recurring"), ("post", "/api/tasks/restart-schedule"),
+                         ("post", "/api/maintenance/compact-schedule"), ("post", "/api/tasks/dedupe"),
+                         ("get", "/api/routine-templates")]:
+        code = getattr(c, method)(path).status_code
+        check(f"removed: {method.upper()} {path}", code in (404, 405), str(code))
 
     # ---------------- Ranged task list ----------------
     reset_schedule()
@@ -158,70 +223,6 @@ with TestClient(server.app, base_url="https://testserver") as c:
     r = c.get("/api/tasks?start_date=nope")
     check("range: invalid date → 422", r.status_code == 422, str(r.status_code))
     check("range: no params still returns everything", len(c.get("/api/tasks").json()) == 5)
-
-    # ---------------- Stage 3: compaction ----------------
-    reset_schedule()
-    tpl = c.post("/api/day-templates", json={"name": "Hari Biasa", "is_default": True}).json()
-    for wd in range(7):
-        c.post("/api/template-tasks", json={"template_id": tpl["id"], "weekday": wd,
-                                            "segment_id": first_seg, "title": "Beres kamar", "points": 10})
-    # Simulate the old fortnight pre-build
-    run(server._fill_days_from_default_template(days_ahead=14))
-    c.post("/api/tasks", json={"title": "Baca buku", "points": 5, "date_key": TODAY,
-                               "target_children": [adskhan["id"]], "recurrence": "daily"})
-    run(server._materialize_recurring(days_ahead=14))
-    total_before = run(server.db.tasks.count_documents({}))
-    # One future day the parent customised: it must survive
-    D6 = day(6)
-    edited = run(server.db.tasks.find_one({"date_key": D6, "title": "Beres kamar"}))
-    c.patch(f"/api/tasks/{edited['id']}", json={"points": 99})
-    # One future day a child already started: it must survive
-    D8 = day(8)
-    started = run(server.db.tasks.find_one({"date_key": D8, "title": "Beres kamar"}))
-    run(server.db.tasks.update_one({"id": started["id"]}, {"$set": {"timer_started_at": server.now_iso()}}))
-
-    r = c.post("/api/maintenance/compact-schedule?dry_run=true")
-    dry = r.json()
-    check("compact: dry run reports without deleting",
-          r.status_code == 200 and dry["removed"] == 0 and run(server.db.tasks.count_documents({})) == total_before,
-          r.text[:200])
-    check("compact: finds removable future copies", dry["removable_tasks"] > 0, r.text[:200])
-    check("compact: never touches today or tomorrow", all(d > TOMORROW for d in dry["days"]), str(dry["days"]))
-    check("compact: keeps the day a parent edited", D6 not in dry["days"], str(dry["days"]))
-    check("compact: keeps the day a child started", D8 not in dry["days"], str(dry["days"]))
-
-    r = c.post("/api/maintenance/compact-schedule?dry_run=false")
-    res = r.json()
-    check("compact: removes and archives", r.status_code == 200 and res["removed"] == dry["removable_tasks"]
-          and run(server.db.tasks_archive.count_documents({"archive_batch": res["archive_batch"]})) == res["removed"],
-          r.text[:200])
-    check("compact: edited mission still exists", run(server.db.tasks.find_one({"id": edited["id"]})) is not None)
-    check("compact: started mission still exists", run(server.db.tasks.find_one({"id": started["id"]})) is not None)
-
-    # The cleared days rebuild identically when opened
-    gone_day = res["days"][0]
-    c.post(f"/api/days/{gone_day}/prepare")
-    rebuilt = c.get(f"/api/tasks?date_key={gone_day}").json()
-    check("compact: a cleared day rebuilds its routine",
-          sorted(t["title"] for t in rebuilt).count("Beres kamar") == len(kids), str([t["title"] for t in rebuilt]))
-    check("compact: a cleared day rebuilds its series",
-          any(t["title"] == "Baca buku" for t in rebuilt), str([t["title"] for t in rebuilt]))
-
-    # Undo puts everything back (skipping what already exists again)
-    r = c.post(f"/api/tasks/undo-restart?archive_batch={res['archive_batch']}")
-    check("compact: undo works", r.status_code == 200, r.text[:150])
-
-    # Vacation mode refuses
-    c.post("/api/config", json={"vacation_mode": True})
-    r = c.post("/api/maintenance/compact-schedule?dry_run=true")
-    check("compact: refused during vacation mode", r.status_code == 409, str(r.status_code))
-    c.post("/api/config", json={"vacation_mode": False})
-
-    # A child cannot compact
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
-    r = c.post("/api/maintenance/compact-schedule?dry_run=true")
-    check("compact: kids are blocked", r.status_code == 403, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
     # ---------------- Member cache follows writes ----------------
     r = c.patch("/api/auth/profile", json={"name": "Abi Baru"})
@@ -357,9 +358,7 @@ with TestClient(server.app, base_url="https://testserver") as c:
 
     # ---------------- Adaptive suggestions ----------------
     reset_schedule()
-    tpl = c.post("/api/day-templates", json={"name": "Biasa", "is_default": True}).json()
-    slot = c.post("/api/template-tasks", json={"template_id": tpl["id"], "weekday": 0, "segment_id": first_seg,
-                                               "title": "Latihan piano", "points": 8}).json()
+    slot = add_routine(c, "Latihan piano", 8, first_seg, weekdays=[0])["created"][0]
     docs = []
     for i in range(1, 11):
         docs.append({"id": f"sg-{i}", "parent_id": "family-default", "child_id": adskhan["id"],
@@ -386,7 +385,6 @@ with TestClient(server.app, base_url="https://testserver") as c:
 
     # ---------------- Photo-required missions in the section flow ----------------
     reset_schedule()
-    c.post("/api/config", json={"min_gap_seconds": 0})
     pr = c.post("/api/tasks", json={"title": "Rapikan meja", "points": 5, "date_key": TODAY,
                                     "segment_id": first_seg, "photo_required": True,
                                     "target_children": [adskhan["id"]]}).json()
@@ -412,8 +410,6 @@ with TestClient(server.app, base_url="https://testserver") as c:
 
     # ---------------- Weekly routine + lazy days ----------------
     reset_schedule()
-    run(server.db.app_meta.delete_many({"_id": "routine_migrated"}))
-    run(server.db.day_builds.delete_many({}))
     r = c.post("/api/routine/slots", json={"weekdays": list(range(7)), "segment_id": first_seg,
                                            "title": "Rutin pagi", "points": 7})
     check("routine: slot added for the whole week", r.status_code == 200, r.text[:200])
@@ -424,16 +420,9 @@ with TestClient(server.app, base_url="https://testserver") as c:
     n = run(server.db.tasks.count_documents({"title": "Rutin pagi"}))
     c.get("/api/tasks"); c.post(f"/api/days/{TODAY}/prepare"); c.post(f"/api/days/{TOMORROW}/prepare")
     check("routine: repeated reads never duplicate", run(server.db.tasks.count_documents({"title": "Rutin pagi"})) == n)
-    # an old default template must not double a routine-built day after migration
-    tplx = c.post("/api/day-templates", json={"name": "Lama", "is_default": True}).json()
-    for wd in range(7):
-        c.post("/api/template-tasks", json={"template_id": tplx["id"], "weekday": wd, "segment_id": first_seg,
-                                            "title": "Dari template lama", "points": 3})
-    run(server.db.app_meta.update_one({"_id": "routine_migrated"}, {"$set": {"at": "x"}}, upsert=True))
     c.post(f"/api/days/{day(3)}/prepare")
     d3 = [t["title"] for t in c.get(f"/api/tasks?date_key={day(3)}").json()]
     check("routine: day 3 comes from the routine", d3.count("Rutin pagi") == len(kids), str(d3))
-    check("routine: superseded template adds nothing", "Dari template lama" not in d3, str(d3))
     # editing the routine shows up on the parent's list straight away
     for slot in [x for x in c.get("/api/routine").json()["slots"] if x["title"] == "Rutin pagi"]:
         c.patch(f"/api/routine/slots/{slot['id']}", json={"points": 21})

@@ -6,7 +6,7 @@ import { todayKey, humanDateKey } from "@/lib/dates";
 
 /**
  * Parent-declared "off days": one date or a range where all tasks are paused —
- * parked tasks disappear from the kids' quest line (no penalties), recurrence
+ * parked tasks disappear from the kids' quest line (no penalties), the routine
  * skips over the range, and streaks bridge across it. Deleting an off-day
  * restores exactly the tasks it parked.
  */

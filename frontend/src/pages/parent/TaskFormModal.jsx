@@ -14,8 +14,6 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
   const [points, setPoints] = useState(10);
   const [penalty, setPenalty] = useState(0);
   const [dateKey, setDateKey] = useState(todayKey());
-  const [scheduleMode, setScheduleMode] = useState("weekdays"); // "weekdays" default | "date"
-  const [weekdays, setWeekdays] = useState([new Date().getDay() === 0 ? 6 : new Date().getDay() - 1]); // default = today's weekday (Mon=0..Sun=6)
   const [segmentId, setSegmentId] = useState("");
   const [segments, setSegments] = useState([]);
   const [isBonus, setIsBonus] = useState(false);
@@ -23,7 +21,6 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
   const [isCoop, setIsCoop] = useState(false);
   const [togetherBonusEnabled, setTogetherBonusEnabled] = useState(false);
   const [togetherBonusPoints, setTogetherBonusPoints] = useState(10);
-  const [recurrence, setRecurrence] = useState("none");
   const [order, setOrder] = useState("");
   const [taskStyle, setTaskStyle] = useState("");
   const [showIdeaBank, setShowIdeaBank] = useState(false);
@@ -52,15 +49,12 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setPoints(editTask.points ?? 10);
       setPenalty(editTask.penalty_points ?? 0);
       setDateKey(editTask.date_key || todayKey());
-      setScheduleMode("date"); // editing is always a single existing date
-      setWeekdays([]);
       setSegmentId(editTask.segment_id || "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
       setIsCoop(!!editTask.is_coop);
       setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
       setTogetherBonusPoints(editTask.together_bonus_points || 10);
-      setRecurrence(editTask.recurrence || "none");
       setOrder(editTask.order ? String(editTask.order) : "");
       setTaskStyle(editTask.task_style || "");
     } else if (isDuplicate) {
@@ -71,29 +65,22 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setPoints(editTask.points ?? 10);
       setPenalty(editTask.penalty_points ?? 0);
       setDateKey(todayKey());
-      setScheduleMode("weekdays");
-      const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
-      setWeekdays([todayWd]);
       setSegmentId(editTask.segment_id || "");
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
       setIsCoop(false);
       setTogetherBonusEnabled(!!editTask.together_bonus_enabled);
       setTogetherBonusPoints(editTask.together_bonus_points || 10);
-      setRecurrence(editTask.recurrence || "none");
       setOrder(""); // fresh order
       setTaskStyle(editTask.task_style || "");
     } else {
       setSelectedKidIds(defaultChildId ? [defaultChildId] : []);
       setTitle(""); setDesc(""); setPoints(10); setPenalty(0);
       setDateKey(todayKey());
-      setScheduleMode("weekdays");
-      const todayWd = new Date().getDay() === 0 ? 6 : new Date().getDay() - 1;
-      setWeekdays([todayWd]);
       setSegmentId("");
       setIsBonus(false); setPhotoRequired(false); setIsCoop(false);
       setTogetherBonusEnabled(false); setTogetherBonusPoints(10);
-      setRecurrence("none"); setOrder(""); setTaskStyle("");
+      setOrder(""); setTaskStyle("");
     }
   }, [open, defaultChildId, editTask, isDuplicate]);
 
@@ -106,15 +93,8 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
   const isBroadcast = selectedKidIds.length === 0;
   const isSingle = selectedKidIds.length === 1;
 
-  const toggleWeekday = (d) => {
-    setWeekdays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d]));
-  };
-
   const submit = async () => {
     if (!title.trim()) return toast.error("Judul tugas wajib diisi");
-    if (!isEdit && scheduleMode === "weekdays" && weekdays.length === 0) {
-      return toast.error("Pilih minimal satu hari");
-    }
     if (!isEdit && isCoop && selectedKidIds.length < 2) {
       return toast.error("Misi bersama butuh minimal 2 anak dipilih (bukan Semua/1 anak)");
     }
@@ -123,31 +103,18 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
     }
     setSaving(true);
     try {
-      const useWeekdays = !isEdit && scheduleMode === "weekdays";
       const body = {
         title: title.trim(),
         description: desc,
         points: Number(points) || 0,
         penalty_points: Number(penalty) || 0,
-        date_key: useWeekdays ? null : (dateKey || null),
-        weekdays: useWeekdays ? weekdays : null,
+        date_key: dateKey || null,
         segment_id: segmentId || null,
-        // Per-mission timing is retired: saving a mission clears whatever an
-        // older version stored, so nothing hidden keeps influencing the clock.
-        max_snooze_minutes: null,
-        min_duration_minutes: null,
-        rush_message: null,
-        overtime_allowed: false,
-        overtime_bonus_points: null,
-        duration_minutes: null,
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
         coop: !isEdit && isCoop,
         together_bonus_enabled: togetherBonusEnabled,
         together_bonus_points: togetherBonusEnabled ? Number(togetherBonusPoints) : null,
-        // Rutin (weekday) mode auto-repeats weekly so the task comes back each
-        // week on the same day. Non-rutin uses the chosen recurrence dropdown.
-        recurrence: useWeekdays ? "weekly" : recurrence,
         order: order ? Number(order) : null,
         task_style: taskStyle || null,
       };
@@ -303,90 +270,26 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
           )}
         </div>
 
-        {/* Schedule: specific date OR weekdays */}
+        {/* A mission made here is for one date. Anything that repeats every
+            week belongs in the weekly routine instead. */}
         <div>
-          <label className={labelClass}>📅 Jadwal misi</label>
+          <label className={labelClass}>📅 Tanggal</label>
           {isEdit ? (
-            /* Editing an existing occurrence: the date is what it is. Showing
-               a date picker here contradicted the rest of the app, where a
-               routine is defined by weekday + section rather than a calendar
-               date — so it's stated as plain information instead. Scheduling
-               changes are made through the section, order and repeat fields. */
             <div className="px-4 py-2.5 rounded-xl bg-slate-50 border-2 border-slate-100">
               <div className="text-sm font-semibold text-slate-700">{humanDateKey(dateKey)}</div>
               <p className="text-xs text-slate-500 mt-0.5">
-                {recurrence !== "none" ? (
-                  <>Misi <span className="font-semibold text-indigo-600">{recurrence === "daily" ? "harian" : "mingguan"}</span> — otomatis berulang, jadi tanggalnya tidak perlu diatur di sini.</>
-                ) : (
-                  <>Misi sekali jalan pada hari ini. Untuk memindahkannya, hapus lalu buat ulang di hari yang kamu mau.</>
-                )}
+                Untuk memindahkannya, hapus lalu buat ulang di hari yang kamu mau.
               </p>
             </div>
           ) : (
-            <>
-              <div className="flex gap-2 mb-2">
-                <button
-                  type="button"
-                  onClick={() => setScheduleMode("weekdays")}
-                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
-                    scheduleMode === "weekdays" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                  }`}
-                >
-                  🔁 Rutin (per hari)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setScheduleMode("date")}
-                  className={`flex-1 px-3 py-2 rounded-xl border-2 text-sm font-semibold transition-colors ${
-                    scheduleMode === "date" ? "border-indigo-500 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                  }`}
-                >
-                  🗓️ Non-rutin (tanggal)
-                </button>
-              </div>
-              {scheduleMode === "date" ? (
-                <div>
-                  <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
-                  <p className="text-xs text-slate-400 mt-1.5">
-                    Untuk aktivitas tidak rutin / anomali — misal ada acara khusus di tanggal tertentu.
-                  </p>
-                </div>
-              ) : (
-                <div>
-                  <div className="grid grid-cols-7 gap-1">
-                    {[["Sen", 0], ["Sel", 1], ["Rab", 2], ["Kam", 3], ["Jum", 4], ["Sab", 5], ["Min", 6]].map(([label, d]) => (
-                      <button
-                        key={d}
-                        type="button"
-                        onClick={() => toggleWeekday(d)}
-                        className={`py-2 rounded-xl border-2 text-xs font-bold transition-colors ${
-                          weekdays.includes(d) ? "border-indigo-500 bg-indigo-500 text-white" : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                        }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                  <p className="text-xs text-slate-400 mt-1.5">
-                    Misi rutin diulang tiap minggu di hari terpilih. Tiap hari bisa punya misi berbeda.
-                  </p>
-                </div>
-              )}
-            </>
+            <div>
+              <input type="date" value={dateKey} onChange={(e) => setDateKey(e.target.value)} className={inputClass} />
+              <p className="text-xs text-slate-400 mt-1.5">
+                Tugas sekali jalan di tanggal ini. Untuk tugas yang berulang tiap minggu, pakai Rutinitas Mingguan.
+              </p>
+            </div>
           )}
         </div>
-
-        {/* Repeat — only for non-rutin (date) mode; rutin auto-repeats weekly */}
-        {(isEdit || scheduleMode === "date") && (
-          <div>
-            <label className={labelClass}>Ulangi</label>
-            <select value={recurrence} onChange={(e) => setRecurrence(e.target.value)} className={inputClass}>
-              <option value="none">Sekali</option>
-              <option value="daily">Harian</option>
-              <option value="weekly">Mingguan</option>
-            </select>
-          </div>
-        )}
 
         <div className="grid grid-cols-3 gap-3">
           <div>

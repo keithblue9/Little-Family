@@ -8,6 +8,7 @@ import { todayKey, shiftDateKey, humanDateKey, isFutureDate } from "@/lib/dates"
 import BeforeAfter from "@/components/BeforeAfter";
 import MonthHeatmap from "@/components/MonthHeatmap";
 import GrowthTrail from "@/components/GrowthTrail";
+import OverdueSectionsCard from "@/components/OverdueSectionsCard";
 
 const statusLabel = {
   pending: { icon: Clock, label: "Belum", color: "text-slate-400" },
@@ -57,6 +58,8 @@ export default function FamilyDayMonitor() {
           </button>
         )}
       </div>
+
+      <OverdueSectionsCard onChanged={load} />
 
       {data?.children?.[0]?.vacation_mode && (
         <div className="bg-sky-50 border-2 border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-sky-700">
@@ -184,30 +187,10 @@ function fmtClock(iso) {
     return new Date(iso).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
   } catch { return ""; }
 }
-function fmtElapsed(startIso, endIso) {
-  try {
-    const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
-    if (ms < 0) return "";
-    const mins = Math.floor(ms / 60000);
-    const secs = Math.floor((ms % 60000) / 1000);
-    if (mins < 1) return `${secs} dtk`;
-    if (mins < 60) return `${mins} mnt`;
-    return `${Math.floor(mins / 60)} jam ${mins % 60} mnt`;
-  } catch { return ""; }
-}
-
-function fmtMins(mins) {
-  if (mins < 60) return `${mins} mnt`;
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return m ? `${h} jam ${m} mnt` : `${h} jam`;
-}
-
 function TaskRow({ task, bonus }) {
   const s = statusLabel[task.status] || statusLabel.pending;
   const Icon = s.icon;
   const isDone = task.status === "approved" || task.status === "completed" || task.status === "skipped";
-  const hasTimes = task.timer_started_at || task.completed_at;
   const hasPhoto = task.before_photo_url || task.completion_photo_url;
   const [showPhoto, setShowPhoto] = useState(false);
 
@@ -232,33 +215,9 @@ function TaskRow({ task, bonus }) {
         <div className="text-xs text-slate-500 flex items-center gap-2 flex-wrap">
           <span>{s.label}</span>
           {task.is_coop && <span className="text-teal-600 font-bold">🤝 Bersama</span>}
-          {task.due_time && <span>· sblm {task.due_time}</span>}
-          {task.duration_minutes && <span>· {task.duration_minutes}m</span>}
-          {task.early_bonus_awarded > 0 && <span className="text-green-600 font-bold">· ⚡ +{task.early_bonus_awarded}</span>}
+          {task.duration_minutes && <span>· ±{task.duration_minutes}m</span>}
+          {task.checked_at && <span title="Waktu anak mencentang">· ✔️ {fmtClock(task.checked_at)}</span>}
         </div>
-        {/* Start / finish / actual duration — for spotting instant-tap-through
-            vs. genuinely doing the task. Only shown once there's timing data. */}
-        {hasTimes && (
-          <div className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap mt-0.5">
-            {task.timer_started_at && <span title="Jam mulai">▶️ {fmtClock(task.timer_started_at)}</span>}
-            {task.completed_at && <span title="Jam selesai">✅ {fmtClock(task.completed_at)}</span>}
-            {/* Idle time before this mission began. Long gaps are where a
-                routine quietly leaks an hour without any single task looking
-                wrong, so it's worth stating plainly rather than leaving the
-                parent to subtract timestamps by hand. */}
-            {task.gap_from_prev_seconds > 120 && (
-              <span
-                className={task.gap_from_prev_seconds >= 1800 ? "text-amber-600 font-semibold" : "text-slate-400"}
-                title="Jeda sejak misi sebelumnya selesai"
-              >
-                ⏸️ jeda {fmtMins(Math.round(task.gap_from_prev_seconds / 60))}
-              </span>
-            )}
-            {task.timer_started_at && task.completed_at && (
-              <span className="text-slate-500 font-semibold" title="Lama pengerjaan">⏳ {fmtElapsed(task.timer_started_at, task.completed_at)}</span>
-            )}
-          </div>
-        )}
       </div>
       {hasPhoto && (
         <button onClick={() => setShowPhoto((v) => !v)} title="Lihat foto misi"

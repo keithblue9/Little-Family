@@ -7,11 +7,17 @@ import api, { formatApiError } from "@/lib/api";
  * A plain, chronological record of what actually happened.
  *
  * The insight cards summarise patterns; this is the raw trail behind them —
- * who started what, who snoozed, who reported being late and why. Useful
+ * which section was started or finished, who was late and why. Useful
  * precisely when a summary looks odd and you want to see the actual sequence
  * rather than a statistic about it.
  */
 const ACTION_META = {
+  segment_started: { icon: "▶️", label: "Memulai bagian" },
+  segment_started_late: { icon: "🕐", label: "Memulai bagian (terlambat)" },
+  segment_finished: { icon: "🏁", label: "Menyelesaikan bagian" },
+  section_reviewed: { icon: "📋", label: "Bagian lewat jam diputuskan" },
+  task_missed: { icon: "❌", label: "Misi dicatat terlewat" },
+  // Older entries from before sections replaced per-mission timing.
   task_started: { icon: "▶️", label: "Memulai misi" },
   task_completed: { icon: "✅", label: "Menyelesaikan misi" },
   task_approved: { icon: "⭐", label: "Misi disetujui" },
@@ -38,6 +44,13 @@ function describe(item) {
     extra = `${d.title} · "${d.reason}"${d.penalized ? " · kena kartu" : ""}`;
   }
   if (item.action === "task_approved" && d.points != null) extra = `${d.title || ""} · +${d.points} poin`;
+  if (item.action.startsWith("segment_") && d.segment) {
+    extra = d.segment + (d.reason ? ` · "${d.reason}"` : "") + (d.late ? " · terlambat" : "")
+      + (d.activities != null ? ` · ${d.activities} tugas` : "");
+  }
+  if (item.action === "section_reviewed") {
+    extra = `${d.segment} · ${d.action === "miss" ? `${d.missed} dicatat terlewat` : "dibiarkan"}`;
+  }
   return { ...meta, extra };
 }
 

@@ -121,9 +121,9 @@ DEFAULT_PUNISHMENT_MODE = "choice"
 DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY = 6  # Sunday
 DEFAULT_PUNISHMENT_OVERDUE_ACTION = "reset_points"
 
-# Timeline sections for the kid's day. Tasks are bucketed by due_time; a task
-# with no due_time lands in a trailing "kapan saja" group so nothing is ever
-# invisible. Ranges may not overlap and must cover a contiguous stretch.
+# The kid's day as sections. Each section is one checklist with one deadline
+# (its finish time); missions without a section land in a trailing "Kapan
+# Saja" group so nothing is ever invisible. Ranges may not overlap.
 DEFAULT_DAY_SEGMENTS = [
     {"id": "pagi", "label": "Pagi", "emoji": "🌅", "start_time": "00:00", "end_time": "09:59"},
     {"id": "siang", "label": "Siang", "emoji": "☀️", "start_time": "10:00", "end_time": "14:59"},
@@ -167,14 +167,6 @@ def new_id() -> str:
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
-
-def validate_due_time(value):
-    """Accept 'HH:MM' 24-hour strings, or None. Raises 422-style error otherwise."""
-    if value in (None, ""):
-        return None
-    if not _TIME_RE.match(value):
-        raise HTTPException(status_code=422, detail="Format jam harus HH:MM (contoh 18:00)")
-    return value
 
 
 # --------------- Auth Dependency ---------------
@@ -327,13 +319,6 @@ class PointsAdjustInput(BaseModel):
     reason: str = Field(default="", max_length=200)
 
 
-class HoldRequestInput(BaseModel):
-    reason: str = Field(min_length=3, max_length=300)
-
-
-class HoldReviewInput(BaseModel):
-    note: str = Field(default="", max_length=200)
-
 
 class ExamRejectInput(BaseModel):
     penalty_points: int = Field(default=100, ge=0, le=10000)
@@ -360,7 +345,6 @@ class AppConfigInput(BaseModel):
     slideshow_background_url: Optional[str] = None
     slideshow_background_image: Optional[str] = None  # base64 data URL (uploaded image)
     rupiah_per_point: Optional[int] = Field(default=None, ge=1, le=1000000)
-    skip_cost_points: Optional[int] = Field(default=None, ge=0, le=100000)
     daily_point_goal: Optional[int] = Field(default=None, ge=0, le=10000)
     # Per-weekday minimum point goals (Mon=0..Sun=6). Dict of "0".."6" -> int.
     # When a day isn't set, falls back to the dynamic sum-of-required or daily_point_goal.
@@ -369,9 +353,6 @@ class AppConfigInput(BaseModel):
     chiky_save_pct: Optional[int] = Field(default=None, ge=0, le=100)
     chiky_spend_pct: Optional[int] = Field(default=None, ge=0, le=100)
     chiky_share_pct: Optional[int] = Field(default=None, ge=0, le=100)
-    # Early-completion bonus: extra % of a task's points awarded when the kid
-    # finishes it BEFORE its due_time. 0 = feature off. Configurable per family.
-    early_bonus_pct: Optional[int] = Field(default=None, ge=0, le=100)
     # Family combo: when EVERY kid finishes all their required tasks on the
     # same day, each gets this bonus. 0 = off.
     family_combo_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
@@ -387,52 +368,20 @@ class AppConfigInput(BaseModel):
     # Kid timeline sections (Pagi/Siang/Sore/Malam...). Fully editable: rename,
     # re-time, add or remove as many as the family wants.
     day_segments: Optional[List[DaySegment]] = None
-    # --- Pacing & honesty guards -------------------------------------------
-    # Cooldown between finishing one mission and being able to start the next.
-    # Stops a whole morning being "rapel"-clicked in one burst. 0 = off.
-    min_gap_seconds: Optional[int] = Field(default=None, ge=0, le=1800)
-    # Finishing below this % of the estimated duration is flagged as "kilat".
-    # Never blocks — the child confirms, and the parent sees the flag.
-    flash_threshold_pct: Optional[int] = Field(default=None, ge=0, le=100)
-    # Reward for a healthy rhythm (sensible gap + not rushed). 0 = off.
-    pacing_bonus_points: Optional[int] = Field(default=None, ge=0, le=100)
-    # Ping the parent the moment a mission is started.
-    notify_parent_on_start: Optional[bool] = None
     # How long after a section's (personal) start time a child may still begin
     # the first mission without it counting as late.
     segment_late_grace_minutes: Optional[int] = Field(default=None, ge=0, le=15)
-    # Offer the next mission automatically after finishing one (same section
-    # only), with a countdown. Set False to keep it quiet.
-    auto_start_next: Optional[bool] = None
-    # Choices offered on the "Tunda dulu" button, in minutes. Fully editable —
-    # every family's idea of "just a moment" is different.
-    snooze_options_minutes: Optional[List[int]] = None
-    # Minutes-remaining marks at which a running mission warns the child that
-    # time is nearly up. Empty list = no warnings at all.
-    duration_warning_minutes: Optional[List[int]] = None
-    # Whether bonus missions must wait their turn in the sequence like required
-    # ones, instead of being startable at any moment.
-    bonus_follows_sequence: Optional[bool] = None
     # Award points the moment a mission is marked done, instead of queueing it
     # for a parent to approve one by one. The parent still sees everything and
     # can undo/deduct — review after the fact rather than gatekeeping.
     auto_approve_tasks: Optional[bool] = None
-    # How long a child may sit idle after finishing one mission before the next
-    # one has to be owned via Terlambat. Measured from server timestamps, so it
-    # keeps running while the app is closed. 0 = no limit.
-    max_idle_minutes: Optional[int] = Field(default=None, ge=0, le=240)
     # Points deducted when a parent rejects a claimed exam day as untrue.
     exam_false_claim_penalty: Optional[int] = Field(default=None, ge=0, le=10000)
-    # One overtime bonus step is granted per this many extra minutes.
-    overtime_bonus_interval_minutes: Optional[int] = Field(default=None, ge=1, le=240)
-    # How long a hold request may wait for a parent before it lapses on its own.
-    hold_auto_reject_minutes: Optional[int] = Field(default=None, ge=1, le=120)
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
-    # Vacation/pause mode: while on, recurring (daily/weekly) tasks don't spawn
-    # their next occurrence on approval, so the routine picks back up cleanly
-    # instead of piling up missed days. Template itself is untouched.
+    # Vacation/pause mode: while on, the weekly routine builds no new days, so
+    # nothing piles up as missed; it picks back up when switched off.
     vacation_mode: Optional[bool] = None
     vacation_note: Optional[str] = Field(default=None, max_length=100)
     # Notifications: instant per-task push is OFF by default (replaced by the
@@ -586,68 +535,6 @@ class ChildUpdate(BaseModel):
     _check_pet_equipped = field_validator("pet_equipped")(classmethod(lambda cls, v: _validate_pet_accessories(v)))
 
 
-class RoutineTemplateTaskInput(BaseModel):
-    title: str = Field(min_length=1, max_length=120)
-    points: int = Field(ge=0, le=1000, default=10)
-    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    due_time: Optional[str] = None
-    task_style: Optional[TASK_STYLE] = None
-
-
-class RoutineTemplateInput(BaseModel):
-    label: str = Field(min_length=1, max_length=60)
-    emoji: str = Field(default="📋", max_length=10)
-    desc: str = Field(default="", max_length=150)
-    tasks: List[RoutineTemplateTaskInput] = Field(min_length=1, max_length=15)
-
-
-# The 5 templates that used to be hardcoded on the frontend — now just the
-# seed data for a family's first-ever GET, after which they're fully
-# editable/deletable rows like anything else the parent creates.
-_DEFAULT_ROUTINE_TEMPLATES = [
-    {
-        "label": "Rutinitas Pagi", "emoji": "🌅", "desc": "Bangun sampai siap beraktivitas",
-        "tasks": [
-            {"title": "Bangun pagi & rapikan tempat tidur", "points": 10, "duration_minutes": 10, "due_time": "06:00", "task_style": "routine"},
-            {"title": "Sikat gigi & cuci muka", "points": 5, "duration_minutes": 5, "due_time": "06:15", "task_style": "routine"},
-            {"title": "Mandi pagi", "points": 10, "duration_minutes": 15, "due_time": "06:45", "task_style": "routine"},
-            {"title": "Sarapan", "points": 5, "duration_minutes": 20, "due_time": "07:15", "task_style": "routine"},
-        ],
-    },
-    {
-        "label": "Rutinitas Sore", "emoji": "🌇", "desc": "Pulang aktivitas sampai makan malam",
-        "tasks": [
-            {"title": "Rapikan tas & seragam", "points": 5, "duration_minutes": 10, "due_time": "16:00", "task_style": "routine"},
-            {"title": "Mandi sore", "points": 10, "duration_minutes": 15, "due_time": "17:00", "task_style": "routine"},
-            {"title": "Bantu siapkan makan malam", "points": 10, "duration_minutes": 20, "due_time": "18:30", "task_style": "helper"},
-        ],
-    },
-    {
-        "label": "Rutinitas Malam", "emoji": "🌙", "desc": "Beres-beres sampai tidur",
-        "tasks": [
-            {"title": "Rapikan mainan & meja belajar", "points": 10, "duration_minutes": 15, "due_time": "19:30", "task_style": "routine"},
-            {"title": "Siapkan perlengkapan besok", "points": 5, "duration_minutes": 10, "due_time": "20:00", "task_style": "routine"},
-            {"title": "Sikat gigi sebelum tidur", "points": 5, "duration_minutes": 5, "due_time": "20:30", "task_style": "routine"},
-        ],
-    },
-    {
-        "label": "Waktu Belajar", "emoji": "📚", "desc": "PR, membaca, dan mengaji",
-        "tasks": [
-            {"title": "Kerjakan PR / tugas sekolah", "points": 15, "duration_minutes": 45, "task_style": "learning"},
-            {"title": "Membaca buku 15 menit", "points": 10, "duration_minutes": 15, "task_style": "learning"},
-            {"title": "Mengaji / hafalan", "points": 15, "duration_minutes": 20, "task_style": "learning"},
-        ],
-    },
-    {
-        "label": "Beres-Beres Rumah", "emoji": "🧹", "desc": "Bantu kebersihan rumah bersama",
-        "tasks": [
-            {"title": "Sapu kamar sendiri", "points": 10, "duration_minutes": 15, "task_style": "helper"},
-            {"title": "Bantu cuci piring", "points": 10, "duration_minutes": 15, "task_style": "helper"},
-            {"title": "Buang sampah", "points": 5, "duration_minutes": 5, "task_style": "helper"},
-        ],
-    },
-]
-
 
 class TaskInput(BaseModel):
     # Assignment: pick 1 kid, several kids, or leave empty = broadcast to ALL kids.
@@ -659,32 +546,14 @@ class TaskInput(BaseModel):
     points: int = Field(ge=0, le=1000, default=10)
     penalty_points: int = Field(ge=0, le=1000, default=0)
     is_bonus: bool = False  # true = counts as bonus above the daily goal, not required
-    due_date: Optional[str] = None       # ISO date string
-    due_time: Optional[str] = None       # "HH:MM" 24h deadline within the day
+    # Estimated minutes — information for the parent and child only. Nothing
+    # is timed per mission: the section's finish time is the only deadline.
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    date_key: Optional[str] = None       # "YYYY-MM-DD" — which daily slot this belongs to
-    weekdays: Optional[List[int]] = None  # [0-6] Mon-Sun; create one copy per upcoming matching day
-    # Which part of the day this belongs to (Pagi/Siang/Sore/Malam…). This is
-    # the new anchor: only the SEGMENT carries a clock time, individual tasks
-    # just hold their position within it. due_time stays supported for older
-    # tasks that were created before segments existed.
+    date_key: Optional[str] = None       # "YYYY-MM-DD" — which day this one-off mission is for
+    weekdays: Optional[List[int]] = None  # [0-6] Mon-Sun; one copy on each upcoming matching day
+    # Which part of the day this belongs to (Pagi/Siang/Sore/Malam…). Only the
+    # section carries a clock; missions just hold their place in its list.
     segment_id: Optional[str] = None
-    # Cap on how long THIS mission may be snoozed, overriding the family-wide
-    # options. Some things genuinely can't wait as long as others — prayer
-    # shouldn't be postponable as far as tidying up. None/0 = use the default.
-    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
-    # Floor on how long a mission must actually take. Studying in 90 seconds
-    # isn't studying, so Finish stays disabled until this has passed.
-    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    # What the child is told if they try to finish too early. Written per
-    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
-    rush_message: Optional[str] = Field(default=None, max_length=200)
-    # Some work deserves to run long. When set, overrunning the duration is not
-    # treated as lateness — for this mission or the ones it pushes back — and
-    # the extra effort earns points instead.
-    overtime_allowed: Optional[bool] = None
-    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
-    recurrence: Literal["none", "daily", "weekly"] = "none"
     icon: str = "star"
     order: Optional[int] = Field(default=None, ge=1)
     task_style: Optional[TASK_STYLE] = None
@@ -719,11 +588,8 @@ class TaskUpdate(BaseModel):
     points: Optional[int] = None
     penalty_points: Optional[int] = None
     is_bonus: Optional[bool] = None
-    due_date: Optional[str] = None
-    due_time: Optional[str] = None
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
     date_key: Optional[str] = None
-    recurrence: Optional[Literal["none", "daily", "weekly"]] = None
     icon: Optional[str] = None
     order: Optional[int] = Field(default=None, ge=1)
     task_style: Optional[TASK_STYLE] = None
@@ -733,18 +599,6 @@ class TaskUpdate(BaseModel):
     # These were missing, so editing a task silently discarded them and the
     # task snapped back to "Kapan Saja" (no section) on every save.
     segment_id: Optional[str] = None
-    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
-    # Floor on how long a mission must actually take. Studying in 90 seconds
-    # isn't studying, so Finish stays disabled until this has passed.
-    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    # What the child is told if they try to finish too early. Written per
-    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
-    rush_message: Optional[str] = Field(default=None, max_length=200)
-    # Some work deserves to run long. When set, overrunning the duration is not
-    # treated as lateness — for this mission or the ones it pushes back — and
-    # the extra effort earns points instead.
-    overtime_allowed: Optional[bool] = None
-    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
 
 
 class RedeemMoneyInput(BaseModel):
@@ -757,93 +611,6 @@ class CharityRequestInput(BaseModel):
     points: int = Field(ge=1, le=1000000)
     note: str = Field(default="", max_length=200)
 
-
-class LateExceptionInput(BaseModel):
-    child_id: str
-    date_key: Optional[str] = None  # defaults to today (family local)
-    reason: str = Field(min_length=3, max_length=300)
-    arrival_time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")  # "HH:MM" jam sampai rumah
-
-
-class LateExceptionReviewInput(BaseModel):
-    note: str = Field(default="", max_length=200)
-
-
-class DayTemplateInput(BaseModel):
-    """A named kind of day — "Hari Biasa", "Tanggal Merah", "Libur Sekolah".
-    Families invent their own; nothing here is fixed in code."""
-    name: str = Field(min_length=1, max_length=60)
-    emoji: str = Field(default="", max_length=8)
-    description: str = Field(default="", max_length=200)
-    is_default: bool = False          # used for any date with no explicit assignment
-
-
-class TemplateTaskInput(BaseModel):
-    """One mission slot inside a template, at a given weekday and section."""
-    template_id: str
-    weekday: int = Field(ge=0, le=6)
-    segment_id: Optional[str] = None
-    child_id: Optional[str] = None            # None = every child gets a copy
-    title: str = Field(min_length=1, max_length=120)
-    description: str = Field(default="", max_length=500)
-    points: int = Field(default=10, ge=0, le=10000)
-    penalty_points: int = Field(default=0, ge=0, le=10000)
-    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    order: Optional[int] = Field(default=None, ge=1)
-    is_bonus: bool = False
-    photo_required: bool = False
-    task_style: Optional[TASK_STYLE] = None
-    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
-    # Floor on how long a mission must actually take. Studying in 90 seconds
-    # isn't studying, so Finish stays disabled until this has passed.
-    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    # What the child is told if they try to finish too early. Written per
-    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
-    rush_message: Optional[str] = Field(default=None, max_length=200)
-    # Some work deserves to run long. When set, overrunning the duration is not
-    # treated as lateness — for this mission or the ones it pushes back — and
-    # the extra effort earns points instead.
-    overtime_allowed: Optional[bool] = None
-    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
-    together_bonus_enabled: bool = False
-    together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
-
-
-class TemplateTaskUpdate(BaseModel):
-    weekday: Optional[int] = Field(default=None, ge=0, le=6)
-    segment_id: Optional[str] = None
-    child_id: Optional[str] = None
-    title: Optional[str] = Field(default=None, min_length=1, max_length=120)
-    description: Optional[str] = Field(default=None, max_length=500)
-    points: Optional[int] = Field(default=None, ge=0, le=10000)
-    penalty_points: Optional[int] = Field(default=None, ge=0, le=10000)
-    duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    order: Optional[int] = Field(default=None, ge=1)
-    is_bonus: Optional[bool] = None
-    photo_required: Optional[bool] = None
-    task_style: Optional[TASK_STYLE] = None
-    max_snooze_minutes: Optional[int] = Field(default=None, ge=0, le=240)
-    # Floor on how long a mission must actually take. Studying in 90 seconds
-    # isn't studying, so Finish stays disabled until this has passed.
-    min_duration_minutes: Optional[int] = Field(default=None, ge=1, le=1440)
-    # What the child is told if they try to finish too early. Written per
-    # mission because "eit, belajarnya buru-buru ya?" only fits studying.
-    rush_message: Optional[str] = Field(default=None, max_length=200)
-    # Some work deserves to run long. When set, overrunning the duration is not
-    # treated as lateness — for this mission or the ones it pushes back — and
-    # the extra effort earns points instead.
-    overtime_allowed: Optional[bool] = None
-    overtime_bonus_points: Optional[int] = Field(default=None, ge=0, le=1000)
-    together_bonus_enabled: Optional[bool] = None
-    together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
-
-
-class TemplateAssignInput(BaseModel):
-    """Stick a template onto real dates — a single day or a whole range."""
-    template_id: str
-    start_date: str
-    end_date: Optional[str] = None
-    replace_existing: bool = True   # clear untouched missions on those days first
 
 
 class OffDayInput(BaseModel):
@@ -2198,8 +1965,7 @@ async def list_tasks(
             rng["$lte"] = ed
         if include_open:
             query["$and"] = [{"$or": [
-                {"date_key": rng}, {"date_key": None},
-                {"status": "completed"}, {"hold_status": "pending"},
+                {"date_key": rng}, {"date_key": None}, {"status": "completed"},
             ]}]
         else:
             query["date_key"] = rng
@@ -2291,17 +2057,10 @@ async def _build_task_doc(
         "points": payload.points,
         "penalty_points": payload.penalty_points,
         "is_bonus": payload.is_bonus,
-        "due_date": payload.due_date,
-        "due_time": validate_due_time(payload.due_time),
         "segment_id": payload.segment_id,
-        "max_snooze_minutes": payload.max_snooze_minutes,
-        "min_duration_minutes": payload.min_duration_minutes,
-        "rush_message": payload.rush_message,
-        "overtime_allowed": bool(payload.overtime_allowed),
-        "overtime_bonus_points": payload.overtime_bonus_points,
         "duration_minutes": payload.duration_minutes,
         "date_key": date_key,
-        "recurrence": payload.recurrence,
+        "recurrence": "none",
         "icon": payload.icon,
         "order": order,
         "task_style": task_style,
@@ -2318,8 +2077,6 @@ async def _build_task_doc(
         "late_reason_label": None,
         "late_no_points": False,    # at-fault lateness → task still doable, but worth 0
         "late_penalized": False,    # this task earned the kid a Kartu Hukuman
-        "timer_started_at": None,
-        "timer_completed_at": None,
         "status": "pending",  # pending -> completed (waiting approval) -> approved / rejected / missed / skipped
         "completed_at": None,
         "approved_at": None,
@@ -2372,9 +2129,6 @@ async def create_task(payload: TaskInput, user: dict = Depends(require_parent)):
     _prep = [d for d in date_keys if d and _today_ct <= d <= _limit_ct]
     if _prep:
         await _ensure_days_ready(_prep)
-    if payload.recurrence != "none":
-        # A new series: tomorrow needs its occurrence on the next read.
-        _invalidate_days_ready()
 
     multi = len(targets) > 1 or len(date_keys) > 1
     broadcast_id = new_id() if multi else None
@@ -2424,9 +2178,7 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
     # Fields the parent is allowed to explicitly clear (set back to empty).
     # Sending null for these means "clear it" (back to Kapan Saja / the family
     # default), as opposed to "leave it alone" — which is what omitting does.
-    clearable = {"due_date", "due_time", "duration_minutes", "task_style",
-                 "segment_id", "max_snooze_minutes", "min_duration_minutes", "rush_message",
-                 "overtime_bonus_points"}
+    clearable = {"duration_minutes", "task_style", "segment_id"}
     raw = payload.model_dump(exclude_unset=True)
 
     updates = {}
@@ -2435,9 +2187,6 @@ async def update_task(task_id: str, payload: TaskUpdate, user: dict = Depends(re
             updates[k] = v
         elif k in clearable:
             updates[k] = None  # explicit clear
-
-    if "due_time" in updates and updates["due_time"] is not None:
-        updates["due_time"] = validate_due_time(updates["due_time"])
 
     # Editing a member of a broadcast group forks it: this child's copy becomes
     # independent (loses broadcast_id) so the parent can customize just this one
@@ -2505,76 +2254,13 @@ async def child_day_progress(
             "is_personal": _fmt_min(_eff) != _sg["start_time"],
         })
 
-    # Tell the client exactly which actions are legal for each mission, rather
-    # than letting it re-derive the rules. The window logic (personal starts,
-    # grace, snooze deadlines, section ends) lives in one place; duplicating it
-    # in the UI is how a "Mulai" button ends up on a task the server refuses.
-    # One config read for the whole request. It was being fetched three or four
-    # times per page load, and every round trip is felt on a phone.
-    _cfg_avail = _cfg_shared
-    _grace_avail = int(_cfg_avail.get("segment_late_grace_minutes", 15))
-    _open_avail = [t for t in tasks if t.get("status") in ("pending", "rejected") and not t.get("is_bonus")]
-    _firsts_avail = _segment_first_ids(_open_avail, _segs_for_kid, tasks)
-    # Projected clock time for every mission: each section starts at its own
-    # (personal) hour, and each mission is expected to begin when the previous
-    # one in that section would have finished. Purely informational — it's a
-    # forecast built from durations, not a deadline anyone is held to, so a
-    # child can see "roughly when is my turn" without us inventing per-task
-    # times to store.
-    _projected: dict = {}
-    _by_segment: dict = {}
-    for _t in tasks:
-        _sg = _segment_for_task(_t, _segs_for_kid)
-        _by_segment.setdefault(_sg.get("id") if _sg else None, []).append(_t)
-    for _sid, _items in _by_segment.items():
-        _sg = next((x for x in _segs_for_kid if x.get("id") == _sid), None)
-        if not _sg:
-            continue  # "kapan saja" tasks have no clock to project from
-        _cursor = _effective_segment_start(_sg, _kid_doc_seg, dk)
-        _seg_end = _effective_segment_end(_sg, _kid_doc_seg, dk)
-        for _t in sorted(_items, key=lambda x: (x.get("order") or 0, x.get("created_at") or "")):
-            if _cursor > _seg_end:
-                break  # the section is full; anything past this can't be placed
-            _projected[_t["id"]] = _fmt_min(_cursor)
-            _cursor += int(_t.get("duration_minutes") or 0)
-
-    await _expire_stale_holds(_cfg_shared)
-    _idle_over = await _idle_exceeded(child_id, dk, _cfg_avail)
-    # Idling only concerns the mission the child should be doing RIGHT NOW.
-    # Applying it to every remaining mission branded the whole evening as late —
-    # including ones not due for hours — and there is nothing a child can even
-    # do about those yet.
-    # Only worth computing when something is actually still open; on a finished
-    # day this saved four queries per load.
-    _turn = (await get_next_actionable_task(child_id, dk)) if any(
-        t.get("status") in ("pending", "rejected") for t in tasks
-    ) else None
-    _turn_id = _turn["id"] if _turn else None
-    _exam_flex = await _active_exam_flex(child_id, dk)
+    # Missions carry no clock of their own any more — their section does. The
+    # parent's views only need each mission's section start for this child.
     _tasks_with_availability = []
     for _t in tasks:
-        _relaxed = (_is_flex_relaxed(_t, _exam_flex, tasks, _segs_for_kid)
-                    or _overtime_pushed_back(_t, tasks, _segs_for_kid))
-        # A relaxed mission is simply available: the clock stops judging it for
-        # the rest of a study night.
-        _av = "open" if (_t.get("is_bonus") or _relaxed) else _task_availability(
-            _t, _segs_for_kid, _kid_doc_seg, _t["id"] in _firsts_avail, _grace_avail,
-            _idle_over and _t["id"] == _turn_id,
-        )
         _sg_t = _segment_for_task(_t, _segs_for_kid)
         _tasks_with_availability.append({
             **_t,
-            "availability": _av,
-            "is_segment_opener": _t["id"] in _firsts_avail,
-            "projected_start_time": _projected.get(_t["id"]),
-            "exam_relaxed": _relaxed,
-            # When the delay was a choice, the UI must only offer the honest
-            # (at-fault) reasons — otherwise it advertises options the server
-            # will reject.
-            "at_fault_only": (_t["id"] not in _firsts_avail) and (
-                (_idle_over and _t["id"] == _turn_id)
-                or (_snooze_expired(_t) and int(_t.get("snooze_count") or 0) > 0)
-            ),
             "effective_start_time": _fmt_min(_effective_segment_start(_sg_t, _kid_doc_seg, dk)) if _sg_t else None,
         })
     active_punishment = await db.punishments.find_one({
@@ -2826,16 +2512,16 @@ async def family_day_progress(
     return {"date_key": dk, "children": out}
 
 
-# --------------- Late-arrival exception (pengajuan keterlambatan) ---------------
+# --------------- Day sections ---------------
 async def _get_day_segments() -> list:
     config = await get_config_cached()
     return config.get("day_segments") or DEFAULT_DAY_SEGMENTS
 
 
 def _segment_for_task(task: dict, segments: list) -> Optional[dict]:
-    """The section a task lives in. Prefers an explicit segment_id; falls back
-    to matching a legacy due_time into whichever section covers it, so tasks
-    made before segments existed keep behaving sensibly."""
+    """The section a task lives in (None = 'Kapan Saja'). An old mission
+    made before sections existed falls into the section its old deadline sat
+    in, so history still groups sensibly."""
     sid = task.get("segment_id")
     if sid:
         return next((s for s in segments if s.get("id") == sid), None)
@@ -2847,124 +2533,6 @@ def _segment_for_task(task: dict, segments: list) -> Optional[dict]:
         )
     return None
 
-
-def _task_sort_anchor(task: dict, segments: list) -> int:
-    """Minutes-into-the-day used to order the quest line. Tasks are sequenced by
-    their SECTION's start time and then by their own order within it — the
-    individual task no longer needs a clock of its own. Anything with no
-    section and no time sorts last (do-whenever)."""
-    # An explicit section wins; otherwise a legacy per-task time still orders
-    # correctly on its own (mapping it onto a section would flatten several
-    # distinct times into one anchor and lose their relative order).
-    sid = task.get("segment_id")
-    if sid:
-        seg = next((x for x in segments if x.get("id") == sid), None)
-        if seg:
-            return _hhmm_to_min(seg["start_time"])
-    if task.get("due_time"):
-        return _hhmm_to_min(task["due_time"])
-    return 24 * 60 + 1
-
-
-async def _last_finish_dt(child_id: str, date_key: str, exclude_task_id: Optional[str] = None):
-    """When this child most recently finished a mission today. Used both for the
-    anti-rapel cooldown and for measuring the gap between missions."""
-    q = {
-        "parent_id": FAMILY_ID, "date_key": date_key,
-        "completed_at": {"$nin": [None, ""]},
-        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
-    }
-    if exclude_task_id:
-        q["id"] = {"$ne": exclude_task_id}
-    rows = await db.tasks.find(q, {"_id": 0, "completed_at": 1}).to_list(500)
-    stamps = []
-    for r in rows:
-        try:
-            d = datetime.fromisoformat(r["completed_at"].replace("Z", "+00:00"))
-            stamps.append(d if d.tzinfo else d.replace(tzinfo=timezone.utc))
-        except Exception:
-            continue
-    return max(stamps) if stamps else None
-
-
-def _elapsed_seconds(task: dict) -> Optional[float]:
-    """How long the child actually spent, from Mulai to Selesai."""
-    st, en = task.get("timer_started_at"), task.get("completed_at")
-    if not st or not en:
-        return None
-    try:
-        a = datetime.fromisoformat(st.replace("Z", "+00:00"))
-        b = datetime.fromisoformat(en.replace("Z", "+00:00"))
-        if a.tzinfo is None:
-            a = a.replace(tzinfo=timezone.utc)
-        if b.tzinfo is None:
-            b = b.replace(tzinfo=timezone.utc)
-        return max(0.0, (b - a).total_seconds())
-    except Exception:
-        return None
-
-
-def _overtime_bonus(task: dict, config: dict) -> int:
-    """Reward genuinely spending longer on work that deserves it.
-
-    Only for missions explicitly marked as allowed to overrun — otherwise this
-    would pay a child for dawdling over toothbrushing. One step of points per
-    configured interval of extra time, so an hour of study is worth more than
-    five minutes over.
-    """
-    if not task.get("overtime_allowed"):
-        return 0
-    per_step = int(task.get("overtime_bonus_points") or 0)
-    if per_step <= 0:
-        return 0
-    planned = task.get("duration_minutes")
-    secs = task.get("actual_seconds")
-    if not planned or secs is None:
-        return 0
-    extra_min = (secs / 60.0) - planned
-    interval = int(config.get("overtime_bonus_interval_minutes", 10)) or 10
-    steps = int(extra_min // interval)
-    if steps <= 0:
-        return 0
-    return min(per_step * steps, per_step * 12)  # a sane ceiling per mission
-
-
-def _pacing_bonus(task: dict, config: dict) -> int:
-    """Small reward for a HEALTHY rhythm rather than raw speed.
-
-    Earned when the child left a sensible gap after the previous mission AND
-    actually spent a believable amount of time on this one. The point is to
-    make honest pacing pay, so doing the day properly beats batching it — a
-    carrot next to the cooldown's stick.
-    """
-    pts = int(config.get("pacing_bonus_points", 2))
-    if pts <= 0 or task.get("is_bonus") or task.get("late_ack"):
-        return 0
-    if task.get("flash_flag"):
-        return 0  # rushed finishes never count as good pacing
-    est_min = task.get("duration_minutes")
-    secs = task.get("actual_seconds")
-    if est_min and secs is not None and secs < est_min * 60 * 0.5:
-        return 0  # far quicker than planned — not a healthy rhythm
-    gap = task.get("gap_from_prev_seconds")
-    min_gap = int(config.get("min_gap_seconds", 60)) or 60
-    # The very first mission of the day has no previous gap to judge; give it
-    # the benefit of the doubt rather than silently withholding the bonus.
-    if gap is not None and gap < min_gap:
-        return 0
-    return pts
-
-
-def _is_flash_finish(task: dict, threshold_pct: int) -> bool:
-    """A finish so fast it probably wasn't really done. Deliberately advisory:
-    it flags, it never blocks — a genuinely quick child shouldn't be punished."""
-    secs = _elapsed_seconds(task)
-    if secs is None:
-        return False
-    est_min = task.get("duration_minutes")
-    if est_min:
-        return secs < max(20, est_min * 60 * (threshold_pct / 100.0))
-    return secs < 20
 
 
 def _effective_segment_start(segment: dict, child: Optional[dict], date_key: Optional[str]) -> int:
@@ -3015,155 +2583,6 @@ def _fmt_min(m: int) -> str:
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
-def _task_availability(task: dict, segments: list, child: Optional[dict] = None, is_segment_first: bool = False, grace_minutes: int = 10, idle_exceeded: bool = False) -> str:
-    """Is this task doable RIGHT NOW? Three states:
-
-      "open"   — its section is running now (or it has no section, or the child
-                 already owned the lateness via Terlambat).
-      "future" — its section hasn't started yet; nothing to do but wait.
-      "closed" — its section has already ended and the lateness wasn't
-                 acknowledged; it needs the Terlambat flow.
-
-    A closed task must NOT block the rest of the day: a missed morning chore
-    shouldn't freeze the afternoon. That's why the sequence skips over them
-    rather than stopping there.
-    """
-    # Which DAY the task belongs to decides this before any clock does. Judging
-    # a future day against the current time marked tomorrow morning as already
-    # missed, and a past day as still open — the hour only means something once
-    # you know it's today.
-    dk = task.get("date_key")
-    today_dk = _today_key()
-    if dk and dk > today_dk:
-        return "future"
-    # An approved hold stops the clock entirely for this mission: the child is
-    # out of the house with no known return time, so there is nothing sensible
-    # to measure them against until they actually start.
-    if task.get("hold_status") == "approved" and not task.get("timer_started_at"):
-        return "open"
-    if task.get("late_ack"):
-        return "open"
-    if dk and dk < today_dk:
-        return "closed"
-    # An expired snooze behaves exactly like any other missed start: not a
-    # failure, but it has to be owned via Terlambat before continuing. While
-    # the snooze is still running the child may start whenever they're ready —
-    # coming back early is always fine.
-    if _snooze_expired(task):
-        return "closed"
-    # Idle too long since the previous mission finished. Measured on the server
-    # from real timestamps, so closing the app doesn't pause it — which is the
-    # whole point: waiting it out has to cost something, or it's just a free
-    # way to stall.
-    # A section opener is judged by its own start time (with the configured
-    # grace), not by how long the child idled — they may simply have got home
-    # late, which the Terlambat flow already handles fairly.
-    if idle_exceeded and not is_segment_first and not task.get("timer_started_at"):
-        return "closed"
-    seg = _segment_for_task(task, segments)
-    if not seg:
-        return "open"  # no section = do it whenever
-    now_min = _now_local().hour * 60 + _now_local().minute
-    start_min = _effective_segment_start(seg, child, task.get("date_key"))
-    if now_min < start_min:
-        return "future"
-    if now_min > _effective_segment_end(seg, child, task.get("date_key")):
-        return "closed"
-    # The FIRST mission of a section carries the "did you start on time?"
-    # question. Past its personal start + grace it needs the Terlambat flow,
-    # so beginning the evening an hour late is acknowledged rather than
-    # silently accepted. Later missions in the section aren't judged this way —
-    # they're paced by the auto-start flow instead.
-    # ...and only where a personal start time was actually configured. Judging
-    # punctuality against a broad section start (e.g. "Pagi 00:00–09:59") would
-    # brand a 05:00 start as late, which is nonsense — the expectation only
-    # exists once a parent sets one.
-    if is_segment_first and _has_start_override(seg, child, task.get("date_key")):
-        if now_min > start_min + max(0, grace_minutes):
-            return "closed"
-    return "open"
-
-
-async def _at_fault_only(task: dict, is_segment_opener: bool, config: dict) -> bool:
-    """Should ONLY the at-fault reasons be offered for this mission?
-
-    Never for the mission that opens a section. Arriving home late from school
-    is genuinely outside a child's control, so "kena macet" has to stay on the
-    table there no matter how long it took — that's the whole reason the
-    Terlambat flow exists.
-
-    For every mission after that, the child was already home and working
-    through their list. Having asked for extra time and let it lapse, or having
-    sat idle past the limit, is a choice — so only the honest reasons remain.
-    """
-    if is_segment_opener:
-        return False
-    if task.get("hold_status") in ("approved", "used"):
-        return False  # the delay was granted, not taken
-    if _snooze_expired(task) and int(task.get("snooze_count") or 0) > 0:
-        return True
-    if task.get("child_id") and task.get("date_key"):
-        return await _idle_exceeded(task["child_id"], task["date_key"], config)
-    return False
-
-
-async def _has_active_hold(child_id: str, date_key: str) -> bool:
-    """Is this child waiting out an approved hold right now?"""
-    doc = await db.tasks.find_one({
-        "parent_id": FAMILY_ID, "date_key": date_key, "hold_status": "approved",
-        "status": {"$in": ["pending", "rejected"]},
-        "timer_started_at": {"$in": [None, ""]},
-        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
-    })
-    return doc is not None
-
-
-async def _idle_exceeded(child_id: str, date_key: str, config: dict) -> bool:
-    limit = int(config.get("max_idle_minutes", 20))
-    if limit <= 0:
-        return False
-    last = await _last_finish_dt(child_id, date_key)
-    if not last:
-        return False  # nothing finished yet today — there's no idling to measure
-    # Time spent under an approved hold isn't idling; it was granted.
-    if await _has_active_hold(child_id, date_key):
-        return False
-    return (datetime.now(timezone.utc) - last).total_seconds() > limit * 60
-
-
-def _snooze_expired(task: dict) -> bool:
-    until = task.get("snooze_until")
-    if not until or task.get("timer_started_at"):
-        return False
-    try:
-        dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) > dt
-    except Exception:
-        return False
-
-
-def _has_start_override(segment: dict, child: Optional[dict], date_key: Optional[str]) -> bool:
-    if not child or not date_key:
-        return False
-    overrides = (child.get("segment_starts") or {}).get(segment.get("id")) or {}
-    try:
-        return bool(overrides.get(str(datetime.strptime(date_key, "%Y-%m-%d").weekday())))
-    except Exception:
-        return False
-
-
-def _task_window_end(task: dict, segments: list) -> Optional[int]:
-    """When this task's opportunity closes: the end of its section. Legacy
-    tasks without a section fall back to their own due_time."""
-    seg = _segment_for_task(task, segments)
-    if seg:
-        return _hhmm_to_min(seg["end_time"])
-    if task.get("due_time"):
-        return _hhmm_to_min(task["due_time"])
-    return None
-
 
 def _validate_day_segments(segments: list):
     """Segments must be sane before they're stored: each range forward-going,
@@ -3189,114 +2608,6 @@ def _hhmm_to_min(hhmm: str) -> int:
     h, m = map(int, hhmm.split(":"))
     return h * 60 + m
 
-
-async def _shift_remaining_tasks(child_id: str, dk: str, arrival_hhmm: str) -> dict:
-    """Reflow the rest of a child's day after an approved late arrival: every
-    still-open individual task with a due_time gets pushed later by one shared
-    delta, chosen so the EARLIEST remaining task's deadline = arrival time +
-    that task's duration (i.e. the kid starts it the moment they get home and
-    still has its full duration). Original spacing between tasks is preserved.
-    Co-op tasks are left untouched (shifting them would move the sibling's
-    schedule too), as are tasks without a due_time and anything already done."""
-    tasks = await db.tasks.find({
-        "parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk,
-        "status": {"$in": ["pending", "rejected"]},
-        "due_time": {"$nin": [None, ""]},
-        "is_coop": {"$ne": True},
-    }).to_list(500)
-    if not tasks:
-        return {"shifted": 0, "delta_minutes": 0, "changes": []}
-    tasks.sort(key=lambda t: _hhmm_to_min(t["due_time"]))
-    first = tasks[0]
-    first_duration = int(first.get("duration_minutes") or 10)
-    new_first_due = _hhmm_to_min(arrival_hhmm) + first_duration
-    delta = new_first_due - _hhmm_to_min(first["due_time"])
-    if delta <= 0:
-        # Arrived at/before the original schedule — nothing needs to move.
-        return {"shifted": 0, "delta_minutes": 0, "changes": []}
-    changes = []
-    for t in tasks:
-        new_min = min(_hhmm_to_min(t["due_time"]) + delta, 23 * 60 + 59)
-        new_hhmm = f"{new_min // 60:02d}:{new_min % 60:02d}"
-        changes.append({"task_id": t["id"], "title": t["title"], "old_due": t["due_time"], "new_due": new_hhmm})
-        await db.tasks.update_one({"id": t["id"]}, {"$set": {"due_time": new_hhmm}})
-    return {"shifted": len(changes), "delta_minutes": delta, "changes": changes}
-
-
-@api.post("/late-exceptions")
-async def submit_late_exception(payload: LateExceptionInput, user: dict = Depends(get_current_user)):
-    """A kid reports they'll be / were late through no fault of their own
-    (stuck in traffic, school event, ...) with the actual time they got home.
-    Goes to the parent for verification; on approval the remaining schedule
-    for that day reflows automatically from the confirmed arrival time."""
-    if user["role"] == "child" and user["id"] != payload.child_id:
-        raise HTTPException(status_code=403, detail="Kamu hanya bisa mengajukan untuk dirimu sendiri")
-    child = await db.children.find_one({"id": payload.child_id, "parent_id": FAMILY_ID})
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
-    dk = validate_date_key(payload.date_key) or _today_key()
-    existing = await db.late_exceptions.find_one({
-        "parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "status": "pending",
-    })
-    if existing:
-        raise HTTPException(status_code=409, detail="Sudah ada pengajuan keterlambatan yang menunggu untuk hari ini")
-    doc = {
-        "id": new_id(), "parent_id": FAMILY_ID, "child_id": payload.child_id,
-        "child_name": child["name"], "date_key": dk,
-        "reason": payload.reason.strip(), "arrival_time": payload.arrival_time,
-        "status": "pending", "review_note": "", "shift_result": None,
-        "created_at": now_iso(), "reviewed_at": None,
-    }
-    await db.late_exceptions.insert_one(doc)
-    doc.pop("_id", None)
-    await log_activity(FAMILY_ID, payload.child_id, "late_exception_requested", {"date_key": dk, "arrival_time": payload.arrival_time})
-    await send_push_to({"role": "parent"}, title="Pengajuan keterlambatan 🕐", body=f'{child["name"]} lapor terlambat (sampai rumah {payload.arrival_time}): "{payload.reason[:60]}"', url="/parent")
-    return doc
-
-
-@api.get("/late-exceptions")
-async def list_late_exceptions(child_id: Optional[str] = None, date_key: Optional[str] = None, user: dict = Depends(get_current_user)):
-    query = {"parent_id": FAMILY_ID}
-    if user["role"] == "child":
-        query["child_id"] = user["id"]
-    elif child_id:
-        query["child_id"] = child_id
-    if date_key:
-        query["date_key"] = date_key
-    items = await db.late_exceptions.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
-    return items
-
-
-@api.post("/late-exceptions/{request_id}/approve")
-async def approve_late_exception(request_id: str, payload: LateExceptionReviewInput = LateExceptionReviewInput(), user: dict = Depends(require_parent)):
-    """Parent confirms the reason is legit → the rest of that day's schedule
-    shifts automatically so it starts from the confirmed arrival time."""
-    req = await db.late_exceptions.find_one({"id": request_id, "parent_id": FAMILY_ID})
-    if not req:
-        raise HTTPException(status_code=404, detail="Pengajuan tidak ditemukan")
-    if req["status"] != "pending":
-        raise HTTPException(status_code=400, detail="Pengajuan ini sudah diproses")
-    shift = await _shift_remaining_tasks(req["child_id"], req["date_key"], req["arrival_time"])
-    await db.late_exceptions.update_one({"id": request_id}, {"$set": {
-        "status": "approved", "reviewed_at": now_iso(), "review_note": payload.note, "shift_result": shift,
-    }})
-    await log_activity(FAMILY_ID, req["child_id"], "late_exception_approved", {"date_key": req["date_key"], "shifted": shift["shifted"], "delta_minutes": shift["delta_minutes"]})
-    await send_push_to({"role": "child", "member_id": req["child_id"]}, title="Pengajuanmu disetujui ✅", body=f"Jadwal misimu digeser mulai jam {req['arrival_time']}. Semangat!", url=f"/kid/{req['child_id']}")
-    return await db.late_exceptions.find_one({"id": request_id}, {"_id": 0})
-
-
-@api.post("/late-exceptions/{request_id}/reject")
-async def reject_late_exception(request_id: str, payload: LateExceptionReviewInput = LateExceptionReviewInput(), user: dict = Depends(require_parent)):
-    req = await db.late_exceptions.find_one({"id": request_id, "parent_id": FAMILY_ID})
-    if not req:
-        raise HTTPException(status_code=404, detail="Pengajuan tidak ditemukan")
-    if req["status"] != "pending":
-        raise HTTPException(status_code=400, detail="Pengajuan ini sudah diproses")
-    await db.late_exceptions.update_one({"id": request_id}, {"$set": {
-        "status": "rejected", "reviewed_at": now_iso(), "review_note": payload.note,
-    }})
-    await log_activity(FAMILY_ID, req["child_id"], "late_exception_rejected", {"date_key": req["date_key"]})
-    return await db.late_exceptions.find_one({"id": request_id}, {"_id": 0})
 
 
 # --------------- Off days (hari libur tugas) ---------------
@@ -3325,206 +2636,6 @@ async def _active_exam_flex(child_id: str, date_key: str) -> Optional[dict]:
         "flex_start": {"$lte": date_key}, "flex_end": {"$gte": date_key},
     }, {"_id": 0})
 
-
-def _overtime_pushed_back(task: dict, tasks_today: list, segments: list) -> bool:
-    """Was this mission delayed by earlier work that was allowed to run long?
-
-    If studying legitimately took an extra hour, everything queued behind it is
-    late through no fault of the child's. Charging them for that would make the
-    overtime permission worthless — they'd still be punished, just one mission
-    later.
-    """
-    ordered = sorted(tasks_today, key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
-    overran_at = None
-    for idx, t in enumerate(ordered):
-        if not t.get("overtime_allowed"):
-            continue
-        planned = t.get("duration_minutes")
-        secs = t.get("actual_seconds")
-        if planned and secs is not None and (secs / 60.0) > planned:
-            overran_at = idx if overran_at is None else min(overran_at, idx)
-    if overran_at is None:
-        return False
-    for idx, t in enumerate(ordered):
-        if t["id"] == task["id"]:
-            return idx > overran_at
-    return False
-
-
-def _is_flex_relaxed(task: dict, exam: Optional[dict], tasks_today: list, segments: list) -> bool:
-    """Is this mission inside the relaxed stretch of a study day?
-
-    Relaxation begins at the chosen pivot mission (usually "Belajar") and runs
-    to the end of the day, because a long study session pushes everything after
-    it — dinner, shower, bedtime — later by knock-on effect. Judging those by
-    the usual clock would punish the child for the very thing we just allowed.
-    """
-    if not exam:
-        return False
-    pivots = exam.get("pivot_task_titles") or []
-    if not pivots:
-        return True  # no pivot chosen: treat the whole day as relaxed
-    anchor_pos = None
-    ordered = sorted(tasks_today, key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
-    for idx, t in enumerate(ordered):
-        if t.get("title") in pivots:
-            anchor_pos = idx
-            break
-    if anchor_pos is None:
-        return False
-    for idx, t in enumerate(ordered):
-        if t["id"] == task["id"]:
-            return idx >= anchor_pos
-    return False
-
-
-@api.post("/tasks/{task_id}/hold-request")
-async def request_hold(task_id: str, payload: HoldRequestInput, user: dict = Depends(get_current_user)):
-    """Ask to put a mission on hold for something genuinely outside the routine
-    — guests arriving, being taken out to eat.
-
-    Unlike a snooze, there is no end time to beat: once a parent approves, the
-    clock simply stops for that mission and the child starts whenever they get
-    back. A snooze answers "how much longer do you need?"; this answers "I have
-    no idea when I'll be free". That's why it needs a parent's word first —
-    otherwise it would be an unlimited, unaccountable pause.
-    """
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    kid_ids = task.get("coop_participants") or [task.get("child_id")]
-    if user["role"] == "child" and user["id"] not in kid_ids:
-        raise HTTPException(status_code=403, detail="Bukan misi kamu")
-    if task.get("status") not in ("pending", "rejected"):
-        raise HTTPException(status_code=400, detail="Misi ini sudah diproses")
-    if task.get("timer_started_at"):
-        raise HTTPException(status_code=400, detail="Misi ini sudah dimulai")
-    if task.get("hold_status") == "pending":
-        raise HTTPException(status_code=409, detail="Sudah ada permintaan tunda yang menunggu persetujuan")
-    if task.get("hold_status") == "approved":
-        raise HTTPException(status_code=400, detail="Misi ini sudah ditahan — mulai saja kapan kamu siap")
-
-    # The mission that opens a section is covered by the Terlambat flow, which
-    # already asks WHY they're late and prices it accordingly. Allowing an
-    # open-ended hold there too would be a softer second route to the same
-    # thing, and the honest one would stop being used.
-    _segs_h = await _get_day_segments()
-    _open_h = await db.tasks.find({
-        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
-        "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True},
-        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
-    }).to_list(500)
-    _all_h = await db.tasks.find({
-        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
-        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
-    }).to_list(500)
-    if task_id in _segment_first_ids(_open_h, _segs_h, _all_h):
-        raise HTTPException(
-            status_code=400,
-            detail="Untuk misi pembuka, pakai tombol Terlambat saja ya — di situ kamu bisa jelaskan alasannya.",
-        )
-
-    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
-    # A parent asking on the child's behalf doesn't need to approve their own
-    # request; it takes effect at once.
-    approved_now = user["role"] == "parent"
-    await db.tasks.update_one({"id": task_id}, {"$set": {
-        "hold_status": "approved" if approved_now else "pending",
-        "hold_reason": payload.reason.strip(),
-        "hold_requested_at": now_iso(),
-        "hold_requested_by": user.get("name", ""),
-        "hold_reviewed_at": now_iso() if approved_now else None,
-    }})
-    await log_activity(FAMILY_ID, child_id, "hold_requested", {
-        "task_id": task_id, "title": task.get("title"),
-        "reason": payload.reason.strip(), "auto_approved": approved_now,
-    })
-    if not approved_now:
-        _kid = await db.children.find_one({"id": child_id})
-        await send_push_to({"role": "parent"}, title="Minta tunda misi ⏸️",
-                           body=f'{(_kid or {}).get("name", "Anak")}: "{task.get("title")}" — {payload.reason.strip()[:60]}',
-                           url="/parent")
-    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
-
-
-async def _expire_stale_holds(config: Optional[dict] = None) -> int:
-    """Let a hold request lapse if no parent answers in time.
-
-    A request that sits unanswered forever would quietly freeze a mission's
-    clock by default, which is the opposite of asking permission. Expiring it
-    puts the mission back on its normal timing — the child can still explain
-    afterwards through the Terlambat flow if the interruption was real.
-    """
-    config = config if config is not None else (await get_config_cached())
-    limit = int(config.get("hold_auto_reject_minutes", 5))
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=limit)).isoformat()
-    stale = await db.tasks.find({
-        "parent_id": FAMILY_ID, "hold_status": "pending",
-        "hold_requested_at": {"$lt": cutoff},
-    }, {"_id": 0}).to_list(200)
-    for t in stale:
-        await db.tasks.update_one({"id": t["id"]}, {"$set": {
-            "hold_status": "expired", "hold_reviewed_at": now_iso(),
-            "hold_review_note": f"Tidak ada jawaban dalam {limit} menit",
-        }})
-        await log_activity(FAMILY_ID, t.get("child_id"), "hold_expired", {
-            "task_id": t["id"], "title": t.get("title"), "minutes": limit,
-        })
-        await send_push_to({"role": "child", "member_id": t.get("child_id")},
-                           title="Permintaan tunda kedaluwarsa",
-                           body=f'"{t.get("title")}" kembali berjalan normal. Kalau memang ada halangan, pakai tombol Terlambat ya.',
-                           url=f"/kid/{t.get('child_id')}")
-    return len(stale)
-
-
-@api.get("/hold-requests")
-async def list_hold_requests(user: dict = Depends(get_current_user)):
-    """Missions waiting on a parent's decision (or, for a child, their own)."""
-    await _expire_stale_holds()
-    query = {"parent_id": FAMILY_ID, "hold_status": "pending"}
-    if user["role"] == "child":
-        query["$or"] = [{"child_id": user["id"]}, {"is_coop": True, "coop_participants": user["id"]}]
-    return await db.tasks.find(query, {"_id": 0}).sort("hold_requested_at", -1).to_list(100)
-
-
-@api.post("/tasks/{task_id}/hold-approve")
-async def approve_hold(task_id: str, payload: HoldReviewInput = HoldReviewInput(), user: dict = Depends(require_parent)):
-    """Grant the hold: the mission's clock stops until the child starts it."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.get("hold_status") != "pending":
-        raise HTTPException(status_code=400, detail="Tidak ada permintaan tunda yang menunggu")
-    await db.tasks.update_one({"id": task_id}, {"$set": {
-        "hold_status": "approved", "hold_reviewed_at": now_iso(),
-        "hold_reviewed_by": user.get("name", ""), "hold_review_note": payload.note,
-    }, "$unset": {"snooze_until": ""}})
-    await log_activity(FAMILY_ID, task.get("child_id"), "hold_approved", {
-        "task_id": task_id, "title": task.get("title"), "by": user.get("name", ""),
-    })
-    await send_push_to({"role": "child", "member_id": task.get("child_id")},
-                       title="Tunda disetujui ⏸️",
-                       body=f'"{task.get("title")}" ditahan dulu. Mulai kapan saja kamu siap ya.',
-                       url=f"/kid/{task.get('child_id')}")
-    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
-
-
-@api.post("/tasks/{task_id}/hold-reject")
-async def reject_hold(task_id: str, payload: HoldReviewInput = HoldReviewInput(), user: dict = Depends(require_parent)):
-    """Decline the hold — the mission goes back to its normal timing."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.get("hold_status") != "pending":
-        raise HTTPException(status_code=400, detail="Tidak ada permintaan tunda yang menunggu")
-    await db.tasks.update_one({"id": task_id}, {"$set": {
-        "hold_status": "rejected", "hold_reviewed_at": now_iso(),
-        "hold_reviewed_by": user.get("name", ""), "hold_review_note": payload.note,
-    }})
-    await log_activity(FAMILY_ID, task.get("child_id"), "hold_rejected", {
-        "task_id": task_id, "title": task.get("title"), "by": user.get("name", ""),
-    })
-    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
 @api.post("/exam-periods")
@@ -3646,296 +2757,6 @@ async def reject_exam_period(exam_id: str, payload: ExamRejectInput = ExamReject
 # broken down by weekday and section. Real dates then just point at a template.
 # Before this, a school holiday falling on a Monday meant rebuilding that day
 # mission by mission; now it's one assignment.
-
-@api.post("/day-templates")
-async def create_day_template(payload: DayTemplateInput, user: dict = Depends(require_parent)):
-    _invalidate_days_ready()
-    if payload.is_default:
-        await db.day_templates.update_many({"parent_id": FAMILY_ID}, {"$set": {"is_default": False}})
-    doc = {
-        "id": new_id(), "parent_id": FAMILY_ID,
-        "name": payload.name.strip(), "emoji": payload.emoji.strip(),
-        "description": payload.description.strip(), "is_default": payload.is_default,
-        "created_at": now_iso(),
-    }
-    await db.day_templates.insert_one(doc)
-    doc.pop("_id", None)
-    await log_activity(FAMILY_ID, None, "day_template_created", {"name": doc["name"]})
-    return doc
-
-
-@api.get("/day-templates")
-async def list_day_templates(user: dict = Depends(get_current_user)):
-    templates = await db.day_templates.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", 1).to_list(50)
-    # One read for every template's slot count instead of one count per template.
-    counts: dict = {}
-    if templates:
-        for row in await db.template_tasks.find(
-            {"parent_id": FAMILY_ID, "template_id": {"$in": [t["id"] for t in templates]}},
-            {"_id": 0, "template_id": 1},
-        ).to_list(None):
-            counts[row["template_id"]] = counts.get(row["template_id"], 0) + 1
-    for t in templates:
-        t["task_count"] = counts.get(t["id"], 0)
-    return templates
-
-
-@api.patch("/day-templates/{template_id}")
-async def update_day_template(template_id: str, payload: DayTemplateInput, user: dict = Depends(require_parent)):
-    _invalidate_days_ready()
-    existing = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
-    if payload.is_default:
-        await db.day_templates.update_many({"parent_id": FAMILY_ID}, {"$set": {"is_default": False}})
-    await db.day_templates.update_one({"id": template_id}, {"$set": {
-        "name": payload.name.strip(), "emoji": payload.emoji.strip(),
-        "description": payload.description.strip(), "is_default": payload.is_default,
-    }})
-    return await db.day_templates.find_one({"id": template_id}, {"_id": 0})
-
-
-@api.delete("/day-templates/{template_id}")
-async def delete_day_template(template_id: str, user: dict = Depends(require_parent)):
-    """Removes the template, its slots, and any future dates pointing at it.
-    Missions already generated onto real days are left alone — they may already
-    have been worked on."""
-    _invalidate_days_ready()
-    doc = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
-    await db.template_tasks.delete_many({"parent_id": FAMILY_ID, "template_id": template_id})
-    await db.template_assignments.delete_many({"parent_id": FAMILY_ID, "template_id": template_id})
-    await db.day_templates.delete_one({"id": template_id})
-    await log_activity(FAMILY_ID, None, "day_template_deleted", {"name": doc.get("name")})
-    return {"success": True}
-
-
-@api.post("/day-templates/{template_id}/duplicate")
-async def duplicate_day_template(template_id: str, user: dict = Depends(require_parent)):
-    """Copy a whole template with its slots — the quickest way to build a
-    holiday routine that only differs from the school-day one in places."""
-    src = await db.day_templates.find_one({"id": template_id, "parent_id": FAMILY_ID}, {"_id": 0})
-    if not src:
-        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
-    new_tpl = {**src, "id": new_id(), "name": f'{src["name"]} (salinan)',
-               "is_default": False, "created_at": now_iso()}
-    await db.day_templates.insert_one(new_tpl)
-    slots = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": template_id}, {"_id": 0}).to_list(2000)
-    if slots:
-        await db.template_tasks.insert_many([
-            {**sl, "id": new_id(), "template_id": new_tpl["id"], "created_at": now_iso()} for sl in slots
-        ])
-    new_tpl.pop("_id", None)
-    return {**new_tpl, "task_count": len(slots)}
-
-
-@api.post("/template-tasks")
-async def create_template_task(payload: TemplateTaskInput, user: dict = Depends(require_parent)):
-    _invalidate_days_ready()
-    tpl = await db.day_templates.find_one({"id": payload.template_id, "parent_id": FAMILY_ID})
-    if not tpl:
-        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
-    if payload.segment_id:
-        segments = await _get_day_segments()
-        if not any(sg["id"] == payload.segment_id for sg in segments):
-            raise HTTPException(status_code=404, detail="Bagian waktu tidak ditemukan")
-    if payload.child_id:
-        await get_child_or_404(FAMILY_ID, payload.child_id)
-
-    order = payload.order
-    if order is None:
-        # Append to the end of that weekday+section so slots keep a sane order
-        # without the parent having to think about numbering.
-        siblings = await db.template_tasks.find({
-            "parent_id": FAMILY_ID, "template_id": payload.template_id,
-            "weekday": payload.weekday, "segment_id": payload.segment_id,
-        }, {"_id": 0, "order": 1}).to_list(500)
-        order = max([s.get("order") or 0 for s in siblings], default=0) + 1
-
-    doc = {**payload.model_dump(), "id": new_id(), "parent_id": FAMILY_ID,
-           "order": order, "created_at": now_iso()}
-    await db.template_tasks.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
-
-@api.get("/template-tasks")
-async def list_template_tasks(template_id: str, weekday: Optional[int] = None, user: dict = Depends(get_current_user)):
-    query = {"parent_id": FAMILY_ID, "template_id": template_id}
-    if weekday is not None:
-        query["weekday"] = weekday
-    rows = await db.template_tasks.find(query, {"_id": 0}).to_list(2000)
-    segments = await _get_day_segments()
-    seg_pos = {sg["id"]: i for i, sg in enumerate(sorted(segments, key=lambda x: _hhmm_to_min(x["start_time"])))}
-    rows.sort(key=lambda t: (t.get("weekday", 0), seg_pos.get(t.get("segment_id"), 999), t.get("order") or 0))
-    return rows
-
-
-@api.patch("/template-tasks/{slot_id}")
-async def update_template_task(slot_id: str, payload: TemplateTaskUpdate, user: dict = Depends(require_parent)):
-    _invalidate_days_ready()
-    existing = await db.template_tasks.find_one({"id": slot_id, "parent_id": FAMILY_ID})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Slot template tidak ditemukan")
-    # Fields a parent may deliberately clear back to empty, as opposed to
-    # simply not sending them.
-    clearable = {"segment_id", "child_id", "duration_minutes", "task_style", "max_snooze_minutes"}
-    raw = payload.model_dump(exclude_unset=True)
-    updates = {k: v for k, v in raw.items() if v is not None or k in clearable}
-    if updates.get("segment_id"):
-        segments = await _get_day_segments()
-        if not any(sg["id"] == updates["segment_id"] for sg in segments):
-            raise HTTPException(status_code=404, detail="Bagian waktu tidak ditemukan")
-    if updates:
-        await db.template_tasks.update_one({"id": slot_id}, {"$set": updates})
-    return await db.template_tasks.find_one({"id": slot_id}, {"_id": 0})
-
-
-@api.delete("/template-tasks/{slot_id}")
-async def delete_template_task(slot_id: str, user: dict = Depends(require_parent)):
-    _invalidate_days_ready()
-    res = await db.template_tasks.delete_one({"id": slot_id, "parent_id": FAMILY_ID})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Slot template tidak ditemukan")
-    return {"success": True}
-
-
-async def _apply_template_to_date(template_id: str, date_key: str, replace_existing: bool) -> dict:
-    """Turn a template's slots into real missions on one date.
-
-    Only untouched missions are cleared when replacing: anything already
-    started, finished or approved stays, so re-applying a template can never
-    wipe out work a child has actually done.
-    """
-    weekday = datetime.strptime(date_key, "%Y-%m-%d").weekday()
-    slots = await db.template_tasks.find({
-        "parent_id": FAMILY_ID, "template_id": template_id, "weekday": weekday,
-    }, {"_id": 0}).to_list(2000)
-
-    removed = 0
-    if replace_existing:
-        res = await db.tasks.delete_many({
-            "parent_id": FAMILY_ID, "date_key": date_key,
-            "status": {"$in": ["pending", "rejected"]},
-            "timer_started_at": {"$in": [None, ""]},
-        })
-        removed = res.deleted_count
-
-    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)
-    created = 0
-    pending_docs: list = []
-    for slot in slots:
-        targets = [slot["child_id"]] if slot.get("child_id") else [k["id"] for k in kids]
-        for cid in targets:
-            if not cid:
-                continue
-            doc = {
-                "id": new_id(), "parent_id": FAMILY_ID, "child_id": cid,
-                "title": slot["title"], "description": slot.get("description", ""),
-                "points": slot.get("points", 10),
-                "penalty_points": slot.get("penalty_points", 0),
-                "duration_minutes": slot.get("duration_minutes"),
-                "segment_id": slot.get("segment_id"),
-                "order": slot.get("order") or 1,
-                "is_bonus": bool(slot.get("is_bonus")),
-                "photo_required": bool(slot.get("photo_required")),
-                "task_style": slot.get("task_style"),
-                "max_snooze_minutes": slot.get("max_snooze_minutes"),
-                "min_duration_minutes": slot.get("min_duration_minutes"),
-                "rush_message": slot.get("rush_message"),
-                "overtime_allowed": bool(slot.get("overtime_allowed")),
-                "overtime_bonus_points": slot.get("overtime_bonus_points"),
-                "together_bonus_enabled": bool(slot.get("together_bonus_enabled")),
-                "together_bonus_points": slot.get("together_bonus_points"),
-                "date_key": date_key, "due_time": None, "recurrence": "none",
-                "status": "pending", "created_at": now_iso(),
-                "from_template_id": template_id, "from_template_slot_id": slot["id"],
-            }
-            pending_docs.append(doc)
-            created += 1
-    if pending_docs:
-        # One write instead of one per mission per child. Building a fortnight
-        # used to mean hundreds of sequential inserts.
-        await db.tasks.insert_many(pending_docs)
-    return {"created": created, "removed": removed, "slots": len(slots)}
-
-
-@api.post("/template-assignments")
-async def assign_template(payload: TemplateAssignInput, user: dict = Depends(require_parent)):
-    """Point one or more dates at a template and build those days from it."""
-    tpl = await db.day_templates.find_one({"id": payload.template_id, "parent_id": FAMILY_ID})
-    if not tpl:
-        raise HTTPException(status_code=404, detail="Template tidak ditemukan")
-    start = validate_date_key(payload.start_date)
-    if not start:
-        raise HTTPException(status_code=422, detail="Tanggal mulai tidak valid (YYYY-MM-DD)")
-    end = validate_date_key(payload.end_date) if payload.end_date else start
-    if not end:
-        raise HTTPException(status_code=422, detail="Tanggal akhir tidak valid (YYYY-MM-DD)")
-    if end < start:
-        raise HTTPException(status_code=422, detail="Tanggal akhir harus sesudah/sama dengan tanggal mulai")
-    span = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days + 1
-    if span > 62:
-        raise HTTPException(status_code=422, detail="Maksimal 62 hari sekali tempel")
-
-    total_created = total_removed = 0
-    days = []
-    cursor = datetime.strptime(start, "%Y-%m-%d")
-    for _ in range(span):
-        dk = cursor.strftime("%Y-%m-%d")
-        await db.template_assignments.update_one(
-            {"parent_id": FAMILY_ID, "date_key": dk},
-            {"$set": {"parent_id": FAMILY_ID, "date_key": dk,
-                      "template_id": payload.template_id, "assigned_at": now_iso(),
-                      "assigned_by": user.get("name", "")}},
-            upsert=True,
-        )
-        res = await _apply_template_to_date(payload.template_id, dk, payload.replace_existing)
-        total_created += res["created"]
-        total_removed += res["removed"]
-        days.append(dk)
-        cursor += timedelta(days=1)
-
-    await log_activity(FAMILY_ID, None, "template_assigned", {
-        "template": tpl.get("name"), "days": len(days),
-        "created": total_created, "removed": total_removed,
-    })
-    return {"success": True, "template_id": payload.template_id, "template_name": tpl.get("name"),
-            "days": days, "created": total_created, "removed": total_removed}
-
-
-@api.get("/template-assignments")
-async def list_template_assignments(start_date: str, end_date: str, user: dict = Depends(get_current_user)):
-    """Which template each date in a range is using — powers the calendar."""
-    start = validate_date_key(start_date)
-    end = validate_date_key(end_date)
-    if not start or not end:
-        raise HTTPException(status_code=422, detail="Rentang tanggal tidak valid")
-    rows = await db.template_assignments.find({
-        "parent_id": FAMILY_ID, "date_key": {"$gte": start, "$lte": end},
-    }, {"_id": 0}).to_list(400)
-    return rows
-
-
-@api.delete("/template-assignments/{date_key}")
-async def unassign_template(date_key: str, remove_tasks: bool = True, user: dict = Depends(require_parent)):
-    """Detach a date from its template. Untouched missions from it are cleared
-    by default; anything already worked on is kept."""
-    dk = validate_date_key(date_key)
-    if not dk:
-        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
-    removed = 0
-    if remove_tasks:
-        res = await db.tasks.delete_many({
-            "parent_id": FAMILY_ID, "date_key": dk,
-            "from_template_id": {"$exists": True},
-            "status": {"$in": ["pending", "rejected"]},
-            "timer_started_at": {"$in": [None, ""]},
-        })
-        removed = res.deleted_count
-    await db.template_assignments.delete_many({"parent_id": FAMILY_ID, "date_key": dk})
-    return {"success": True, "removed_tasks": removed}
 
 
 @api.get("/export/weekly-xlsx")
@@ -4196,6 +3017,8 @@ async def _ensure_day_built(dk: str) -> int:
     race can't produce duplicates."""
     if not dk or dk < _today_key():
         return 0
+    if (await get_config_cached()).get("vacation_mode"):
+        return 0  # paused: no new days are built until the family is back
     tpl = await _routine_template(create=False)
     if not tpl:
         return 0
@@ -4263,7 +3086,6 @@ async def _invalidate_days(start: str, end: Optional[str] = None, include_today:
     rows = await db.tasks.find({
         "parent_id": FAMILY_ID, "date_key": q_dates, "from_routine": True,
         "status": {"$in": ["pending", "rejected"]}, "checked": {"$ne": True},
-        "timer_started_at": {"$in": [None, ""]},
     }, {"_id": 0, "id": 1, "child_id": 1, "date_key": 1, "segment_id": 1}).to_list(20000)
     doomed = [r["id"] for r in rows
               if (r["child_id"], r["date_key"], r.get("segment_id") or ANYTIME_SEGMENT_ID) not in started]
@@ -4364,6 +3186,76 @@ async def _migrate_legacy_to_routine() -> Optional[dict]:
     await db.app_meta.update_one({"_id": "routine_migrated"},
                                  {"$set": {"at": now_iso(), **summary}}, upsert=True)
     await log_activity(FAMILY_ID, None, "routine_migrated", summary)
+    return summary
+
+
+# Fields that only meant something to the old per-mission flow (a clock per
+# mission, snoozing, holds, overtime, repeating series). Open missions lose
+# them; finished ones keep them as history.
+_LEGACY_TASK_FIELDS = (
+    "due_time", "due_date", "max_snooze_minutes", "min_duration_minutes", "rush_message",
+    "overtime_allowed", "overtime_bonus_points", "snooze_until", "snooze_count",
+    "hold_status", "hold_reason", "hold_minutes", "hold_requested_at", "hold_until",
+    "timer_started_at", "timer_completed_at",
+)
+# Settings that steered that flow.
+_LEGACY_CONFIG_FIELDS = (
+    "min_gap_seconds", "flash_threshold_pct", "pacing_bonus_points", "notify_parent_on_start",
+    "auto_start_next", "snooze_options_minutes", "duration_warning_minutes",
+    "bonus_follows_sequence", "max_idle_minutes", "overtime_bonus_interval_minutes",
+    "hold_auto_reject_minutes", "early_bonus_pct", "skip_cost_points", "last_materialize_at",
+)
+
+
+async def _cleanup_legacy_schedule() -> Optional[dict]:
+    """One-time removal of the old schedule machinery's leftovers, after the
+    weekly routine took over. Everything removed is copied to `legacy_archive`
+    first, so nothing is lost."""
+    if await db.app_meta.find_one({"_id": "legacy_cleanup_v1"}):
+        return None
+    summary: dict = {}
+    routine = await _routine_template(create=False)
+    rid = routine["id"] if routine else None
+
+    async def archive(kind: str, coll, query: dict) -> int:
+        rows = await coll.find(query, {"_id": 0}).to_list(None)
+        if rows:
+            await db.legacy_archive.insert_many(
+                [{"kind": kind, "archived_at": now_iso(), "doc": r} for r in rows])
+            await coll.delete_many(query)
+        return len(rows)
+
+    old_tpl_ids = [t["id"] for t in await db.day_templates.find(
+        {"parent_id": FAMILY_ID, "is_routine": {"$ne": True}}, {"_id": 0, "id": 1}).to_list(None)]
+    summary["template_slots"] = await archive(
+        "template_task", db.template_tasks,
+        {"parent_id": FAMILY_ID, "template_id": {"$nin": [rid] if rid else []}})
+    summary["templates"] = await archive(
+        "day_template", db.day_templates, {"parent_id": FAMILY_ID, "id": {"$in": old_tpl_ids}})
+    summary["assignments"] = await archive(
+        "template_assignment", db.template_assignments, {"parent_id": FAMILY_ID})
+    summary["task_bundles"] = await archive("routine_template", db.routine_templates, {"parent_id": FAMILY_ID})
+    summary["late_exceptions"] = await archive("late_exception", db.late_exceptions, {"parent_id": FAMILY_ID})
+    # Untouched future copies of the old repeating missions: the routine
+    # builds those days now.
+    summary["future_copies"] = await archive("task", db.tasks, {
+        "parent_id": FAMILY_ID, "date_key": {"$gt": _today_key()}, "from_routine": {"$ne": True},
+        "$or": [{"recurrence": {"$in": ["daily", "weekly"]}}, {"migrated_to_routine": True},
+                {"from_template_id": {"$exists": True}}],
+        "status": {"$in": ["pending", "rejected"]}, "checked": {"$ne": True},
+    })
+    res = await db.tasks.update_many(
+        {"parent_id": FAMILY_ID, "status": {"$in": ["pending", "rejected"]}},
+        {"$unset": {f: "" for f in _LEGACY_TASK_FIELDS}, "$set": {"recurrence": "none"}},
+    )
+    summary["open_tasks_cleaned"] = res.modified_count
+    await db.tasks.update_many({"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}},
+                               {"$set": {"recurrence": "none"}})
+    await _write_config({"$unset": {f: "" for f in _LEGACY_CONFIG_FIELDS}}, upsert=False)
+    _invalidate_config_cache()
+    await db.app_meta.update_one({"_id": "legacy_cleanup_v1"},
+                                 {"$set": {"at": now_iso(), **summary}}, upsert=True)
+    await log_activity(FAMILY_ID, None, "legacy_schedule_cleaned", summary)
     return summary
 
 
@@ -5004,6 +3896,13 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
         "segment": (seg or {}).get("label", "Kapan Saja"), "activities": len(to_award),
         "late": finish_update["finish_late"], "no_points": no_points,
     })
+    if config.get("instant_task_notifications"):
+        await send_push_to(
+            {"role": "parent"},
+            title=f"{child['name']} menyelesaikan {(seg or {}).get('label', 'Kapan Saja')} ✅",
+            body=f"{len(to_award)} tugas dicentang" + (" · terlambat" if finish_update["finish_late"] else ""),
+            url="/parent",
+        )
     return {"success": True, "completed": len(to_award), "awarded": awarded,
             "finish_late": finish_update["finish_late"], "no_points": no_points}
 
@@ -5114,123 +4013,243 @@ async def delete_off_day(off_day_id: str, user: dict = Depends(require_parent)):
 # --------------- Honesty insight (analisa kejujuran, non-accusatory) ---------------
 @api.get("/family/honesty-insight")
 async def honesty_insight(days: int = 14, user: dict = Depends(require_parent)):
-    """Gentle per-child working-pattern stats from the start/finish timestamps
-    over the last N days: average actual duration vs the estimated one, how
-    many finishes look like instant tap-throughs ('kilat'), and how many ran
-    far over the estimate (possible struggle). Meant as conversation-starter
-    signals for the parent — not verdicts."""
+    """Gentle per-child signals from how each section was worked through,
+    meant as conversation starters, never verdicts:
+      * sections_rushed — finished in under a quarter of its estimated time;
+      * bursts — every activity ticked within a few seconds of each other;
+      * late — started or finished past the deadline."""
     days = max(1, min(days, 60))
     since = (_now_local() - timedelta(days=days)).strftime("%Y-%m-%d")
     kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50)
+    sessions = await db.segment_sessions.find(
+        {"parent_id": FAMILY_ID, "date_key": {"$gte": since}, "completed_at": {"$nin": [None, ""]}},
+        {"_id": 0}).to_list(5000)
+    acts = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "date_key": {"$gte": since}, "is_bonus": {"$ne": True}},
+        {"_id": 0, "child_id": 1, "date_key": 1, "segment_id": 1, "checked_at": 1,
+         "duration_minutes": 1}).to_list(20000)
+    by_section: dict = {}
+    for a in acts:
+        by_section.setdefault((a.get("child_id"), a.get("date_key"), a.get("segment_id") or ANYTIME_SEGMENT_ID), []).append(a)
+
+    def ts(v):
+        try:
+            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
     out = []
     for k in kids:
-        tasks = await db.tasks.find({
-            "parent_id": FAMILY_ID, "child_id": k["id"],
-            "date_key": {"$gte": since},
-            "status": {"$in": ["approved", "completed"]},
-            "timer_started_at": {"$nin": [None, ""]},
-            "completed_at": {"$nin": [None, ""]},
-        }, {"_id": 0}).to_list(1000)
-        total = 0
-        sum_actual = 0.0
-        sum_est = 0.0
-        est_count = 0
-        flash_count = 0     # suspiciously instant (< 20s, or < 15% of the estimate)
-        overrun_count = 0   # > 2x the estimate (possible struggle, not cheating)
-        for t in tasks:
-            try:
-                start = datetime.fromisoformat(t["timer_started_at"].replace("Z", "+00:00"))
-                end = datetime.fromisoformat(t["completed_at"].replace("Z", "+00:00"))
-                actual_s = (end - start).total_seconds()
-            except Exception:
-                continue
-            if actual_s < 0:
-                continue
-            total += 1
-            sum_actual += actual_s
-            est_min = t.get("duration_minutes")
-            if est_min:
-                est_s = est_min * 60
-                sum_est += est_s
-                est_count += 1
-                if actual_s < max(20, est_s * 0.15):
-                    flash_count += 1
-                elif actual_s > est_s * 2:
-                    overrun_count += 1
-            elif actual_s < 20:
-                flash_count += 1
-        # "Rapel" detection: missions started almost immediately after the
-        # previous one finished, repeatedly. One quick hand-off is normal; a
-        # run of them across a morning that should have taken an hour is the
-        # signature of batch-clicking. Reported as a signal, never a verdict.
-        burst_count = 0
-        for t in tasks:
-            gap = t.get("gap_from_prev_seconds")
-            if gap is not None and gap < 120:
-                burst_count += 1
-        flagged_flash = len([t for t in tasks if t.get("flash_flag")])
-
+        mine = [x for x in sessions if x.get("child_id") == k["id"]]
+        rushed = bursts = late = 0
+        actual_total = est_total = 0.0
+        measured = 0
+        for se in mine:
+            rows = by_section.get((k["id"], se["date_key"], se["segment_id"]), [])
+            st, en = ts(se.get("started_at")), ts(se.get("completed_at"))
+            est = sum(int(r.get("duration_minutes") or 0) for r in rows) * 60
+            if st and en and en >= st:
+                measured += 1
+                spent = (en - st).total_seconds()
+                actual_total += spent
+                if est:
+                    est_total += est
+                    if spent < est * 0.25:
+                        rushed += 1
+            ticks = sorted(t for t in (ts(r.get("checked_at")) for r in rows) if t)
+            if len(ticks) >= 3 and (ticks[-1] - ticks[0]).total_seconds() <= 20:
+                bursts += 1
+            if se.get("start_late") or se.get("finish_late"):
+                late += 1
         out.append({
             "child_id": k["id"], "child_name": k["name"],
-            "burst_count": burst_count,
-            "flagged_flash_count": flagged_flash,
             "avatar_emoji": k.get("avatar_emoji"), "avatar_color": k.get("avatar_color"),
-            "tasks_measured": total,
-            "avg_actual_minutes": round(sum_actual / total / 60, 1) if total else None,
-            "avg_estimated_minutes": round(sum_est / est_count / 60, 1) if est_count else None,
-            "flash_count": flash_count,
-            "overrun_count": overrun_count,
+            "sections_measured": measured,
+            "avg_actual_minutes": round(actual_total / measured / 60, 1) if measured else None,
+            "avg_estimated_minutes": round(est_total / measured / 60, 1) if measured and est_total else None,
+            "sections_rushed": rushed, "bursts": bursts, "late": late,
             "days": days,
         })
     return {"since": since, "children": out}
 
 
-# --------------- Smart reminders (cron-triggered push nudges) ---------------
+# --------------- Section deadlines: who is behind, and who to tell ----------
+# A section is a list with one deadline — its (personal) finish time. Children
+# get a nudge shortly before it; once it has passed with the list unfinished,
+# the parents are told and decide what happens. Nothing is penalised
+# automatically.
+SECTION_NUDGE_MINUTES = 15
+
+
+async def _sections_status(dk: str) -> list:
+    """Every child's sections on one day, with where they stand."""
+    await _refresh_segments_cache()
+    segments = await _get_day_segments()
+    kids = await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50)
+    tasks = await db.tasks.find(
+        {"parent_id": FAMILY_ID, "date_key": dk, "status": {"$ne": "off"}, "is_bonus": {"$ne": True}},
+        {"_id": 0, "id": 1, "child_id": 1, "title": 1, "segment_id": 1, "checked": 1, "status": 1,
+         "is_coop": 1, "coop_participants": 1, "points": 1, "penalty_points": 1},
+    ).to_list(5000)
+    sessions = {
+        (x["child_id"], x["segment_id"]): x for x in await db.segment_sessions.find(
+            {"parent_id": FAMILY_ID, "date_key": dk}, {"_id": 0}).to_list(500)
+    }
+    reviews = {
+        (x["child_id"], x["segment_id"]): x for x in await db.section_reviews.find(
+            {"parent_id": FAMILY_ID, "date_key": dk}, {"_id": 0}).to_list(500)
+    }
+    def done(t):
+        return bool(t.get("checked")) or t.get("status") in ("completed", "approved", "skipped")
+
+    out = []
+    for k in kids:
+        mine = [t for t in tasks if t.get("child_id") == k["id"]
+                or (t.get("is_coop") and k["id"] in (t.get("coop_participants") or []))]
+        for sg in segments:
+            acts = [t for t in mine if t.get("segment_id") == sg["id"]]
+            if not acts:
+                continue
+            sess = sessions.get((k["id"], sg["id"])) or {}
+            left = [t for t in acts if not done(t) and t.get("status") != "missed"]
+            out.append({
+                "child_id": k["id"], "child_name": k["name"], "avatar_emoji": k.get("avatar_emoji"),
+                "segment_id": sg["id"], "label": sg["label"], "emoji": sg.get("emoji", ""),
+                "end_min": _effective_segment_end(sg, k, dk),
+                "end_time": _fmt_min(_effective_segment_end(sg, k, dk)),
+                "started": bool(sess.get("started_at")), "finished": bool(sess.get("completed_at")),
+                "total": len(acts), "left": [{"id": t["id"], "title": t["title"],
+                                             "penalty_points": int(t.get("penalty_points") or 0)} for t in left],
+                "reviewed": bool(reviews.get((k["id"], sg["id"]))),
+            })
+    return out
+
+
+async def _overdue_sections(dk: Optional[str] = None) -> list:
+    """Sections whose finish time has passed without being finished, that a
+    parent hasn't dealt with yet."""
+    dk = dk or _today_key()
+    today = _today_key()
+    now_min = _now_minutes()
+    rows = []
+    for r in await _sections_status(dk):
+        if r["finished"] or r["reviewed"]:
+            continue
+        if dk == today and now_min <= r["end_min"]:
+            continue
+        if dk > today:
+            continue
+        rows.append(r)
+    return rows
+
+
+@api.get("/family/overdue-sections")
+async def list_overdue_sections(date_key: Optional[str] = None, user: dict = Depends(require_parent)):
+    """Sections whose finish time passed unfinished, waiting for a parent to
+    decide. Covers today plus the previous two days so nothing slips by
+    overnight."""
+    if date_key:
+        dk = validate_date_key(date_key)
+        if not dk:
+            raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+        days = [dk]
+    else:
+        today = datetime.strptime(_today_key(), "%Y-%m-%d")
+        days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(3)]
+    out = []
+    for dk in days:
+        for r in await _overdue_sections(dk):
+            out.append({**r, "date_key": dk})
+    return {"sections": out}
+
+
+class OverdueResolveInput(BaseModel):
+    child_id: str
+    date_key: str
+    segment_id: str
+    # "miss": the unfinished missions are recorded as missed (each one's own
+    # penalty applies); "dismiss": let it go — nothing changes.
+    action: Literal["miss", "dismiss"]
+    task_ids: Optional[List[str]] = None  # default: every unfinished one
+
+
+@api.post("/family/overdue-sections/resolve")
+async def resolve_overdue_section(payload: OverdueResolveInput, user: dict = Depends(require_parent)):
+    dk = validate_date_key(payload.date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    row = next((r for r in await _sections_status(dk)
+                if r["child_id"] == payload.child_id and r["segment_id"] == payload.segment_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="Bagian tidak ditemukan")
+    missed = penalty_total = 0
+    if payload.action == "miss":
+        wanted = set(payload.task_ids) if payload.task_ids is not None else {t["id"] for t in row["left"]}
+        for t in row["left"]:
+            if t["id"] not in wanted:
+                continue
+            res = await mark_task_missed(t["id"], user)
+            missed += 1
+            penalty_total += int(res.get("_undo_miss_penalty") or 0)
+    await db.section_reviews.update_one(
+        {"parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "segment_id": payload.segment_id},
+        {"$set": {"action": payload.action, "missed": missed, "reviewed_at": now_iso(),
+                  "reviewed_by": user.get("name", "")}},
+        upsert=True,
+    )
+    await log_activity(FAMILY_ID, payload.child_id, "section_reviewed", {
+        "segment": row["label"], "action": payload.action, "missed": missed, "penalty": penalty_total})
+    return {"success": True, "missed": missed, "penalty": penalty_total}
+
+
 async def _run_reminder_sweep() -> dict:
-    """Two nudge types, both deduplicated via reminder_log so repeated cron
-    hits never spam:
-      1. Kid: a task due within the next 60 minutes that hasn't been started.
-      2. Parent: pending requests (sedekah / keterlambatan / reset pet /
-         penukaran hadiah & uang) sitting unreviewed for over 2 hours —
-         throttled to at most one nudge per 3-hour block per day."""
+    """Nudges, each sent once (deduplicated via reminder_log):
+      1. Child: a section closes within the next 15 minutes and isn't finished.
+      2. Parent: a section's finish time passed and the list isn't finished —
+         the parent decides what happens (nothing is penalised automatically).
+      3. Parent: pending requests (sedekah / reset pet / penukaran hadiah &
+         uang) unreviewed for over 2 hours — at most one per 3-hour block."""
     now = _now_local()
     today = _today_key()
     now_min = now.hour * 60 + now.minute
-    sent = {"task_reminders": 0, "parent_nudge": False}
+    sent = {"section_nudges": 0, "overdue_sections": 0, "parent_nudge": False}
 
-    tasks = await db.tasks.find({
-        "parent_id": FAMILY_ID, "date_key": today,
-        "status": {"$in": ["pending", "rejected"]},
-        "due_time": {"$nin": [None, ""]},
-        "timer_started_at": {"$in": [None, ""]},
-    }).to_list(500)
-    for t in tasks:
-        try:
-            due_min = _hhmm_to_min(t["due_time"])
-        except Exception:
+    for r in await _sections_status(today):
+        if r["finished"] or r["reviewed"]:
             continue
-        lead = due_min - now_min
-        if not (0 <= lead <= 60):
-            continue  # only nudge when the deadline is genuinely coming up
-        marker = f"task-reminder:{t['id']}"
-        if await db.reminder_log.find_one({"key": marker}):
-            continue
-        await send_push_to(
-            {"role": "child", "member_id": t["child_id"]},
-            title="Misi sebentar lagi! ⏰",
-            body=f'"{t["title"]}" harus selesai sebelum {t["due_time"]}. Yuk mulai sekarang!',
-            url=f"/kid/{t['child_id']}",
-        )
-        await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
-        sent["task_reminders"] += 1
+        lead = r["end_min"] - now_min
+        if 0 <= lead <= SECTION_NUDGE_MINUTES and r["left"]:
+            marker = f"section-nudge:{today}:{r['child_id']}:{r['segment_id']}"
+            if not await db.reminder_log.find_one({"key": marker}):
+                await send_push_to(
+                    {"role": "child", "member_id": r["child_id"]},
+                    title=f"{r['label']} selesai jam {r['end_time']} ⏰",
+                    body=f"Masih ada {len(r['left'])} tugas lagi. Yuk diselesaikan!",
+                    url=f"/kid/{r['child_id']}",
+                )
+                await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
+                sent["section_nudges"] += 1
+        elif lead < 0:
+            marker = f"section-overdue:{today}:{r['child_id']}:{r['segment_id']}"
+            if not await db.reminder_log.find_one({"key": marker}):
+                what = (f"belum mulai {r['label']}" if not r["started"]
+                        else f"belum menyelesaikan {r['label']} ({len(r['left'])} dari {r['total']} tugas belum)")
+                await send_push_to(
+                    {"role": "parent"},
+                    title=f"{r['child_name']} {what} 📋",
+                    body=f"Batasnya jam {r['end_time']}. Buka Monitor Harian untuk memutuskan.",
+                    url="/parent",
+                )
+                await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
+                sent["overdue_sections"] += 1
 
-    sent["holds_expired"] = await _expire_stale_holds()
     expired = await _sweep_overdue_punishments()
     sent["punishments_expired"] = expired
 
     two_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     pending_total = 0
-    for coll in (db.charity_requests, db.late_exceptions, db.pet_reset_requests):
+    for coll in (db.charity_requests, db.pet_reset_requests):
         pending_total += min(200, await coll.count_documents({"status": "pending", "created_at": {"$lt": two_hours_ago}}))
     pending_total += min(200, await db.redemptions.count_documents({"status": "pending", "created_at": {"$lt": two_hours_ago}}))
     pending_total += min(200, await db.money_redemptions.count_documents({"status": "pending", "created_at": {"$lt": two_hours_ago}}))
@@ -5265,78 +4284,6 @@ async def run_reminders_manual(user: dict = Depends(require_parent)):
     """Parent-triggered manual sweep (handy for testing the nudges)."""
     return await _run_reminder_sweep()
 
-
-async def get_next_actionable_task(child_id: str, date_key: Optional[str] = None) -> Optional[dict]:
-    """The task still blocking today's quest line for this child.
-
-    Ordered CHRONOLOGICALLY (due_time, then `order` as tie-breaker), not by raw
-    creation order. The kid's timeline is laid out by the clock, so gating by
-    creation order made the active task jump to the middle of the day while
-    earlier tasks sat greyed out as "menunggu giliran" — the sequence has to
-    agree with what they actually see. Tasks with no due_time sort last, since
-    they can be done whenever. Bonus tasks (is_bonus=True) never block.
-    """
-    cfg_seq = await get_config_cached()
-    bonus_in_line = bool(cfg_seq.get("bonus_follows_sequence", True))
-    query = {
-        "status": {"$in": ["pending", "rejected"]},
-        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
-    }
-    if not bonus_in_line:
-        query["is_bonus"] = {"$ne": True}
-    if date_key:
-        query["date_key"] = date_key
-    open_tasks = await db.tasks.find(query).to_list(500)
-    if not open_tasks:
-        return None
-    segments = await _get_day_segments()
-    open_tasks.sort(key=lambda t: (_task_sort_anchor(t, segments), t.get("order") or 0))
-    child = await db.children.find_one({"id": child_id})
-    cfg = await get_config_cached()
-    grace = int(cfg.get("segment_late_grace_minutes", 15))
-    all_today = (await db.tasks.find({
-        "parent_id": FAMILY_ID, "date_key": date_key,
-        "$or": [{"child_id": child_id}, {"is_coop": True, "coop_participants": child_id}],
-    }, {"_id": 0, "id": 1, "segment_id": 1, "due_time": 1, "order": 1, "status": 1,
-        "timer_started_at": 1, "overtime_allowed": 1, "duration_minutes": 1,
-        "actual_seconds": 1}).to_list(500)) if date_key else open_tasks
-    firsts = _segment_first_ids(open_tasks, segments, all_today)
-    actionable = [
-        t for t in open_tasks
-        # A mission under an approved hold, or still awaiting one, must not
-        # hold up the queue: the child stepped away from THAT task, not from
-        # the whole evening. Blocking everything behind it would turn a granted
-        # pause into a punishment.
-        if t.get("hold_status") not in ("pending", "approved")
-        and _task_availability(t, segments, child, t["id"] in firsts, grace) == "open"
-    ]
-    return actionable[0] if actionable else None
-
-
-def _segment_first_ids(open_tasks: list, segments: list, all_tasks: Optional[list] = None) -> set:
-    """Ids of missions whose START TIME should be judged for punctuality.
-
-    Only the mission that OPENS a section counts, and only while the child
-    hasn't begun that section at all. Once they've started anything in it, the
-    "did you begin on time?" question has already been answered — judging every
-    subsequent mission against the same section start would keep flagging them
-    as late for the rest of the evening.
-    """
-    entered = set()
-    for t in (all_tasks or []):
-        if t.get("timer_started_at") or t.get("status") in ("completed", "approved", "skipped"):
-            seg = _segment_for_task(t, segments)
-            if seg:
-                entered.add(seg.get("id"))
-    seen: dict = {}
-    for t in sorted(open_tasks, key=lambda x: (_task_sort_anchor(x, segments), x.get("order") or 0)):
-        seg = _segment_for_task(t, segments)
-        key = seg.get("id") if seg else "__none__"
-        if key in entered:
-            continue
-        if key not in seen:
-            seen[key] = t["id"]
-    return set(seen.values())
 
 
 def _now_local():
@@ -5434,148 +4381,6 @@ def _assert_child_owns_task(user: dict, task: dict):
         raise HTTPException(status_code=403, detail="Ini bukan misimu")
 
 
-class StartTaskInput(BaseModel):
-    # Set when the child taps "Mulai Sekarang" on the hand-off popup instead of
-    # waiting out the countdown.
-    start_early: bool = False
-
-
-@api.post("/tasks/{task_id}/start")
-async def start_task_timer(task_id: str, payload: StartTaskInput = StartTaskInput(), user: dict = Depends(get_current_user)):
-    """Kid clicks Start → records timer_started_at. A required task can be
-    started any time on its OWN day, as long as it's the next one in sequence
-    (bonuses can be started any time and never block the sequence). We no longer
-    gate on the due_time 'window' — kids may work ahead of schedule. Overshooting
-    the due_time turns the task time-stuck (owned via the Terlambat flow / skip),
-    handled separately at finish time."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    _assert_child_owns_task(user, task)
-    if task["status"] not in ("pending", "rejected"):
-        raise HTTPException(status_code=400, detail="Misi tidak bisa dimulai")
-
-    # Can only act on tasks for today — not past or future days.
-    date_key = task.get("date_key")
-    if date_key:
-        today = _now_local().strftime("%Y-%m-%d")
-        if date_key < today:
-            raise HTTPException(status_code=409, detail="Misi ini sudah lewat harinya")
-        if date_key > today:
-            raise HTTPException(status_code=409, detail="Misi ini belum waktunya (hari yang akan datang)")
-
-    # Missions must be inside their section's window AND next in line. Bonus
-    # missions follow the same queue unless the family explicitly frees them.
-    _cfg_gate = await get_config_cached()
-    _gate_applies = (not task.get("is_bonus")) or bool(_cfg_gate.get("bonus_follows_sequence", True))
-    if _gate_applies:
-        # The TIME WINDOW is checked first on purpose: "belum waktunya" and
-        # "sudah lewat, pakai Terlambat" tell the child exactly what to do,
-        # whereas the generic "finish the previous mission first" would be
-        # technically true but useless for a task that simply isn't due yet.
-        await _refresh_segments_cache()
-        _segs_now = await _get_day_segments()
-        _cfg_now = await get_config_cached()
-        _grace = int(_cfg_now.get("segment_late_grace_minutes", 15))
-        _kid_doc = await db.children.find_one({"id": task["child_id"]})
-        _open_now = await db.tasks.find({
-            "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
-            "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True},
-            "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
-        }, {"_id": 0, "id": 1, "segment_id": 1, "due_time": 1, "order": 1}).to_list(500)
-        _all_now = await db.tasks.find({
-            "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
-            "$or": [{"child_id": task["child_id"]}, {"is_coop": True, "coop_participants": task["child_id"]}],
-        }).to_list(500)
-        _is_first = task_id in _segment_first_ids(_open_now, _segs_now, _all_now)
-        _exam_now = await _active_exam_flex(task["child_id"], task.get("date_key") or _today_key())
-        _relaxed_now = (_is_flex_relaxed(task, _exam_now, _all_now, _segs_now)
-                        or _overtime_pushed_back(task, _all_now, _segs_now))
-        # Idling is only held against the mission whose turn it actually is.
-        _turn_now = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-        _is_turn = bool(_turn_now and _turn_now["id"] == task_id)
-        _idle_now = (
-            False if _relaxed_now or not _is_turn
-            else await _idle_exceeded(task["child_id"], task.get("date_key") or _today_key(), _cfg_now)
-        )
-        _avail = "open" if _relaxed_now else _task_availability(
-            task, _segs_now, _kid_doc, _is_first, _grace, _idle_now
-        )
-        if _avail == "future":
-            _sg = _segment_for_task(task, _segs_now)
-            _st = _fmt_min(_effective_segment_start(_sg, _kid_doc, task.get("date_key")))
-            raise HTTPException(
-                status_code=409,
-                detail=f'Belum waktunya — bagian "{_sg["label"]}" mulai jam {_st}.',
-            )
-        if _avail == "closed":
-            raise HTTPException(
-                status_code=409,
-                detail="Misi ini sudah lewat waktunya — tekan tombol Terlambat dulu untuk memilih alasannya.",
-            )
-        # A held mission is exempt from the queue in both directions: it doesn't
-        # block what follows, and it can be picked up whenever the child gets
-        # back — that IS the hold.
-        if task.get("hold_status") not in ("approved", "used"):
-            nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-            if nxt and nxt["id"] != task_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\"",
-                )
-
-    cfg_start = await get_config_cached()
-    gap_seconds = None
-    started_early = False
-    prev_finish = await _last_finish_dt(task["child_id"], task.get("date_key") or _today_key(), task_id)
-    if prev_finish:
-        gap_seconds = (datetime.now(timezone.utc) - prev_finish).total_seconds()
-        # Anti-"rapel": a whole morning can't be clicked through in one burst.
-        # Bonus missions are exempt — they're meant to be opportunistic.
-        min_gap = int(cfg_start.get("min_gap_seconds", 60))
-        if min_gap > 0 and not task.get("is_bonus") and gap_seconds < min_gap:
-            # A child who is genuinely ready shouldn't be made to stare at a
-            # countdown, so "Mulai Sekarang" may cut it short — but the choice
-            # is recorded rather than waved through. Skipping once is fine;
-            # skipping every time is exactly the batch-clicking pattern the
-            # Honesty Insight surfaces to the parent.
-            if not payload.start_early:
-                wait = int(min_gap - gap_seconds) + 1
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Sabar sebentar ya — tunggu {wait} detik lagi sebelum mulai misi berikutnya.",
-                )
-            started_early = True
-
-    await db.tasks.update_one({"id": task_id}, {"$set": {
-        "timer_started_at": now_iso(),
-        "gap_from_prev_seconds": gap_seconds,
-        "started_early": started_early,
-        # Once they've begun, the hold has served its purpose — everything after
-        # this runs on the normal clock again.
-        "hold_status": "used" if task.get("hold_status") == "approved" else task.get("hold_status"),
-    }, "$unset": {"snooze_until": ""}})
-    if started_early:
-        await log_activity(FAMILY_ID, task["child_id"], "task_started_early", {
-            "task_id": task_id, "title": task.get("title"),
-            "gap_seconds": int(gap_seconds or 0),
-        })
-
-    if cfg_start.get("notify_parent_on_start", True):
-        _kid = await db.children.find_one({"id": task["child_id"]})
-        await send_push_to(
-            {"role": "parent"},
-            title=f'{(_kid or {}).get("name", "Anak")} mulai misi ▶️',
-            body=f'"{task["title"]}" dimulai sekarang.',
-            url="/parent",
-        )
-    return await db.tasks.find_one({"id": task_id}, {"_id": 0})
-
-
-class TaskCompleteInput(BaseModel):
-    photo_url: Optional[str] = None
-    done_together: Optional[bool] = None  # answers the "was this done together?" prompt, when applicable
-
 
 class TaskApproveInput(BaseModel):
     # A short note and/or voice clip (base64 data URL, same pattern as photo
@@ -5585,216 +4390,11 @@ class TaskApproveInput(BaseModel):
     encouragement_voice_url: Optional[str] = None
 
 
-def _check_minimum_duration(task):
-    """Block Finish until the mission has actually been worked on long enough.
-
-    A duration is a budget; a minimum is a floor. Without one, "Belajar 30
-    menit" can be dismissed in ten seconds — which is the exact behaviour the
-    points are meant to discourage.
-    """
-    floor = task.get("min_duration_minutes")
-    started = task.get("timer_started_at")
-    if not floor or not started:
-        return
-    try:
-        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
-    except Exception:
-        return
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=timezone.utc)
-    elapsed_min = (datetime.now(timezone.utc) - start_dt).total_seconds() / 60
-    if elapsed_min < floor:
-        left = max(1, int(floor - elapsed_min + 0.999))
-        raise HTTPException(
-            status_code=409,
-            detail=task.get("rush_message")
-            or f"Sabar ya, misi ini minimal {floor} menit — masih kurang sekitar {left} menit lagi.",
-        )
-
-
-def _check_duration_not_exceeded(task):
-    """If the task has a duration and a running timer, block Finish once that
-    duration has elapsed since Start — mirrors the frontend's disabled-button
-    behavior so a direct API call can't bypass it. The kid's way forward once
-    overdue is Skip (still available), not a late Finish."""
-    # Already owned the delay (Terlambat) or granted a pause (hold)? Then the
-    # elapsed time has been accounted for, and blocking Finish would leave the
-    # child unable to start it again OR complete it — a dead end.
-    # Work that's allowed to run long has no ceiling to breach.
-    if task.get("overtime_allowed"):
-        return
-    if task.get("late_ack") or task.get("hold_status") in ("approved", "used"):
-        return
-    started = task.get("timer_started_at")
-    duration = task.get("duration_minutes")
-    if not started or not duration:
-        return  # no duration set, or timer never started — nothing to enforce
-    try:
-        start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
-    except Exception:
-        return
-    now = datetime.now(timezone.utc) if start_dt.tzinfo else datetime.utcnow()
-    elapsed_min = (now - start_dt).total_seconds() / 60
-    if elapsed_min > duration:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Waktu {duration} menit sudah habis — lewati misi ini untuk lanjut ke misi berikutnya.",
-        )
-
-
-@api.post("/tasks/{task_id}/complete")
-async def complete_task(task_id: str, payload: TaskCompleteInput = TaskCompleteInput(), user: dict = Depends(get_current_user)):
-    """Kid marks a task complete → awaits parent approval. Treasure-hunt rule:
-    only the next non-bonus task in the day's sequence can be completed.
-    If the task requires a photo, one must be attached to complete it."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    _assert_child_owns_task(user, task)
-    if task["status"] not in ("pending", "rejected"):
-        raise HTTPException(status_code=400, detail="Task cannot be completed in current state")
-
-    # A mission already under way must always be finishable. Re-checking the
-    # queue here could strand a child who had legitimately started something —
-    # after a granted hold, say — leaving them unable to start it again OR mark
-    # it done. Held missions are exempt for the same reason they don't block
-    # the queue: the pause applies to that task alone.
-    if not task.get("is_bonus") and not task.get("timer_started_at") \
-            and task.get("hold_status") not in ("approved", "used"):
-        nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-        if nxt and nxt["id"] != task_id:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Selesaikan dulu misi sebelumnya: \"{nxt['title']}\" (atau lewati dengan poin)",
-            )
-
-    _check_minimum_duration(task)
-    _check_duration_not_exceeded(task)
-
-    if task.get("photo_required") and not payload.photo_url:
-        raise HTTPException(status_code=422, detail="Misi ini butuh foto sebagai bukti sebelum selesai")
-
-    if task.get("together_bonus_enabled") and payload.done_together is None:
-        raise HTTPException(status_code=422, detail="Jawab dulu: apakah misi ini dilakukan bersama?")
-
-    await db.tasks.update_one(
-        {"id": task_id},
-        {"$set": {
-            "status": "completed", "completed_at": now_iso(), "timer_completed_at": now_iso(),
-            "completion_photo_url": await _store_task_photo(task_id, "completion_photo_url", payload.photo_url),
-            "actual_seconds": _elapsed_seconds({**task, "completed_at": now_iso()}),
-            "flash_flag": _is_flash_finish(
-                {**task, "completed_at": now_iso()},
-                int((await get_config_cached()).get("flash_threshold_pct", 15)),
-            ),
-            "coop_completed_by": user["id"] if task.get("is_coop") else task.get("coop_completed_by"),
-            "done_together": payload.done_together if task.get("together_bonus_enabled") else None,
-        }},
-    )
-    await log_activity(FAMILY_ID, task["child_id"], "task_completed", {"task_id": task_id, "title": task["title"]})
-    config_for_notify = await get_config_cached()
-    if config_for_notify.get("instant_task_notifications"):
-        child = await db.children.find_one({"id": task["child_id"]})
-        child_name = child["name"] if child else "Anak"
-        await send_push_to(
-            {"role": "parent"},
-            title=f"{child_name} menyelesaikan misi! 🎉",
-            body=f'"{task["title"]}" menunggu untuk dicek dan disetujui.',
-            url="/parent",
-        )
-
-    # Hand-off to the next mission IN THE SAME SECTION. Offering it right away
-    # (with a countdown) keeps the child moving through their routine instead
-    # of drifting off and batch-clicking everything later. Deliberately limited:
-    # never across sections, never for co-op (needs both kids ready) or bonus
-    # missions (those are meant to be free choice).
-    # Award the points straight away unless the family wants to gate them.
-    # Approving twenty missions a day one at a time is a chore in itself; the
-    # parent still sees every completion (and every honesty signal) and can
-    # undo an approval or dock points if something looks off. Review after the
-    # fact, rather than standing in the way of it.
-    auto_approved = False
-    if config_for_notify.get("auto_approve_tasks", True) and not task.get("photo_required"):
-        try:
-            await approve_task(task_id, TaskApproveInput(), {"id": "system", "role": "parent", "name": "Otomatis"})
-            auto_approved = True
-        except HTTPException:
-            # A co-op mission still waiting on a sibling, or any other guard —
-            # fall back to the manual queue rather than losing the completion.
-            pass
-
-    updated_task = await db.tasks.find_one({"id": task_id}, {"_id": 0})
-    auto_next = None
-    if config_for_notify.get("auto_start_next", True) and not task.get("is_coop"):
-        segs = await _get_day_segments()
-        this_seg = _segment_for_task(task, segs)
-        if this_seg:
-            nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-            if nxt and not nxt.get("is_coop") and not nxt.get("is_bonus"):
-                nxt_seg = _segment_for_task(nxt, segs)
-                if nxt_seg and nxt_seg.get("id") == this_seg.get("id"):
-                    auto_next = {
-                        "id": nxt["id"],
-                        "title": nxt["title"],
-                        "points": nxt.get("points"),
-                        "duration_minutes": nxt.get("duration_minutes"),
-                        "segment_label": nxt_seg.get("label"),
-                        "wait_seconds": int(config_for_notify.get("min_gap_seconds", 60)),
-                        "snooze_options": _snooze_options_for(nxt, config_for_notify),
-                    }
-    return {**updated_task, "auto_next": auto_next, "auto_approved": auto_approved}
-
-
-def _task_is_time_stuck(task: dict) -> bool:
-    """True when a REQUIRED task is blocked purely by time running out — either
-    (a) the kid started it but the duration elapsed before they could finish,
-    or (b) they never started it and the due_time window has already closed.
-    This is exactly the situation the 'Terlambat' flow exists for — as opposed
-    to a kid simply not wanting to do a task that's still well within its
-    window, which is what the points-cost Skip is for."""
-    # Nothing scheduled for a future day can be late yet.
-    if task.get("date_key") and task["date_key"] > _today_key():
-        return False
-    # A granted hold pauses the clock until the mission is actually begun.
-    if task.get("hold_status") == "approved" and not task.get("timer_started_at"):
-        return False
-    if task.get("late_ack"):
-        # The lateness was already explained via the "Terlambat" flow — the
-        # task is unblocked (points behavior decided by the chosen reason).
-        return False
-    started = task.get("timer_started_at")
-    duration = task.get("duration_minutes")
-    if started and duration:
-        try:
-            start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
-            now_utc = datetime.now(timezone.utc) if start_dt.tzinfo else datetime.utcnow()
-            elapsed_min = (now_utc - start_dt).total_seconds() / 60
-            if elapsed_min > duration:
-                return True
-        except Exception:
-            pass
-    # Never started and the task's SECTION has already closed → the chance for
-    # it has passed. Section-based rather than per-task, because tasks no longer
-    # carry their own clock: everything in "Pagi" is late once Pagi is over.
-    if not started and _snooze_expired(task):
-        return True
-    if not started:
-        end = _segment_window_end_cached(task)
-        if end is not None:
-            now_local = _now_local()
-            if now_local.hour * 60 + now_local.minute > end:
-                return True
-    return False
-
 
 # _task_is_time_stuck is called from sync contexts, so the segment list is
 # refreshed by the async callers and stashed here rather than awaited inline.
 _SEGMENTS_CACHE: dict = {"segments": None}
 
-
-def _segment_window_end_cached(task: dict) -> Optional[int]:
-    segments = _SEGMENTS_CACHE.get("segments") or DEFAULT_DAY_SEGMENTS
-    return _task_window_end(task, segments)
 
 
 _CONFIG_CACHE = {"doc": None, "at": 0.0}
@@ -5834,252 +4434,6 @@ def _invalidate_config_cache():
 async def _refresh_segments_cache():
     _SEGMENTS_CACHE["segments"] = await _get_day_segments()
 
-
-@api.post("/tasks/{task_id}/skip")
-async def skip_task(task_id: str, user: dict = Depends(get_current_user)):
-    """Pay points to skip a blocking task and unlock the next one."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    _assert_child_owns_task(user, task)
-    if task["status"] not in ("pending", "rejected"):
-        raise HTTPException(status_code=400, detail="Only open tasks can be skipped")
-
-    # Bonus tasks (including co-op, which are always bonus) aren't part of the
-    # required sequence, so they can be skipped any time — matches the same
-    # exemption complete_task already has. Only required tasks must be "next".
-    if not task.get("is_bonus"):
-        nxt = await get_next_actionable_task(task["child_id"], task.get("date_key"))
-        if nxt and nxt["id"] != task_id:
-            raise HTTPException(status_code=409, detail="Hanya misi terdepan yang bisa dilewati")
-
-    config = await get_config_cached()
-    cost = int(config.get("skip_cost_points", 20))
-
-    child = await db.children.find_one({"id": task["child_id"]})
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
-    if child.get("points", 0) < cost:
-        raise HTTPException(status_code=400, detail=f"Poin tidak cukup. Butuh {cost} poin untuk melewati misi ini.")
-
-    await db.children.update_one({"id": child["id"]}, {"$inc": {"points": -cost}})
-    await db.tasks.update_one({"id": task_id}, {"$set": {"status": "skipped", "completed_at": now_iso()}})
-    await log_activity(FAMILY_ID, child["id"], "task_skipped", {"task_id": task_id, "title": task["title"], "cost": cost})
-    updated = await db.tasks.find_one({"id": task_id}, {"_id": 0})
-    _cfg_combo = await get_config_cached()
-    await _check_family_combo(task.get("date_key"), _cfg_combo)
-    return {"task": updated, "points_spent": cost}
-
-
-class LateReasonPickInput(BaseModel):
-    reason_id: str
-
-
-def _snooze_options_for(task: dict, config: dict) -> list:
-    """Snooze choices valid for THIS mission: the family list, trimmed by the
-    mission's own cap when it has one. A cap below the smallest option leaves
-    no choices at all, which is the honest way to express "this one can't
-    really be put off"."""
-    base = config.get("snooze_options_minutes") or [5, 10, 15, 20]
-    cap = task.get("max_snooze_minutes")
-    if not cap:
-        return sorted(base)
-    return sorted([m for m in base if m <= int(cap)])
-
-
-class SnoozeInput(BaseModel):
-    minutes: int = Field(ge=1, le=240)
-
-
-@api.post("/tasks/{task_id}/snooze")
-async def snooze_task(task_id: str, payload: SnoozeInput, user: dict = Depends(get_current_user)):
-    """"Tunda dulu" on the hand-off popup.
-
-    The deadline is stored as a real wall-clock timestamp rather than a ticking
-    client countdown: a timer that paused whenever the app was closed would be
-    trivially gamed. Coming back EARLY is fine — the child can start whenever
-    they like before the deadline. Coming back late doesn't fail the mission,
-    it just routes them through the ordinary Terlambat flow so the delay is
-    acknowledged out loud.
-    """
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    kid_ids = task.get("coop_participants") or [task.get("child_id")]
-    if user["role"] == "child" and user["id"] not in kid_ids:
-        raise HTTPException(status_code=403, detail="Bukan misi kamu")
-    if task.get("status") not in ("pending", "rejected"):
-        raise HTTPException(status_code=400, detail="Misi ini sudah diproses")
-    if task.get("timer_started_at"):
-        raise HTTPException(status_code=400, detail="Misi ini sudah dimulai")
-
-    config = await get_config_cached()
-    allowed = _snooze_options_for(task, config)
-    if not allowed:
-        raise HTTPException(status_code=400, detail="Misi ini tidak boleh ditunda")
-    if payload.minutes not in allowed:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Misi ini paling lama ditunda {max(allowed)} menit (pilihan: {allowed})",
-        )
-
-    until = datetime.now(timezone.utc) + timedelta(minutes=payload.minutes)
-    await db.tasks.update_one({"id": task_id}, {"$set": {
-        "snooze_until": until.isoformat(),
-        "snooze_minutes": payload.minutes,
-    }, "$inc": {"snooze_count": 1}})
-    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
-    await log_activity(FAMILY_ID, child_id, "task_snoozed", {
-        "task_id": task_id, "title": task.get("title"), "minutes": payload.minutes,
-    })
-    return {
-        "task": await db.tasks.find_one({"id": task_id}, {"_id": 0}),
-        "snooze_until": until.isoformat(),
-        "minutes": payload.minutes,
-    }
-
-
-@api.post("/tasks/{task_id}/late-reason")
-async def acknowledge_late_task(task_id: str, payload: LateReasonPickInput, user: dict = Depends(get_current_user)):
-    """The "Terlambat" flow: an overdue, never-started task shows a Terlambat
-    button; the kid picks one of the parent-configured reasons.
-
-      • Excused reason (not the kid's fault, e.g. stuck in traffic) → task is
-        unblocked, full points still available.
-      • At-fault reason (e.g. overslept) → +1 Kartu Hukuman for the kid, and
-        the task is unblocked but worth 0 points ("lanjutkan tapi tanpa poin").
-        Reaching the configured threshold notifies the parents that a real
-        consequence is due.
-
-    Honest self-reporting is the point: the parent sees which reason was picked
-    on the approval card either way."""
-    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    kid_ids = task.get("coop_participants") or [task.get("child_id")]
-    if user["role"] == "child" and user["id"] not in kid_ids:
-        raise HTTPException(status_code=403, detail="Bukan misi kamu")
-    if task.get("status") not in ("pending", "rejected"):
-        raise HTTPException(status_code=400, detail="Misi ini sudah diproses")
-    if task.get("late_ack"):
-        raise HTTPException(status_code=400, detail="Alasan keterlambatan sudah dipilih untuk misi ini")
-    # A mission that was started but ran well past its duration is exactly the
-    # case that needs explaining, so only refuse when the child is still
-    # comfortably inside their time — otherwise they'd be stuck: unable to
-    # report, and unable to finish an over-run task either.
-    await _refresh_segments_cache()
-    if task.get("timer_started_at") and not _task_is_time_stuck(task):
-        raise HTTPException(status_code=400, detail="Misi ini masih berjalan, belum perlu lapor terlambat")
-    # Must actually be overdue: a past day, or today with the task's SECTION
-    # already closed (sections carry the clock now, not individual tasks).
-    today = _today_key()
-    segments = await _get_day_segments()
-    # Whatever the start guard refuses as "closed" must be acceptable here, or
-    # the child is stuck: unable to start AND unable to explain why they're
-    # late. Reusing the same availability call keeps the two in lockstep by
-    # construction rather than by careful duplication.
-    _cfg_lr = await get_config_cached()
-    _kid_lr = await db.children.find_one({"id": task.get("child_id")})
-    _open_lr = await db.tasks.find({
-        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
-        "status": {"$in": ["pending", "rejected"]}, "is_bonus": {"$ne": True},
-        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
-    }).to_list(500)
-    _all_lr = await db.tasks.find({
-        "parent_id": FAMILY_ID, "date_key": task.get("date_key"),
-        "$or": [{"child_id": task.get("child_id")}, {"is_coop": True, "coop_participants": task.get("child_id")}],
-    }).to_list(500)
-    _first_lr = task_id in _segment_first_ids(_open_lr, segments, _all_lr)
-    overdue = _task_availability(
-        task, segments, _kid_lr, _first_lr, int(_cfg_lr.get("segment_late_grace_minutes", 15))
-    ) == "closed"
-    # Running past the allotted duration counts as late too. The availability
-    # check only looks at section windows, so on its own it would call an
-    # over-run mission "open" and refuse the very report the UI is offering.
-    overdue = overdue or _task_is_time_stuck(task)
-    # Idling past the limit is a form of being late too — without this the
-    # child would be blocked from starting AND blocked from explaining.
-    if not overdue and task.get("child_id") and task.get("date_key"):
-        overdue = await _idle_exceeded(task["child_id"], task["date_key"], _cfg_lr)
-    if task.get("date_key") and task["date_key"] < today:
-        overdue = True
-    if not overdue:
-        raise HTTPException(status_code=400, detail="Misi ini belum terlewat")
-
-    config = await get_config_cached()
-    reasons = config.get("late_reasons") or DEFAULT_LATE_REASONS
-    reason = next((r for r in reasons if r.get("id") == payload.reason_id), None)
-    if not reason:
-        raise HTTPException(status_code=404, detail="Pilihan alasan tidak ditemukan")
-
-    # Deliberate stalling forfeits the benefit of the doubt. If the child
-    # already asked for extra time (snooze) and let even that run out, or sat
-    # idle past the limit, the excused reasons stop being offered — the delay
-    # was a choice, not something that happened to them.
-    _opener_lr = task_id in _segment_first_ids(_open_lr, segments, _all_lr)
-    if await _at_fault_only(task, _opener_lr, config):
-        if not reason.get("gives_penalty_card"):
-            raise HTTPException(
-                status_code=422,
-                detail="Kamu sudah minta tambahan waktu dan tetap lewat batas — pilih alasan yang jujur ya, yang ini tidak bisa dimaklumi.",
-            )
-
-    child_id = user["id"] if user["role"] == "child" else task.get("child_id")
-    # Reschedule the slot to start now: the child gets the FULL original
-    # duration from this moment, and the card stops showing a deadline that has
-    # already passed. The duration itself is never changed — only when the
-    # window sits on the clock. Clamped to end-of-day so a late-night
-    # acknowledgement can't roll the deadline past midnight.
-    updates = {
-        "late_ack": True,
-        "late_reason_id": reason["id"],
-        "late_reason_label": reason.get("label", ""),
-        "late_no_points": not reason.get("award_points", True),
-        "late_penalized": bool(reason.get("gives_penalty_card")),
-    }
-    # An over-run mission gets a clean clock: they've owned the delay, so the
-    # duration starts again rather than leaving them permanently out of time.
-    if task.get("timer_started_at"):
-        updates["timer_started_at"] = now_iso()
-        updates["restarted_after_late"] = True
-    if task.get("due_time"):
-        now_min = _now_local().hour * 60 + _now_local().minute
-        new_due = min(now_min + int(task.get("duration_minutes") or 10), 23 * 60 + 59)
-        updates["due_time_original"] = task.get("due_time_original") or task["due_time"]
-        updates["due_time"] = f"{new_due // 60:02d}:{new_due % 60:02d}"
-        updates["late_rescheduled"] = True
-    await db.tasks.update_one({"id": task_id}, {"$set": updates})
-
-    penalty_cards = None
-    threshold_hit = False
-    if reason.get("gives_penalty_card") and child_id:
-        child = await db.children.find_one({"id": child_id})
-        penalty_cards = int((child or {}).get("penalty_cards", 0)) + 1
-        await db.children.update_one({"id": child_id}, {"$set": {"penalty_cards": penalty_cards}})
-        threshold = int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD))
-        threshold_hit = penalty_cards >= threshold
-        if threshold_hit:
-            await _issue_punishment({**(child or {}), "id": child_id}, config, penalty_cards)
-        kid_name = (child or {}).get("name", "Anak")
-        if threshold_hit:
-            await send_push_to({"role": "parent"}, title="Kartu Hukuman penuh ⚠️",
-                               body=f"{kid_name} sudah mengumpulkan {penalty_cards} Kartu Hukuman (batas {threshold}). Saatnya konsekuensi & reset kartunya.",
-                               url="/parent")
-        else:
-            await send_push_to({"role": "parent"}, title="Kartu Hukuman +1",
-                               body=f'{kid_name} terlambat ("{reason.get("label", "")}") — total {penalty_cards} kartu.',
-                               url="/parent")
-    await log_activity(FAMILY_ID, child_id, "task_late_reason", {
-        "task_id": task_id, "title": task.get("title"), "reason": reason.get("label"),
-        "penalized": bool(reason.get("gives_penalty_card")),
-    })
-    return {
-        "task": await db.tasks.find_one({"id": task_id}, {"_id": 0}),
-        "gives_penalty_card": bool(reason.get("gives_penalty_card")),
-        "award_points": bool(reason.get("award_points", True)),
-        "penalty_cards": penalty_cards,
-        "threshold_hit": threshold_hit,
-    }
 
 
 def _next_deadline_date(deadline_weekday: int) -> str:
@@ -6423,288 +4777,6 @@ def _child_share_of_task(task: dict, child_id: str) -> int:
     return base_share + (1 if idx < remainder else 0)
 
 
-def _series_key(task: dict) -> tuple:
-    """Identity of a repeating task 'series'.
-
-    CRITICAL: this must distinguish every *distinct scheduled slot*, not just
-    the task's name. A family legitimately has the same title on several days
-    ("Piket" every Monday AND every Wednesday) and several times of day
-    ("Sholat" at 05:00 and at 18:00). Keying only on title/cadence/child
-    collapsed those into one series and silently dropped the rest — so the
-    slot's weekday (for weeklies) and its due_time are part of the identity.
-    """
-    if task.get("is_coop"):
-        who = ("coop", tuple(sorted(task.get("coop_participants") or [])))
-    else:
-        who = ("child", task.get("child_id"))
-    weekday = None
-    if task.get("recurrence") == "weekly" and task.get("date_key"):
-        try:
-            weekday = datetime.strptime(task["date_key"], "%Y-%m-%d").weekday()
-        except Exception:
-            weekday = None
-    return (
-        task.get("title"),
-        task.get("recurrence"),
-        who,
-        task.get("due_time") or "",
-        # The section is part of the slot's identity now that tasks are anchored
-        # to sections rather than clock times — "Memberi makan" in Sore and the
-        # same chore in Malam are two separate slots, and collapsing them made
-        # the materializer duplicate one into the other.
-        task.get("segment_id") or "",
-        bool(task.get("is_bonus")),
-        weekday,
-    )
-
-
-def _clone_series_instance(template: dict, date_key: str) -> dict:
-    """A fresh, clean occurrence of a series on a given day. Everything
-    instance-specific (timers, photos, approvals, lateness) is reset — only the
-    definition carries over."""
-    return {
-        **{k: v for k, v in template.items() if k != "_id"},
-        "id": new_id(),
-        "date_key": date_key,
-        "status": "pending",
-        "completed_at": None,
-        "approved_at": None,
-        "timer_started_at": None,
-        "timer_completed_at": None,
-        "coop_completed_by": None,
-        "completion_photo_url": None,
-        "done_together": None,
-        "early_bonus_awarded": 0,
-        "together_bonus_awarded": 0,
-        "off_day_id": None,
-        "due_date": None,
-        "late_ack": False,
-        "late_reason_id": None,
-        "late_reason_label": None,
-        "late_no_points": False,
-        "late_penalized": False,
-        "created_at": now_iso(),
-    }
-
-
-_SERIES_LIGHT_FIELDS = {
-    "_id": 0, "id": 1, "title": 1, "recurrence": 1, "is_coop": 1, "coop_participants": 1,
-    "child_id": 1, "due_time": 1, "segment_id": 1, "is_bonus": 1, "date_key": 1,
-}
-
-
-async def _fully_off_days(start: str, end: str) -> set:
-    """Every date in [start, end] that is off for the WHOLE day, from one query.
-
-    Same rule as _is_off_day, but asking once for the window instead of once per
-    series per day — the old per-day probe was the materializer's N+1.
-    """
-    rows = await db.off_days.find(
-        {"parent_id": FAMILY_ID, "end_date": {"$gte": start}, "start_date": {"$lte": end}},
-        {"_id": 0},
-    ).to_list(500)
-    out: set = set()
-    if not rows:
-        return out
-    cursor = datetime.strptime(start, "%Y-%m-%d")
-    last = datetime.strptime(end, "%Y-%m-%d")
-    while cursor <= last:
-        dk = cursor.strftime("%Y-%m-%d")
-        for off in rows:
-            if not (off["start_date"] <= dk <= off["end_date"]):
-                continue
-            starts_mid = off.get("start_segment_id") and off["start_date"] == dk
-            ends_mid = off.get("end_segment_id") and off["end_date"] == dk
-            if not starts_mid and not ends_mid:
-                out.add(dk)
-                break
-        cursor += timedelta(days=1)
-    return out
-
-
-async def _materialize_recurring(days_ahead: int = 14, from_date: Optional[str] = None,
-                                 only_days: Optional[List[str]] = None) -> int:
-    """Make sure every repeating series has its upcoming occurrences on the
-    calendar, WITHOUT waiting for the previous one to be approved.
-
-    This is the fix for 'my weekly chore disappeared': recurrence used to
-    advance only when a parent approved the previous instance, so a single
-    missed or unapproved day silently killed the series forever.
-
-    Idempotent: never creates a duplicate for a day that already has one,
-    never backfills the past, and skips declared off days.
-
-    `only_days` limits the work to specific dates (the lazy path builds just
-    today and tomorrow). Series are found in two steps — a light scan of the
-    identifying fields, then the full document of only the newest occurrence
-    of each series — so the cost no longer grows with the whole task history.
-    """
-    config = await get_config_cached()
-    if config.get("vacation_mode"):
-        return 0
-
-    today = _today_key()
-    if only_days:
-        wanted = sorted({d for d in only_days if d and d >= today})
-        if not wanted:
-            return 0
-        start, horizon = wanted[0], wanted[-1]
-        wanted_set = set(wanted)
-    else:
-        start = from_date or today
-        if start < today:
-            start = today
-        horizon = (datetime.strptime(start, "%Y-%m-%d") + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-        wanted_set = None
-
-    light = await db.tasks.find(
-        {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}},
-        _SERIES_LIGHT_FIELDS,
-    ).to_list(None)
-    if not light:
-        return 0
-
-    latest_id: dict = {}
-    latest_dk: dict = {}
-    existing_days: dict = {}
-    by_series: dict = {}
-    for t in light:
-        dk = t.get("date_key")
-        if not dk:
-            continue
-        key = _series_key(t)
-        existing_days.setdefault(key, set()).add(dk)
-        by_series.setdefault(key, []).append((dk, t["id"]))
-        if key not in latest_dk or dk > latest_dk[key]:
-            latest_dk[key] = dk
-            latest_id[key] = t["id"]
-
-    if wanted_set is not None:
-        # Lazy path: a wanted day belongs to a series when an occurrence exists
-        # on or before it on the series' rhythm; its definition is the NEAREST
-        # earlier occurrence. Unlike stepping forward from the newest copy, this
-        # also fills gaps — so future days can be left unbuilt (or compacted)
-        # and still come back exactly as they would have been.
-        plan: list = []
-        for key, occ in by_series.items():
-            occ.sort()
-            have = existing_days[key]
-            for dk in sorted(wanted_set):
-                if dk in have:
-                    continue
-                prior = [o for o in occ if o[0] <= dk]
-                if not prior:
-                    continue
-                anchor_dk, anchor_id = prior[-1]
-                step = 1 if key[1] == "daily" else 7
-                gap = (datetime.strptime(dk, "%Y-%m-%d") - datetime.strptime(anchor_dk, "%Y-%m-%d")).days
-                if gap % step:
-                    continue
-                plan.append((dk, anchor_id, key))
-        if not plan:
-            return 0
-        anchors = {
-            d["id"]: d for d in await db.tasks.find(
-                {"parent_id": FAMILY_ID, "id": {"$in": list({a for _, a, _ in plan})}}, {"_id": 0},
-            ).to_list(None)
-        }
-        off = await _fully_off_days(start, horizon)
-        docs = []
-        for dk, anchor_id, key in plan:
-            tpl_doc = anchors.get(anchor_id)
-            if not tpl_doc or dk in off or dk in existing_days[key]:
-                continue
-            docs.append(_clone_series_instance(tpl_doc, dk))
-            existing_days[key].add(dk)
-        if docs:
-            await db.tasks.insert_many(docs)
-        return len(docs)
-
-    full = {
-        d["id"]: d for d in await db.tasks.find(
-            {"parent_id": FAMILY_ID, "id": {"$in": list(latest_id.values())}}, {"_id": 0},
-        ).to_list(None)
-    }
-    off = await _fully_off_days(start, horizon)
-
-    created = 0
-    pending_docs: list = []
-    for key, tid in latest_id.items():
-        template = full.get(tid)
-        if not template:
-            continue
-        step = 1 if template.get("recurrence") == "daily" else 7
-        try:
-            cursor = datetime.strptime(template.get("date_key"), "%Y-%m-%d")
-        except Exception:
-            continue
-        while cursor.strftime("%Y-%m-%d") < start:
-            cursor += timedelta(days=step)
-        have = existing_days.get(key, set())
-        while cursor.strftime("%Y-%m-%d") <= horizon:
-            dk = cursor.strftime("%Y-%m-%d")
-            if (wanted_set is None or dk in wanted_set) and dk not in have and dk not in off:
-                pending_docs.append(_clone_series_instance(template, dk))
-                have.add(dk)
-                created += 1
-            cursor += timedelta(days=step)
-    if pending_docs:
-        await db.tasks.insert_many(pending_docs)
-    return created
-
-
-async def _fill_days_from_default_template(days_ahead: int = 14, only_days: Optional[List[str]] = None) -> int:
-    """Build any upcoming day that has no template assigned from the default one.
-
-    Without this a parent would have to paste the ordinary weekday template onto
-    every single date; the whole point is that normal days look after themselves
-    and only the exceptions need attention.
-    """
-    if await _routine_template(create=False):
-        return 0  # the weekly routine builds days itself, lazily
-    default_tpl = await db.day_templates.find_one({"parent_id": FAMILY_ID, "is_default": True}, {"_id": 0})
-    if not default_tpl:
-        return 0
-    today = _today_key()
-    created = 0
-    if only_days:
-        window = sorted({d for d in only_days if d and d >= today})
-    else:
-        window = [(datetime.strptime(today, "%Y-%m-%d") + timedelta(days=o)).strftime("%Y-%m-%d")
-                  for o in range(days_ahead + 1)]
-    if not window:
-        return 0
-
-    # Ask about the whole window at once. Probing day by day meant ~45 round
-    # trips before a single mission was written — on a remote database that is
-    # seconds of waiting, and it was happening inside the child's page load.
-    assigned = {
-        d["date_key"] for d in await db.template_assignments.find(
-            {"parent_id": FAMILY_ID, "date_key": {"$in": window}}, {"_id": 0, "date_key": 1}
-        ).to_list(400)
-    }
-    have_tasks = {
-        t["date_key"] for t in await db.tasks.find(
-            {"parent_id": FAMILY_ID, "date_key": {"$in": window}}, {"_id": 0, "date_key": 1}
-        ).to_list(None)
-    }
-    off = await _fully_off_days(window[0], window[-1])
-
-    for dk in window:
-        if dk in assigned or dk in have_tasks or dk in off:
-            continue
-        res = await _apply_template_to_date(default_tpl["id"], dk, replace_existing=False)
-        if res["created"]:
-            await db.template_assignments.update_one(
-                {"parent_id": FAMILY_ID, "date_key": dk},
-                {"$set": {"parent_id": FAMILY_ID, "date_key": dk,
-                          "template_id": default_tpl["id"], "assigned_at": now_iso(),
-                          "assigned_by": "otomatis"}},
-                upsert=True,
-            )
-            created += res["created"]
-    return created
-
 
 # ---- Lazy day preparation -------------------------------------------------
 # The schedule used to be pre-built a fortnight ahead by a sweep that ran on
@@ -6768,15 +4840,13 @@ async def _ensure_days_ready(days: Optional[List[str]] = None, force: bool = Fal
     _DAYS_READY["dirty"] = False
     try:
         created = 0
+        # A family still on the old per-task schedule is moved onto the weekly
+        # routine first (once), so the routine is the only thing that builds.
+        await _ensure_routine_migrated()
         # The weekly routine is the schedule. Its builder is idempotent per
         # slot and remembers each built day, so it is safe to call for any day.
         for d in due:
             created += await _ensure_day_built(d)
-        # The old default template is superseded once the routine took over
-        # (its slots were migrated); building from it too would double days.
-        if not await db.app_meta.find_one({"_id": "routine_migrated"}, {"_id": 1}):
-            created += await _fill_days_from_default_template(only_days=due)
-        created += await _materialize_recurring(only_days=due)
     except Exception:
         for d in due:
             _DAYS_READY["at"].pop(d, None)
@@ -6784,6 +4854,17 @@ async def _ensure_days_ready(days: Optional[List[str]] = None, force: bool = Fal
     if is_near:
         await _write_config({"$set": {"last_materialize_at": datetime.now(timezone.utc).isoformat()}})
     return created
+
+
+_ROUTINE_MIGRATED = {"done": False}
+
+
+async def _ensure_routine_migrated():
+    if _ROUTINE_MIGRATED["done"]:
+        return
+    await _migrate_legacy_to_routine()
+    await _cleanup_legacy_schedule()
+    _ROUTINE_MIGRATED["done"] = True
 
 
 def _schedule_materialize():
@@ -6801,10 +4882,6 @@ async def _maybe_materialize_recurring():
     """Kept for callers of the old name: builds today + tomorrow only."""
     return await _ensure_days_ready()
 
-
-class BulkTaskImportInput(BaseModel):
-    tasks: List[TaskInput] = Field(min_length=1, max_length=200)
-    skip_existing: bool = True  # don't recreate a slot that's already scheduled
 
 
 class TaskReorderInput(BaseModel):
@@ -6837,50 +4914,6 @@ class BulkDeleteInput(BaseModel):
     task_ids: List[str] = Field(min_length=1, max_length=500)
 
 
-@api.post("/tasks/dedupe")
-async def dedupe_tasks(dry_run: bool = False, user: dict = Depends(require_parent)):
-    """Remove duplicate copies of the same slot, keeping one of each.
-
-    An older bug let one chore be copied into a second slot; fixing the cause
-    stops it happening again but leaves the copies already on the calendar.
-    Two tasks count as the same slot only when they'd be indistinguishable to a
-    child: same title, same child, same day, same section and same bonus flag.
-
-    Whichever copy has actually been touched (started, finished, approved) is
-    the one kept, so cleaning up can never erase real progress. Pass
-    dry_run=true to see what would go before committing to it.
-    """
-    tasks = await db.tasks.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(20000)
-
-    def touched_rank(t: dict) -> tuple:
-        # Higher sorts first: real progress beats an untouched copy.
-        status_rank = {"approved": 4, "completed": 3, "skipped": 2, "rejected": 1}.get(t.get("status"), 0)
-        return (status_rank, 1 if t.get("timer_started_at") else 0, t.get("created_at") or "")
-
-    groups: dict = {}
-    for t in tasks:
-        who = tuple(sorted(t.get("coop_participants") or [])) if t.get("is_coop") else t.get("child_id")
-        key = (t.get("title"), who, t.get("date_key"), t.get("segment_id") or "",
-               t.get("due_time") or "", bool(t.get("is_bonus")))
-        groups.setdefault(key, []).append(t)
-
-    doomed = []
-    for key, items in groups.items():
-        if len(items) < 2:
-            continue
-        items.sort(key=touched_rank, reverse=True)
-        doomed.extend(items[1:])  # keep the most-progressed copy
-
-    preview = [{"id": t["id"], "title": t["title"], "date_key": t.get("date_key"),
-                "status": t.get("status")} for t in doomed[:50]]
-    if dry_run:
-        return {"would_delete": len(doomed), "sample": preview}
-
-    if doomed:
-        await db.tasks.delete_many({"parent_id": FAMILY_ID, "id": {"$in": [t["id"] for t in doomed]}})
-        await log_activity(FAMILY_ID, None, "tasks_deduped", {"deleted": len(doomed)})
-    return {"deleted": len(doomed), "sample": preview}
-
 
 @api.post("/tasks/bulk-delete")
 async def bulk_delete_tasks(payload: BulkDeleteInput, user: dict = Depends(require_parent)):
@@ -6898,425 +4931,8 @@ async def bulk_delete_tasks(payload: BulkDeleteInput, user: dict = Depends(requi
     return {"success": True, "deleted": res.deleted_count, "skipped": len(payload.task_ids) - len(ids)}
 
 
-@api.post("/tasks/bulk-import")
-async def bulk_import_tasks(payload: BulkTaskImportInput, user: dict = Depends(require_parent)):
-    """Recreate a whole routine in one go — used by 'Pulihkan Jadwal'.
-
-    Each entry goes through the exact same creation path as the normal task
-    form (so weekdays, recurrence, co-op bonuses and broadcasting all behave
-    identically); this just spares a parent from re-entering dozens of rows by
-    hand. Already-scheduled slots are skipped by default, so re-running it is
-    safe and won't double up the calendar.
-    """
-    created = 0
-    skipped = 0
-    errors = []
-    for idx, item in enumerate(payload.tasks):
-        try:
-            if payload.skip_existing:
-                dup_q = {
-                    "parent_id": FAMILY_ID, "title": item.title,
-                    "due_time": item.due_time, "is_bonus": bool(item.is_bonus),
-                    "status": {"$in": ["pending", "rejected"]},
-                }
-                if await db.tasks.find_one(dup_q):
-                    skipped += 1
-                    continue
-            result = await create_task(item, user)
-            made = result.get("tasks") if isinstance(result, dict) else None
-            created += len(made) if isinstance(made, list) else 1
-        except HTTPException as e:
-            errors.append({"index": idx, "title": item.title, "error": str(e.detail)})
-        except Exception as e:  # keep importing the rest rather than aborting everything
-            errors.append({"index": idx, "title": item.title, "error": str(e)})
-    await log_activity(FAMILY_ID, None, "tasks_bulk_imported", {"created": created, "skipped": skipped, "errors": len(errors)})
-    return {"created": created, "skipped": skipped, "errors": errors}
-
-
-@api.post("/tasks/materialize-recurring")
-async def materialize_recurring_now(days_ahead: int = 14, user: dict = Depends(require_parent)):
-    """Manual 'refresh my schedule' for parents — fills in any missing upcoming
-    occurrences of every repeating task right now."""
-    created = await _materialize_recurring(days_ahead=max(1, min(days_ahead, 60)))
-    return {"created": created}
-
-
-class RestartScheduleInput(BaseModel):
-    start_date: str                      # fresh start begins on this day (e.g. tomorrow)
-    reset_streaks: bool = False          # also zero streaks so the restart is genuine
-    clear_pending_requests: bool = True  # drop stale approval queues from the old run
-    days_ahead: int = Field(default=14, ge=1, le=60)
-
-
-@api.post("/tasks/restart-schedule")
-async def restart_schedule(payload: RestartScheduleInput, user: dict = Depends(require_parent)):
-    """Wipe the accumulated backlog and start the routine over from a chosen
-    day. Everything dated BEFORE start_date is removed (done, missed, and
-    never-touched alike), then every repeating series is re-seeded from
-    start_date onward so the calendar is clean and populated.
-
-    Points, rewards, and pet progress are deliberately left alone — this
-    restarts the *schedule*, not the child's earnings. Streak reset is opt-in.
-    """
-    start = validate_date_key(payload.start_date)
-    if not start:
-        raise HTTPException(status_code=422, detail="Tanggal mulai tidak valid (YYYY-MM-DD)")
-
-    # Capture series definitions BEFORE deleting, or a series that only ever
-    # existed in the past would be lost with nothing left to rebuild from.
-    recurring = await db.tasks.find(
-        {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}},
-        {"_id": 0},
-    ).to_list(5000)
-    templates: dict = {}
-    for t in recurring:
-        if not t.get("date_key"):
-            continue
-        key = _series_key(t)
-        if key not in templates or t["date_key"] > templates[key]["date_key"]:
-            templates[key] = t
-
-    # Archive before deleting so a restart is always reversible. Losing a
-    # carefully built schedule to one button press is not acceptable.
-    batch_id = new_id()
-    doomed = await db.tasks.find({"parent_id": FAMILY_ID, "date_key": {"$lt": start}}, {"_id": 0}).to_list(20000)
-    if doomed:
-        await db.tasks_archive.insert_many([
-            {"archive_batch": batch_id, "archived_at": now_iso(), "parent_id": FAMILY_ID, "task": t}
-            for t in doomed
-        ])
-    deleted = await db.tasks.delete_many({"parent_id": FAMILY_ID, "date_key": {"$lt": start}})
-
-    if payload.clear_pending_requests:
-        for coll in (db.charity_requests, db.late_exceptions, db.pet_reset_requests):
-            await coll.delete_many({"parent_id": FAMILY_ID, "status": "pending"})
-    await db.family_combo_awards.delete_many({"parent_id": FAMILY_ID, "date_key": {"$lt": start}})
-    await db.reminder_log.delete_many({})
-
-    if payload.reset_streaks:
-        await db.children.update_many(
-            {"parent_id": FAMILY_ID},
-            {"$set": {"streak_days": 0, "last_completion_date": None}},
-        )
-
-    # Re-seed each series at its first valid day on/after start_date, then let
-    # the normal materializer fill the rest of the horizon.
-    seeded = 0
-    for key, template in templates.items():
-        step = 1 if template.get("recurrence") == "daily" else 7
-        try:
-            cursor = datetime.strptime(template["date_key"], "%Y-%m-%d")
-        except Exception:
-            continue
-        while cursor.strftime("%Y-%m-%d") < start:
-            cursor += timedelta(days=step)
-        guard = 0
-        while await _is_off_day(cursor.strftime("%Y-%m-%d")) and guard < 60:
-            cursor += timedelta(days=step)
-            guard += 1
-        dk = cursor.strftime("%Y-%m-%d")
-        dup_q = {
-            "parent_id": FAMILY_ID, "title": template["title"],
-            "recurrence": template["recurrence"], "date_key": dk,
-            "due_time": template.get("due_time"),
-            "is_bonus": bool(template.get("is_bonus")),
-        }
-        if template.get("is_coop"):
-            dup_q["is_coop"] = True
-            dup_q["coop_participants"] = template.get("coop_participants")
-        else:
-            dup_q["child_id"] = template.get("child_id")
-        exists = await db.tasks.find_one(dup_q)
-        if not exists:
-            await db.tasks.insert_one(_clone_series_instance(template, dk))
-            seeded += 1
-
-    filled = await _materialize_recurring(days_ahead=payload.days_ahead, from_date=start)
-    await log_activity(FAMILY_ID, None, "schedule_restarted", {
-        "start_date": start, "deleted": deleted.deleted_count,
-        "seeded": seeded, "filled": filled, "reset_streaks": payload.reset_streaks,
-    })
-    return {
-        "success": True, "start_date": start,
-        "deleted_tasks": deleted.deleted_count,
-        "series_restarted": seeded, "upcoming_created": seeded + filled,
-        "archive_batch": batch_id,
-    }
-
 
 # ---- Stage 3: compact the pre-built schedule -------------------------------
-# Older versions built every routine a fortnight ahead, so the collection holds
-# many untouched copies of future days. Now that days are built lazily, those
-# copies are pure weight. This removes only what would be rebuilt IDENTICALLY:
-# a future day is cleared only if every mission on it is an untouched copy of
-# its template slot or its repeating series, and a series is thinned only if
-# none of its future copies has to stay. Everything removed is archived first
-# and can be put back with /tasks/undo-restart.
-_SERIES_DEF_FIELDS = (
-    "title", "description", "points", "penalty_points", "is_bonus", "due_time", "segment_id",
-    "duration_minutes", "icon", "order", "task_style", "photo_required", "max_snooze_minutes",
-    "min_duration_minutes", "rush_message", "overtime_allowed", "overtime_bonus_points",
-    "together_bonus_enabled", "together_bonus_points", "child_id", "is_coop", "coop_participants",
-    "recurrence",
-)
-_SLOT_FIELDS = (
-    ("title", "title", None), ("description", "description", ""), ("points", "points", 10),
-    ("penalty_points", "penalty_points", 0), ("duration_minutes", "duration_minutes", None),
-    ("segment_id", "segment_id", None), ("is_bonus", "is_bonus", False),
-    ("photo_required", "photo_required", False), ("task_style", "task_style", None),
-    ("max_snooze_minutes", "max_snooze_minutes", None),
-    ("min_duration_minutes", "min_duration_minutes", None), ("rush_message", "rush_message", None),
-    ("overtime_allowed", "overtime_allowed", False),
-    ("overtime_bonus_points", "overtime_bonus_points", None),
-    ("together_bonus_enabled", "together_bonus_enabled", False),
-    ("together_bonus_points", "together_bonus_points", None),
-)
-
-
-def _norm(v):
-    """Compare definitions loosely: list order and ""/None don't matter."""
-    if isinstance(v, (list, tuple)):
-        return tuple(sorted(str(x) for x in v)) or None
-    if v is False or (isinstance(v, str) and v == ""):
-        return None
-    return v
-
-
-def _untouched(t: dict) -> bool:
-    return (t.get("status") == "pending" and not t.get("timer_started_at")
-            and not t.get("completed_at") and not t.get("hold_status")
-            and not t.get("completion_photo_url") and not t.get("late_ack")
-            and not t.get("off_day_id"))
-
-
-@api.post("/maintenance/compact-schedule")
-async def compact_schedule(dry_run: bool = True, user: dict = Depends(require_parent)):
-    config = await get_config_cached()
-    if config.get("vacation_mode"):
-        raise HTTPException(status_code=409, detail="Matikan mode liburan dulu — saat liburan jadwal tidak dibangun ulang")
-    near = _near_days()
-    tomorrow = near[1]
-    future = await db.tasks.find(
-        {"parent_id": FAMILY_ID, "date_key": {"$gt": tomorrow}}, {"_id": 0},
-    ).to_list(None)
-    if not future:
-        return {"dry_run": dry_run, "removable_tasks": 0, "days": [], "removed": 0}
-
-    default_tpl = await db.day_templates.find_one({"parent_id": FAMILY_ID, "is_default": True}, {"_id": 0})
-    future_days = sorted({t["date_key"] for t in future})
-    assignments = {
-        a["date_key"]: a for a in await db.template_assignments.find(
-            {"parent_id": FAMILY_ID, "date_key": {"$in": future_days}}, {"_id": 0},
-        ).to_list(None)
-    }
-    slots = {}
-    if default_tpl:
-        slots = {s["id"]: s for s in await db.template_tasks.find(
-            {"parent_id": FAMILY_ID, "template_id": default_tpl["id"]}, {"_id": 0}).to_list(None)}
-    kids = [k["id"] for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(100)]
-    expected_per_weekday: dict = {}
-    for s_ in slots.values():
-        n = 1 if s_.get("child_id") else len(kids)
-        expected_per_weekday[s_["weekday"]] = expected_per_weekday.get(s_["weekday"], 0) + n
-
-    # Series anchors: the newest occurrence on or before tomorrow.
-    recurring_all = await db.tasks.find(
-        {"parent_id": FAMILY_ID, "recurrence": {"$in": ["daily", "weekly"]}, "date_key": {"$lte": tomorrow}},
-        _SERIES_LIGHT_FIELDS,
-    ).to_list(None)
-    anchor_id: dict = {}
-    anchor_dk: dict = {}
-    for t in recurring_all:
-        if not t.get("date_key"):
-            continue
-        k = _series_key(t)
-        if k not in anchor_dk or t["date_key"] > anchor_dk[k]:
-            anchor_dk[k], anchor_id[k] = t["date_key"], t["id"]
-    anchors = {}
-    if anchor_id:
-        full = {d["id"]: d for d in await db.tasks.find(
-            {"parent_id": FAMILY_ID, "id": {"$in": list(anchor_id.values())}}, {"_id": 0}).to_list(None)}
-        anchors = {k: full.get(i) for k, i in anchor_id.items() if full.get(i)}
-
-    def template_copy_ok(t: dict) -> bool:
-        if not default_tpl or t.get("from_template_id") != default_tpl["id"]:
-            return False
-        a = assignments.get(t["date_key"])
-        if not a or a.get("assigned_by") != "otomatis" or a.get("template_id") != default_tpl["id"]:
-            return False
-        s_ = slots.get(t.get("from_template_slot_id"))
-        if not s_:
-            return False
-        if (t.get("order") or 1) != (s_.get("order") or 1):
-            return False
-        return all(_norm(t.get(tf)) == _norm(s_.get(sf, dflt)) for tf, sf, dflt in _SLOT_FIELDS)
-
-    def is_series(t: dict) -> bool:
-        return t.get("recurrence") in ("daily", "weekly") and not t.get("from_template_id")
-
-    def same_def(a: dict, b: dict) -> bool:
-        return all(_norm(a.get(f)) == _norm(b.get(f)) for f in _SERIES_DEF_FIELDS)
-
-    ok = {t["id"]: (_untouched(t) and (template_copy_ok(t) or (is_series(t) and _series_key(t) in anchors)))
-          for t in future}
-    by_day: dict = {}
-    for t in future:
-        by_day.setdefault(t["date_key"], []).append(t)
-    by_series: dict = {}
-    for t in future:
-        if is_series(t):
-            by_series.setdefault(_series_key(t), []).append(t)
-    for rows in by_series.values():
-        rows.sort(key=lambda r: r["date_key"])
-
-    def series_pass(keep_day) -> bool:
-        """A series copy may go only if it matches the nearest copy that STAYS
-        before it — exactly what the lazy builder will clone in its place."""
-        moved = False
-        for key, rows in by_series.items():
-            current = anchors.get(key)
-            for r in rows:
-                if not keep_day(r):
-                    if current is None or not same_def(r, current):
-                        ok[r["id"]] = False
-                        moved = True
-                        current = r
-                else:
-                    current = r
-        return moved
-
-    # Fixed point: a day goes only if ALL its missions go.
-    changed = True
-    while changed:
-        changed = False
-        for dk, rows in by_day.items():
-            if any(not ok[r["id"]] for r in rows) and any(ok[r["id"]] for r in rows):
-                for r in rows:
-                    if ok[r["id"]]:
-                        ok[r["id"]] = False
-                        changed = True
-        if series_pass(lambda r: not ok[r["id"]]):
-            changed = True
-    # A template day must also be complete, or the rebuild would add back a
-    # slot the parent had removed by hand.
-    final_days = []
-    for dk, rows in by_day.items():
-        if not all(ok[r["id"]] for r in rows):
-            continue
-        tpl_rows = [r for r in rows if r.get("from_template_id")]
-        if tpl_rows:
-            wd = datetime.strptime(dk, "%Y-%m-%d").weekday()
-            if len(tpl_rows) != expected_per_weekday.get(wd, -1):
-                continue
-        final_days.append(dk)
-    # Dropping an incomplete template day keeps its missions, which can change
-    # the "nearest kept copy" of a series for later days: settle that too.
-    final_set = set(final_days)
-    while True:
-        for r in future:
-            if r["date_key"] not in final_set:
-                ok[r["id"]] = False
-        if not series_pass(lambda r: not ok[r["id"]]):
-            break
-        final_set = {dk for dk in final_set if all(ok[r["id"]] for r in by_day[dk])}
-    final_days = sorted(final_set)
-    doomed = [t for dk in final_days for t in by_day[dk]]
-
-    if dry_run or not doomed:
-        return {"dry_run": dry_run, "removable_tasks": len(doomed), "days": final_days, "removed": 0}
-
-    batch_id = new_id()
-    await db.tasks_archive.insert_many([
-        {"archive_batch": batch_id, "archived_at": now_iso(), "parent_id": FAMILY_ID,
-         "reason": "compact", "task": t}
-        for t in doomed
-    ])
-    res = await db.tasks.delete_many({"parent_id": FAMILY_ID, "id": {"$in": [t["id"] for t in doomed]}})
-    await db.template_assignments.delete_many(
-        {"parent_id": FAMILY_ID, "date_key": {"$in": final_days}, "assigned_by": "otomatis"})
-    _invalidate_days_ready()
-    await log_activity(FAMILY_ID, None, "schedule_compacted", {"removed": res.deleted_count, "days": len(final_days)})
-    return {"dry_run": False, "removable_tasks": len(doomed), "days": final_days,
-            "removed": res.deleted_count, "archive_batch": batch_id}
-
-@api.get("/tasks/restart-archives")
-async def list_restart_archives(user: dict = Depends(require_parent)):
-    """Restart batches available to undo, newest first."""
-    rows = await db.tasks_archive.find({"parent_id": FAMILY_ID}, {"_id": 0, "archive_batch": 1, "archived_at": 1}).to_list(20000)
-    grouped: dict = {}
-    for r in rows:
-        b = r["archive_batch"]
-        g = grouped.setdefault(b, {"archive_batch": b, "archived_at": r["archived_at"], "task_count": 0})
-        g["task_count"] += 1
-        if r["archived_at"] < g["archived_at"]:
-            g["archived_at"] = r["archived_at"]
-    return sorted(grouped.values(), key=lambda g: g["archived_at"], reverse=True)
-
-
-@api.post("/tasks/undo-restart")
-async def undo_restart(archive_batch: Optional[str] = None, user: dict = Depends(require_parent)):
-    """Put back everything a restart removed. Defaults to the most recent
-    restart. Tasks that already exist again are skipped, so undoing twice or
-    undoing after a partial rebuild can't create duplicates."""
-    query = {"parent_id": FAMILY_ID}
-    if archive_batch:
-        query["archive_batch"] = archive_batch
-    rows = await db.tasks_archive.find(query, {"_id": 0}).to_list(20000)
-    if not rows:
-        raise HTTPException(status_code=404, detail="Tidak ada arsip untuk dikembalikan")
-    if not archive_batch:
-        newest = max(rows, key=lambda r: r["archived_at"])["archive_batch"]
-        rows = [r for r in rows if r["archive_batch"] == newest]
-        archive_batch = newest
-    restored = 0
-    for r in rows:
-        t = r["task"]
-        if await db.tasks.find_one({"id": t["id"]}):
-            continue
-        await db.tasks.insert_one(t)
-        restored += 1
-    await db.tasks_archive.delete_many({"parent_id": FAMILY_ID, "archive_batch": archive_batch})
-    await log_activity(FAMILY_ID, None, "restart_undone", {"batch": archive_batch, "restored": restored})
-    return {"success": True, "restored_tasks": restored, "archive_batch": archive_batch}
-
-
-def _early_completion_bonus(task: dict, base_points: int, config: dict) -> int:
-    """Extra points for finishing a task BEFORE its due_time. Returns the bonus
-    (rounded, at least 1 if the pct would round to 0 but is configured > 0), or
-    0 when there's no due_time, no completion timestamp, it wasn't actually
-    early, or the feature is turned off (early_bonus_pct == 0)."""
-    if task.get("late_ack"):
-        # You can't be "early" on a task you already reported late — the window
-        # was moved to accommodate the lateness, so beating the new deadline
-        # isn't an achievement worth paying for.
-        return 0
-    pct = int(config.get("early_bonus_pct", 10))
-    if pct <= 0:
-        return 0
-    due_time = task.get("due_time")
-    completed_at = task.get("completed_at")
-    date_key = task.get("date_key")
-    if not due_time or not completed_at:
-        return 0
-    try:
-        # completed_at is a UTC ISO string; convert to family local (GMT+7),
-        # then compare against the due_time on the task's own local day.
-        comp_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-        if comp_dt.tzinfo:
-            comp_local = comp_dt.astimezone(timezone.utc).replace(tzinfo=None) + timedelta(hours=7)
-        else:
-            comp_local = comp_dt + timedelta(hours=7)
-        dh, dm = map(int, due_time.split(":"))
-        base_date = date_key or comp_local.strftime("%Y-%m-%d")
-        y, mo, d = map(int, base_date.split("-"))
-        due_dt = comp_local.replace(year=y, month=mo, day=d, hour=dh, minute=dm, second=0, microsecond=0)
-        if comp_local < due_dt:
-            bonus = round(base_points * pct / 100)
-            return max(bonus, 1) if base_points > 0 else 0
-    except Exception:
-        return 0
-    return 0
-
 
 async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> dict:
     """Applies streak/Chikybank updates for ONE child earning
@@ -7387,79 +5003,6 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
     }
 
 
-async def _spawn_recurrence_if_due(task: dict, config: dict) -> Optional[str]:
-    """Shared recurrence-spawn logic (used by both normal and co-op approval
-    paths). Returns the new task's id, or None if nothing was spawned."""
-    if task["recurrence"] not in ("daily", "weekly") or config.get("vacation_mode"):
-        return None
-    delta_days = 1 if task["recurrence"] == "daily" else 7
-    next_date_key = None
-    if task.get("date_key"):
-        try:
-            base_day = datetime.strptime(task["date_key"], "%Y-%m-%d")
-            next_date_key = (base_day + timedelta(days=delta_days)).strftime("%Y-%m-%d")
-        except Exception:
-            next_date_key = None
-    if not next_date_key:
-        next_date_key = (_now_local() + timedelta(days=delta_days)).strftime("%Y-%m-%d")
-
-    # If the next occurrence lands on a declared off day, keep stepping until a
-    # working day: daily tasks slide day by day, weekly ones jump whole weeks
-    # (so a weekly-Saturday task skipped over an off Saturday stays a Saturday
-    # task). Guard-capped so a pathological all-off calendar can't loop forever.
-    step = 1 if task["recurrence"] == "daily" else 7
-    for _ in range(60):
-        if not await _is_off_day(next_date_key):
-            break
-        next_date_key = (datetime.strptime(next_date_key, "%Y-%m-%d") + timedelta(days=step)).strftime("%Y-%m-%d")
-
-    next_due = None
-    if task.get("due_date"):
-        try:
-            base = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
-            next_due = (base + timedelta(days=delta_days)).isoformat()
-        except Exception:
-            next_due = None
-
-    match_query = {
-        "title": task["title"], "date_key": next_date_key,
-        "recurrence": task["recurrence"], "status": {"$in": ["pending", "rejected"]},
-        # Same title at a DIFFERENT time of day is a different slot, not a
-        # duplicate — without this, a morning task could suppress the evening one.
-        "due_time": task.get("due_time"),
-        "segment_id": task.get("segment_id"),
-        "is_bonus": bool(task.get("is_bonus")),
-    }
-    if task.get("is_coop"):
-        match_query["is_coop"] = True
-        match_query["coop_participants"] = task.get("coop_participants")
-    else:
-        match_query["child_id"] = task["child_id"]
-
-    existing = await db.tasks.find_one(match_query)
-    if existing:
-        return None
-
-    spawned_id = new_id()
-    new_task = {
-        **{k: v for k, v in task.items() if k != "_id"},
-        "id": spawned_id,
-        "status": "pending",
-        "completed_at": None,
-        "approved_at": None,
-        "due_date": next_due,
-        "date_key": next_date_key,
-        "timer_started_at": None,
-        "timer_completed_at": None,
-        "coop_completed_by": None,
-        "completion_photo_url": None,  # was previously carried over from the just-approved instance — a fresh day shouldn't start with yesterday's photo already attached
-        "done_together": None,  # same bug: a fresh day's "was this done together?" answer must start unset, not inherit yesterday's
-        "freed_with_card": False,  # same reasoning — a fresh day hasn't been freed by anything yet
-        "created_at": now_iso(),
-    }
-    await db.tasks.insert_one(new_task)
-    return spawned_id
-
 
 @api.post("/tasks/{task_id}/approve")
 async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInput(), user: dict = Depends(require_parent)):
@@ -7488,15 +5031,12 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
             snap = await _apply_approval_rewards(cid, share, config)
             snapshots.append(snap)
 
-        spawned_next_id = await _spawn_recurrence_if_due(task, config)
-
         await db.tasks.update_one(
             {"id": task_id},
             {"$set": {
                 "status": "approved",
                 "approved_at": now_iso(),
                 "_undo_coop_snapshots": snapshots,
-                "_undo_spawned_next_id": spawned_next_id,
                 "encouragement_message": payload.encouragement_message,
                 "encouragement_voice_url": payload.encouragement_voice_url,
             }},
@@ -7524,22 +5064,14 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
     together_bonus_awarded = 0
     if task.get("together_bonus_enabled") and task.get("done_together") is True:
         together_bonus_awarded = task.get("together_bonus_points") or 0
-    early_bonus_awarded = _early_completion_bonus(task, task["points"], config)
-    pacing_bonus_awarded = _pacing_bonus(task, config)
-    overtime_bonus_awarded = _overtime_bonus(task, config)
-    points = (task["points"] + together_bonus_awarded + early_bonus_awarded
-              + pacing_bonus_awarded + overtime_bonus_awarded)
+    points = task["points"] + together_bonus_awarded
     if task.get("late_no_points"):
         # At-fault lateness: the kid chose to continue anyway, which is the
         # honest thing to do — but the reward is gone. No base points and no
         # bonuses of any kind.
         points = 0
-        early_bonus_awarded = 0
         together_bonus_awarded = 0
-        pacing_bonus_awarded = 0
-        overtime_bonus_awarded = 0
     snap = await _apply_approval_rewards(task["child_id"], points, config)
-    spawned_next_id = await _spawn_recurrence_if_due(task, config)
 
     await db.tasks.update_one(
         {"id": task_id},
@@ -7551,14 +5083,10 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                 "_undo_prev_streak": snap["prev_streak"],
                 "_undo_prev_last_completion": snap["prev_last_completion"],
                 "_undo_points_awarded": points,
-                "early_bonus_awarded": early_bonus_awarded,
                 "together_bonus_awarded": together_bonus_awarded,
-                "pacing_bonus_awarded": pacing_bonus_awarded,
-                "overtime_bonus_awarded": overtime_bonus_awarded,
                 "_undo_chiky_save": snap["chiky_save"],
                 "_undo_chiky_spend": snap["chiky_spend"],
                 "_undo_chiky_share": snap["chiky_share"],
-                "_undo_spawned_next_id": spawned_next_id,
                 "_undo_prev_best_streak": snap["prev_best_streak"],
                 "_undo_feed_earned": snap["feed_earned"],
                 "encouragement_message": payload.encouragement_message,
@@ -7633,8 +5161,7 @@ UNDO_WINDOW_MINUTES = 30
 @api.post("/tasks/{task_id}/undo-approval")
 async def undo_task_approval(task_id: str, user: dict = Depends(require_parent)):
     """Reverse a mistaken approval within a short window: refunds the points/Chikybank
-    split, restores the previous streak, and removes the auto-spawned next
-    occurrence if it's still untouched (so recurrence doesn't double up)."""
+    split and restores the previous streak."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -7669,12 +5196,6 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
                 },
             )
             total_points += snap["points"]
-
-        spawned_id = task.get("_undo_spawned_next_id")
-        if spawned_id:
-            spawned = await db.tasks.find_one({"id": spawned_id})
-            if spawned and spawned.get("status") == "pending" and not spawned.get("timer_started_at"):
-                await db.tasks.delete_one({"id": spawned_id})
 
         await db.tasks.update_one(
             {"id": task_id},
@@ -7712,15 +5233,6 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
             },
         },
     )
-
-    # Remove the auto-spawned next occurrence if it's still untouched (parent
-    # hasn't started/edited it) — otherwise leave it alone to avoid clobbering
-    # something the family already interacted with.
-    spawned_id = task.get("_undo_spawned_next_id")
-    if spawned_id:
-        spawned = await db.tasks.find_one({"id": spawned_id})
-        if spawned and spawned.get("status") == "pending" and not spawned.get("timer_started_at"):
-            await db.tasks.delete_one({"id": spawned_id})
 
     await db.tasks.update_one(
         {"id": task_id},
@@ -7862,16 +5374,6 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
                     opt["id"] = new_id()[:8]
         if update_data.get("day_segments") is not None:
             _validate_day_segments(update_data["day_segments"])
-        if update_data.get("duration_warning_minutes") is not None:
-            warns = sorted({int(x) for x in update_data["duration_warning_minutes"] if int(x) > 0}, reverse=True)
-            if len(warns) > 6 or (warns and warns[0] > 120):
-                raise HTTPException(status_code=422, detail="Pengingat waktu maksimal 6 titik, masing-masing 1–120 menit")
-            update_data["duration_warning_minutes"] = warns
-        if update_data.get("snooze_options_minutes") is not None:
-            opts = sorted({int(x) for x in update_data["snooze_options_minutes"] if int(x) > 0})
-            if not opts or len(opts) > 6 or opts[-1] > 240:
-                raise HTTPException(status_code=422, detail="Pilihan tunda harus 1–6 opsi, masing-masing 1–240 menit")
-            update_data["snooze_options_minutes"] = opts
         # Merge dict-typed fields so partial updates don't wipe existing keys.
         for dict_field in ("custom_labels", "weekday_goals"):
             if dict_field in update_data:
@@ -7895,13 +5397,11 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "slideshow_background_url": "",
             "slideshow_background_image": "",
             "rupiah_per_point": 100,
-            "skip_cost_points": 20,
             "daily_point_goal": 50,
             "weekday_goals": {},
             "chiky_save_pct": 40,
             "chiky_spend_pct": 40,
             "chiky_share_pct": 20,
-            "early_bonus_pct": 10,
             "family_combo_bonus_points": 10,
             "late_reasons": DEFAULT_LATE_REASONS,
             "penalty_card_threshold": DEFAULT_PENALTY_CARD_THRESHOLD,
@@ -7910,20 +5410,9 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "punishment_deadline_weekday": DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY,
             "punishment_overdue_action": DEFAULT_PUNISHMENT_OVERDUE_ACTION,
             "day_segments": DEFAULT_DAY_SEGMENTS,
-            "min_gap_seconds": 60,
-            "flash_threshold_pct": 15,
-            "pacing_bonus_points": 2,
-            "notify_parent_on_start": True,
             "segment_late_grace_minutes": 15,
-            "auto_start_next": True,
-            "snooze_options_minutes": [5, 10, 15, 20],
-            "duration_warning_minutes": [3, 2, 1],
-            "bonus_follows_sequence": True,
             "auto_approve_tasks": True,
-            "max_idle_minutes": 20,
             "exam_false_claim_penalty": 100,
-            "overtime_bonus_interval_minutes": 10,
-            "hold_auto_reject_minutes": 5,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -7948,16 +5437,6 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
                     opt["id"] = new_id()[:8]
         if incoming.get("day_segments") is not None:
             _validate_day_segments(incoming["day_segments"])
-        if incoming.get("duration_warning_minutes") is not None:
-            warns = sorted({int(x) for x in incoming["duration_warning_minutes"] if int(x) > 0}, reverse=True)
-            if len(warns) > 6 or (warns and warns[0] > 120):
-                raise HTTPException(status_code=422, detail="Pengingat waktu maksimal 6 titik, masing-masing 1–120 menit")
-            incoming["duration_warning_minutes"] = warns
-        if incoming.get("snooze_options_minutes") is not None:
-            opts = sorted({int(x) for x in incoming["snooze_options_minutes"] if int(x) > 0})
-            if not opts or len(opts) > 6 or opts[-1] > 240:
-                raise HTTPException(status_code=422, detail="Pilihan tunda harus 1–6 opsi, masing-masing 1–240 menit")
-            incoming["snooze_options_minutes"] = opts
         config = {"id": new_id(), "parent_id": FAMILY_ID, "created_at": now_iso(), **defaults, **incoming}
         await db.app_config.insert_one(config)
     await log_activity(FAMILY_ID, None, "config_updated", {"changes": payload.model_dump()})
@@ -8058,13 +5537,11 @@ async def get_app_config(user: dict = Depends(get_current_user), lite: bool = Fa
             "slideshow_background_url": "",
             "slideshow_background_image": "",
             "rupiah_per_point": 100,
-            "skip_cost_points": 20,
             "daily_point_goal": 50,
             "weekday_goals": {},
             "chiky_save_pct": 40,
             "chiky_spend_pct": 40,
             "chiky_share_pct": 20,
-            "early_bonus_pct": 10,
             "family_combo_bonus_points": 10,
             "late_reasons": DEFAULT_LATE_REASONS,
             "penalty_card_threshold": DEFAULT_PENALTY_CARD_THRESHOLD,
@@ -8073,20 +5550,9 @@ async def get_app_config(user: dict = Depends(get_current_user), lite: bool = Fa
             "punishment_deadline_weekday": DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY,
             "punishment_overdue_action": DEFAULT_PUNISHMENT_OVERDUE_ACTION,
             "day_segments": DEFAULT_DAY_SEGMENTS,
-            "min_gap_seconds": 60,
-            "flash_threshold_pct": 15,
-            "pacing_bonus_points": 2,
-            "notify_parent_on_start": True,
             "segment_late_grace_minutes": 15,
-            "auto_start_next": True,
-            "snooze_options_minutes": [5, 10, 15, 20],
-            "duration_warning_minutes": [3, 2, 1],
-            "bonus_follows_sequence": True,
             "auto_approve_tasks": True,
-            "max_idle_minutes": 20,
             "exam_false_claim_penalty": 100,
-            "overtime_bonus_interval_minutes": 10,
-            "hold_auto_reject_minutes": 5,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -8106,13 +5572,11 @@ async def get_app_config(user: dict = Depends(get_current_user), lite: bool = Fa
         "slideshow_background_url": config.get("slideshow_background_url", ""),
         "slideshow_background_image": config.get("slideshow_background_image", ""),
         "rupiah_per_point": int(config.get("rupiah_per_point", 100)),
-        "skip_cost_points": int(config.get("skip_cost_points", 20)),
         "daily_point_goal": int(config.get("daily_point_goal", 50)),
         "weekday_goals": config.get("weekday_goals", {}) or {},
         "chiky_save_pct": int(config.get("chiky_save_pct", 40)),
         "chiky_spend_pct": int(config.get("chiky_spend_pct", 40)),
         "chiky_share_pct": int(config.get("chiky_share_pct", 20)),
-        "early_bonus_pct": int(config.get("early_bonus_pct", 10)),
         "family_combo_bonus_points": int(config.get("family_combo_bonus_points", 10)),
         "late_reasons": config.get("late_reasons") or DEFAULT_LATE_REASONS,
         "penalty_card_threshold": int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD)),
@@ -8121,21 +5585,9 @@ async def get_app_config(user: dict = Depends(get_current_user), lite: bool = Fa
         "punishment_deadline_weekday": int(config.get("punishment_deadline_weekday", DEFAULT_PUNISHMENT_DEADLINE_WEEKDAY)),
         "punishment_overdue_action": config.get("punishment_overdue_action", DEFAULT_PUNISHMENT_OVERDUE_ACTION),
         "day_segments": config.get("day_segments") or DEFAULT_DAY_SEGMENTS,
-        "min_gap_seconds": int(config.get("min_gap_seconds", 60)),
-        "flash_threshold_pct": int(config.get("flash_threshold_pct", 15)),
-        "pacing_bonus_points": int(config.get("pacing_bonus_points", 2)),
-        "notify_parent_on_start": bool(config.get("notify_parent_on_start", True)),
         "segment_late_grace_minutes": int(config.get("segment_late_grace_minutes", 15)),
-        "auto_start_next": bool(config.get("auto_start_next", True)),
-        "snooze_options_minutes": config.get("snooze_options_minutes") or [5, 10, 15, 20],
-        "duration_warning_minutes": config.get("duration_warning_minutes")
-            if config.get("duration_warning_minutes") is not None else [3, 2, 1],
-        "bonus_follows_sequence": bool(config.get("bonus_follows_sequence", True)),
         "auto_approve_tasks": bool(config.get("auto_approve_tasks", True)),
-        "max_idle_minutes": int(config.get("max_idle_minutes", 20)),
         "exam_false_claim_penalty": int(config.get("exam_false_claim_penalty", 100)),
-        "overtime_bonus_interval_minutes": int(config.get("overtime_bonus_interval_minutes", 10)),
-        "hold_auto_reject_minutes": int(config.get("hold_auto_reject_minutes", 5)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),
@@ -8218,56 +5670,6 @@ async def toggle_reminder(reminder_id: str, user: dict = Depends(require_parent)
 
 
 # --------------- Routine Templates (parent-editable) ---------------
-@api.get("/routine-templates")
-async def list_routine_templates(user: dict = Depends(get_current_user)):
-    """The 5 starter templates are seeded into this family's own editable
-    collection on first access — after that, they're just rows the parent
-    can rename, retask, or delete like anything else they create."""
-    existing_count = await db.routine_templates.count_documents({"parent_id": FAMILY_ID})
-    if existing_count == 0:
-        for tpl in _DEFAULT_ROUTINE_TEMPLATES:
-            await db.routine_templates.insert_one({
-                "id": new_id(), "parent_id": FAMILY_ID,
-                "label": tpl["label"], "emoji": tpl["emoji"], "desc": tpl["desc"],
-                "tasks": tpl["tasks"], "created_at": now_iso(),
-            })
-    templates = await db.routine_templates.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", 1).to_list(100)
-    return templates
-
-
-@api.post("/routine-templates")
-async def create_routine_template(payload: RoutineTemplateInput, user: dict = Depends(require_parent)):
-    doc = {
-        "id": new_id(), "parent_id": FAMILY_ID,
-        "label": payload.label, "emoji": payload.emoji, "desc": payload.desc,
-        "tasks": [t.model_dump() for t in payload.tasks],
-        "created_at": now_iso(),
-    }
-    await db.routine_templates.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
-
-
-@api.patch("/routine-templates/{template_id}")
-async def update_routine_template(template_id: str, payload: RoutineTemplateInput, user: dict = Depends(require_parent)):
-    existing = await db.routine_templates.find_one({"id": template_id, "parent_id": FAMILY_ID})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Template not found")
-    await db.routine_templates.update_one(
-        {"id": template_id},
-        {"$set": {
-            "label": payload.label, "emoji": payload.emoji, "desc": payload.desc,
-            "tasks": [t.model_dump() for t in payload.tasks],
-        }},
-    )
-    return await db.routine_templates.find_one({"id": template_id}, {"_id": 0})
-
-
-@api.delete("/routine-templates/{template_id}")
-async def delete_routine_template(template_id: str, user: dict = Depends(require_parent)):
-    await db.routine_templates.delete_one({"id": template_id, "parent_id": FAMILY_ID})  # idempotent
-    return {"success": True}
-
 
 # --------------- Rewards ---------------
 @api.get("/rewards")
@@ -9206,32 +6608,9 @@ async def cron_send_reminders(request: Request):
     except Exception as e:  # noqa: BLE001
         logger.warning(f"photo offload failed: {e}")
 
-    now = _now_local()
-    today = now.strftime("%Y-%m-%d")
-    now_min = now.hour * 60 + now.minute
-
-    candidates = await db.tasks.find({
-        "parent_id": FAMILY_ID, "date_key": today, "status": {"$in": ["pending", "rejected"]},
-        "due_time": {"$ne": None},
-    }, {"_id": 0}).to_list(500)
-
-    sent = 0
-    for t in candidates:
-        try:
-            dh, dm = map(int, t["due_time"].split(":"))
-        except Exception:
-            continue
-        due_min = dh * 60 + dm
-        # Fire once, in the 10-minute window starting 15 minutes before due_time.
-        if 5 <= (due_min - now_min) <= 15:
-            await send_push_to(
-                {"role": "child", "member_id": t["child_id"]},
-                title="Sebentar lagi waktunya! ⏰",
-                body=f'"{t["title"]}" harus dimulai sebelum jam {t["due_time"]}.',
-                url=f"/kid/{t['child_id']}",
-            )
-            sent += 1
-    return {"checked": len(candidates), "reminders_sent": sent}
+    # Section deadlines: nudge the child shortly before, tell the parents
+    # once a section's finish time has passed unfinished.
+    return await _run_reminder_sweep()
 
 
 @api.get("/cron/send-digest")
@@ -9613,9 +6992,6 @@ async def migrate_existing_data():
 
     # 4. Ensure new task fields exist on older tasks.
     await db.tasks.update_many(
-        {"due_time": {"$exists": False}}, {"$set": {"due_time": None}}
-    )
-    await db.tasks.update_many(
         {"duration_minutes": {"$exists": False}}, {"$set": {"duration_minutes": None}}
     )
     await db.tasks.update_many(
@@ -9623,9 +6999,6 @@ async def migrate_existing_data():
     )
     await db.tasks.update_many(
         {"broadcast_id": {"$exists": False}}, {"$set": {"broadcast_id": None}}
-    )
-    await db.tasks.update_many(
-        {"timer_started_at": {"$exists": False}}, {"$set": {"timer_started_at": None, "timer_completed_at": None}}
     )
     # date_key backfill: derive from created_at, else from due_date, else today.
     async for t in db.tasks.find({"date_key": {"$in": [None, ""]}}, {"id": 1, "created_at": 1, "due_date": 1}):
@@ -9774,7 +7147,6 @@ async def _run_one_time_init():
             await db.tasks.create_index([("parent_id", 1), ("date_key", 1)])
             await db.tasks.create_index([("parent_id", 1), ("date_key", 1), ("child_id", 1)])
             await db.tasks.create_index([("parent_id", 1), ("date_key", 1), ("status", 1)])
-            await db.tasks.create_index([("parent_id", 1), ("hold_status", 1)])
             await db.template_tasks.create_index([("parent_id", 1), ("template_id", 1), ("weekday", 1)])
             await db.template_assignments.create_index([("parent_id", 1), ("date_key", 1)])
             await db.day_templates.create_index("parent_id")

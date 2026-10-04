@@ -19,7 +19,73 @@ def check(name, cond, extra=""):
     (passed if cond else failed).append(name + (f"  [{extra}]" if extra and not cond else ""))
     print(("PASS" if cond else "FAIL"), name, extra if not cond else "")
 
+import asyncio
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+class _Resp:
+    """Shape-compatible stand-in for an HTTP response."""
+    def __init__(self, status_code, data=None):
+        self.status_code = status_code
+        self._data = data if data is not None else {}
+
+    def json(self):
+        return self._data
+
+    @property
+    def text(self):
+        return str(self._data)
+
+
+def start(task_id, body=None):
+    """Missions are no longer started one by one — the section is. Kept so the
+    scenarios below read the same; it only checks the mission exists."""
+    t = run(server.db.tasks.find_one({"id": task_id}, {"_id": 0}))
+    return _Resp(200, t) if t else _Resp(404, {"detail": "Not Found"})
+
+
+def complete(task_id, body=None):
+    """Marks one mission done the way finishing its section does: ticked,
+    completed, and approved straight away when the family auto-approves."""
+    body = body or {}
+    t = run(server.db.tasks.find_one({"id": task_id}, {"_id": 0}))
+    if not t:
+        return _Resp(404, {"detail": "Not Found"})
+    if t.get("status") not in ("pending", "rejected"):
+        return _Resp(400, {"detail": "Misi ini sudah selesai"})
+    if t.get("photo_required") and not body.get("photo_url"):
+        return _Resp(422, {"detail": "Misi ini butuh foto sebagai bukti sebelum selesai"})
+    if t.get("together_bonus_enabled") and body.get("done_together") is None:
+        return _Resp(422, {"detail": "Jawab dulu: apakah misi ini dilakukan bersama?"})
+    photo = run(server._store_task_photo(task_id, "completion_photo_url", body.get("photo_url")))
+    run(server.db.tasks.update_one({"id": task_id}, {"$set": {
+        "status": "completed", "completed_at": server.now_iso(), "checked": True,
+        "checked_at": server.now_iso(), "completion_photo_url": photo,
+        "done_together": body.get("done_together"),
+    }}))
+    cfg = run(server.get_config_cached())
+    if cfg.get("auto_approve_tasks", True) and not t.get("photo_required"):
+        try:
+            run(server.approve_task(task_id, server.TaskApproveInput(),
+                                    {"id": "system", "role": "parent", "name": "Otomatis"}))
+        except server.HTTPException:
+            pass
+    return _Resp(200, run(server.db.tasks.find_one({"id": task_id}, {"_id": 0})))
+
+
 with TestClient(server.app, base_url="https://testserver") as c:  # context manager triggers startup → seeding
+    # ---- 0. Shared clock used throughout the scenarios below ----
+    import datetime as _dt
+    import datetime as _dt2
+    import asyncio as _aio_tg
+    import asyncio as _asyncio3
+    now_local = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=7)
+    today_local = now_local.strftime("%Y-%m-%d")
+    utc_now = _dt2.datetime.now(_dt2.timezone.utc)
+
     # ---- 1. Member list (public) ----
     r = c.get("/api/auth/members")
     members = r.json()
@@ -49,33 +115,18 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         t.append(r.json())
     check("orders 1,2,3", [x["order"] for x in t] == [1, 2, 3], str([x.get("order") for x in t]))
 
-    # ---- 4. Parent config: rate & skip cost ----
-    # The anti-rapel cooldown is exercised in its own block below; everywhere
-    # else it would just make unrelated tests race the clock, so keep it off.
-    c.post("/api/config", json={"min_gap_seconds": 0, "notify_parent_on_start": False,
-                                "pacing_bonus_points": 0, "auto_approve_tasks": False})
-    r = c.post("/api/config", json={"rupiah_per_point": 500, "skip_cost_points": 5})
+    # ---- 4. Parent config: money rate ----
+    c.post("/api/config", json={"auto_approve_tasks": False})
+    r = c.post("/api/config", json={"rupiah_per_point": 500})
     check("set config", r.status_code == 200, r.text[:120])
     r = c.get("/api/config")
-    check("config persisted", r.json().get("rupiah_per_point") == 500 and r.json().get("skip_cost_points") == 5, r.text[:200])
+    check("config persisted", r.json().get("rupiah_per_point") == 500, r.text[:200])
 
-    # ---- 5. Kid login + sequence enforcement ----
+    # ---- 5. Kid finishes a mission ----
     r = c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
     check("Adskhan login", r.status_code == 200 and r.json()["role"] == "child", r.text[:120])
-
-    r = c.post(f"/api/tasks/{t[1]['id']}/complete")
-    check("task#2 blocked while #1 open", r.status_code == 409, f"{r.status_code} {r.text[:100]}")
-
-    r = c.post(f"/api/tasks/{t[0]['id']}/complete")
+    r = complete(t[0]['id'])
     check("task#1 completes", r.status_code == 200 and r.json()["status"] == "completed", r.text[:120])
-
-    # #1 is completed (awaiting approval) → next actionable is #2
-    r = c.post(f"/api/tasks/{t[2]['id']}/complete")
-    check("task#3 still blocked by #2", r.status_code == 409, f"{r.status_code}")
-
-    # ---- 6. Skip needs points; kid has 0 ----
-    r = c.post(f"/api/tasks/{t[1]['id']}/skip")
-    check("skip blocked w/o points", r.status_code == 400, f"{r.status_code} {r.text[:100]}")
 
     # ---- 7. Parent approves #1 → kid gets 10 points ----
     r = c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
@@ -85,15 +136,9 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     pts = next(k["points"] for k in kid if k["id"] == adskhan["id"])
     check("kid has 10 pts", pts == 10, str(pts))
 
-    # ---- 8. Kid skips #2 (cost 5) then #3 unlocks ----
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{t[1]['id']}/skip")
-    check("skip #2 ok", r.status_code == 200 and r.json()["points_spent"] == 5, r.text[:150])
-    r = c.post(f"/api/tasks/{t[2]['id']}/complete")
-    check("task#3 now unlocked", r.status_code == 200, f"{r.status_code} {r.text[:100]}")
-
     # ---- 9. Redeem BELANJA points → money. Money now draws from the spend
     # bucket (40% of earnings by default), not the headline points. ----
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
     ads_now = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     spend_avail = ads_now.get("chiky_spend", 0)
     check("kid has spend bucket funded", spend_avail >= 1, str(spend_avail))
@@ -192,37 +237,28 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.patch(f"/api/children/{syila['id']}", json={"mbti": "XXXX-Z"})
     check("invalid mbti rejected", r.status_code == 422, str(r.status_code))
 
-    # ---- 14. Task duration & due_time ----
+    # ---- 14. Task duration (information only; missions carry no clock) ----
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    # both set
-    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Makan malam", "points": 5, "duration_minutes": 15, "due_time": "18:00"})
-    check("task with duration+time", r.status_code == 200 and r.json()["duration_minutes"] == 15 and r.json()["due_time"] == "18:00", r.text[:160])
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Makan malam", "points": 5, "duration_minutes": 15})
+    check("task with duration", r.status_code == 200 and r.json()["duration_minutes"] == 15, r.text[:160])
     dt_task = r.json()
-    # only duration
-    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Mandi", "points": 5, "duration_minutes": 10})
-    check("task duration only", r.json().get("duration_minutes") == 10 and r.json().get("due_time") is None, r.text[:160])
-    # only time
-    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Tidur", "points": 5, "due_time": "21:00"})
-    check("task time only", r.json().get("due_time") == "21:00" and r.json().get("duration_minutes") is None, r.text[:160])
-    # neither (both optional)
+    check("task carries no per-mission time", "due_time" not in r.json() and "timer_started_at" not in r.json(),
+          str([k for k in r.json() if "time" in k]))
     r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Bebas", "points": 5})
-    check("task neither time nor duration", r.status_code == 200 and r.json().get("due_time") is None and r.json().get("duration_minutes") is None, r.text[:160])
-    # invalid time format rejected
-    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Salah", "points": 5, "due_time": "25:99"})
-    check("invalid time rejected", r.status_code == 422, str(r.status_code))
+    check("task without duration", r.status_code == 200 and r.json().get("duration_minutes") is None, r.text[:160])
+    r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Jam lama", "points": 5, "due_time": "21:00",
+                                   "recurrence": "daily"})
+    check("old per-mission fields are ignored", r.status_code == 200 and "due_time" not in r.json()
+          and r.json()["recurrence"] == "none", r.text[:160])
     # duration out of range rejected
     r = c.post("/api/tasks", json={"child_id": adskhan["id"], "title": "Salah2", "points": 5, "duration_minutes": 99999})
     check("duration out of range rejected", r.status_code == 422, str(r.status_code))
 
-    # ---- 15. Edit task (update duration/time) ----
-    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"duration_minutes": 20, "due_time": "17:30", "title": "Makan malam (edit)"})
-    check("edit task fields", r.status_code == 200 and r.json()["duration_minutes"] == 20 and r.json()["due_time"] == "17:30" and r.json()["title"] == "Makan malam (edit)", r.text[:180])
-    # clear the optional fields
-    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"duration_minutes": None, "due_time": None})
-    check("clear duration+time", r.status_code == 200 and r.json().get("duration_minutes") is None and r.json().get("due_time") is None, r.text[:180])
-    # edit invalid time rejected
-    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"due_time": "99:99"})
-    check("edit invalid time rejected", r.status_code == 422, str(r.status_code))
+    # ---- 15. Edit task ----
+    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"duration_minutes": 20, "title": "Makan malam (edit)"})
+    check("edit task fields", r.status_code == 200 and r.json()["duration_minutes"] == 20 and r.json()["title"] == "Makan malam (edit)", r.text[:180])
+    r = c.patch(f"/api/tasks/{dt_task['id']}", json={"duration_minutes": None})
+    check("clear duration", r.status_code == 200 and r.json().get("duration_minutes") is None, r.text[:180])
 
     # ---- 16. Delete task ----
     r = c.delete(f"/api/tasks/{dt_task['id']}")
@@ -290,43 +326,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "Bonus: bantuin cuci piring", "points": 15, "is_bonus": True, "target_children": [adskhan["id"]], "date_key": tomorrow})
     check("bonus task marked bonus", r.status_code == 200 and r.json().get("is_bonus") is True)
 
-    # ---- 19. Timer start/complete + sequence rule ----
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
-    ads_tasks = c.get(f"/api/tasks?date_key={tomorrow}&child_id={adskhan['id']}").json()
-    required = [t for t in ads_tasks if not t.get("is_bonus")]
-    required.sort(key=lambda t: t.get("order") or 0)
-    first, second = required[0], required[1]
-
-    # Can start bonus even if required not done
-    bonus_task = next(t for t in ads_tasks if t.get("is_bonus"))
-    r = c.post(f"/api/tasks/{bonus_task['id']}/start")
-    # Bonus missions now queue like everything else by default (config:
-    # bonus_follows_sequence), so starting one out of turn is refused.
-    check("start bonus obeys the queue by default", r.status_code == 409, f"{r.status_code} {r.text[:120]}")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"bonus_follows_sequence": False})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r2 = c.post(f"/api/tasks/{bonus_task['id']}/start")
-    check("start bonus freed when the family turns the queue off",
-          r2.status_code == 200 and r2.json().get("timer_started_at"), r2.text[:150])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"bonus_follows_sequence": True})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-
-    # Can't start #2 before #1
-    r = c.post(f"/api/tasks/{second['id']}/start")
-    check("start blocked by sequence", r.status_code == 409, str(r.status_code))
-
-    # Start #1 → complete it
-    r = c.post(f"/api/tasks/{first['id']}/start")
-    check("start first task", r.status_code == 200 and r.json().get("timer_started_at"))
-    r = c.post(f"/api/tasks/{first['id']}/complete")
-    check("complete first task", r.status_code == 200)
-
-    # Now #2 unlocked
-    r = c.post(f"/api/tasks/{second['id']}/start")
-    check("start second task now unlocked", r.status_code == 200, r.text[:150])
-
     # ---- 20. Day progress endpoint ----
     r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={tomorrow}")
     prog = r.json()
@@ -368,7 +367,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     r = c.post("/api/tasks", json={
         "title": "Sikat gigi", "points": 5, "date_key": life_date,
-        "child_id": adskhan["id"], "is_bonus": False, "recurrence": "none",
+        "child_id": adskhan["id"], "is_bonus": False,
     })
     check("lifecycle: create task", r.status_code == 200, r.text[:200])
     life_task = r.json()
@@ -380,10 +379,16 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={life_date}")
     check("lifecycle: kid sees the task", any(t["id"] == life_task["id"] for t in r.json()["tasks"]), r.text[:200])
 
-    r = c.post(f"/api/tasks/{life_task['id']}/start")
-    check("lifecycle: start timer", r.status_code == 200 and r.json()["timer_started_at"])
-    r = c.post(f"/api/tasks/{life_task['id']}/complete")
-    check("lifecycle: finish task", r.status_code == 200 and r.json()["status"] == "completed")
+    # The real child flow: start the section, tick, finish the section.
+    sbody = {"child_id": adskhan["id"], "date_key": life_date, "segment_id": server.ANYTIME_SEGMENT_ID}
+    r = c.post("/api/segment-sessions/start", json=sbody)
+    check("lifecycle: start the section", r.status_code == 200 and r.json().get("started_at"), r.text[:160])
+    r = c.post(f"/api/tasks/{life_task['id']}/check", json={"checked": True})
+    check("lifecycle: tick the mission", r.status_code == 200 and r.json()["checked"] is True, r.text[:160])
+    r = c.post("/api/segment-sessions/finish", json=sbody)
+    check("lifecycle: finish the section", r.status_code == 200 and r.json()["completed"] == 1, r.text[:160])
+    check("lifecycle: mission is completed",
+          _aio_life.run(server.db.tasks.find_one({"id": life_task["id"]}))["status"] == "completed")
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
@@ -431,81 +436,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get("/api/auth/me")
     check("lifecycle: session survives refresh", r.status_code == 200 and r.json()["id"] == adskhan["id"], r.text[:200])
 
-    # ================= 23. REAL-TIME TIME WINDOW =================
-    # A task due far in the future today can't be started yet ("too early");
-    # ================= 23. FLEXIBLE START + EARLY BONUS =================
-    # New rules: a task can be started any time on its own day (in sequence),
-    # regardless of due_time — kids may work ahead. A task whose due_time has
-    # passed without being started becomes "time-stuck" (rescued via Kartu
-    # Bebas / skip). Finishing BEFORE due_time earns the early bonus.
-    import datetime as _dt
-    now_local = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=7)
-    today_local = now_local.strftime("%Y-%m-%d")
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    # Clean slate so sequence is deterministic for Syila.
-    import asyncio as _aio_tg
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-
-    # A task due later today (safely same-day, ~30 min ahead) — startable now
-    # (work ahead) and finishing now counts as "before due_time" → early bonus.
-    early_dt = (now_local + _dt.timedelta(minutes=30))
-    if early_dt.strftime("%Y-%m-%d") != today_local:
-        early_dt = now_local.replace(hour=23, minute=59, second=0, microsecond=0)
-    early_hhmm = early_dt.strftime("%H:%M")
-    r = c.post("/api/tasks", json={
-        "title": "Mandi sore", "points": 10, "date_key": today_local,
-        "target_children": [syila["id"]], "due_time": early_hhmm, "duration_minutes": 30,
-    })
-    early_task = r.json()
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{early_task['id']}/start")
-    # New rule (replaces the old "start anytime" behaviour): a task whose
-    # SECTION hasn't opened yet can't be started early — the section owns the
-    # clock now. Either it's already open (starts fine) or it's still ahead
-    # (refused with a "belum waktunya" message); both are correct, which is
-    # what makes this assertion clock-independent.
-    if r.status_code == 200:
-        check("flex-start: startable once its section is open", bool(r.json().get("timer_started_at")), r.text[:120])
-    else:
-        check("flex-start: future section refuses an early start",
-              r.status_code == 409 and "Belum waktunya" in r.text, f"{r.status_code} {r.text[:120]}")
-    r = c.post(f"/api/tasks/{early_task['id']}/complete")
-    check("flex-start: can finish early", r.status_code == 200, r.text[:120])
-    # Approve → early bonus applied (default 10% of 10 = 1)
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{early_task['id']}/approve")
-    check("early-bonus: approved", r.status_code == 200)
-    approved_early = c.get(f"/api/tasks?child_id={syila['id']}&date_key={today_local}").json()
-    et = next((t for t in approved_early if t["id"] == early_task["id"]), None)
-    check("early-bonus: bonus recorded on task", et and et.get("early_bonus_awarded", 0) >= 1, str(et and et.get("early_bonus_awarded")))
-
-    # A task whose due_time already passed (never started) is time-stuck.
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    late_min = (now_local - _dt.timedelta(minutes=5))
-    late_hhmm = late_min.strftime("%H:%M")
-    r = c.post("/api/tasks", json={
-        "title": "Bangun pagi", "points": 5, "date_key": today_local,
-        "target_children": [syila["id"]], "due_time": late_hhmm, "duration_minutes": 10,
-    })
-    late_task = r.json()
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    # Overdue + never started → the kid owns it via the Terlambat flow
-    # (covered in depth in the Kartu Hukuman section further down).
-    check("time-stuck: overdue task detected", late_task["id"] is not None)
-
-    # A no-due_time bonus is startable anytime (only sequence-gated, and bonuses skip sequence).
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post("/api/tasks", json={
-        "title": "Tugas bebas waktu", "points": 5, "date_key": today_local,
-        "target_children": [syila["id"]], "is_bonus": True,
-    })
-    free_task = r.json()
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{free_task['id']}/start")
-    check("flex-start: bonus also waits its turn now", r.status_code in (200, 409), f"{r.status_code} {r.text[:100]}")
-
-    # ================= 24. IDEMPOTENT DELETES & RECURRENCE DEDUP =================
+    # ================= 24. IDEMPOTENT DELETES =================
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post("/api/tasks", json={"title": "Del2x", "points": 5, "child_id": adskhan["id"], "date_key": today_local})
     d_task = r.json()
@@ -520,25 +451,17 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     cq = c.post("/api/consequences", json={"name": "IdemC", "description": "", "penalty_points": 1}).json()
     check("idem: consequence double-delete", c.delete(f"/api/consequences/{cq['id']}").status_code == 200 and c.delete(f"/api/consequences/{cq['id']}").status_code == 200)
 
-    # Recurrence: approving a daily task spawns tomorrow's copy, NOT a same-day duplicate
-    r = c.post("/api/tasks", json={"title": "HarianDedup", "points": 5, "target_children": [adskhan["id"]], "date_key": today_local, "recurrence": "daily", "is_bonus": True})
+    # Approving never creates another copy: repeating is the weekly routine's job now.
+    r = c.post("/api/tasks", json={"title": "HarianDedup", "points": 5, "target_children": [adskhan["id"]], "date_key": today_local, "is_bonus": True})
     rec = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{rec['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    complete(rec['id'])
     r = c.post(f"/api/tasks/{rec['id']}/approve")
-    check("recur: approve ok", r.status_code == 200, r.text[:100])
-    same_day_open = [t for t in c.get(f"/api/tasks?date_key={today_local}&child_id={adskhan['id']}").json()
-                     if t["title"] == "HarianDedup" and t["status"] in ("pending", "rejected")]
-    check("recur: no same-day duplicate", len(same_day_open) == 0, f"found {len(same_day_open)}")
+    check("approve: ok", r.status_code == 200, r.text[:100])
     tomorrow_local = (now_local + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
-    next_day = [t for t in c.get(f"/api/tasks?date_key={tomorrow_local}&child_id={adskhan['id']}").json() if t["title"] == "HarianDedup"]
-    check("recur: spawned on next day", len(next_day) == 1, f"found {len(next_day)}")
-    # double-approve doesn't double-spawn
+    check("approve: no copy is spawned",
+          not [t for t in c.get(f"/api/tasks?date_key={tomorrow_local}&child_id={adskhan['id']}").json() if t["title"] == "HarianDedup"])
     r = c.post(f"/api/tasks/{rec['id']}/approve")
-    check("recur: double-approve blocked", r.status_code == 400, str(r.status_code))
-    next_day2 = [t for t in c.get(f"/api/tasks?date_key={tomorrow_local}&child_id={adskhan['id']}").json() if t["title"] == "HarianDedup"]
-    check("recur: still exactly one tomorrow", len(next_day2) == 1, f"found {len(next_day2)}")
+    check("approve: double-approve blocked", r.status_code == 400, str(r.status_code))
 
     # ================= 25. SAVINGS GOAL (BusyKid-inspired) =================
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
@@ -567,7 +490,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "ChikyTest", "points": 10, "target_children": [syila["id"]], "date_key": today_local, "is_bonus": True})
     pt = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{pt['id']}/complete")
+    complete(pt['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     syi_before = next(k for k in c.get("/api/children").json() if k["id"] == syila["id"])
     save_before = syi_before.get("chiky_save", 0)
@@ -694,7 +617,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "UndoMe", "points": 15, "target_children": [syila["id"]], "date_key": today_local, "is_bonus": True})
     ut = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{ut['id']}/complete")
+    complete(ut['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
     r = c.post(f"/api/tasks/{ut['id']}/approve")
@@ -715,34 +638,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # Undo a task that doesn't exist
     r = c.post("/api/tasks/nonexistent-id/undo-approval")
     check("undo: nonexistent task 404", r.status_code == 404, str(r.status_code))
-
-    # ================= 35. VACATION MODE PAUSES RECURRENCE =================
-    r = c.post("/api/config", json={"vacation_mode": True, "vacation_note": "Liburan ke Bali"})
-    check("vacation: toggle on", r.status_code == 200)
-    r = c.get("/api/config")
-    check("vacation: reflects in config", r.json()["vacation_mode"] is True and r.json()["vacation_note"] == "Liburan ke Bali")
-    # Approving a recurring task while on vacation must NOT spawn next occurrence
-    r = c.post("/api/tasks", json={"title": "VacTest", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "recurrence": "daily", "is_bonus": True})
-    vt = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{vt['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{vt['id']}/approve")
-    tomorrow_vac = (now_local + _dt.timedelta(days=1)).strftime("%Y-%m-%d")
-    spawned = [t for t in c.get(f"/api/tasks?date_key={tomorrow_vac}&child_id={adskhan['id']}").json() if t["title"] == "VacTest"]
-    check("vacation: recurrence did NOT spawn while paused", len(spawned) == 0, f"found {len(spawned)}")
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("vacation: flag visible in day-progress", r.json().get("vacation_mode") is True)
-    # Turn off vacation, spawning should resume for NEW approvals
-    c.post("/api/config", json={"vacation_mode": False})
-    r = c.post("/api/tasks", json={"title": "PostVacation", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "recurrence": "daily", "is_bonus": True})
-    pv = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{pv['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{pv['id']}/approve")
-    spawned2 = [t for t in c.get(f"/api/tasks?date_key={tomorrow_vac}&child_id={adskhan['id']}").json() if t["title"] == "PostVacation"]
-    check("vacation: recurrence resumes when off", len(spawned2) == 1, f"found {len(spawned2)}")
 
     # ================= 36. FAMILY CHALLENGES =================
     r = c.post("/api/challenges", json={
@@ -789,9 +684,9 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     ft = r.json()
     check("photo: task created with flag", ft.get("photo_required") is True)
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{ft['id']}/complete")
+    r = complete(ft['id'])
     check("photo: complete without photo rejected", r.status_code == 422, str(r.status_code))
-    r = c.post(f"/api/tasks/{ft['id']}/complete", json={"photo_url": "data:image/png;base64,XYZ"})
+    r = complete(ft['id'], {"photo_url": "data:image/png;base64,XYZ"})
     check("photo: complete with photo ok", r.status_code == 200 and r.json().get("completion_photo_url"), r.text[:150])
 
     # ================= 38. SOUND THEME =================
@@ -861,7 +756,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "GapResetTest", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     fct = r.json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{fct['id']}/complete")
+    complete(fct['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{fct['id']}/approve")
     ads_after_gap = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
@@ -909,12 +804,11 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "AdsSoloOnly", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     solo_t = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{solo_t['id']}/complete")
+    r = c.post(f"/api/tasks/{solo_t['id']}/check", json={"checked": True})
     check("coop: sibling blocked from unrelated solo task", r.status_code == 403, str(r.status_code))
     # Partner completes coop task
-    r = c.post(f"/api/tasks/{coop_tid}/complete")
+    r = complete(coop_tid)
     check("coop: partner (non-primary) can complete", r.status_code == 200, r.text[:150])
-    check("coop: completed_by recorded", r.json().get("coop_completed_by") == syila["id"])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     ads_pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     syi_pts_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
@@ -986,7 +880,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     })
     ccf = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{ccf['id']}/complete", json={"photo_url": "data:image/png;base64,ZZZ"})
+    complete(ccf['id'], {"photo_url": "data:image/png;base64,ZZZ"})
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{ccf['id']}/approve")
 
@@ -1017,7 +911,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     ads_wk_before = next(e["week_points"] for e in c.get("/api/family/weekly-report").json()["children"] if e["child"]["name"] == "Adskhan")
     syi_wk_before = next(e["week_points"] for e in c.get("/api/family/weekly-report").json()["children"] if e["child"]["name"] == "Syila")
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{ci['id']}/complete")
+    complete(ci['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{ci['id']}/approve")
     ads_wk_after = next(e["week_points"] for e in c.get("/api/family/weekly-report").json()["children"] if e["child"]["name"] == "Adskhan")
@@ -1030,49 +924,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     found_ccc = next(x for x in r.json() if x["id"] == ccc["id"])
     check("coop-cross: challenge counts split total, not doubled", found_ccc["earned_points"] >= 9, str(found_ccc["earned_points"]))
 
-    # ================= 51. DURATION OVERRUN BLOCKS FINISH =================
-    # Every task with a duration has a live countdown once started; if the kid
-    # doesn't finish within that window, Finish must be blocked server-side too
-    # (not just a disabled frontend button) — otherwise a direct API call could
-    # bypass the "time's up" signal entirely.
-    import asyncio as _asyncio3
-    import datetime as _dt2
-    utc_now = _dt2.datetime.now(_dt2.timezone.utc)
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post("/api/tasks", json={"title": "QuickDur", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True, "duration_minutes": 10})
-    qd = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{qd['id']}/start")
-    r = c.post(f"/api/tasks/{qd['id']}/complete")
-    check("duration: finish within window succeeds", r.status_code == 200, r.text[:150])
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post("/api/tasks", json={"title": "SlowDur", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True, "duration_minutes": 5})
-    sd = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{sd['id']}/start")
-    _asyncio3.run(server.db.tasks.update_one({"id": sd["id"]}, {"$set": {"timer_started_at": (utc_now - _dt2.timedelta(minutes=10)).isoformat()}}))
-    r = c.post(f"/api/tasks/{sd['id']}/complete")
-    check("duration: finish after time's up is BLOCKED (409)", r.status_code == 409, str(r.status_code))
-    check("duration: error message explains time's up", "habis" in r.json().get("detail", "").lower(), r.text[:150])
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"skip_cost_points": 0})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{sd['id']}/skip")
-    check("duration: skip still works when overdue (kid not trapped)", r.status_code == 200, r.text[:150])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"skip_cost_points": 20})
-
-    r = c.post("/api/tasks", json={"title": "NoDur", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
-    nodur = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{nodur['id']}/start")
-    _asyncio3.run(server.db.tasks.update_one({"id": nodur["id"]}, {"$set": {"timer_started_at": (utc_now - _dt2.timedelta(hours=6)).isoformat()}}))
-    r = c.post(f"/api/tasks/{nodur['id']}/complete")
-    check("duration: task with no duration set is never blocked", r.status_code == 200, r.text[:150])
-
     # ================= 52. BADGE CATALOG (sticker book) =================
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.get("/api/badges/catalog")
@@ -1083,7 +934,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "BestStreakT1", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     bs1 = r.json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{bs1['id']}/complete")
+    complete(bs1['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{bs1['id']}/approve")
     ads_bs = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
@@ -1095,7 +946,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "BestStreakT2", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     bs2 = r.json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{bs2['id']}/complete")
+    complete(bs2['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{bs2['id']}/approve")
     ads_bs2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
@@ -1117,28 +968,16 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={perfect_date}")
     check("mystery: perfect_day false while pending", r.json()["perfect_day"] is False)
 
+    # Clear the way: finish any required missions Syila still has open today
+    # from earlier sections, so the new one is the only thing left.
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    # Free bonus missions from the queue for this block: it clears only the
-    # REQUIRED tasks, and a queued bonus in front of them would deadlock it.
-    c.post("/api/config", json={"skip_cost_points": 0, "bonus_follows_sequence": False})
-    # Clear the way: skip through any required tasks Syila already has pending
-    # today from earlier test sections (missed wouldn't count as "finished"
-    # for perfect_day purposes — must actually resolve them), so our new task
-    # is unambiguously the only thing standing between her and a perfect day.
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    for _ in range(20):
-        prog = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}").json()
-        open_required = [t for t in prog["tasks"] if not t.get("is_bonus") and t["status"] in ("pending", "rejected")]
-        if not open_required:
-            break
-        c.post(f"/api/tasks/{open_required[0]['id']}/skip")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"skip_cost_points": 20})
+    prog = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}").json()
+    for t_open in [t for t in prog["tasks"] if not t.get("is_bonus") and t["status"] in ("pending", "rejected")]:
+        complete(t_open["id"])
     r = c.post("/api/tasks", json={"title": "PerfectToday1", "points": 5, "child_id": syila["id"], "date_key": today_local})
     pt1 = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{pt1['id']}/start")
-    c.post(f"/api/tasks/{pt1['id']}/complete")
+    complete(pt1['id'])
     r = c.get(f"/api/children/{syila['id']}/day-progress?date_key={today_local}")
     check("mystery: perfect_day true once all required completed", r.json()["perfect_day"] is True, str(r.json().get("perfect_day")))
     check("mystery: not yet claimed", r.json()["perfect_day_claimed"] is False)
@@ -1235,7 +1074,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "FeedTest1", "points": 12, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     ft1 = r.json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{ft1['id']}/complete")
+    complete(ft1['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{ft1['id']}/approve")
     ads_after = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
@@ -1253,7 +1092,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "FeedTest2", "points": 20, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     ft2 = r.json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{ft2['id']}/complete")
+    complete(ft2['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{ft2['id']}/approve")
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
@@ -1274,7 +1113,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "SyiFeedSeed", "points": 20, "child_id": syila["id"], "date_key": today_local, "is_bonus": True})
     syi_seed = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{syi_seed['id']}/complete")
+    complete(syi_seed['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{syi_seed['id']}/approve")
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
@@ -1348,7 +1187,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "MsgTest", "points": 5, "child_id": adskhan["id"], "date_key": today_local, "is_bonus": True})
     msgt = r.json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{msgt['id']}/complete")
+    complete(msgt['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post(f"/api/tasks/{msgt['id']}/approve", json={"encouragement_message": "Kerja bagus!"})
     check("msg: approve with message succeeds", r.status_code == 200 and r.json()["task"]["encouragement_message"] == "Kerja bagus!", r.text[:150])
@@ -1357,9 +1196,9 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     found = next(t for t in r.json() if t["id"] == msgt["id"])
     check("msg: cleared after undo", not found.get("encouragement_message"), str(found.get("encouragement_message")))
     huge_voice = "data:audio/webm;base64," + ("A" * 2_100_000)
-    r = c.post(f"/api/tasks/{msgt['id']}/complete") if False else None
+    r = complete(msgt['id']) if False else None
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{msgt['id']}/complete")
+    complete(msgt['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post(f"/api/tasks/{msgt['id']}/approve", json={"encouragement_voice_url": huge_voice})
     check("msg: oversized voice note rejected", r.status_code == 413, str(r.status_code))
@@ -1404,10 +1243,10 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # Sholat Subuh, 10 pts each), PLUS a co-op bonus that only pays out when
     # done together (Sholat Subuh Berjamaah, 20 pts total -> 10 each via the
     # existing even-split). No new feature needed — this locks in that the
-    # combination behaves correctly across days via recurrence.
+    # combination behaves correctly.
     r = c.post("/api/tasks", json={
         "title": "Sholat Subuh", "points": 10, "target_children": [],
-        "date_key": today_local, "recurrence": "daily", "order": 1,
+        "date_key": today_local, "order": 1,
     })
     indiv_tasks = r.json()["tasks"]
     check("berjamaah: individual broadcast creates 2 separate copies", len(indiv_tasks) == 2, str(len(indiv_tasks)))
@@ -1417,18 +1256,18 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={
         "title": "Sholat Subuh Berjamaah", "points": 20,
         "target_children": [adskhan["id"], syila["id"]], "coop": True,
-        "date_key": today_local, "recurrence": "daily",
+        "date_key": today_local,
     })
     coop_bj = r.json()
     check("berjamaah: coop bonus task forced to is_bonus", coop_bj["is_bonus"] is True)
 
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{ads_indiv['id']}/start")
-    c.post(f"/api/tasks/{ads_indiv['id']}/complete")
-    c.post(f"/api/tasks/{coop_bj['id']}/complete")
+    start(ads_indiv['id'])
+    complete(ads_indiv['id'])
+    complete(coop_bj['id'])
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{syi_indiv['id']}/start")
-    c.post(f"/api/tasks/{syi_indiv['id']}/complete")
+    start(syi_indiv['id'])
+    complete(syi_indiv['id'])
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     ads_bj_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
@@ -1440,26 +1279,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     syi_bj_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == syila["id"])
     check("berjamaah: each kid gets individual(10) + coop-split(10) = 20", ads_bj_after - ads_bj_before == 20 and syi_bj_after - syi_bj_before == 20, f"ads+{ads_bj_after-ads_bj_before} syi+{syi_bj_after-syi_bj_before}")
 
-    import datetime as _dt3
-    tomorrow_bj = (_dt3.datetime.now(_dt3.timezone.utc) + _dt3.timedelta(hours=7, days=1)).strftime("%Y-%m-%d")
-    r = c.get(f"/api/tasks?date_key={tomorrow_bj}")
-    spawned_bj = [t for t in r.json() if "Sholat Subuh" in t["title"]]
-    check("berjamaah: recurrence spawns 2 individual + 1 coop tomorrow", len(spawned_bj) == 3, str([(t["title"], t.get("is_coop")) for t in spawned_bj]))
-    spawned_coop_bj = [t for t in spawned_bj if t["title"] == "Sholat Subuh Berjamaah"]
-    check("berjamaah: exactly 1 coop copy spawned (not duplicated per kid)", len(spawned_coop_bj) == 1, str(len(spawned_coop_bj)))
-    check("berjamaah: spawned coop still has both participants + 20 pts", set(spawned_coop_bj[0].get("coop_participants", [])) == {adskhan["id"], syila["id"]} and spawned_coop_bj[0]["points"] == 20)
-
-    # Negative: no berjamaah that day -> no bonus, no penalty, doesn't block anything
-    ads_solo_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    ads_tomorrow_indiv = next(t for t in spawned_bj if t["title"] == "Sholat Subuh" and t["child_id"] == adskhan["id"])
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{ads_tomorrow_indiv['id']}/start")
-    c.post(f"/api/tasks/{ads_tomorrow_indiv['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{ads_tomorrow_indiv['id']}/approve")
-    ads_solo_after = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("berjamaah: no berjamaah that day -> only individual 10, no bonus", ads_solo_after - ads_solo_before == 10, f"+{ads_solo_after-ads_solo_before}")
-
     # ================= 66. TOGETHER-BONUS (single task, self-reported "did it together") =================
     r = c.post("/api/tasks", json={"title": "TB1", "points": 10, "child_id": adskhan["id"], "date_key": today_local, "together_bonus_enabled": True})
     check("together-bonus: enabled without points rejected", r.status_code == 422, str(r.status_code))
@@ -1468,7 +1287,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     r = c.post("/api/tasks", json={
         "title": "SholatSubuhTB", "points": 10, "target_children": [],
-        "date_key": today_local, "recurrence": "daily", "order": 1,
+        "date_key": today_local, "order": 1,
         "together_bonus_enabled": True, "together_bonus_points": 10,
     })
     tb_tasks = r.json()["tasks"]
@@ -1477,15 +1296,15 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("together-bonus: broadcast still creates 2 individual copies", len(tb_tasks) == 2)
 
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{ads_tb['id']}/start")
-    r = c.post(f"/api/tasks/{ads_tb['id']}/complete")
+    start(ads_tb['id'])
+    r = complete(ads_tb['id'])
     check("together-bonus: complete without answering the question rejected", r.status_code == 422, r.text[:150])
-    r = c.post(f"/api/tasks/{ads_tb['id']}/complete", json={"done_together": True})
+    r = complete(ads_tb['id'], {"done_together": True})
     check("together-bonus: complete with done_together=True succeeds", r.status_code == 200, r.text[:150])
 
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{syi_tb['id']}/start")
-    c.post(f"/api/tasks/{syi_tb['id']}/complete", json={"done_together": False})
+    start(syi_tb['id'])
+    complete(syi_tb['id'], {"done_together": False})
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     ads_tb_before = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
@@ -1497,43 +1316,10 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("together-bonus: said YES gets base+bonus (20)", ads_tb_after - ads_tb_before == 20, f"+{ads_tb_after-ads_tb_before}")
     check("together-bonus: said NO gets only base (10)", syi_tb_after - syi_tb_before == 10, f"+{syi_tb_after-syi_tb_before}")
 
-    # Check spawn BEFORE any undo — undoing an approval correctly removes its
-    # just-spawned next-occurrence too (contingent on the approval standing),
-    # so checking spawn state has to happen while the approval is still intact.
-    _y, _m, _d = map(int, today_local.split("-"))
-    tb_tomorrow = (_dt2.date(_y, _m, _d) + _dt2.timedelta(days=1)).strftime("%Y-%m-%d")
-    r = c.get(f"/api/tasks?date_key={tb_tomorrow}")
-    spawned_tb = [t for t in r.json() if t["title"] == "SholatSubuhTB"]
-    ads_spawned_tb = next((t for t in spawned_tb if t["child_id"] == adskhan["id"]), None)
-    check("together-bonus: spawned copy exists tomorrow", ads_spawned_tb is not None, str(spawned_tb))
-    check("together-bonus: spawned copy's done_together reset (bug fix verified)", ads_spawned_tb is not None and ads_spawned_tb.get("done_together") is None, str(ads_spawned_tb.get("done_together") if ads_spawned_tb else None))
-
     r = c.post(f"/api/tasks/{ads_tb['id']}/undo-approval")
     check("together-bonus: undo reverses full amount incl. bonus", r.status_code == 200)
     ads_tb_undone = next(k["points"] for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     check("together-bonus: undo restores exactly", ads_tb_undone == ads_tb_before)
-    r = c.get(f"/api/tasks?date_key={tb_tomorrow}")
-    check("together-bonus: undo correctly removes the spawned next-occurrence too (it was contingent on the approval)", not any(t["title"] == "SholatSubuhTB" and t["child_id"] == adskhan["id"] for t in r.json()))
-
-    # ================= 67. ROUTINE TEMPLATES (parent-editable CRUD) =================
-    r = c.get("/api/routine-templates")
-    check("templates: first GET seeds 5 defaults", len(r.json()) == 5, str(len(r.json())))
-    r = c.get("/api/routine-templates")
-    check("templates: second GET doesn't duplicate", len(r.json()) == 5)
-    r = c.post("/api/routine-templates", json={"label": "Weekend", "emoji": "🎉", "tasks": [{"title": "Cuci mobil", "points": 20}]})
-    check("templates: parent creates custom", r.status_code == 200, r.text[:150])
-    custom_tpl = r.json()
-    r = c.patch(f"/api/routine-templates/{custom_tpl['id']}", json={"label": "Weekend Edit", "tasks": [{"title": "x", "points": 5}, {"title": "y", "points": 5}]})
-    check("templates: edit succeeds, replaces tasks", r.status_code == 200 and len(r.json()["tasks"]) == 2, r.text[:150])
-    r = c.post("/api/routine-templates", json={"label": "Empty", "tasks": []})
-    check("templates: empty tasks rejected", r.status_code == 422, str(r.status_code))
-    r = c.delete(f"/api/routine-templates/{custom_tpl['id']}")
-    check("templates: delete succeeds", r.status_code == 200)
-    r = c.delete(f"/api/routine-templates/{custom_tpl['id']}")
-    check("templates: delete idempotent", r.status_code == 200)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post("/api/routine-templates", json={"label": "hack", "tasks": [{"title": "x"}]})
-    check("templates: kid blocked from creating", r.status_code == 403, str(r.status_code))
 
     # ================= 68. LEVEL CONFIG (parent-editable ladder) =================
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
@@ -1878,62 +1664,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("wishlist: remaining computed", wl and wl["remaining"] == 70, str(wl and wl["remaining"]))
     check("wishlist: days estimate", wl and wl["days_estimate"] == 4, str(wl and wl["days_estimate"]))
 
-    # =============== FLEXIBLE FLOW CONFIG (early bonus) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get("/api/config")
-    check("flowcfg: defaults present", r.json().get("early_bonus_pct") == 10, str(r.json().get("early_bonus_pct")))
-    r = c.post("/api/config", json={"early_bonus_pct": 25})
-    check("flowcfg: accepted", r.status_code == 200, r.text[:150])
-    r = c.get("/api/config")
-    check("flowcfg: persisted", r.json()["early_bonus_pct"] == 25, str(r.json()["early_bonus_pct"]))
-    r = c.post("/api/config", json={"early_bonus_pct": 150})
-    check("flowcfg: early bonus >100 rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"penalty_card_threshold": 0})
-    check("flowcfg: penalty threshold <1 rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"penalty_card_threshold": 99})
-    check("flowcfg: penalty threshold >50 rejected", r.status_code == 422, str(r.status_code))
-
-    # Early bonus OFF (0%) → no bonus even when finished early
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"early_bonus_pct": 0})
-    safe_due = (now_local + _dt.timedelta(minutes=30))
-    if safe_due.strftime("%Y-%m-%d") != today_local:
-        safe_due = now_local.replace(hour=23, minute=59)
-    r = c.post("/api/tasks", json={"title": "NoBonus", "points": 20, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": safe_due.strftime("%H:%M")})
-    nb_task = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{nb_task['id']}/start")
-    c.post(f"/api/tasks/{nb_task['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{nb_task['id']}/approve")
-    nb_after = next((t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json() if t["id"] == nb_task["id"]), None)
-    check("early-bonus: 0% config gives no bonus", nb_after and nb_after.get("early_bonus_awarded", 0) == 0, str(nb_after and nb_after.get("early_bonus_awarded")))
-
-    # Custom early bonus % honored (30% of 20 = 6)
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"day_segments": [{"label": "Sehari penuh", "start_time": "00:00", "end_time": "23:59"}]})
-    __import__("asyncio").run(server._refresh_segments_cache())
-    c.post("/api/config", json={"early_bonus_pct": 30})
-    r = c.post("/api/tasks", json={"title": "Bonus30", "points": 20, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": safe_due.strftime("%H:%M")})
-    b30 = r.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{b30['id']}/start")
-    c.post(f"/api/tasks/{b30['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{b30['id']}/approve")
-    b30_after = next((t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json() if t["id"] == b30["id"]), None)
-    check("early-bonus: custom 30% honored", b30_after and b30_after.get("early_bonus_awarded", 0) == 6, str(b30_after and b30_after.get("early_bonus_awarded")))
-
-    # Timestamps surfaced for parent honesty analysis (see the all-day section
-    # pinned above — this block is about bonuses/timestamps, not time windows)
-    check("timestamps: start recorded", b30_after and b30_after.get("timer_started_at"), str(b30_after and b30_after.get("timer_started_at")))
-    check("timestamps: completion recorded", b30_after and b30_after.get("completed_at"), str(b30_after and b30_after.get("completed_at")))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"early_bonus_pct": 10})
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
     # =============== MAINTENANCE MODE ===============
     # Public status check works without any auth
     r = c.get("/api/maintenance-status")
@@ -2021,76 +1751,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/maintenance/toggle", json={"enabled": False})
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
-    # =============== LATE-ARRIVAL EXCEPTION (pengajuan keterlambatan) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.late_exceptions.delete_many({}))
-    # Schedule: 16:00 (30m), 16:45 (15m), 19:00 (no dur), plus one timeless and one done
-    r = c.post("/api/tasks", json={"title": "Mandi sore", "points": 10, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": "16:00", "duration_minutes": 30})
-    t1 = r.json()
-    r = c.post("/api/tasks", json={"title": "Beres tas", "points": 5, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": "16:45", "duration_minutes": 15})
-    t2 = r.json()
-    r = c.post("/api/tasks", json={"title": "Belajar malam", "points": 10, "date_key": today_local, "target_children": [adskhan["id"]], "due_time": "19:00"})
-    t3 = r.json()
-    r = c.post("/api/tasks", json={"title": "Tanpa jam", "points": 5, "date_key": today_local, "target_children": [adskhan["id"]]})
-    t_nodue = r.json()
-
-    # Kid submits: arrived home 17:15
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Macet pulang sekolah, ada rapat", "arrival_time": "17:15"})
-    check("late: kid can submit", r.status_code == 200 and r.json()["status"] == "pending", r.text[:150])
-    late_id = r.json()["id"]
-    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Dobel", "arrival_time": "17:20"})
-    check("late: duplicate pending blocked", r.status_code == 409, str(r.status_code))
-    r = c.post("/api/late-exceptions", json={"child_id": syila["id"], "reason": "Bukan punyaku", "arrival_time": "17:00"})
-    check("late: sibling blocked", r.status_code == 403, str(r.status_code))
-    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "x", "arrival_time": "25:99"})
-    check("late: invalid time rejected", r.status_code == 422, str(r.status_code))
-    r = c.post(f"/api/late-exceptions/{late_id}/approve")
-    check("late: kid can't approve", r.status_code == 403, str(r.status_code))
-    r = c.get("/api/late-exceptions")
-    check("late: kid sees own request", any(x["id"] == late_id for x in r.json()))
-
-    # Parent approves → schedule reflows: first task (16:00, 30m) → due 17:45
-    # (arrival 17:15 + 30m). delta = 105 min. 16:45→18:30, 19:00→20:45.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get("/api/late-exceptions")
-    check("late: parent sees request", any(x["id"] == late_id for x in r.json()))
-    r = c.post(f"/api/late-exceptions/{late_id}/approve", json={"note": "Oke, dimaklumi"})
-    check("late: approve ok", r.status_code == 200 and r.json()["status"] == "approved", r.text[:200])
-    check("late: shift result recorded", r.json()["shift_result"]["shifted"] == 3 and r.json()["shift_result"]["delta_minutes"] == 105, str(r.json()["shift_result"]))
-    after = {t["id"]: t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()}
-    check("late: task1 shifted 16:00→17:45", after[t1["id"]]["due_time"] == "17:45", after[t1["id"]]["due_time"])
-    check("late: task2 shifted 16:45→18:30", after[t2["id"]]["due_time"] == "18:30", after[t2["id"]]["due_time"])
-    check("late: task3 shifted 19:00→20:45", after[t3["id"]]["due_time"] == "20:45", after[t3["id"]]["due_time"])
-    check("late: timeless task untouched", not after[t_nodue["id"]].get("due_time"), str(after[t_nodue["id"]].get("due_time")))
-    r = c.post(f"/api/late-exceptions/{late_id}/approve")
-    check("late: cannot re-approve", r.status_code == 400, str(r.status_code))
-
-    # Reject path: no shift happens
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/tasks", json={"title": "x", "points": 1})
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post("/api/tasks", json={"title": "Sore Syila", "points": 5, "date_key": today_local, "target_children": [syila["id"]], "due_time": "16:00", "duration_minutes": 10})
-    sy_task = r.json()
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/late-exceptions", json={"child_id": syila["id"], "reason": "Latihan menari", "arrival_time": "18:00"})
-    sy_late = r.json()["id"]
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/late-exceptions/{sy_late}/reject", json={"note": "Cek dulu ya"})
-    check("late: reject ok", r.status_code == 200 and r.json()["status"] == "rejected")
-    sy_after = next(t for t in c.get(f"/api/tasks?child_id={syila['id']}&date_key={today_local}").json() if t["id"] == sy_task["id"])
-    check("late: reject leaves schedule untouched", sy_after["due_time"] == "16:00", sy_after["due_time"])
-
-    # Early arrival (before schedule) → approve succeeds but shifts nothing
-    _aio_tg.run(server.db.late_exceptions.delete_many({}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Ternyata pulang cepat", "arrival_time": "10:00"})
-    early_late_id = r.json()["id"]
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/late-exceptions/{early_late_id}/approve")
-    check("late: early arrival shifts nothing", r.status_code == 200 and r.json()["shift_result"]["shifted"] == 0, str(r.json()["shift_result"]))
-
     # =============== OFF DAYS (hari libur tugas) ===============
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
@@ -2139,21 +1799,10 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={after_off}")
     check("offday: normal day not flagged", r.json()["is_off_day"] is False)
 
-    # Parked task can't be started
-    r = c.post(f"/api/tasks/{off_task1['id']}/start")
-    check("offday: parked task can't be started", r.status_code in (400, 409), str(r.status_code))
-
-    # Recurrence skips over the off range: approve a daily task dated the day
-    # BEFORE the range → next copy lands AFTER the range, not inside it.
+    # Parked task can't be ticked or worked on
+    r = c.post(f"/api/tasks/{off_task1['id']}/check", json={"checked": True})
+    check("offday: parked task can't be ticked", r.status_code in (400, 409), str(r.status_code))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    before_off = (_off_base + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
-    r = c.post("/api/tasks", json={"title": "Harian lompat libur", "points": 5, "date_key": before_off, "target_children": [adskhan["id"]], "recurrence": "daily"})
-    daily_task = r.json()
-    _aio_tg.run(server.db.tasks.update_one({"id": daily_task["id"]}, {"$set": {"status": "completed", "completed_at": server.now_iso()}}))
-    r = c.post(f"/api/tasks/{daily_task['id']}/approve")
-    check("offday: daily approve ok", r.status_code == 200, r.text[:150])
-    spawned = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json() if t["title"] == "Harian lompat libur" and t["status"] == "pending"]
-    check("offday: recurrence skipped off range", len(spawned) == 1 and spawned[0]["date_key"] == after_off, str([s["date_key"] for s in spawned]))
 
     # Streak bridges across off days: last completion = day before off range,
     # then approving on the day AFTER the range continues the streak without
@@ -2170,8 +1819,8 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     r = c.post("/api/tasks", json={"title": "Streak jembatan", "points": 5, "date_key": today_local, "target_children": [syila["id"]]})
     streak_task = r.json()
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{streak_task['id']}/start")
-    c.post(f"/api/tasks/{streak_task['id']}/complete")
+    start(streak_task['id'])
+    complete(streak_task['id'])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post(f"/api/tasks/{streak_task['id']}/approve")
     check("offday: streak-bridge approve ok", r.status_code == 200, r.text[:150])
@@ -2206,8 +1855,8 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         rr = c.post("/api/tasks", json={"title": title, "points": 5, "date_key": today_local, "target_children": [kid["id"]]})
         tid = rr.json()["id"]
         c.post("/api/auth/login", json={"member_id": kid["id"], "passcode": passcode})
-        c.post(f"/api/tasks/{tid}/start")
-        c.post(f"/api/tasks/{tid}/complete")
+        start(tid)
+        complete(tid)
         c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
         return c.post(f"/api/tasks/{tid}/approve")
 
@@ -2260,303 +1909,95 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("combo: single-child day is not a combo", r.json().get("family_combo") is None, str(r.json().get("family_combo")))
 
     # =============== HONESTY INSIGHT ===============
+    # Signals come from how each SECTION was worked through.
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
     import datetime as _dt_hi
     _t_now = _dt_hi.datetime.now(_dt_hi.timezone.utc)
-    def _seed_timed_task(kid, title, est_min, actual_sec, status="approved"):
-        rr = c.post("/api/tasks", json={"title": title, "points": 5, "date_key": today_local,
-                                        "target_children": [kid["id"]], "duration_minutes": est_min})
-        tid = rr.json()["id"]
-        st = _t_now - _dt_hi.timedelta(seconds=actual_sec)
-        _aio_tg.run(server.db.tasks.update_one({"id": tid}, {"$set": {
-            "status": status, "timer_started_at": st.isoformat(), "completed_at": _t_now.isoformat()}}))
-        return tid
-    _seed_timed_task(adskhan, "Kilat 1", 10, 3)      # 3s vs 10m estimate → flash
-    _seed_timed_task(adskhan, "Kilat 2", 10, 5)      # flash
-    _seed_timed_task(adskhan, "Wajar", 10, 540)      # 9m vs 10m → normal
-    _seed_timed_task(adskhan, "Kelamaan", 10, 1800)  # 30m vs 10m → overrun
+
+    def _seed_section(kid, seg_id, n_acts, est_min, spent_sec, tick_spread_sec, late=False):
+        ids = []
+        for i in range(n_acts):
+            ids.append(c.post("/api/tasks", json={"title": f"{seg_id}-{i}", "points": 5, "date_key": today_local,
+                                                  "segment_id": seg_id, "target_children": [kid["id"]],
+                                                  "duration_minutes": est_min}).json()["id"])
+        st = _t_now - _dt_hi.timedelta(seconds=spent_sec)
+        for i, tid in enumerate(ids):
+            tick = st + _dt_hi.timedelta(seconds=tick_spread_sec * i / max(1, n_acts - 1))
+            _aio_tg.run(server.db.tasks.update_one({"id": tid}, {"$set": {
+                "status": "approved", "checked": True, "checked_at": tick.isoformat()}}))
+        _aio_tg.run(server.db.segment_sessions.insert_one({
+            "parent_id": "family-default", "child_id": kid["id"], "date_key": today_local, "segment_id": seg_id,
+            "started_at": st.isoformat(), "completed_at": _t_now.isoformat(), "start_late": late}))
+
+    HSEG = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    _seed_section(adskhan, HSEG[0], 4, 10, 60, 5)            # 40 min of work done in 1 min, all ticked in 5 s
+    _seed_section(adskhan, HSEG[1], 3, 10, 1500, 1200)       # 25 of 30 min, ticks spread out
+    _seed_section(adskhan, HSEG[2], 3, 10, 1800, 1500, late=True)
 
     r = c.get("/api/family/honesty-insight?days=14")
     check("honesty: endpoint ok", r.status_code == 200, r.text[:150])
     ads_hi = next(x for x in r.json()["children"] if x["child_id"] == adskhan["id"])
-    check("honesty: counts measured tasks", ads_hi["tasks_measured"] == 4, str(ads_hi["tasks_measured"]))
-    check("honesty: detects instant tap-throughs", ads_hi["flash_count"] == 2, str(ads_hi["flash_count"]))
-    check("honesty: detects overruns", ads_hi["overrun_count"] == 1, str(ads_hi["overrun_count"]))
-    check("honesty: reports averages", ads_hi["avg_actual_minutes"] is not None and ads_hi["avg_estimated_minutes"] == 10.0, str(ads_hi["avg_estimated_minutes"]))
+    check("honesty: counts finished sections", ads_hi["sections_measured"] == 3, str(ads_hi))
+    check("honesty: flags a rushed section", ads_hi["sections_rushed"] == 1, str(ads_hi["sections_rushed"]))
+    check("honesty: flags ticks done all at once", ads_hi["bursts"] == 1, str(ads_hi["bursts"]))
+    check("honesty: counts late sections", ads_hi["late"] == 1, str(ads_hi["late"]))
+    check("honesty: reports averages", ads_hi["avg_actual_minutes"] is not None
+          and ads_hi["avg_estimated_minutes"] is not None, str(ads_hi))
+    syi_hi = next(x for x in r.json()["children"] if x["child_id"] == syila["id"])
+    check("honesty: a child with no finished sections shows nothing", syi_hi["sections_measured"] == 0)
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
     r = c.get("/api/family/honesty-insight")
     check("honesty: kid blocked", r.status_code == 403, str(r.status_code))
 
     # =============== SMART REMINDERS ===============
+    # Section deadlines: the child is nudged shortly before a section closes;
+    # once it closed unfinished, the parents are told (nothing automatic).
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
     _aio_tg.run(server.db.reminder_log.delete_many({}))
-    _soon = (now_local + _dt.timedelta(minutes=30))
-    _far = (now_local + _dt.timedelta(hours=6))
-    _soon_ok = _soon.strftime("%Y-%m-%d") == today_local
-    if _soon_ok:
-        c.post("/api/tasks", json={"title": "Segera", "points": 5, "date_key": today_local,
-                                   "target_children": [adskhan["id"]], "due_time": _soon.strftime("%H:%M")})
-    if _far.strftime("%Y-%m-%d") == today_local:
-        c.post("/api/tasks", json={"title": "Masih lama", "points": 5, "date_key": today_local,
-                                   "target_children": [adskhan["id"]], "due_time": _far.strftime("%H:%M")})
-    r = c.post("/api/reminders/run")
-    check("reminder: manual sweep ok", r.status_code == 200, r.text[:150])
-    if _soon_ok:
-        check("reminder: nudges only the imminent task", r.json()["task_reminders"] == 1, str(r.json()))
+    _nm_r = now_local.hour * 60 + now_local.minute
+    def _hm(m):
+        return f"{m // 60:02d}:{m % 60:02d}"
+    _old_segs = c.get("/api/config").json()["day_segments"]
+    if 40 <= _nm_r <= 23 * 60 + 40:
+        c.post("/api/config", json={"day_segments": [
+            {"label": "Tadi", "start_time": "00:00", "end_time": _hm(_nm_r - 30)},
+            {"label": "Sekarang", "start_time": _hm(_nm_r - 29), "end_time": _hm(_nm_r + 10)},
+            {"label": "Nanti", "start_time": _hm(_nm_r + 11), "end_time": "23:59"}]})
+        RSG = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
+        for lbl in ("Tadi", "Sekarang", "Nanti"):
+            c.post("/api/tasks", json={"title": f"R-{lbl}", "points": 5, "date_key": today_local,
+                                       "segment_id": RSG[lbl], "target_children": [adskhan["id"]]})
+        r = c.post("/api/reminders/run")
+        check("reminder: manual sweep ok", r.status_code == 200, r.text[:150])
+        check("reminder: child nudged before a section closes", r.json()["section_nudges"] == 1, str(r.json()))
+        check("reminder: parents told about a closed, unfinished section", r.json()["overdue_sections"] == 1, str(r.json()))
         r2 = c.post("/api/reminders/run")
-        check("reminder: deduplicated on repeat run", r2.json()["task_reminders"] == 0, str(r2.json()))
+        check("reminder: deduplicated on repeat run",
+              r2.json()["section_nudges"] == 0 and r2.json()["overdue_sections"] == 0, str(r2.json()))
+        od = c.get("/api/family/overdue-sections").json()
+        check("reminder: the closed section waits for the parent's decision",
+              [x["label"] for x in od["sections"]] == ["Tadi"] and od["sections"][0]["left"], str(od)[:200])
+        tadi_task = od["sections"][0]["left"][0]["id"]
+        r = c.post("/api/family/overdue-sections/resolve", json={
+            "child_id": adskhan["id"], "date_key": today_local, "segment_id": RSG["Tadi"],
+            "action": "miss", "task_ids": [tadi_task]})
+        check("reminder: parent can mark the leftovers as missed", r.status_code == 200 and r.json()["missed"] == 1, r.text[:150])
+        check("reminder: decided sections drop off the list", not c.get("/api/family/overdue-sections").json()["sections"])
+        check("reminder: missed is recorded on the mission",
+              _aio_tg.run(server.db.tasks.find_one({"id": tadi_task}))["status"] == "missed")
+        c.post("/api/config", json={"day_segments": _old_segs})
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
     r = c.post("/api/reminders/run")
     check("reminder: kid blocked from manual sweep", r.status_code == 403, str(r.status_code))
+    check("reminder: kid can't read the parents' list", c.get("/api/family/overdue-sections").status_code == 403)
     r = c.get("/api/cron/reminders?key=wrong")
     check("reminder: cron rejects bad key", r.status_code == 403, str(r.status_code))
     r = c.get("/api/cron/reminders")
     check("reminder: cron rejects empty key", r.status_code == 403, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
-    # =============== RECURRENCE SELF-HEALING (tugas berulang tak boleh putus) ===============
-    # Regression: recurrence used to advance ONLY on approval, so one unapproved
-    # day killed a series forever ("tugas mingguan hilang").
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.off_days.delete_many({}))
-    c.post("/api/config", json={"vacation_mode": False})
-
-    _base_now = _dt_off.datetime.utcnow() + _dt_off.timedelta(hours=7)
-    _past_weekly = (_base_now - _dt_off.timedelta(days=21)).strftime("%Y-%m-%d")
-    _past_daily = (_base_now - _dt_off.timedelta(days=5)).strftime("%Y-%m-%d")
-
-    # A weekly series stranded 3 weeks in the past, never approved
-    r = c.post("/api/tasks", json={"title": "Mingguan terlantar", "points": 10, "date_key": _past_weekly,
-                                   "target_children": [adskhan["id"]], "recurrence": "weekly"})
-    check("recur: stranded weekly created", r.status_code == 200, r.text[:150])
-    # A daily series stranded 5 days back
-    c.post("/api/tasks", json={"title": "Harian terlantar", "points": 5, "date_key": _past_daily,
-                               "target_children": [syila["id"]], "recurrence": "daily"})
-
-    r = c.post("/api/tasks/materialize-recurring?days_ahead=14")
-    check("recur: materialize ok", r.status_code == 200 and r.json()["created"] > 0, r.text[:150])
-
-    all_tasks = c.get("/api/tasks").json()
-    weekly_future = [t for t in all_tasks if t["title"] == "Mingguan terlantar" and t["date_key"] >= today_local]
-    daily_future = [t for t in all_tasks if t["title"] == "Harian terlantar" and t["date_key"] >= today_local]
-    check("recur: stranded weekly revived", len(weekly_future) >= 1, str(len(weekly_future)))
-    check("recur: stranded daily revived", len(daily_future) >= 10, str(len(daily_future)))
-    # Weekly must stay on its original weekday
-    _orig_wd = _dt_off.datetime.strptime(_past_weekly, "%Y-%m-%d").weekday()
-    check("recur: weekly keeps its weekday",
-          all(_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday() == _orig_wd for t in weekly_future),
-          str([t["date_key"] for t in weekly_future]))
-    # Never backfills the past
-    check("recur: no past backfill",
-          not [t for t in all_tasks if t["title"] == "Harian terlantar" and _past_daily < t["date_key"] < today_local],
-          "found backfilled days")
-
-    # Idempotent
-    before_n = len(c.get("/api/tasks").json())
-    r = c.post("/api/tasks/materialize-recurring?days_ahead=14")
-    check("recur: second run creates nothing", r.json()["created"] == 0, str(r.json()))
-    check("recur: no duplicates", len(c.get("/api/tasks").json()) == before_n, "count changed")
-
-    # Off days are skipped
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _skip_day = (_base_now + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
-    c.post("/api/off-days", json={"start_date": _skip_day, "note": "libur tengah"})
-    c.post("/api/tasks", json={"title": "Harian lewat libur", "points": 5, "date_key": _past_daily,
-                               "target_children": [syila["id"]], "recurrence": "daily"})
-    c.post("/api/tasks/materialize-recurring?days_ahead=10")
-    got_days = [t["date_key"] for t in c.get("/api/tasks").json() if t["title"] == "Harian lewat libur"]
-    check("recur: off day skipped by materializer", _skip_day not in got_days, str(got_days))
-    _aio_tg.run(server.db.off_days.delete_many({}))
-
-    # Vacation mode pauses materialization entirely
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"vacation_mode": True})
-    c.post("/api/tasks", json={"title": "Libur panjang", "points": 5, "date_key": _past_daily,
-                               "target_children": [syila["id"]], "recurrence": "daily"})
-    r = c.post("/api/tasks/materialize-recurring?days_ahead=10")
-    check("recur: vacation mode creates nothing", r.json()["created"] == 0, str(r.json()))
-    c.post("/api/config", json={"vacation_mode": False})
-
-    # Kid can't trigger it manually
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/tasks/materialize-recurring")
-    check("recur: kid blocked from manual materialize", r.status_code == 403, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
-    # Lazy self-heal on a plain read (throttled marker cleared first)
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.app_config.update_one({"parent_id": "family-default"},
-                                                {"$unset": {"last_materialize_at": ""}}))
-    c.post("/api/tasks", json={"title": "Auto sembuh", "points": 5, "date_key": _past_daily,
-                               "target_children": [adskhan["id"]], "recurrence": "daily"})
-    healed = [t for t in c.get("/api/tasks").json() if t["title"] == "Auto sembuh" and t["date_key"] >= today_local]
-    check("recur: heals automatically on read", len(healed) >= 1, str(len(healed)))
-
-    # =============== RESTART SCHEDULE (mulai ulang dari tanggal tertentu) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _tomorrow = (_base_now + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
-        "points": 77, "streak_days": 9, "last_completion_date": today_local}}))
-
-    # Old backlog: done + missed + untouched, all in the past
-    for i, st in enumerate(["approved", "missed", "pending"]):
-        rr = c.post("/api/tasks", json={"title": f"Lama {st}", "points": 5,
-                                        "date_key": (_base_now - _dt_off.timedelta(days=i + 2)).strftime("%Y-%m-%d"),
-                                        "target_children": [adskhan["id"]]})
-        _aio_tg.run(server.db.tasks.update_one({"id": rr.json()["id"]}, {"$set": {"status": st}}))
-    # A weekly series that only ever existed in the past
-    c.post("/api/tasks", json={"title": "Mingguan lama", "points": 10, "date_key": _past_weekly,
-                               "target_children": [adskhan["id"]], "recurrence": "weekly"})
-    # Stale pending requests from the old run
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post("/api/late-exceptions", json={"child_id": adskhan["id"], "reason": "Sisa lama", "arrival_time": "18:00"})
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
-    r = c.post("/api/tasks/restart-schedule", json={"start_date": "bukan-tanggal"})
-    check("restart: invalid date rejected", r.status_code == 422, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tomorrow})
-    check("restart: kid blocked", r.status_code == 403, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
-    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tomorrow, "reset_streaks": True, "days_ahead": 14})
-    check("restart: ok", r.status_code == 200, r.text[:200])
-    check("restart: deleted old backlog", r.json()["deleted_tasks"] >= 4, str(r.json()))
-    check("restart: rebuilt upcoming", r.json()["upcoming_created"] >= 1, str(r.json()))
-
-    post_tasks = c.get("/api/tasks").json()
-    check("restart: nothing left before start date",
-          not [t for t in post_tasks if t.get("date_key") and t["date_key"] < _tomorrow], "old tasks remain")
-    check("restart: past-only weekly series revived",
-          any(t["title"] == "Mingguan lama" and t["date_key"] >= _tomorrow for t in post_tasks),
-          str([t["date_key"] for t in post_tasks if t["title"] == "Mingguan lama"]))
-    check("restart: fresh instances are pending",
-          all(t["status"] == "pending" for t in post_tasks if t["title"] == "Mingguan lama"),
-          "non-pending instance found")
-
-    ads_r = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("restart: points untouched", ads_r["points"] == 77, str(ads_r["points"]))
-    check("restart: streak reset when asked", ads_r["streak_days"] == 0, str(ads_r["streak_days"]))
-    r = c.get("/api/late-exceptions")
-    check("restart: stale pending requests cleared",
-          not [x for x in r.json() if x["status"] == "pending"], str(len(r.json())))
-
-    # Streaks preserved when the parent doesn't ask for a reset
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"streak_days": 6}}))
-    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tomorrow, "reset_streaks": False})
-    check("restart: streak kept when not requested",
-          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["streak_days"] == 6,
-          "streak was reset unexpectedly")
-
-    # =============== REGRESSION: DISTINCT SLOTS MUST NEVER COLLAPSE ===============
-    # Bug report: "jadwal Rabu hilang semua, Senin yang pagi hilang juga".
-    # Cause: series identity ignored weekday and time-of-day, so same-titled
-    # tasks on different days/times overwrote each other and vanished.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.tasks_archive.delete_many({}))
-    _aio_tg.run(server.db.off_days.delete_many({}))
-    c.post("/api/config", json={"vacation_mode": False})
-
-    # Find a past Monday and the Wednesday of that same week
-    _probe = _base_now - _dt_off.timedelta(days=14)
-    while _probe.weekday() != 0:
-        _probe -= _dt_off.timedelta(days=1)
-    _mon = _probe.strftime("%Y-%m-%d")
-    _wed = (_probe + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
-
-    # Same title, same child, weekly — but on TWO different weekdays
-    c.post("/api/tasks", json={"title": "Piket", "points": 5, "date_key": _mon,
-                               "target_children": [adskhan["id"]], "recurrence": "weekly", "due_time": "06:00"})
-    c.post("/api/tasks", json={"title": "Piket", "points": 5, "date_key": _wed,
-                               "target_children": [adskhan["id"]], "recurrence": "weekly", "due_time": "06:00"})
-    # Same title, same day, DIFFERENT time slots (pagi & sore)
-    c.post("/api/tasks", json={"title": "Sholat", "points": 5, "date_key": _mon,
-                               "target_children": [adskhan["id"]], "recurrence": "daily", "due_time": "05:00"})
-    c.post("/api/tasks", json={"title": "Sholat", "points": 5, "date_key": _mon,
-                               "target_children": [adskhan["id"]], "recurrence": "daily", "due_time": "18:00"})
-
-    c.post("/api/tasks/materialize-recurring?days_ahead=14")
-    fut = [t for t in c.get("/api/tasks").json() if t["date_key"] >= today_local]
-    piket_wd = {_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday()
-                for t in fut if t["title"] == "Piket"}
-    check("slots: Monday weekly survives", 0 in piket_wd, str(sorted(piket_wd)))
-    check("slots: Wednesday weekly survives", 2 in piket_wd, str(sorted(piket_wd)))
-    sholat_times = {t.get("due_time") for t in fut if t["title"] == "Sholat"}
-    check("slots: morning time slot survives", "05:00" in sholat_times, str(sholat_times))
-    check("slots: evening time slot survives", "18:00" in sholat_times, str(sholat_times))
-    # And each slot gets its own instance per day (no silent suppression)
-    _one_day = [t for t in fut if t["title"] == "Sholat" and t["date_key"] == fut[0]["date_key"]]
-    check("slots: both daily slots materialize on the same day",
-          len({t.get("due_time") for t in [t for t in fut if t["title"] == "Sholat" and t["date_key"] == today_local]}) in (0, 2),
-          "only one slot present on a day")
-
-    # Restart must preserve every distinct slot too
-    _tmr = (_base_now + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
-    r = c.post("/api/tasks/restart-schedule", json={"start_date": _tmr, "days_ahead": 21})
-    check("slots: restart ok", r.status_code == 200, r.text[:200])
-    after = [t for t in c.get("/api/tasks").json() if t["date_key"] >= _tmr]
-    piket_wd2 = {_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday()
-                 for t in after if t["title"] == "Piket"}
-    check("slots: restart keeps Monday series", 0 in piket_wd2, str(sorted(piket_wd2)))
-    check("slots: restart keeps Wednesday series", 2 in piket_wd2, str(sorted(piket_wd2)))
-    sholat_times2 = {t.get("due_time") for t in after if t["title"] == "Sholat"}
-    check("slots: restart keeps both time slots", sholat_times2 == {"05:00", "18:00"}, str(sholat_times2))
-
-    # =============== UNDO RESTART (jaring pengaman) ===============
-    r = c.get("/api/tasks/restart-archives")
-    check("undo: archive recorded", r.status_code == 200 and len(r.json()) >= 1, r.text[:150])
-    archived_count = r.json()[0]["task_count"]
-    r = c.post("/api/tasks/undo-restart")
-    check("undo: restore ok", r.status_code == 200 and r.json()["restored_tasks"] == archived_count, r.text[:200])
-    restored_past = [t for t in c.get("/api/tasks").json() if t["date_key"] < _tmr]
-    check("undo: old tasks are back", len(restored_past) >= 1, str(len(restored_past)))
-    r = c.post("/api/tasks/undo-restart")
-    check("undo: nothing left to undo", r.status_code == 404, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/tasks/undo-restart")
-    check("undo: kid blocked", r.status_code == 403, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
-    # =============== BULK IMPORT (pulihkan jadwal) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _bulk = {"tasks": [
-        {"title": "Bangun pagi", "due_time": "05:00", "duration_minutes": 10, "points": 5,
-         "task_style": "routine", "weekdays": [0, 1, 2, 3, 4], "recurrence": "weekly",
-         "target_children": [adskhan["id"]]},
-        {"title": "Sholat Subuh", "due_time": "05:15", "duration_minutes": 15, "points": 10,
-         "task_style": "routine", "weekdays": [0, 1, 2, 3, 4], "recurrence": "weekly",
-         "target_children": [adskhan["id"]], "together_bonus_enabled": True, "together_bonus_points": 5},
-        {"title": "Beres kamar", "due_time": "10:00", "duration_minutes": 30, "points": 15,
-         "task_style": "helper", "weekdays": [5], "recurrence": "weekly",
-         "target_children": [syila["id"]]},
-    ]}
-    r = c.post("/api/tasks/bulk-import", json=_bulk)
-    check("bulk: import ok", r.status_code == 200 and r.json()["created"] > 0, r.text[:200])
-    check("bulk: no errors", not r.json()["errors"], str(r.json()["errors"])[:200])
-    made = c.get("/api/tasks").json()
-    check("bulk: weekday task spread over 5 days",
-          len([t for t in made if t["title"] == "Bangun pagi"]) == 5,
-          str(len([t for t in made if t["title"] == "Bangun pagi"])))
-    check("bulk: together bonus preserved",
-          all(t.get("together_bonus_points") == 5 for t in made if t["title"] == "Sholat Subuh"),
-          "bonus missing")
-    check("bulk: saturday-only task lands on Saturday",
-          all(_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday() == 5
-              for t in made if t["title"] == "Beres kamar"),
-          str([t["date_key"] for t in made if t["title"] == "Beres kamar"]))
-    # Re-running skips instead of duplicating
-    r2 = c.post("/api/tasks/bulk-import", json=_bulk)
-    check("bulk: rerun skips existing", r2.json()["created"] == 0 and r2.json()["skipped"] == 3, str(r2.json()))
-    check("bulk: no duplicates after rerun", len(c.get("/api/tasks").json()) == len(made), "count grew")
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/tasks/bulk-import", json=_bulk)
-    check("bulk: kid blocked", r.status_code == 403, str(r.status_code))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
     # =============== SISTEM TERLAMBAT + KARTU HUKUMAN ===============
@@ -2584,68 +2025,61 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     excused_id = cfg["late_reasons"][0]["id"]
     fault_id = cfg["late_reasons"][2]["id"]
 
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Sudah tutup", "start_time": "00:00", "end_time": "00:01"},
-        {"label": "Masih buka", "start_time": "00:02", "end_time": "23:59"}]})
-    __import__("asyncio").run(server._refresh_segments_cache())
-    def _mk_overdue(kid, title, pts=10):
-        rr = c.post("/api/tasks", json={"title": title, "points": pts, "date_key": today_local,
-                                        "target_children": [kid["id"]], "due_time": "00:01", "duration_minutes": 10})
-        return rr.json()
+    # Lateness is judged per section: a section started after its time (here:
+    # on an earlier day) needs a reason; an at-fault reason costs a card and
+    # the section's points.
+    _late_days = iter(range(1, 200))
+    LSEG = c.get("/api/config").json()["day_segments"][0]["id"]
 
-    # Excused path: no card, task unblocked, FULL points on approval
-    t_ex = _mk_overdue(adskhan, "Telat macet")
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_ex['id']}/late-reason", json={"reason_id": excused_id})
-    check("late2: excused ack ok", r.status_code == 200 and r.json()["gives_penalty_card"] is False, r.text[:200])
-    check("late2: excused no card", r.json()["penalty_cards"] is None)
-    r = c.post(f"/api/tasks/{t_ex['id']}/start")
-    check("late2: unblocked after ack", r.status_code == 200, r.text[:150])
-    c.post(f"/api/tasks/{t_ex['id']}/complete")
+    def late_start(kid, passcode, reason_id, title, pts=10):
+        dk = (now_local - _dt.timedelta(days=next(_late_days))).strftime("%Y-%m-%d")
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        tt = c.post("/api/tasks", json={"title": title, "points": pts, "date_key": dk, "segment_id": LSEG,
+                                        "target_children": [kid["id"]]}).json()
+        c.post("/api/auth/login", json={"member_id": kid["id"], "passcode": passcode})
+        body = {"child_id": kid["id"], "date_key": dk, "segment_id": LSEG}
+        rr = c.post("/api/segment-sessions/start", json={**body, "late_reason_id": reason_id})
+        return rr, tt, body
+
+    def cards(kid):
+        return int(_aio_tg.run(server.db.children.find_one({"id": kid["id"]})).get("penalty_cards", 0))
+
+    # Excused path: no card, full points
+    r, t_ex, b_ex = late_start(adskhan, "654321", excused_id, "Telat macet")
+    check("late2: excused start ok", r.status_code == 200 and r.json()["start_late"] is True, r.text[:200])
+    check("late2: excused no card", cards(adskhan) == 0, str(cards(adskhan)))
+    c.post(f"/api/tasks/{t_ex['id']}/check", json={"checked": True})
+    r = c.post("/api/segment-sessions/finish", json=b_ex)
+    check("late2: finishing needs no second reason", r.status_code == 200, r.text[:150])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post(f"/api/tasks/{t_ex['id']}/approve")
     ads_l1 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     check("late2: excused keeps full points", ads_l1["points"] == 10, str(ads_l1["points"]))
-    check("late2: excused zero cards", int(ads_l1.get("penalty_cards", 0)) == 0, str(ads_l1.get("penalty_cards")))
 
-    # At-fault path: +1 card, task unblocked but ZERO points
-    t_f1 = _mk_overdue(adskhan, "Telat bangun", pts=20)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_f1['id']}/late-reason", json={"reason_id": fault_id})
-    check("late2: at-fault ack ok", r.status_code == 200 and r.json()["gives_penalty_card"] is True, r.text[:200])
-    check("late2: card counted", r.json()["penalty_cards"] == 1 and r.json()["threshold_hit"] is False, str(r.json()["penalty_cards"]))
-    c.post(f"/api/tasks/{t_f1['id']}/start")
-    c.post(f"/api/tasks/{t_f1['id']}/complete")
+    # At-fault path: +1 card, ZERO points
+    r, t_f1, b_f1 = late_start(adskhan, "654321", fault_id, "Telat bangun", pts=20)
+    check("late2: at-fault start ok", r.status_code == 200 and r.json()["no_points"] is True, r.text[:200])
+    check("late2: card counted", cards(adskhan) == 1, str(cards(adskhan)))
+    c.post(f"/api/tasks/{t_f1['id']}/check", json={"checked": True})
+    c.post("/api/segment-sessions/finish", json=b_f1)
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.post(f"/api/tasks/{t_f1['id']}/approve")
     check("late2: at-fault approve ok", r.status_code == 200, r.text[:150])
     ads_l2 = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("late2: at-fault earns ZERO points", ads_l2["points"] == 10, str(ads_l2["points"]))  # unchanged from 10
+    check("late2: at-fault earns ZERO points", ads_l2["points"] == 10, str(ads_l2["points"]))
     check("late2: buckets unchanged too", ads_l2["chiky_save"] + ads_l2["chiky_spend"] + ads_l2["chiky_share"] == 10, "buckets grew")
 
-    # Second at-fault → threshold (2) hit
-    t_f2 = _mk_overdue(adskhan, "Telat lagi")
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_f2['id']}/late-reason", json={"reason_id": fault_id})
-    check("late2: threshold hit at 2", r.json()["penalty_cards"] == 2 and r.json()["threshold_hit"] is True, str(r.json()))
+    # Second at-fault → threshold (2) reached
+    r, t_f2, b_f2 = late_start(adskhan, "654321", fault_id, "Telat lagi")
+    check("late2: threshold reached at 2", cards(adskhan) == 2, str(cards(adskhan)))
 
     # Guards
-    r = c.post(f"/api/tasks/{t_f2['id']}/late-reason", json={"reason_id": fault_id})
-    check("late2: double ack blocked", r.status_code == 400, str(r.status_code))
-    r = c.post(f"/api/tasks/{t_f2['id']}/late-reason", json={"reason_id": "zzz"})
-    check("late2: unknown reason handled", r.status_code in (400, 404), str(r.status_code))
-    t_future = c.get(f"/api/tasks?child_id={adskhan['id']}").json()
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    rr = c.post("/api/tasks", json={"title": "Belum lewat", "points": 5, "date_key": today_local,
-                                    "target_children": [adskhan["id"]], "due_time": "23:59"})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{rr.json()['id']}/late-reason", json={"reason_id": fault_id})
-    check("late2: not-yet-overdue rejected", r.status_code == 400, str(r.status_code))
-    r = c.post(f"/api/tasks/{t_ex['id']}/late-reason", json={"reason_id": fault_id})
-    check("late2: already-processed task rejected", r.status_code == 400, str(r.status_code))
+    r = c.post("/api/segment-sessions/start", json={**b_f2, "late_reason_id": fault_id})
+    check("late2: starting twice costs nothing more", r.status_code == 200 and cards(adskhan) == 2, str(cards(adskhan)))
+    r2, t_u, b_u = late_start(adskhan, "654321", "zzz", "Alasan ngawur")
+    check("late2: unknown reason asks again", r2.status_code == 409 and "LATE_REASON_REQUIRED" in r2.text, r2.text[:150])
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    t_sib = t_f2["id"]
-    r = c.post(f"/api/tasks/{t_sib}/late-reason", json={"reason_id": fault_id})
+    r = c.post("/api/segment-sessions/start", json={**b_u, "late_reason_id": fault_id})
     check("late2: sibling blocked", r.status_code == 403, str(r.status_code))
 
     # Parent resets cards after the consequence is served
@@ -2700,11 +2134,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     fault2 = c.get("/api/config").json()["late_reasons"][0]["id"]
 
     def _earn_card(kid, passcode, title):
-        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-        rr = c.post("/api/tasks", json={"title": title, "points": 10, "date_key": today_local,
-                                        "target_children": [kid["id"]], "due_time": "00:01", "duration_minutes": 10})
-        c.post("/api/auth/login", json={"member_id": kid["id"], "passcode": passcode})
-        return c.post(f"/api/tasks/{rr.json()['id']}/late-reason", json={"reason_id": fault2})
+        return late_start(kid, passcode, fault2, title)[0]
 
     # 1st card: below threshold(2) → no punishment yet
     _earn_card(adskhan, "654321", "Telat A")
@@ -2713,7 +2143,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     # 2nd card: threshold reached → punishment issued awaiting the kid's choice
     r = _earn_card(adskhan, "654321", "Telat B")
-    check("pun: threshold reported", r.json()["threshold_hit"] is True, str(r.json()))
+    check("pun: second card counted", r.status_code == 200 and cards(adskhan) == 2, str(cards(adskhan)))
     pl = c.get("/api/punishments").json()
     check("pun: punishment issued at threshold", len(pl) == 1, str(len(pl)))
     pun = pl[0]
@@ -2883,279 +2313,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
 
-    # =============== REGRESSION: QUEST SEQUENCE FOLLOWS THE CLOCK ===============
-    # Bug: gating used raw creation `order`, but the kid's timeline is laid out
-    # by due_time — so the "active" task jumped to the middle of the day while
-    # earlier ones showed "menunggu giliran".
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    # One all-day section so every task is "open" regardless of the wall clock —
-    # this block is about ORDERING, not about time windows.
-    c.post("/api/config", json={"day_segments": [{"label": "Sehari penuh", "start_time": "00:00", "end_time": "23:59"}]})
-    _asgz = __import__("asyncio"); _asgz.run(server._refresh_segments_cache())
-    # Deliberately CREATE them out of chronological order
-    seq_specs = [("Sore 17:30", "17:30"), ("Pagi 05:30", "05:30"), ("Malam 19:00", "19:00"), ("Siang 12:00", "12:00")]
-    seq_ids = {}
-    for title, due in seq_specs:
-        rr = c.post("/api/tasks", json={"title": title, "points": 5, "date_key": today_local,
-                                        "target_children": [adskhan["id"]], "due_time": due, "duration_minutes": 10})
-        seq_ids[title] = rr.json()["id"]
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    import asyncio as _aseq
-    def _next_title():
-        t = _aseq.run(server.get_next_actionable_task(adskhan["id"], today_local))
-        return t["title"] if t else None
-    check("seq: earliest task is the active one", _next_title() == "Pagi 05:30", str(_next_title()))
-
-    # Only ONE required task may be startable at a time
-    r = c.post(f"/api/tasks/{seq_ids['Malam 19:00']}/start")
-    check("seq: later task cannot start out of turn", r.status_code == 409, str(r.status_code))
-    # Advance the queue without depending on the wall clock (these fixed times
-    # may already be in the past, which is now correctly refused by the start
-    # guard — that behaviour is covered on its own further down).
-    _aio_tg.run(server.db.tasks.update_one({"id": seq_ids["Pagi 05:30"]},
-                                           {"$set": {"status": "approved"}}))
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    check("seq: advances to the next-earliest, not creation order", _next_title() == "Siang 12:00", str(_next_title()))
-
-    # Timeless tasks sort last — they never steal the turn from a scheduled one
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/tasks", json={"title": "Tanpa jam", "points": 5, "date_key": today_local,
-                               "target_children": [adskhan["id"]]})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    check("seq: timeless task does not jump the queue", _next_title() == "Siang 12:00", str(_next_title()))
-
-    # A bonus task is startable alongside the active required one — by design,
-    # bonuses never block and are never blocked.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    rb = c.post("/api/tasks", json={"title": "Bonus bebas", "points": 10, "date_key": today_local,
-                                    "target_children": [adskhan["id"]], "is_bonus": True})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{rb.json()['id']}/start")
-    check("seq: bonus startable regardless of sequence", r.status_code == 200, r.text[:150])
-    check("seq: bonus never becomes the blocking task", _next_title() == "Siang 12:00", str(_next_title()))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
-    # =============== LATE ACK RESCHEDULES THE SLOT (durasi tetap) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"late_reasons": [
-        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
-        {"label": "Terlambat bangun", "gives_penalty_card": True, "award_points": False},
-    ]})
-    _lr = c.get("/api/config").json()["late_reasons"]
-    _ex_id, _ft_id = _lr[0]["id"], _lr[1]["id"]
-
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Sudah tutup", "start_time": "00:00", "end_time": "00:01"},
-        {"label": "Masih buka", "start_time": "00:02", "end_time": "23:59"}]})
-    __import__("asyncio").run(server._refresh_segments_cache())
-    _closed_sid = c.get("/api/config").json()["day_segments"][0]["id"]
-    rr = c.post("/api/tasks", json={"title": "Geser jadwal", "points": 10, "date_key": today_local,
-                                    "target_children": [adskhan["id"]], "due_time": "00:05",
-                                    "segment_id": _closed_sid, "duration_minutes": 25})
-    resched = rr.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{resched['id']}/late-reason", json={"reason_id": _ex_id})
-    check("resched: ack ok", r.status_code == 200, r.text[:150])
-    t_after = r.json()["task"]
-    check("resched: original time remembered", t_after.get("due_time_original") == "00:05", str(t_after.get("due_time_original")))
-    check("resched: flagged as rescheduled", t_after.get("late_rescheduled") is True, str(t_after.get("late_rescheduled")))
-    check("resched: duration untouched", t_after["duration_minutes"] == 25, str(t_after["duration_minutes"]))
-    _now_m = server._now_local().hour * 60 + server._now_local().minute
-    _new_m = server._hhmm_to_min(t_after["due_time"])
-    check("resched: new deadline gives the full duration from now",
-          _new_m >= min(_now_m + 24, 23 * 60 + 59), f'{t_after["due_time"]} vs now {_now_m}')
-    check("resched: deadline never rolls past midnight", _new_m <= 23 * 60 + 59, t_after["due_time"])
-
-    # The task must now actually be doable end-to-end
-    r = c.post(f"/api/tasks/{resched['id']}/start")
-    check("resched: startable after ack", r.status_code == 200, r.text[:150])
-    r = c.post(f"/api/tasks/{resched['id']}/complete")
-    check("resched: completable after ack", r.status_code == 200, r.text[:150])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{resched['id']}/approve")
-    check("resched: approvable after ack", r.status_code == 200, r.text[:150])
-
-    # A timeless task has no slot to move — ack must still work, nothing shifts
-    rr = c.post("/api/tasks", json={"title": "Tanpa jam telat", "points": 5, "date_key": (_off_base - _dt_off.timedelta(days=1)).strftime("%Y-%m-%d"),
-                                    "target_children": [adskhan["id"]]})
-    no_time = rr.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{no_time['id']}/late-reason", json={"reason_id": _ft_id})
-    check("resched: timeless task ack ok", r.status_code == 200, r.text[:150])
-    check("resched: timeless task gains no due_time", not r.json()["task"].get("due_time"), str(r.json()["task"].get("due_time")))
-    check("resched: at-fault still forfeits points", r.json()["task"]["late_no_points"] is True)
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-
-    # =============== OVERDUE TASKS MUST GO THROUGH "TERLAMBAT" FIRST ===============
-    # Bug: a morning task whose window had closed stayed freely startable all
-    # evening, so it sat "active" at the same time as the current task.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"min_gap_seconds": 0})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"late_reasons": [
-        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
-        {"label": "Terlambat bangun", "gives_penalty_card": True, "award_points": False},
-    ]})
-    _lr2 = c.get("/api/config").json()["late_reasons"]
-    _ex2, _ft2 = _lr2[0]["id"], _lr2[1]["id"]
-
-    rr = c.post("/api/tasks", json={"title": "Pagi kelewat", "points": 10, "date_key": today_local,
-                                    "target_children": [adskhan["id"]], "due_time": "00:01", "duration_minutes": 10})
-    stale = rr.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{stale['id']}/start")
-    check("overdue: expired window cannot be started", r.status_code == 409, str(r.status_code))
-    check("overdue: refusal points at the Terlambat button", "Terlambat" in r.text, r.text[:160])
-
-    # After owning the lateness it becomes startable again (window moved to now)
-    r = c.post(f"/api/tasks/{stale['id']}/late-reason", json={"reason_id": _ex2})
-    check("overdue: ack ok", r.status_code == 200, r.text[:150])
-    r = c.post(f"/api/tasks/{stale['id']}/start")
-    check("overdue: startable after acknowledging", r.status_code == 200, r.text[:150])
-    r = c.post(f"/api/tasks/{stale['id']}/complete")
-    check("overdue: completable after acknowledging", r.status_code == 200, r.text[:150])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{stale['id']}/approve")
-    check("overdue: approvable after acknowledging", r.status_code == 200, r.text[:150])
-
-    # A task still inside its window starts normally — the guard must not
-    # over-block tasks that are merely scheduled for later today.
-    _future_m = min(server._now_local().hour * 60 + server._now_local().minute + 90, 23 * 60 + 58)
-    _future = f"{_future_m // 60:02d}:{_future_m % 60:02d}"
-    rr = c.post("/api/tasks", json={"title": "Masih berlaku", "points": 5, "date_key": today_local,
-                                    "target_children": [adskhan["id"]], "due_time": _future, "duration_minutes": 30})
-    fresh = rr.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{fresh['id']}/start")
-    check("overdue: in-window task still starts freely", r.status_code == 200, r.text[:150])
-
-    # A bonus task with a past time is NOT sequence-gated, but the same
-    # lateness rule should not trap it either — bonuses stay free.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    rr = c.post("/api/tasks", json={"title": "Bonus lewat", "points": 10, "date_key": today_local,
-                                    "target_children": [adskhan["id"]], "due_time": "00:02",
-                                    "duration_minutes": 10, "is_bonus": True})
-    lateb = rr.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{lateb['id']}/start")
-    check("overdue: bonus stays startable despite past time", r.status_code == 200, r.text[:150])
-
-    # Timeless required tasks have no window to expire → never blocked by this
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    rr = c.post("/api/tasks", json={"title": "Tanpa jam bebas", "points": 5, "date_key": today_local,
-                                    "target_children": [adskhan["id"]]})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{rr.json()['id']}/start")
-    check("overdue: timeless task unaffected by the guard", r.status_code == 200, r.text[:150])
-
-    # At-fault ack also unblocks (kid may continue), but without points
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0, "penalty_cards": 0}}))
-    rr = c.post("/api/tasks", json={"title": "Telat salah sendiri", "points": 20, "date_key": today_local,
-                                    "target_children": [adskhan["id"]], "due_time": "00:01", "duration_minutes": 10})
-    fault_task = rr.json()
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{fault_task['id']}/late-reason", json={"reason_id": _ft2})
-    r = c.post(f"/api/tasks/{fault_task['id']}/start")
-    check("overdue: at-fault ack still unblocks the task", r.status_code == 200, r.text[:150])
-    c.post(f"/api/tasks/{fault_task['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{fault_task['id']}/approve")
-    ads_ov = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("overdue: at-fault path awards zero points", ads_ov["points"] == 0, str(ads_ov["points"]))
-
-    # =============== SEGMENT-ANCHORED TASKS (tanpa jam per tugas) ===============
-    # New concept: a task belongs to a SECTION (Pagi/Siang/…); only the section
-    # carries a clock. Order inside the section decides the sequence.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    seg_cfg = [
-        {"label": "Pagi", "emoji": "🌅", "start_time": "04:45", "end_time": "09:59"},
-        {"label": "Siang", "emoji": "☀️", "start_time": "10:00", "end_time": "14:59"},
-        {"label": "Malam", "emoji": "🌙", "start_time": "18:00", "end_time": "23:59"},
-    ]
-    c.post("/api/config", json={"day_segments": seg_cfg})
-    live_segs = c.get("/api/config").json()["day_segments"]
-    S_PAGI, S_SIANG, S_MALAM = [x["id"] for x in live_segs]
-
-    # Created deliberately out of section order, and with NO due_time at all
-    mk = lambda title, seg, order: c.post("/api/tasks", json={
-        "title": title, "points": 5, "date_key": today_local, "duration_minutes": 10,
-        "target_children": [adskhan["id"]], "segment_id": seg, "order": order}).json()
-    t_m2 = mk("Malam kedua", S_MALAM, 2)
-    t_p1 = mk("Pagi pertama", S_PAGI, 1)
-    t_p2 = mk("Pagi kedua", S_PAGI, 2)
-    t_s1 = mk("Siang pertama", S_SIANG, 1)
-
-    check("segtask: segment stored on the task", c.get(f"/api/tasks?child_id={adskhan['id']}").json()[0].get("segment_id") is not None)
-    check("segtask: no per-task time needed", all(not t.get("due_time") for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json()))
-
-    import asyncio as _asg
-    def _seq():
-        """Queue order only — deliberately independent of which section happens
-        to be open at the moment the suite runs."""
-        rows = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
-        rows = [t for t in rows if t["status"] in ("pending", "rejected")]
-        segs = c.get("/api/config").json()["day_segments"]
-        rows.sort(key=lambda t: (server._task_sort_anchor(t, segs), t.get("order") or 0))
-        return [t["title"] for t in rows]
-
-    check("segtask: sections ordered by their start time, tasks by order",
-          _seq() == ["Pagi pertama", "Pagi kedua", "Siang pertama", "Malam kedua"], str(_seq()))
-    _asg.run(server.db.tasks.update_one({"id": t_p1["id"]}, {"$set": {"status": "approved"}}))
-    check("segtask: order within a section is respected",
-          _seq() == ["Pagi kedua", "Siang pertama", "Malam kedua"], str(_seq()))
-    _asg.run(server.db.tasks.update_one({"id": t_p2["id"]}, {"$set": {"status": "approved"}}))
-    check("segtask: moves to the next section by its start time",
-          _seq() == ["Siang pertama", "Malam kedua"], str(_seq()))
-    _asg.run(server.db.tasks.update_one({"id": t_s1["id"]}, {"$set": {"status": "approved"}}))
-    check("segtask: later section last despite being created first", _seq() == ["Malam kedua"], str(_seq()))
-
-    # Lateness is section-based: a task in a section that has already closed
-    # is time-stuck even though it has no time of its own.
-    _asg.run(server._refresh_segments_cache())
-    past_seg = [{"label": "Sudah lewat", "start_time": "00:00", "end_time": "00:01"},
-                {"label": "Nanti", "start_time": "23:58", "end_time": "23:59"}]
-    c.post("/api/config", json={"day_segments": past_seg})
-    ps = c.get("/api/config").json()["day_segments"]
-    _asg.run(server._refresh_segments_cache())
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    closed = mk("Di sesi yang sudah lewat", ps[0]["id"], 1)
-    future = mk("Di sesi nanti malam", ps[1]["id"], 1)
-    check("segtask: closed section marks task stuck",
-          server._task_is_time_stuck(_asg.run(server.db.tasks.find_one({"id": closed["id"]}))) is True)
-    check("segtask: open section does not",
-          server._task_is_time_stuck(_asg.run(server.db.tasks.find_one({"id": future["id"]}))) is False)
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{closed['id']}/start")
-    check("segtask: closed-section task blocked from starting", r.status_code == 409, str(r.status_code))
-    check("segtask: refusal mentions Terlambat", "Terlambat" in r.text, r.text[:150])
-
-    # Weekday tagging (no explicit date) still creates the right slots
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    r = c.post("/api/tasks", json={"title": "Tiap Senin & Rabu", "points": 5, "duration_minutes": 10,
-                                   "target_children": [adskhan["id"]], "segment_id": ps[0]["id"],
-                                   "weekdays": [0, 2], "recurrence": "weekly"})
-    check("segtask: weekday tagging accepted without a date", r.status_code == 200, r.text[:200])
-    made = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json() if t["title"] == "Tiap Senin & Rabu"]
-    check("segtask: one copy per tagged weekday", len(made) == 2, str(len(made)))
-    check("segtask: copies land on Mon and Wed",
-          sorted(_dt_off.datetime.strptime(t["date_key"], "%Y-%m-%d").weekday() for t in made) == [0, 2],
-          str([t["date_key"] for t in made]))
-    check("segtask: weekday copies keep the section", all(t.get("segment_id") == ps[0]["id"] for t in made))
-    check("segtask: weekday copies are weekly-recurring", all(t["recurrence"] == "weekly" for t in made))
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    _asg.run(server._refresh_segments_cache())
-
     # =============== DRAG & DROP REORDER ===============
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
@@ -3173,11 +2330,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     after = {t["id"]: t["order"] for t in c.get(f"/api/tasks?child_id={adskhan['id']}").json()}
     check("reorder: positions applied in the given sequence",
           after[ids[2]] == 1 and after[ids[1]] == 2 and after[ids[0]] == 3, str(after))
-
-    # Sequencing follows the new order
-    import asyncio as _aro
-    nxt = _aro.run(server.get_next_actionable_task(adskhan["id"], today_local))
-    check("reorder: quest sequence follows the new order", nxt["title"] == "Ro C", str(nxt["title"]))
 
     # Guards
     r = c.post("/api/tasks/reorder", json={"task_ids": ids + ["ghost-id"]})
@@ -3250,51 +2402,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
 
-    # =============== SECTION WINDOWS GATE STARTING ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _now_l = server._now_local()
-    _nm = _now_l.hour * 60 + _now_l.minute
-    def _hhmm(m):
-        m = max(0, min(m, 23 * 60 + 59))
-        return f"{m // 60:02d}:{m % 60:02d}"
-    c.post("/api/config", json={"min_gap_seconds": 0})
-    win_segs = [
-        {"label": "Lewat", "start_time": "00:00", "end_time": _hhmm(max(1, _nm - 30))},
-        {"label": "Sekarang", "start_time": _hhmm(max(2, _nm - 29)), "end_time": _hhmm(min(_nm + 30, 23 * 60 + 58))},
-        {"label": "Nanti", "start_time": _hhmm(min(_nm + 31, 23 * 60 + 59)), "end_time": "23:59"},
-    ]
-    r = c.post("/api/config", json={"day_segments": win_segs})
-    check("window: three-window config accepted", r.status_code == 200, r.text[:200])
-    W = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    mkw = lambda title, seg: c.post("/api/tasks", json={
-        "title": title, "points": 5, "date_key": today_local, "duration_minutes": 10,
-        "target_children": [adskhan["id"]], "segment_id": seg}).json()
-    w_past, w_now, w_future = mkw("Sesi lewat", W[0]), mkw("Sesi sekarang", W[1]), mkw("Sesi nanti", W[2])
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{w_future['id']}/start")
-    check("window: future section refuses start", r.status_code == 409 and "Belum waktunya" in r.text, r.text[:160])
-    r = c.post(f"/api/tasks/{w_past['id']}/start")
-    check("window: closed section refuses start", r.status_code == 409 and "Terlambat" in r.text, r.text[:160])
-    # The key fix: a missed earlier section must NOT freeze the current one.
-    r = c.post(f"/api/tasks/{w_now['id']}/start")
-    check("window: current section starts even with an unresolved earlier one",
-          r.status_code == 200, r.text[:160])
-
-    # Owning the lateness unblocks the closed-section task without waiting
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"late_reasons": [{"label": "Macet", "gives_penalty_card": False, "award_points": True}]})
-    _wr = c.get("/api/config").json()["late_reasons"][0]["id"]
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{w_past['id']}/late-reason", json={"reason_id": _wr})
-    check("window: closed-section task can be owned via Terlambat", r.status_code == 200, r.text[:150])
-    # Future sections are simply not late yet — Terlambat must refuse them
-    r = c.post(f"/api/tasks/{w_future['id']}/late-reason", json={"reason_id": _wr})
-    check("window: future section is not 'late'", r.status_code == 400, str(r.status_code))
-
     # =============== BULK DELETE ===============
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
@@ -3322,146 +2429,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
-    # =============== PACING & ANTI-RAPEL GUARDS ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
-        "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
-    c.post("/api/config", json={"day_segments": [{"label": "Sehari penuh", "start_time": "00:00", "end_time": "23:59"}]})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    r = c.get("/api/config")
-    check("pacing: defaults exposed", r.json()["min_gap_seconds"] == 0
-          and "flash_threshold_pct" in r.json() and "pacing_bonus_points" in r.json(), str(r.json().get("flash_threshold_pct")))
-    r = c.post("/api/config", json={"min_gap_seconds": 2000})
-    check("pacing: absurd cooldown rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"flash_threshold_pct": 150})
-    check("pacing: flash pct >100 rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"pacing_bonus_points": -1})
-    check("pacing: negative bonus rejected", r.status_code == 422, str(r.status_code))
-
-    mkp = lambda title, dur=10, bonus=False: c.post("/api/tasks", json={
-        "title": title, "points": 10, "date_key": today_local, "duration_minutes": dur,
-        "target_children": [adskhan["id"]], "is_bonus": bonus}).json()
-
-    # --- Cooldown blocks a rapid second start ---
-    c.post("/api/config", json={"min_gap_seconds": 60, "pacing_bonus_points": 0})
-    p1, p2 = mkp("Pacing satu"), mkp("Pacing dua")
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{p1['id']}/start")
-    check("pacing: first mission of the day starts freely", r.status_code == 200, r.text[:150])
-    c.post(f"/api/tasks/{p1['id']}/complete")
-    r = c.post(f"/api/tasks/{p2['id']}/start")
-    check("pacing: rapid next start blocked", r.status_code == 429, str(r.status_code))
-    check("pacing: block tells the child how long to wait", "detik" in r.text, r.text[:150])
-
-    # Bonus missions are exempt from the cooldown
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    pb = mkp("Pacing bonus", bonus=True)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{pb['id']}/start")
-    check("pacing: bonus mission ignores the cooldown", r.status_code == 200, r.text[:150])
-
-    # Cooldown honours its config: 0 disables it entirely
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"min_gap_seconds": 0})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{p2['id']}/start")
-    check("pacing: cooldown of 0 disables the guard", r.status_code == 200, r.text[:150])
-
-    # --- Flash flag: fast finish is recorded, never blocked ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"flash_threshold_pct": 15})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{p2['id']}/complete")
-    check("pacing: instant finish still allowed", r.status_code == 200, r.text[:150])
-    p2_after = _aio_tg.run(server.db.tasks.find_one({"id": p2["id"]}, {"_id": 0}))
-    check("pacing: instant finish flagged as kilat", p2_after.get("flash_flag") is True, str(p2_after.get("flash_flag")))
-    check("pacing: actual duration recorded", p2_after.get("actual_seconds") is not None, str(p2_after.get("actual_seconds")))
-
-    # A believable finish is NOT flagged
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    slow = mkp("Dikerjakan wajar", dur=1)
-    _aio_tg.run(server.db.tasks.update_one({"id": slow["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=50)).isoformat()}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{slow['id']}/complete")
-    slow_after = _aio_tg.run(server.db.tasks.find_one({"id": slow["id"]}, {"_id": 0}))
-    check("pacing: believable finish not flagged", not slow_after.get("flash_flag"), str(slow_after.get("flash_flag")))
-
-    # --- Pacing bonus: healthy rhythm pays, rushing doesn't ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"pacing_bonus_points": 3, "min_gap_seconds": 60, "early_bonus_pct": 0})
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
-        "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
-    good = mkp("Ritme sehat", dur=1)
-    _aio_tg.run(server.db.tasks.update_one({"id": good["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=55)).isoformat(),
-        "gap_from_prev_seconds": 300}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{good['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{good['id']}/approve")
-    ads_pb = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("pacing: healthy rhythm earns the bonus", ads_pb["points"] == 13, str(ads_pb["points"]))
-    good_after = next(t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json() if t["id"] == good["id"])
-    check("pacing: bonus recorded on the task", good_after.get("pacing_bonus_awarded") == 3, str(good_after.get("pacing_bonus_awarded")))
-
-    # Rushed finish earns no pacing bonus
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
-    rush = mkp("Buru-buru", dur=10)
-    _aio_tg.run(server.db.tasks.update_one({"id": rush["id"]}, {"$set": {
-        "timer_started_at": _dt_off.datetime.now(_dt_off.timezone.utc).isoformat(),
-        "gap_from_prev_seconds": 600}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{rush['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{rush['id']}/approve")
-    ads_rush = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("pacing: rushed finish earns no bonus", ads_rush["points"] == 10, str(ads_rush["points"]))
-
-    # Batched (tiny gap) finish earns no pacing bonus either
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
-    batched = mkp("Dirapel", dur=1)
-    _aio_tg.run(server.db.tasks.update_one({"id": batched["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=55)).isoformat(),
-        "gap_from_prev_seconds": 5}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{batched['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{batched['id']}/approve")
-    ads_b = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("pacing: batched start earns no bonus", ads_b["points"] == 10, str(ads_b["points"]))
-
-    # Bonus of 0 turns the whole reward off
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
-    c.post("/api/config", json={"pacing_bonus_points": 0})
-    off = mkp("Bonus mati", dur=1)
-    _aio_tg.run(server.db.tasks.update_one({"id": off["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(seconds=55)).isoformat(),
-        "gap_from_prev_seconds": 300}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{off['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{off['id']}/approve")
-    check("pacing: bonus of 0 disables the reward",
-          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 10)
-
-    # --- Rapel signal surfaces in the honesty insight ---
-    r = c.get("/api/family/honesty-insight?days=14")
-    ins = next(x for x in r.json()["children"] if x["child_id"] == adskhan["id"])
-    check("pacing: insight reports burst count", ins.get("burst_count", 0) >= 1, str(ins.get("burst_count")))
-    check("pacing: insight reports flagged kilat finishes", ins.get("flagged_flash_count", 0) >= 1, str(ins.get("flagged_flash_count")))
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.get("/api/family/honesty-insight")
-    check("pacing: insight stays parent-only", r.status_code == 403, str(r.status_code))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"min_gap_seconds": 0, "pacing_bonus_points": 0, "early_bonus_pct": 10,
-                                "day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== JAM MULAI PER ANAK PER HARI + AUTO-START ===============
+    # =============== JAM MULAI PER ANAK PER HARI ===============
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
     _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
@@ -3473,15 +2441,13 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         return f"{m // 60:02d}:{m % 60:02d}"
     # One wide section that is definitely open right now
     wide = [{"label": "Sesi Uji", "start_time": "00:00", "end_time": "23:59"}]
-    c.post("/api/config", json={"day_segments": wide, "segment_late_grace_minutes": 10,
-                                "auto_start_next": True, "min_gap_seconds": 0})
+    c.post("/api/config", json={"day_segments": wide, "segment_late_grace_minutes": 10})
     SID = c.get("/api/config").json()["day_segments"][0]["id"]
     _asx.run(server._refresh_segments_cache())
     _today_wd = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
 
     r = c.get("/api/config")
-    check("segstart: grace + auto-start defaults exposed",
-          r.json()["segment_late_grace_minutes"] == 10 and r.json()["auto_start_next"] is True, r.text[:120])
+    check("segstart: grace exposed", r.json()["segment_late_grace_minutes"] == 10, r.text[:120])
 
     # --- validation ---
     r = c.put(f"/api/children/{adskhan['id']}/segment-starts",
@@ -3522,361 +2488,59 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     mkseg = lambda title, order: c.post("/api/tasks", json={
         "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
         "target_children": [adskhan["id"]], "segment_id": SID, "order": order}).json()
+    sbody_ads = {"child_id": adskhan["id"], "date_key": today_local, "segment_id": SID}
     later = _fm(min(_nmin + 90, 23 * 60 + 59))
     c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {_today_wd: later}}})
     t_ns = mkseg("Belum mulai personal", 1)
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_ns['id']}/start")
-    check("segstart: personal start blocks an early start", r.status_code == 409, str(r.status_code))
-    check("segstart: message quotes the personal time", later in r.text, r.text[:180])
+    r = c.post("/api/segment-sessions/start", json=sbody_ads)
+    if _nmin + 90 <= 23 * 60 + 59:
+        check("segstart: personal start blocks an early start", r.status_code == 409, str(r.status_code))
+        check("segstart: message quotes the personal time", later in r.text, r.text[:180])
 
-    # Sibling with no override is NOT blocked by Adskhan's personal time.
-    # Clear Syila's overrides first: an earlier block set one for weekday 0,
-    # which silently collides whenever the suite happens to run on a Monday.
+    # Sibling is NOT bound by Adskhan's personal time (hers starts now).
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.put(f"/api/children/{syila['id']}/segment-starts", json={"starts": {}})
-    t_syi = c.post("/api/tasks", json={"title": "Syila bebas", "points": 10, "date_key": today_local,
-                                       "duration_minutes": 10, "target_children": [syila["id"]],
-                                       "segment_id": SID, "order": 1}).json()
+    c.put(f"/api/children/{syila['id']}/segment-starts", json={"starts": {SID: {_today_wd: _fm(_nmin)}}})
+    c.post("/api/tasks", json={"title": "Syila bebas", "points": 10, "date_key": today_local,
+                               "duration_minutes": 10, "target_children": [syila["id"]],
+                               "segment_id": SID, "order": 1})
     c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{t_syi['id']}/start")
+    r = c.post("/api/segment-sessions/start", json={**sbody_ads, "child_id": syila["id"]})
     check("segstart: sibling unaffected by the other's personal start", r.status_code == 200, r.text[:150])
 
-    # --- lateness vs grace on the FIRST mission of a section ---
+    # --- lateness vs grace when starting a section ---
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
     within = _fm(max(0, _nmin - 5))     # started 5 min ago → inside 10-min grace
     beyond = _fm(max(0, _nmin - 40))    # 40 min ago → past grace
     c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {_today_wd: within}}})
-    t_grace = mkseg("Masih dalam toleransi", 1)
+    mkseg("Masih dalam toleransi", 1)
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_grace['id']}/start")
-    check("segstart: inside the grace window still starts", r.status_code == 200, r.text[:150])
+    r = c.post("/api/segment-sessions/start", json=sbody_ads)
+    check("segstart: inside the grace window still starts", r.status_code == 200 and r.json()["start_late"] is False,
+          r.text[:150])
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
     c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {SID: {_today_wd: beyond}}})
-    t_late = mkseg("Lewat toleransi", 1)
+    mkseg("Lewat toleransi", 1)
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_late['id']}/start")
-    check("segstart: past grace demands the Terlambat flow",
-          r.status_code == 409 and "Terlambat" in r.text, r.text[:180])
-    # Widening the grace makes it acceptable again — config really is in charge
+    r = c.post("/api/segment-sessions/start", json=sbody_ads)
+    if _nmin >= 40:
+        check("segstart: past grace asks for a reason", r.status_code == 409 and "LATE_REASON_REQUIRED" in r.text,
+              r.text[:180])
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     # Tolerance is capped at 15 minutes, so anything wider is refused outright.
     r = c.post("/api/config", json={"segment_late_grace_minutes": 120})
     check("segstart: tolerance above 15 minutes is rejected", r.status_code == 422, str(r.status_code))
     r = c.post("/api/config", json={"segment_late_grace_minutes": 15})
     check("segstart: 15 minutes is the accepted maximum", r.status_code == 200, r.text[:150])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"segment_late_grace_minutes": 10})
-
-    # Only the FIRST mission is judged on punctuality
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    f1, f2 = mkseg("Pertama", 1), mkseg("Kedua", 2)
-    _aio_tg.run(server.db.tasks.update_one({"id": f1["id"]}, {"$set": {"status": "approved"}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{f2['id']}/start")
-    check("segstart: later missions aren't judged on punctuality", r.status_code == 200, r.text[:150])
-
-    # --- auto-start hand-off ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={"min_gap_seconds": 45, "auto_start_next": True})
-    a1, a2 = mkseg("Rantai satu", 1), mkseg("Rantai dua", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{a1['id']}/start")
-    r = c.post(f"/api/tasks/{a1['id']}/complete")
-    nx = r.json().get("auto_next")
-    check("autostart: next mission offered on finish", nx and nx["id"] == a2["id"], str(nx))
-    check("autostart: popup carries title, points and duration",
-          nx and nx["title"] == "Rantai dua" and nx["points"] == 10 and nx["duration_minutes"] == 10, str(nx))
-    check("autostart: countdown matches the cooldown", nx and nx["wait_seconds"] == 45, str(nx))
-
-    # Last mission of a section hands off to nothing
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.update_one({"id": a2["id"]}, {"$set": {"gap_from_prev_seconds": 999}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{a2['id']}/start")
-    r = c.post(f"/api/tasks/{a2['id']}/complete")
-    check("autostart: no hand-off after the last mission", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
-
-    # Never hands off across sections
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    two_segs = [{"label": "Sesi A", "start_time": "00:00", "end_time": "23:58"},
-                {"label": "Sesi B", "start_time": "23:59", "end_time": "23:59"}]
-    c.post("/api/config", json={"day_segments": two_segs})
-    SA, SB = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
-    _asx.run(server._refresh_segments_cache())
-    x1 = c.post("/api/tasks", json={"title": "Akhir sesi A", "points": 5, "date_key": today_local,
-                                    "duration_minutes": 5, "target_children": [adskhan["id"]],
-                                    "segment_id": SA, "order": 1}).json()
-    c.post("/api/tasks", json={"title": "Awal sesi B", "points": 5, "date_key": today_local,
-                               "duration_minutes": 5, "target_children": [adskhan["id"]],
-                               "segment_id": SB, "order": 2})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{x1['id']}/start")
-    r = c.post(f"/api/tasks/{x1['id']}/complete")
-    check("autostart: never hands off across sections", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
-
-    # Bonus missions are never auto-offered, and the toggle silences it
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"day_segments": wide})
-    SID = c.get("/api/config").json()["day_segments"][0]["id"]
-    _asx.run(server._refresh_segments_cache())
-    b1 = mkseg("Wajib satu", 1)
-    c.post("/api/tasks", json={"title": "Bonus jangan ditawarkan", "points": 5, "date_key": today_local,
-                               "duration_minutes": 5, "target_children": [adskhan["id"]],
-                               "segment_id": SID, "is_bonus": True, "order": 2})
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{b1['id']}/start")
-    r = c.post(f"/api/tasks/{b1['id']}/complete")
-    check("autostart: bonus missions are never auto-offered", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"auto_start_next": False})
-    d1, d2 = mkseg("Diam satu", 1), mkseg("Diam dua", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{d1['id']}/start")
-    r = c.post(f"/api/tasks/{d1['id']}/complete")
-    check("autostart: toggle off silences the hand-off", r.json().get("auto_next") is None, str(r.json().get("auto_next")))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"auto_start_next": True, "min_gap_seconds": 0,
-                                "day_segments": server.DEFAULT_DAY_SEGMENTS})
+    c.post("/api/config", json={"segment_late_grace_minutes": 10, "day_segments": server.DEFAULT_DAY_SEGMENTS})
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
     _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
     _asx.run(server._refresh_segments_cache())
-
-    # =============== TUNDA (snooze) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    _asn = __import__("asyncio")
-    c.post("/api/config", json={"day_segments": [{"label": "Sesi Tunda", "start_time": "00:00", "end_time": "23:59"}],
-                                "min_gap_seconds": 0, "auto_start_next": True})
-    TSID = c.get("/api/config").json()["day_segments"][0]["id"]
-    _asn.run(server._refresh_segments_cache())
-
-    r = c.get("/api/config")
-    check("snooze: default options exposed", r.json()["snooze_options_minutes"] == [5, 10, 15, 20], str(r.json().get("snooze_options_minutes")))
-
-    # --- config validation ---
-    r = c.post("/api/config", json={"snooze_options_minutes": [3, 7, 12]})
-    check("snooze: custom options accepted", r.status_code == 200, r.text[:150])
-    check("snooze: options stored sorted", c.get("/api/config").json()["snooze_options_minutes"] == [3, 7, 12])
-    r = c.post("/api/config", json={"snooze_options_minutes": []})
-    check("snooze: empty options rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"snooze_options_minutes": [1, 2, 3, 4, 5, 6, 7]})
-    check("snooze: too many options rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"snooze_options_minutes": [5, 999]})
-    check("snooze: absurd duration rejected", r.status_code == 422, str(r.status_code))
-    c.post("/api/config", json={"snooze_options_minutes": [5, 10, 15, 20]})
-
-    mksn = lambda title, order: c.post("/api/tasks", json={
-        "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
-        "target_children": [adskhan["id"]], "segment_id": TSID, "order": order}).json()
-    s1, s2 = mksn("Tunda satu", 1), mksn("Tunda dua", 2)
-
-    # --- snoozing a task ---
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{s2['id']}/snooze", json={"minutes": 7})
-    check("snooze: value outside the configured options rejected", r.status_code == 422, str(r.status_code))
-    r = c.post(f"/api/tasks/{s2['id']}/snooze", json={"minutes": 10})
-    check("snooze: accepted option works", r.status_code == 200 and r.json()["minutes"] == 10, r.text[:180])
-    check("snooze: deadline is a real timestamp", bool(r.json().get("snooze_until")), r.text[:150])
-    s2_doc = _aio_tg.run(server.db.tasks.find_one({"id": s2["id"]}, {"_id": 0}))
-    check("snooze: counted for the parent to see", s2_doc.get("snooze_count") == 1, str(s2_doc.get("snooze_count")))
-
-    # Coming back EARLY is always fine — still startable during the snooze
-    r = c.post(f"/api/tasks/{s1['id']}/start")
-    check("snooze: unrelated task unaffected", r.status_code == 200, r.text[:150])
-    c.post(f"/api/tasks/{s1['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{s1['id']}/approve")
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{s2['id']}/start")
-    check("snooze: starting before the deadline is allowed", r.status_code == 200, r.text[:150])
-    s2_started = _aio_tg.run(server.db.tasks.find_one({"id": s2["id"]}, {"_id": 0}))
-    check("snooze: deadline cleared once started", not s2_started.get("snooze_until"), str(s2_started.get("snooze_until")))
-
-    # --- an EXPIRED snooze routes through Terlambat, it does not fail ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"late_reasons": [
-        {"label": "Ke kamar mandi", "gives_penalty_card": False, "award_points": True},
-        {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
-    _snr = c.get("/api/config").json()["late_reasons"]
-    _sn_ok, _sn_bad = _snr[0]["id"], _snr[1]["id"]
-    # A section OPENER keeps its excused reasons (arriving home late is not the
-    # child's doing), so this must be a later mission to exercise the strict
-    # path — the opener case is covered on its own below.
-    _s3_opener = mksn("Pembuka sesi", 1)
-    _aio_tg.run(server.db.tasks.update_one({"id": _s3_opener["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-    s3 = mksn("Tunda kelewat", 2)
-    _aio_tg.run(server.db.tasks.update_one({"id": s3["id"]}, {"$set": {
-        "snooze_until": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=5)).isoformat(),
-        "snooze_count": 1}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{s3['id']}/start")
-    check("snooze: expired snooze blocks a plain start", r.status_code == 409, str(r.status_code))
-    check("snooze: refusal points to Terlambat", "Terlambat" in r.text, r.text[:170])
-    # Having already asked for extra time and let it lapse, the excused reasons
-    # are no longer on offer — the delay was a choice.
-    r = c.post(f"/api/tasks/{s3['id']}/late-reason", json={"reason_id": _sn_ok})
-    check("snooze: an excused reason is refused after the snooze lapsed", r.status_code == 422, str(r.status_code))
-    r = c.post(f"/api/tasks/{s3['id']}/late-reason", json={"reason_id": _sn_bad})
-    check("snooze: expired snooze can be owned with an at-fault reason", r.status_code == 200, r.text[:150])
-    r = c.post(f"/api/tasks/{s3['id']}/start")
-    check("snooze: startable again after acknowledging", r.status_code == 200, r.text[:150])
-    c.post(f"/api/tasks/{s3['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{s3['id']}/approve")
-    check("snooze: at-fault overrun still approves fine", r.status_code == 200, r.text[:150])
-
-    # At-fault overrun still costs the points
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0, "penalty_cards": 0}}))
-    s4 = mksn("Tunda kelewat salah sendiri", 1)
-    _aio_tg.run(server.db.tasks.update_one({"id": s4["id"]}, {"$set": {
-        "snooze_until": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=30)).isoformat()}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{s4['id']}/late-reason", json={"reason_id": _sn_bad})
-    c.post(f"/api/tasks/{s4['id']}/start")
-    c.post(f"/api/tasks/{s4['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{s4['id']}/approve")
-    ads_sn = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
-    check("snooze: at-fault overrun earns no points", ads_sn["points"] == 0, str(ads_sn["points"]))
-    check("snooze: at-fault overrun still costs a card", ads_sn["penalty_cards"] >= 1, str(ads_sn["penalty_cards"]))
-
-    # --- guards ---
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    s5 = mksn("Guard tunda", 1)
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{s5['id']}/snooze", json={"minutes": 5})
-    check("snooze: sibling cannot snooze someone else's mission", r.status_code == 403, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{s5['id']}/start")
-    r = c.post(f"/api/tasks/{s5['id']}/snooze", json={"minutes": 5})
-    check("snooze: an already-started mission cannot be snoozed", r.status_code == 400, str(r.status_code))
-    c.post(f"/api/tasks/{s5['id']}/complete")
-    r = c.post(f"/api/tasks/{s5['id']}/snooze", json={"minutes": 5})
-    check("snooze: a finished mission cannot be snoozed", r.status_code == 400, str(r.status_code))
-    r = c.post("/api/tasks/tidak-ada/snooze", json={"minutes": 5})
-    check("snooze: unknown mission → 404", r.status_code == 404, str(r.status_code))
-
-    # --- parent visibility ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get(f"/api/activity?child_id={adskhan['id']}&limit=50")
-    check("snooze: logged for parent monitoring",
-          any(x["action"] == "task_snoozed" for x in r.json()), str([x["action"] for x in r.json()][:8]))
-    snoozed_log = next(x for x in r.json() if x["action"] == "task_snoozed")
-    check("snooze: log records which mission and how long",
-          snoozed_log["details"].get("minutes") and snoozed_log["details"].get("title"), str(snoozed_log.get("details")))
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "snooze_options_minutes": [5, 10, 15, 20]})
-    _asn.run(server._refresh_segments_cache())
-
-    # =============== BATAS TUNDA PER TUGAS ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"snooze_options_minutes": [5, 10, 15, 20],
-                                "day_segments": [{"label": "Sesi Cap", "start_time": "00:00", "end_time": "23:59"}],
-                                "min_gap_seconds": 0, "auto_start_next": True})
-    CSID = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    mkcap = lambda title, order, cap=None: c.post("/api/tasks", json={
-        "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
-        "target_children": [adskhan["id"]], "segment_id": CSID, "order": order,
-        **({"max_snooze_minutes": cap} if cap is not None else {})}).json()
-
-    r = c.post("/api/tasks", json={"title": "Cap invalid", "points": 5, "date_key": today_local,
-                                   "target_children": [adskhan["id"]], "max_snooze_minutes": 999})
-    check("cap: absurd cap rejected", r.status_code == 422, str(r.status_code))
-
-    normal = mkcap("Beres-beres", 1)
-    sholat = mkcap("Sholat Maghrib", 2, cap=10)
-    never = mkcap("Tidak boleh ditunda", 3, cap=1)
-    check("cap: stored on the task", sholat.get("max_snooze_minutes") == 10, str(sholat.get("max_snooze_minutes")))
-    check("cap: absent when not set", not normal.get("max_snooze_minutes"), str(normal.get("max_snooze_minutes")))
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    # Uncapped mission still accepts the family's longest option
-    r = c.post(f"/api/tasks/{normal['id']}/snooze", json={"minutes": 20})
-    check("cap: uncapped mission allows the longest snooze", r.status_code == 200, r.text[:150])
-
-    # Capped mission refuses anything beyond its own limit...
-    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 20})
-    check("cap: capped mission refuses a longer snooze", r.status_code == 422, str(r.status_code))
-    check("cap: refusal states the mission's own limit", "10 menit" in r.text, r.text[:180])
-    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 15})
-    check("cap: still refuses just above the cap", r.status_code == 422, str(r.status_code))
-    # ...but accepts anything within it
-    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 10})
-    check("cap: accepts a snooze at exactly the cap", r.status_code == 200, r.text[:150])
-    _aio_tg.run(server.db.tasks.update_one({"id": sholat["id"]}, {"$unset": {"snooze_until": ""}}))
-    r = c.post(f"/api/tasks/{sholat['id']}/snooze", json={"minutes": 5})
-    check("cap: accepts a snooze below the cap", r.status_code == 200, r.text[:150])
-
-    # A cap below every option means the mission simply can't be put off
-    r = c.post(f"/api/tasks/{never['id']}/snooze", json={"minutes": 5})
-    check("cap: a cap below all options blocks snoozing entirely", r.status_code == 400, str(r.status_code))
-    check("cap: block says so plainly", "tidak boleh ditunda" in r.text.lower(), r.text[:170])
-
-    # The hand-off popup only advertises options the mission actually allows
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    h1 = mkcap("Pembuka", 1)
-    mkcap("Sholat Isya", 2, cap=10)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{h1['id']}/start")
-    r = c.post(f"/api/tasks/{h1['id']}/complete")
-    nxt_cap = r.json().get("auto_next")
-    check("cap: hand-off carries the trimmed options",
-          nxt_cap and nxt_cap.get("snooze_options") == [5, 10], str(nxt_cap and nxt_cap.get("snooze_options")))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== PENGINGAT WAKTU HAMPIR HABIS ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get("/api/config")
-    check("warn: defaults exposed newest-first", r.json()["duration_warning_minutes"] == [3, 2, 1],
-          str(r.json().get("duration_warning_minutes")))
-
-    r = c.post("/api/config", json={"duration_warning_minutes": [1, 5, 10]})
-    check("warn: custom marks accepted", r.status_code == 200, r.text[:150])
-    check("warn: stored descending (soonest warning last)",
-          c.get("/api/config").json()["duration_warning_minutes"] == [10, 5, 1],
-          str(c.get("/api/config").json()["duration_warning_minutes"]))
-    r = c.post("/api/config", json={"duration_warning_minutes": [5, 5, 3, 3]})
-    check("warn: duplicates collapsed", c.get("/api/config").json()["duration_warning_minutes"] == [5, 3],
-          str(c.get("/api/config").json()["duration_warning_minutes"]))
-    r = c.post("/api/config", json={"duration_warning_minutes": []})
-    check("warn: empty list turns the feature off", r.status_code == 200
-          and c.get("/api/config").json()["duration_warning_minutes"] == [], r.text[:150])
-    r = c.post("/api/config", json={"duration_warning_minutes": [1, 2, 3, 4, 5, 6, 7]})
-    check("warn: too many marks rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"duration_warning_minutes": [500]})
-    check("warn: absurd mark rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/config", json={"duration_warning_minutes": [0, -3]})
-    check("warn: non-positive marks dropped",
-          r.status_code == 200 and c.get("/api/config").json()["duration_warning_minutes"] == [], r.text[:150])
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/config", json={"duration_warning_minutes": [9]})
-    check("warn: kid cannot change the marks", r.status_code == 403, str(r.status_code))
-    r = c.get("/api/config")
-    check("warn: kid can read them (their app needs to fire the alarm)",
-          r.status_code == 200 and "duration_warning_minutes" in r.json())
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"duration_warning_minutes": [3, 2, 1]})
 
     # =============== TIMELINE ANAK MEMAKAI JAM PERSONALNYA ===============
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
@@ -3924,7 +2588,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     __import__("asyncio").run(server._refresh_segments_cache())
 
     # =============== REGRESI: EDIT TUGAS HARUS MENYIMPAN SEGMEN ===============
-    # Bug: TaskUpdate had no segment_id/max_snooze_minutes, so every edit
+    # Bug: TaskUpdate had no segment_id, so every edit
     # silently dropped them and the task snapped back to "Kapan Saja".
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
@@ -3960,341 +2624,80 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     after4 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
     check("editseg: null clears back to Kapan Saja", not after4.get("segment_id"), str(after4.get("segment_id")))
 
-    # Same story for the per-task snooze cap
-    c.patch(f"/api/tasks/{et['id']}", json={"max_snooze_minutes": 10})
-    after5 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
-    check("editseg: snooze cap persists through edit", after5.get("max_snooze_minutes") == 10, str(after5.get("max_snooze_minutes")))
-    c.patch(f"/api/tasks/{et['id']}", json={"title": "Ganti judul saja"})
-    after6 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
-    check("editseg: snooze cap survives an unrelated edit", after6.get("max_snooze_minutes") == 10, str(after6.get("max_snooze_minutes")))
-    c.patch(f"/api/tasks/{et['id']}", json={"max_snooze_minutes": None})
-    after7 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
-    check("editseg: snooze cap can be cleared", not after7.get("max_snooze_minutes"), str(after7.get("max_snooze_minutes")))
-
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
-    # =============== REGRESI: TOMBOL TERLAMBAT HARUS MUNCUL ===============
-    # Reported: at 05:05 with a personal 04:45 start and a 10-minute grace, the
-    # card still offered "Mulai" instead of "Terlambat". The UI was deriving the
-    # window rules itself and drifted from the server, so day-progress now
-    # states each task's availability outright.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    _nl2 = server._now_local(); _nm2 = _nl2.hour * 60 + _nl2.minute
-    _f2 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
-    c.post("/api/config", json={"day_segments": [{"label": "Pagi", "start_time": "00:00", "end_time": "23:59"}],
-                                "segment_late_grace_minutes": 10})
-    AVS = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    _wd2 = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
-
-    mkav = lambda title, order: c.post("/api/tasks", json={
-        "title": title, "points": 10, "date_key": today_local, "duration_minutes": 10,
-        "target_children": [adskhan["id"]], "segment_id": AVS, "order": order}).json()
-
-    # Personal start 20 minutes ago → past the 10-minute grace
-    c.put(f"/api/children/{adskhan['id']}/segment-starts",
-          json={"starts": {AVS: {_wd2: _f2(max(0, _nm2 - 20))}}})
-    av1 = mkav("Bangun pagi", 1)
-    mkav("Sholat Subuh", 2)
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    by_id = {t["id"]: t for t in r.json()["tasks"]}
-    check("avail: day-progress reports availability per task", "availability" in by_id[av1["id"]], str(by_id[av1["id"]].keys())[:120])
-    check("avail: past-grace opener marked closed (→ Terlambat)",
-          by_id[av1["id"]]["availability"] == "closed", str(by_id[av1["id"]]["availability"]))
-    check("avail: the server agrees and refuses a plain start",
-          c.post(f"/api/tasks/{av1['id']}/start").status_code == 409)
-
-    # Inside the grace → open, so "Mulai" is genuinely correct
-    c.put(f"/api/children/{adskhan['id']}/segment-starts",
-          json={"starts": {AVS: {_wd2: _f2(max(0, _nm2 - 5))}}})
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("avail: inside grace stays open",
-          {t["id"]: t for t in r.json()["tasks"]}[av1["id"]]["availability"] == "open")
-
-    # Personal start still ahead → future, and the exact hour is surfaced
-    _future_start = _f2(min(_nm2 + 120, 23 * 60 + 59))
-    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {AVS: {_wd2: _future_start}}})
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    fut = {t["id"]: t for t in r.json()["tasks"]}[av1["id"]]
-    check("avail: not-yet-started section marked future", fut["availability"] == "future", str(fut["availability"]))
-    check("avail: personal start time surfaced for the label",
-          fut.get("effective_start_time") == _future_start, str(fut.get("effective_start_time")))
-
-    # Acknowledging lateness reopens it
-    c.put(f"/api/children/{adskhan['id']}/segment-starts",
-          json={"starts": {AVS: {_wd2: _f2(max(0, _nm2 - 45))}}})
-    c.post("/api/config", json={"late_reasons": [{"label": "Bangun kesiangan", "gives_penalty_card": True, "award_points": False}]})
-    _avr = c.get("/api/config").json()["late_reasons"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    _rlr = c.post(f"/api/tasks/{av1['id']}/late-reason", json={"reason_id": _avr})
-    check("avail: overdue opener accepts a late reason", _rlr.status_code == 200, _rlr.text[:170])
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("avail: reopens after acknowledging the lateness",
-          {t["id"]: t for t in r.json()["tasks"]}[av1["id"]]["availability"] == "open")
-
-    # Bonus missions are always open regardless of section windows
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {AVS: {_wd2: _future_start}}})
-    bn = c.post("/api/tasks", json={"title": "Bonus bebas jam", "points": 5, "date_key": today_local,
-                                    "duration_minutes": 5, "target_children": [adskhan["id"]],
-                                    "segment_id": AVS, "is_bonus": True}).json()
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("avail: bonus missions ignore section windows",
-          {t["id"]: t for t in r.json()["tasks"]}[bn["id"]]["availability"] == "open")
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "segment_late_grace_minutes": 10})
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== "MULAI SEKARANG" MELEWATI JEDA ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={"day_segments": [{"label": "Sesi Early", "start_time": "00:00", "end_time": "23:59"}],
-                                "min_gap_seconds": 60, "bonus_follows_sequence": True})
-    EID = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mke = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                  "segment_id": EID, "order": o}).json()
-    e1, e2 = mke("Early satu", 1), mke("Early dua", 2)
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{e1['id']}/start")
-    c.post(f"/api/tasks/{e1['id']}/complete")
-    # Default: the cooldown still applies
-    r = c.post(f"/api/tasks/{e2['id']}/start")
-    check("early: cooldown still blocks a plain start", r.status_code == 429, str(r.status_code))
-    # "Mulai Sekarang" cuts it short
-    r = c.post(f"/api/tasks/{e2['id']}/start", json={"start_early": True})
-    check("early: start_early cuts the cooldown short", r.status_code == 200, r.text[:170])
-    e2_doc = _aio_tg.run(server.db.tasks.find_one({"id": e2["id"]}, {"_id": 0}))
-    check("early: the shortcut is recorded on the task", e2_doc.get("started_early") is True, str(e2_doc.get("started_early")))
-
-    # ...and it's visible to the parent rather than silently allowed
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get(f"/api/activity?child_id={adskhan['id']}&limit=40")
-    check("early: logged for the parent to see",
-          any(x["action"] == "task_started_early" for x in r.json()),
-          str([x["action"] for x in r.json()][:8]))
-    _elog = next(x for x in r.json() if x["action"] == "task_started_early")
-    check("early: log records the mission and the gap",
-          _elog["details"].get("title") and "gap_seconds" in _elog["details"], str(_elog.get("details")))
-
-    # A normal start (no rush) is NOT marked as early
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    e3 = mke("Early tiga", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{e3['id']}/start")
-    e3_doc = _aio_tg.run(server.db.tasks.find_one({"id": e3["id"]}, {"_id": 0}))
-    check("early: an ordinary start isn't flagged", not e3_doc.get("started_early"), str(e3_doc.get("started_early")))
-
-    # The shortcut must not bypass the OTHER guards
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _nl3 = server._now_local(); _nm3 = _nl3.hour * 60 + _nl3.minute
-    _f3 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
-    _wd3 = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
-    c.put(f"/api/children/{adskhan['id']}/segment-starts",
-          json={"starts": {EID: {_wd3: _f3(min(_nm3 + 120, 23 * 60 + 59))}}})
-    e4 = mke("Belum waktunya", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{e4['id']}/start", json={"start_early": True})
-    check("early: cannot bypass a section that hasn't opened", r.status_code == 409, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {}})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    q1, q2 = mke("Antre satu", 1), mke("Antre dua", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{q2['id']}/start", json={"start_early": True})
-    check("early: cannot jump the queue either", r.status_code == 409, str(r.status_code))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "min_gap_seconds": 0})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
     # =============== POIN OTOMATIS (tanpa antre persetujuan) ===============
+    # Finishing a section awards its missions straight away; the parent
+    # reviews afterwards and can undo.
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
     _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
         "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
-    c.post("/api/config", json={"auto_approve_tasks": True, "min_gap_seconds": 0,
-                                "day_segments": [{"label": "Sesi Auto", "start_time": "00:00", "end_time": "23:59"}],
-                                "early_bonus_pct": 0, "pacing_bonus_points": 0})
+    c.post("/api/config", json={"auto_approve_tasks": True,
+                                "late_reasons": [{"label": "Ada acara sekolah", "gives_penalty_card": False,
+                                                  "award_points": True}],
+                                "day_segments": [{"label": "Sesi Auto", "start_time": "00:00", "end_time": "23:59"}]})
     AAS = c.get("/api/config").json()["day_segments"][0]["id"]
     __import__("asyncio").run(server._refresh_segments_cache())
-    mka = lambda t, o, **kw: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                        "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                        "segment_id": AAS, "order": o, **kw}).json()
+    mka = lambda t, o, dk=today_local, **kw: c.post("/api/tasks", json={
+        "title": t, "points": 10, "date_key": dk, "duration_minutes": 10, "target_children": [adskhan["id"]],
+        "segment_id": AAS, "order": o, **kw}).json()
+
+    def run_section(dk, tids, photo=None):
+        c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
+        body = {"child_id": adskhan["id"], "date_key": dk, "segment_id": AAS}
+        reason = (c.get(f"/api/children/{adskhan['id']}/segments-day", params={"date_key": dk}).json()
+                  .get("late_reasons") or [{}])[0].get("id")
+        rs = c.post("/api/segment-sessions/start", json=body)
+        if rs.status_code == 409:
+            c.post("/api/segment-sessions/start", json={**body, "late_reason_id": reason})
+        for tid in tids:
+            c.post(f"/api/tasks/{tid}/check", json={"checked": True})
+            if photo:
+                c.post(f"/api/tasks/{tid}/photo", json={"kind": "after", "photo_url": photo})
+        return c.post("/api/segment-sessions/finish", json={**body, "late_reason_id": reason})
 
     a1 = mka("Otomatis satu", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{a1['id']}/start")
-    r = c.post(f"/api/tasks/{a1['id']}/complete")
-    check("autoapprove: reported on the completion", r.json().get("auto_approved") is True, str(r.json().get("auto_approved")))
-    check("autoapprove: task lands approved, not queued", r.json()["status"] == "approved", str(r.json()["status"]))
+    r = run_section(today_local, [a1["id"]])
+    check("autoapprove: reported on the finish", r.status_code == 200 and r.json()["awarded"] == 1, r.text[:150])
+    check("autoapprove: task lands approved, not queued",
+          _aio_tg.run(server.db.tasks.find_one({"id": a1["id"]}))["status"] == "approved")
     ads_aa = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     check("autoapprove: points awarded immediately", ads_aa["points"] == 10, str(ads_aa["points"]))
     check("autoapprove: buckets filled too",
           ads_aa["chiky_save"] + ads_aa["chiky_spend"] + ads_aa["chiky_share"] == 10, str(ads_aa["points"]))
 
-    # Nothing left sitting in the parent's approval queue
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     pending_q = [t for t in c.get("/api/tasks").json() if t["status"] == "completed"]
     check("autoapprove: approval queue stays empty", len(pending_q) == 0, str(len(pending_q)))
-
-    # Parent can still review and undo — that's the whole point of "review, not gatekeep"
     r = c.post(f"/api/tasks/{a1['id']}/undo-approval")
     check("autoapprove: parent can undo an automatic approval", r.status_code == 200, r.text[:170])
     ads_undo = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])
     check("autoapprove: undo takes the points back", ads_undo["points"] == 0, str(ads_undo["points"]))
 
-    # Photo-required missions still wait for a human look
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
-    a2 = mka("Butuh foto", 1, photo_required=True)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{a2['id']}/start")
-    r = c.post(f"/api/tasks/{a2['id']}/complete", json={"photo_url": "data:image/png;base64,iVBORw0KGgo="})
+    # Photo-required missions still wait for a human look (another day: one session per section per day)
+    d2 = (now_local - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    a2 = mka("Butuh foto", 1, dk=d2, photo_required=True)
+    r = run_section(d2, [a2["id"]], photo="data:image/png;base64,iVBORw0KGgo=")
     check("autoapprove: photo missions still need a human check",
-          r.json()["status"] == "completed" and r.json().get("auto_approved") is False, str(r.json()["status"]))
-    check("autoapprove: photo mission awards nothing yet",
-          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 0)
+          r.status_code == 200 and r.json()["awarded"] == 0
+          and _aio_tg.run(server.db.tasks.find_one({"id": a2["id"]}))["status"] == "completed", r.text[:150])
 
     # Turning it off restores the manual queue
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
     c.post("/api/config", json={"auto_approve_tasks": False})
-    a3 = mka("Manual lagi", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{a3['id']}/start")
-    r = c.post(f"/api/tasks/{a3['id']}/complete")
+    d3 = (now_local - _dt.timedelta(days=2)).strftime("%Y-%m-%d")
+    a3 = mka("Manual lagi", 1, dk=d3)
+    r = run_section(d3, [a3["id"]])
     check("autoapprove: toggle off returns to the manual queue",
-          r.json()["status"] == "completed" and r.json().get("auto_approved") is False, str(r.json()["status"]))
-    check("autoapprove: no points until a parent approves",
-          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 0)
+          r.status_code == 200 and r.json()["awarded"] == 0
+          and _aio_tg.run(server.db.tasks.find_one({"id": a3["id"]}))["status"] == "completed", r.text[:150])
 
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"auto_approve_tasks": False, "day_segments": server.DEFAULT_DAY_SEGMENTS,
-                                "early_bonus_pct": 10})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== MISI YANG KELEWAT DURASI TIDAK BOLEH BUNTU ===============
-    # Reported: a running mission that overran showed "Terlambat", but the
-    # server refused it as "already started" — leaving the child unable to
-    # report AND unable to finish.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0, "penalty_cards": 0}}))
-    c.post("/api/config", json={"day_segments": [{"label": "Sesi Overrun", "start_time": "00:00", "end_time": "23:59"}],
-                                "min_gap_seconds": 0, "auto_approve_tasks": False,
-                                "late_reasons": [{"label": "Kelamaan", "gives_penalty_card": False, "award_points": True}]})
-    OVS = c.get("/api/config").json()["day_segments"][0]["id"]
-    _ovr = c.get("/api/config").json()["late_reasons"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    ov = c.post("/api/tasks", json={"title": "Kelewat durasi", "points": 10, "date_key": today_local,
-                                    "duration_minutes": 5, "target_children": [adskhan["id"]],
-                                    "segment_id": OVS, "order": 1}).json()
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{ov['id']}/start")
-    # A mission comfortably inside its time has nothing to report
-    r = c.post(f"/api/tasks/{ov['id']}/late-reason", json={"reason_id": _ovr})
-    check("overrun: a mission still in time refuses a late report", r.status_code == 400, str(r.status_code))
-
-    # Push the start back so the duration has clearly elapsed
-    _aio_tg.run(server.db.tasks.update_one({"id": ov["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=30)).isoformat()}}))
-    r = c.post(f"/api/tasks/{ov['id']}/late-reason", json={"reason_id": _ovr})
-    check("overrun: an over-run mission CAN be reported", r.status_code == 200, r.text[:180])
-    ov_doc = _aio_tg.run(server.db.tasks.find_one({"id": ov["id"]}, {"_id": 0}))
-    check("overrun: the clock restarts so it's finishable", ov_doc.get("restarted_after_late") is True, str(ov_doc.get("restarted_after_late")))
-    check("overrun: fresh timer, not the stale one",
-          server._elapsed_seconds({**ov_doc, "completed_at": server.now_iso()}) < 120,
-          str(server._elapsed_seconds({**ov_doc, "completed_at": server.now_iso()})))
-
-    # ...and the whole flow completes rather than dead-ending
-    r = c.post(f"/api/tasks/{ov['id']}/complete")
-    check("overrun: can be completed after reporting", r.status_code == 200, r.text[:150])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{ov['id']}/approve")
-    check("overrun: can be approved", r.status_code == 200, r.text[:150])
-    check("overrun: excused reason keeps the points",
-          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 10,
-          str(next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"]))
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== REGRESI: SLOT DI SEGMEN BERBEDA TIDAK BOLEH MENYATU ===============
-    # Reported: one bonus chore configured in two sections showed up duplicated
-    # in both — the series identity ignored the section, so the materializer
-    # copied one slot into the other's day.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Sore", "start_time": "15:00", "end_time": "17:59"},
-        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
-    DS = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # Same title, same child, one in each section — two distinct slots. Dated in
-    # the PAST so the materializer has to revive them, which is exactly where a
-    # collapsed identity turns two slots into one (or duplicates one of them).
-    _past_dupe = (_off_base - _dt_off.timedelta(days=3)).strftime("%Y-%m-%d")
-    for sid in DS:
-        c.post("/api/tasks", json={"title": "Memberi makan white", "points": 5, "date_key": _past_dupe,
-                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                   "segment_id": sid, "is_bonus": True, "recurrence": "daily"})
-    c.post("/api/tasks/materialize-recurring?days_ahead=2")
-    before = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
-              if t["title"] == "Memberi makan white"]
-    check("dupe: two sections give exactly two slots", len(before) == 2, str(len(before)))
-
-    # The materializer must not turn them into four
-    c.post("/api/tasks/materialize-recurring?days_ahead=3")
-    after = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
-             if t["title"] == "Memberi makan white"]
-    check("dupe: materializing does not duplicate them", len(after) == 2, str(len(after)))
-    check("dupe: one slot per section", sorted(t["segment_id"] for t in after) == sorted(DS),
-          str([t["segment_id"] for t in after]))
-    c.post("/api/tasks/materialize-recurring?days_ahead=3")
-    again = [t for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
-             if t["title"] == "Memberi makan white"]
-    check("dupe: still stable on a second sweep", len(again) == 2, str(len(again)))
-
-    # =============== HANYA MISI PEMBUKA YANG MENAMPILKAN JAM ===============
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _nl4 = server._now_local(); _nm4 = _nl4.hour * 60 + _nl4.minute
-    _f4 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
-    _later = _f4(min(_nm4 + 120, 23 * 60 + 58))
-    c.post("/api/config", json={"day_segments": [{"label": "Nanti", "start_time": _later, "end_time": "23:59"}]})
-    OSID = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    for i in range(1, 4):
-        c.post("/api/tasks", json={"title": f"Antre {i}", "points": 5, "date_key": today_local,
-                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                   "segment_id": OSID, "order": i})
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    rows = sorted(r.json()["tasks"], key=lambda t: t.get("order") or 0)
-    check("opener: every mission in a future section is 'future'",
-          all(t["availability"] == "future" for t in rows), str([t["availability"] for t in rows]))
-    check("opener: exactly one is flagged as the section opener",
-          sum(1 for t in rows if t.get("is_segment_opener")) == 1,
-          str([t.get("is_segment_opener") for t in rows]))
-    check("opener: it's the first by order, not an arbitrary one",
-          rows[0].get("is_segment_opener") is True, str(rows[0].get("title")))
-    check("opener: the rest are plainly queued, not each advertising the hour",
-          all(not t.get("is_segment_opener") for t in rows[1:]),
-          str([t.get("is_segment_opener") for t in rows[1:]]))
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
+    c.post("/api/config", json={"auto_approve_tasks": False, "day_segments": server.DEFAULT_DAY_SEGMENTS})
+    _aio_tg.run(server.db.segment_sessions.delete_many({}))
     __import__("asyncio").run(server._refresh_segments_cache())
 
     # =============== REGRESI: RESET POIN HARUS IKUT MENOLKAN KANTONG ===============
@@ -4356,137 +2759,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("rebalance: kid cannot run it", r.status_code == 403, str(r.status_code))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"chiky_save_pct": 40, "chiky_spend_pct": 40, "chiky_share_pct": 20})
-
-    # =============== PEMBERSIH DUPLIKAT ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Sore", "start_time": "15:00", "end_time": "17:59"},
-        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
-    DD = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    mkd = lambda title, sid, bonus=False: c.post("/api/tasks", json={
-        "title": title, "points": 5, "date_key": today_local, "duration_minutes": 10,
-        "target_children": [adskhan["id"]], "segment_id": sid, "is_bonus": bonus}).json()
-
-    keep = mkd("Memberi makan white", DD[1], bonus=True)
-    dupe = mkd("Memberi makan white", DD[1], bonus=True)   # exact same slot
-    other_seg = mkd("Memberi makan white", DD[0], bonus=True)  # different section = NOT a duplicate
-    solo = mkd("Makan malam", DD[1])
-
-    r = c.post("/api/tasks/dedupe?dry_run=true")
-    check("dedupe: dry run reports without deleting", r.status_code == 200 and r.json()["would_delete"] == 1,
-          str(r.json().get("would_delete")))
-    check("dedupe: dry run really changed nothing",
-          len(c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()) == 4)
-
-    r = c.post("/api/tasks/dedupe")
-    check("dedupe: removes exactly the duplicate", r.json()["deleted"] == 1, str(r.json()))
-    left = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
-    titles = sorted(t["title"] for t in left)
-    check("dedupe: three tasks remain", len(left) == 3, str(titles))
-    check("dedupe: the OTHER section's copy is untouched",
-          any(t["segment_id"] == DD[0] and t["title"] == "Memberi makan white" for t in left), str(titles))
-    check("dedupe: unrelated task untouched", any(t["title"] == "Makan malam" for t in left), str(titles))
-    r = c.post("/api/tasks/dedupe")
-    check("dedupe: running it again finds nothing left", r.json()["deleted"] == 0, str(r.json()))
-
-    # Progress must never be thrown away: the touched copy is the one kept
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    fresh = mkd("Dobel dengan progres", DD[1])
-    done = mkd("Dobel dengan progres", DD[1])
-    _aio_tg.run(server.db.tasks.update_one({"id": done["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-    c.post("/api/tasks/dedupe")
-    survivors = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()
-    check("dedupe: keeps the copy that has real progress",
-          len(survivors) == 1 and survivors[0]["id"] == done["id"],
-          str([(t["id"][:6], t["status"]) for t in survivors]))
-
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post("/api/tasks/dedupe")
-    check("dedupe: kid cannot run it", r.status_code == 403, str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== PERKIRAAN JAM MULAI TIAP TUGAS ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"},
-        {"label": "Pagi", "start_time": "05:00", "end_time": "09:00"}]})
-    PJ = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mkp2 = lambda title, sid, dur, order: c.post("/api/tasks", json={
-        "title": title, "points": 5, "date_key": today_local, "duration_minutes": dur,
-        "target_children": [adskhan["id"]], "segment_id": sid, "order": order}).json()
-
-    mkp2("Makan malam", PJ["Malam"], 15, 1)
-    mkp2("Cuci piring", PJ["Malam"], 5, 2)
-    mkp2("Sholat Isya", PJ["Malam"], 10, 3)
-    mkp2("Bangun", PJ["Pagi"], 20, 1)
-    mkp2("Mandi", PJ["Pagi"], 10, 2)
-    no_seg = c.post("/api/tasks", json={"title": "Kapan saja", "points": 5, "date_key": today_local,
-                                        "duration_minutes": 10, "target_children": [adskhan["id"]]}).json()
-
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    by = {t["title"]: t for t in r.json()["tasks"]}
-    check("proj: first mission starts at the section's hour",
-          by["Makan malam"]["projected_start_time"] == "18:00", str(by["Makan malam"].get("projected_start_time")))
-    check("proj: second follows the first's duration (+15m)",
-          by["Cuci piring"]["projected_start_time"] == "18:15", str(by["Cuci piring"].get("projected_start_time")))
-    check("proj: third chains on again (+5m)",
-          by["Sholat Isya"]["projected_start_time"] == "18:20", str(by["Sholat Isya"].get("projected_start_time")))
-    check("proj: each section starts from its OWN hour",
-          by["Bangun"]["projected_start_time"] == "05:00" and by["Mandi"]["projected_start_time"] == "05:20",
-          f'{by["Bangun"].get("projected_start_time")}/{by["Mandi"].get("projected_start_time")}')
-    check("proj: a task with no section has nothing to project",
-          by["Kapan saja"].get("projected_start_time") is None, str(by["Kapan saja"].get("projected_start_time")))
-
-    # A personal start time shifts the whole chain for that child only
-    _wd5 = str(_dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday())
-    c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {PJ["Malam"]: {_wd5: "18:50"}}})
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    by2 = {t["title"]: t for t in r.json()["tasks"]}
-    check("proj: personal start shifts the whole chain",
-          by2["Makan malam"]["projected_start_time"] == "18:50"
-          and by2["Cuci piring"]["projected_start_time"] == "19:05"
-          and by2["Sholat Isya"]["projected_start_time"] == "19:10",
-          f'{by2["Makan malam"]["projected_start_time"]}/{by2["Cuci piring"]["projected_start_time"]}/{by2["Sholat Isya"]["projected_start_time"]}')
-    check("proj: the other section is unaffected by that override",
-          by2["Bangun"]["projected_start_time"] == "05:00", str(by2["Bangun"].get("projected_start_time")))
-
-    # Reordering re-flows the forecast
-    ids = {t["title"]: t["id"] for t in c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()}
-    c.post("/api/tasks/reorder", json={"task_ids": [ids["Cuci piring"], ids["Makan malam"], ids["Sholat Isya"]]})
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    by3 = {t["title"]: t for t in r.json()["tasks"]}
-    check("proj: reordering re-flows the times",
-          by3["Cuci piring"]["projected_start_time"] == "18:50"
-          and by3["Makan malam"]["projected_start_time"] == "18:55",
-          f'{by3["Cuci piring"]["projected_start_time"]}/{by3["Makan malam"]["projected_start_time"]}')
-
-    # Missions that would spill past the section's end aren't given a fake hour
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"day_segments": [{"label": "Sempit", "start_time": "18:00", "end_time": "18:20"}]})
-    NS = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mkp2("Muat", NS, 15, 1)
-    mkp2("Pas di batas", NS, 10, 2)
-    mkp2("Kelebihan", NS, 10, 3)
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    by4 = {t["title"]: t for t in r.json()["tasks"]}
-    check("proj: fits within the section gets a time", by4["Muat"]["projected_start_time"] == "18:00")
-    check("proj: still inside the end boundary gets one too", by4["Pas di batas"]["projected_start_time"] == "18:15")
-    check("proj: past the section's end gets none rather than a fake hour",
-          by4["Kelebihan"].get("projected_start_time") is None, str(by4["Kelebihan"].get("projected_start_time")))
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    __import__("asyncio").run(server._refresh_segments_cache())
 
     # =============== OFF DAY PER BAGIAN HARI ===============
     # "Off from Friday afternoon until Monday morning": Friday's morning still
@@ -4569,218 +2841,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
-    # =============== REGRESI: HARI DEPAN TIDAK BOLEH DICAP TERLAMBAT ===============
-    # Reported: opening TOMORROW showed every morning mission as "Terlambat",
-    # because availability was judged against the current clock without first
-    # asking which day the task belongs to.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Pagi", "start_time": "04:45", "end_time": "11:59"},
-        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
-    FS = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    _tomorrow_k = (_off_base + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
-    _yesterday_k = (_off_base - _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
-    mkf = lambda title, dk, seg: c.post("/api/tasks", json={
-        "title": title, "points": 5, "date_key": dk, "duration_minutes": 10,
-        "target_children": [adskhan["id"]], "segment_id": FS[seg]}).json()
-
-    t_tom_am = mkf("Besok pagi", _tomorrow_k, "Pagi")
-    t_tom_pm = mkf("Besok malam", _tomorrow_k, "Malam")
-    t_yes_am = mkf("Kemarin pagi", _yesterday_k, "Pagi")
-
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={_tomorrow_k}")
-    tom = {t["title"]: t for t in r.json()["tasks"]}
-    check("futureday: tomorrow's morning is NOT late", tom["Besok pagi"]["availability"] == "future",
-          str(tom["Besok pagi"]["availability"]))
-    check("futureday: tomorrow's evening is NOT late either", tom["Besok malam"]["availability"] == "future",
-          str(tom["Besok malam"]["availability"]))
-    check("futureday: nothing tomorrow counts as time-stuck",
-          server._task_is_time_stuck(_aio_tg.run(server.db.tasks.find_one({"id": t_tom_am["id"]}, {"_id": 0}))) is False)
-
-    # ...and a genuinely past day is still closed, not quietly reopened
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={_yesterday_k}")
-    yes = {t["title"]: t for t in r.json()["tasks"]}
-    check("futureday: yesterday is still closed", yes["Kemarin pagi"]["availability"] == "closed",
-          str(yes["Kemarin pagi"]["availability"]))
-
-    # Starting a future task is refused with the "not yet" message, not a late one
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{t_tom_am['id']}/start")
-    check("futureday: starting tomorrow's task is refused as not-yet (never as late)",
-          r.status_code == 409 and "belum waktunya" in r.text.lower() and "Terlambat" not in r.text,
-          r.text[:180])
-    r = c.post(f"/api/tasks/{t_tom_am['id']}/late-reason", json={"reason_id": "apa-saja"})
-    check("futureday: tomorrow cannot be reported late", r.status_code in (400, 404), str(r.status_code))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== BATAS MENGANGGUR (jalan walau app ditutup) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Idle", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
-        "late_reasons": [
-            {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
-            {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
-    IS = c.get("/api/config").json()["day_segments"][0]["id"]
-    _ilr = c.get("/api/config").json()["late_reasons"]
-    _ok_id, _bad_id = _ilr[0]["id"], _ilr[1]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    check("idle: limit exposed in config", c.get("/api/config").json()["max_idle_minutes"] == 20)
-
-    mki = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                  "segment_id": IS, "order": o}).json()
-    i1, i2 = mki("Idle satu", 1), mki("Idle dua", 2)
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{i1['id']}/start")
-    c.post(f"/api/tasks/{i1['id']}/complete")
-    # Straight after finishing, the next one is simply available
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("idle: next mission open right after finishing",
-          {t["id"]: t for t in r.json()["tasks"]}[i2["id"]]["availability"] == "open")
-
-    # Backdate the finish so the child has "been idle" for 40 minutes — this is
-    # what would happen while the app sat closed.
-    _aio_tg.run(server.db.tasks.update_one({"id": i1["id"]}, {"$set": {
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=40)).isoformat()}}))
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("idle: past the limit the next mission closes",
-          {t["id"]: t for t in r.json()["tasks"]}[i2["id"]]["availability"] == "closed")
-    r = c.post(f"/api/tasks/{i2['id']}/start")
-    check("idle: it can't just be started", r.status_code == 409 and "Terlambat" in r.text, r.text[:170])
-
-    # ...and stalling deliberately means only the at-fault reasons are offered
-    r = c.post(f"/api/tasks/{i2['id']}/late-reason", json={"reason_id": _ok_id})
-    check("idle: an excused reason is refused after stalling", r.status_code == 422, str(r.status_code))
-    check("idle: refusal explains why", "tidak bisa dimaklumi" in r.text, r.text[:200])
-    r = c.post(f"/api/tasks/{i2['id']}/late-reason", json={"reason_id": _bad_id})
-    check("idle: an at-fault reason is accepted", r.status_code == 200, r.text[:150])
-    check("idle: and it costs the points", r.json()["task"]["late_no_points"] is True)
-    r = c.post(f"/api/tasks/{i2['id']}/start")
-    check("idle: startable again once owned", r.status_code == 200, r.text[:150])
-
-    # A limit of 0 switches the whole thing off
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"max_idle_minutes": 0})
-    j1, j2 = mki("Tanpa batas satu", 1), mki("Tanpa batas dua", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{j1['id']}/start")
-    c.post(f"/api/tasks/{j1['id']}/complete")
-    _aio_tg.run(server.db.tasks.update_one({"id": j1["id"]}, {"$set": {
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=3)).isoformat()}}))
-    r = c.post(f"/api/tasks/{j2['id']}/start")
-    check("idle: a limit of 0 disables the guard entirely", r.status_code == 200, r.text[:150])
-
-    # The very first mission of the day has nothing to idle from
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"max_idle_minutes": 20})
-    k1 = mki("Pertama hari ini", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{k1['id']}/start")
-    check("idle: the day's first mission is never blocked by idling", r.status_code == 200, r.text[:150])
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "max_idle_minutes": 20})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== PEMBUKA SEGMEN TETAP BOLEH DIMAKLUMI ===============
-    # Arriving home late is outside a child's control, so the mission that
-    # OPENS a section must keep its excused reasons however long it took. Only
-    # the missions after it — when the child was already home — lose them.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Opener", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
-        "segment_late_grace_minutes": 10,
-        "late_reasons": [
-            {"label": "Kena macet pulang", "gives_penalty_card": False, "award_points": True},
-            {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
-    OS2 = c.get("/api/config").json()["day_segments"][0]["id"]
-    _o = c.get("/api/config").json()["late_reasons"]
-    OK2, BAD2 = _o[0]["id"], _o[1]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mkq = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                  "segment_id": OS2, "order": o}).json()
-
-    # --- The opener, with the child idle for hours ---
-    op = mkq("Ganti baju sepulang sekolah", 1)
-    later = mkq("Kerjakan PR", 2)
-    _aio_tg.run(server.db.tasks.update_one({"id": op["id"]}, {"$set": {"snooze_count": 1,
-        "snooze_until": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    op_row = {t["id"]: t for t in r.json()["tasks"]}[op["id"]]
-    check("opener: never restricted to at-fault reasons", op_row["at_fault_only"] is False, str(op_row["at_fault_only"]))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{op['id']}/late-reason", json={"reason_id": OK2})
-    check("opener: an excused reason is still accepted for the opener", r.status_code == 200, r.text[:180])
-    check("opener: and it keeps the points", r.json()["task"]["late_no_points"] is False)
-    c.post(f"/api/tasks/{op['id']}/start")
-    c.post(f"/api/tasks/{op['id']}/complete")
-
-    # --- The mission after it, once the child has been home and idle too long ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.update_one({"id": op["id"]}, {"$set": {
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=45)).isoformat()}}))
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    later_row = {t["id"]: t for t in r.json()["tasks"]}[later["id"]]
-    check("opener: a LATER mission does get restricted", later_row["at_fault_only"] is True, str(later_row["at_fault_only"]))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{later['id']}/late-reason", json={"reason_id": OK2})
-    check("opener: excused refused for the later mission", r.status_code == 422, str(r.status_code))
-    r = c.post(f"/api/tasks/{later['id']}/late-reason", json={"reason_id": BAD2})
-    check("opener: at-fault accepted for the later mission", r.status_code == 200, r.text[:150])
-    check("opener: and that one costs the points", r.json()["task"]["late_no_points"] is True)
-
-    # --- An UNTOUCHED section opens freely even after a long idle gap ---
-    # (Once a section has been entered, its later missions are held to the idle
-    # rule — "opener" is a one-off status per section, not a rolling exemption.)
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    # Split the day at the current minute so "Sesi Baru" is always open right
-    # now, whatever time the suite happens to run.
-    _now_sp = server._now_local(); _nm_sp = _now_sp.hour * 60 + _now_sp.minute
-    _fmt_sp = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Sesi Lama", "start_time": "00:00", "end_time": _fmt_sp(max(1, _nm_sp - 30))},
-        {"label": "Sesi Baru", "start_time": _fmt_sp(max(2, _nm_sp - 29)), "end_time": "23:59"}]})
-    OLD_S, NEW_S = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    prev = c.post("/api/tasks", json={"title": "Selesai tadi pagi", "points": 5, "date_key": today_local,
-                                      "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                      "segment_id": OLD_S, "order": 1}).json()
-    _aio_tg.run(server.db.tasks.update_one({"id": prev["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso(),
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=3)).isoformat()}}))
-    nxt_open = c.post("/api/tasks", json={"title": "Pembuka sesi baru", "points": 5, "date_key": today_local,
-                                          "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                          "segment_id": NEW_S, "order": 1}).json()
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("opener: a fresh section's opener isn't closed by earlier idling",
-          {t["id"]: t for t in r.json()["tasks"]}[nxt_open["id"]]["availability"] == "open",
-          str({t["id"]: t for t in r.json()["tasks"]}[nxt_open["id"]]["availability"]))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{nxt_open['id']}/start")
-    check("opener: and it can simply be started", r.status_code == 200, r.text[:150])
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
     # =============== HARI UJIAN (mode belajar fleksibel) ===============
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
@@ -4788,8 +2848,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
     c.post("/api/config", json={
         "day_segments": [{"label": "Malam", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
-        "exam_false_claim_penalty": 100})
+        "auto_approve_tasks": False, "exam_false_claim_penalty": 100})
     XS = c.get("/api/config").json()["day_segments"][0]["id"]
     __import__("asyncio").run(server._refresh_segments_cache())
     check("exam: penalty is configurable, not hardcoded",
@@ -4815,44 +2874,8 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
           f'{r.json()["flex_start"]}..{r.json()["flex_end"]}')
     exam_id = r.json()["id"]
 
-    # Only from the pivot onwards is relaxed — earlier missions still follow the clock
-    rr = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    by = {t["title"]: t for t in rr.json()["tasks"]}
-    check("exam: missions BEFORE the pivot are not relaxed", by["Mandi sore"]["exam_relaxed"] is False)
-    check("exam: the pivot itself is relaxed", by["Belajar"]["exam_relaxed"] is True)
-    check("exam: knock-on missions after it are relaxed too",
-          by["Makan malam"]["exam_relaxed"] is True and by["Sikat gigi"]["exam_relaxed"] is True)
-
-    # Idling no longer closes the relaxed stretch
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{x_pivot['id']}/start")
-    c.post(f"/api/tasks/{x_pivot['id']}/complete")
-    _aio_tg.run(server.db.tasks.update_one({"id": x_pivot["id"]}, {"$set": {
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
-    rr = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("exam: a two-hour study gap doesn't close what follows",
-          {t["title"]: t for t in rr.json()["tasks"]}["Makan malam"]["availability"] == "open")
-    # Relaxation lifts the CLOCK rules, not the queue — the earlier mission
-    # still has to be dealt with first, which is the correct behaviour.
-    r = c.post(f"/api/tasks/{x_after['id']}/start")
-    check("exam: the sequence still applies (clock rules relaxed, queue intact)",
-          r.status_code == 409 and "Selesaikan dulu" in r.text, r.text[:170])
-    for _t in (x_before["id"], x_pivot["id"]):
-        _aio_tg.run(server.db.tasks.update_one({"id": _t}, {"$set": {"status": "approved"}}))
-    r = c.post(f"/api/tasks/{x_after['id']}/start")
-    check("exam: starts fine once it's genuinely next in line", r.status_code == 200, r.text[:170])
-
-    # A day outside the window is untouched
-    _outside = (_off_base + _dt_off.timedelta(days=6)).strftime("%Y-%m-%d")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/tasks", json={"title": "Belajar", "points": 10, "date_key": _outside,
-                               "duration_minutes": 10, "target_children": [adskhan["id"]],
-                               "segment_id": XS, "order": 1})
-    rr = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={_outside}")
-    check("exam: days outside the window aren't relaxed",
-          all(t["exam_relaxed"] is False for t in rr.json()["tasks"]), str(rr.json()["tasks"])[:120])
-
     # Guards
+    r = c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _ex_start, "exam_end": _ex_end})    # Guards
     r = c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _ex_start, "exam_end": _ex_end})
     check("exam: only one live claim per child", r.status_code == 409, str(r.status_code))
     r = c.post("/api/exam-periods", json={"child_id": adskhan["id"], "exam_start": _ex_end, "exam_end": _ex_start})
@@ -4892,384 +2915,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
           and any(x["action"] == "exam_period_rejected" for x in r.json()))
 
     _aio_tg.run(server.db.exam_periods.delete_many({}))
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== TAHAN SEMENTARA (hold/freeze) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.exam_periods.delete_many({}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Hold", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False})
-    HS = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mkh = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                  "segment_id": HS, "order": o}).json()
-    h_prev, h_task, h_next = mkh("Selesai duluan", 1), mkh("Belajar", 2), mkh("Sikat gigi", 3)
-
-    # A child asks; it waits for a parent rather than taking effect at once
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{h_task['id']}/hold-request", json={"reason": "Diajak beli makan keluar"})
-    check("hold: child request is created", r.status_code == 200 and r.json()["hold_status"] == "pending", r.text[:180])
-    check("hold: the reason is recorded", r.json()["hold_reason"] == "Diajak beli makan keluar")
-    r = c.post(f"/api/tasks/{h_task['id']}/hold-request", json={"reason": "Sekali lagi"})
-    check("hold: duplicate request refused", r.status_code == 409, str(r.status_code))
-    r = c.post(f"/api/tasks/{h_task['id']}/hold-approve")
-    check("hold: a child cannot approve their own", r.status_code == 403, str(r.status_code))
-
-    # Parent sees it queued and approves
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get("/api/hold-requests")
-    check("hold: parent sees the pending request", any(t["id"] == h_task["id"] for t in r.json()), str(len(r.json())))
-    r = c.post(f"/api/tasks/{h_task['id']}/hold-approve", json={"note": "Oke, hati-hati di jalan"})
-    check("hold: parent approves", r.status_code == 200 and r.json()["hold_status"] == "approved", r.text[:180])
-    check("hold: no longer in the pending queue", not any(t["id"] == h_task["id"] for t in c.get("/api/hold-requests").json()))
-
-    # The clock stops: two hours later it is still perfectly startable
-    _aio_tg.run(server.db.tasks.update_one({"id": h_prev["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso(),
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    held = {t["id"]: t for t in r.json()["tasks"]}[h_task["id"]]
-    check("hold: still open after a two-hour absence", held["availability"] == "open", str(held["availability"]))
-    check("hold: not counted as time-stuck",
-          server._task_is_time_stuck(_aio_tg.run(server.db.tasks.find_one({"id": h_task["id"]}, {"_id": 0}))) is False)
-    check("hold: the idle limit doesn't fire while a hold is live",
-          _aio_tg.run(server._idle_exceeded(adskhan["id"], today_local,
-                      _aio_tg.run(server.db.app_config.find_one({"parent_id": "family-default"})) or {})) is False)
-
-    # Starting it consumes the hold; the rest of the day is timed as usual again
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{h_task['id']}/start")
-    check("hold: startable whenever the child gets back", r.status_code == 200, r.text[:180])
-    h_doc = _aio_tg.run(server.db.tasks.find_one({"id": h_task["id"]}, {"_id": 0}))
-    check("hold: marked as used once started", h_doc["hold_status"] == "used", str(h_doc["hold_status"]))
-    c.post(f"/api/tasks/{h_task['id']}/complete")
-    _aio_tg.run(server.db.tasks.update_one({"id": h_task["id"]}, {"$set": {
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=45)).isoformat()}}))
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    check("hold: normal timing resumes for what follows",
-          {t["id"]: t for t in r.json()["tasks"]}[h_next["id"]]["availability"] == "closed",
-          str({t["id"]: t for t in r.json()["tasks"]}[h_next["id"]]["availability"]))
-
-    # Rejection puts the mission back on the ordinary clock
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    # Holds don't apply to a section's opening mission, so put one in front.
-    _h2_open = mkh("Pembuka dulu", 1)
-    _aio_tg.run(server.db.tasks.update_one({"id": _h2_open["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-    h2 = mkh("Minta tunda ditolak", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{h2['id']}/hold-request", json={"reason": "Mau main dulu"})
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{h2['id']}/hold-reject", json={"note": "Kerjakan dulu ya"})
-    check("hold: parent can reject", r.status_code == 200 and r.json()["hold_status"] == "rejected", r.text[:180])
-    r = c.post(f"/api/tasks/{h2['id']}/hold-approve")
-    check("hold: cannot approve an already-decided request", r.status_code == 400, str(r.status_code))
-
-    # A parent asking on the child's behalf needs no second approval
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _h3_open = mkh("Pembuka dulu lagi", 1)
-    _aio_tg.run(server.db.tasks.update_one({"id": _h3_open["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-    h3 = mkh("Diminta orang tua", 2)
-    r = c.post(f"/api/tasks/{h3['id']}/hold-request", json={"reason": "Ada tamu, saya yang minta"})
-    check("hold: a parent's own request is granted immediately",
-          r.status_code == 200 and r.json()["hold_status"] == "approved", r.text[:180])
-
-    # Guards
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{h3['id']}/hold-request", json={"reason": "Bukan misiku"})
-    check("hold: a sibling cannot request on someone else's mission", r.status_code in (400, 403), str(r.status_code))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    h4 = mkh("Sudah dimulai", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{h4['id']}/start")
-    r = c.post(f"/api/tasks/{h4['id']}/hold-request", json={"reason": "Terlambat mintanya"})
-    check("hold: cannot hold a mission already under way", r.status_code == 400, str(r.status_code))
-    r = c.post(f"/api/tasks/{h4['id']}/hold-request", json={"reason": "x"})
-    check("hold: a too-short reason is rejected", r.status_code == 422, str(r.status_code))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get("/api/activity?limit=40")
-    check("hold: requests and decisions are logged",
-          any(x["action"] == "hold_requested" for x in r.json())
-          and any(x["action"] in ("hold_approved", "hold_rejected") for x in r.json()))
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== HOLD: KEDALUWARSA & BUKAN UNTUK MISI PEMBUKA ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Hold2", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "hold_auto_reject_minutes": 5, "auto_approve_tasks": False})
-    H2 = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    check("hold2: expiry window is configurable", c.get("/api/config").json()["hold_auto_reject_minutes"] == 5)
-    mkh2 = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                   "segment_id": H2, "order": o}).json()
-    opener, second = mkh2("Pembuka sesi", 1), mkh2("Misi kedua", 2)
-
-    # The opening mission uses Terlambat, not a hold
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{opener['id']}/hold-request", json={"reason": "Ada tamu"})
-    check("hold2: the section opener cannot be held", r.status_code == 400, str(r.status_code))
-    check("hold2: it points at Terlambat instead", "Terlambat" in r.text, r.text[:170])
-
-    # A later mission can, and it lapses if nobody answers
-    r = c.post(f"/api/tasks/{second['id']}/hold-request", json={"reason": "Diajak keluar mendadak"})
-    check("hold2: a later mission can be held", r.status_code == 200 and r.json()["hold_status"] == "pending", r.text[:170])
-    _aio_tg.run(server.db.tasks.update_one({"id": second["id"]}, {"$set": {
-        "hold_requested_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=9)).isoformat()}}))
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.get("/api/hold-requests")
-    check("hold2: an unanswered request drops out of the queue",
-          not any(t["id"] == second["id"] for t in r.json()), str(len(r.json())))
-    sec_doc = _aio_tg.run(server.db.tasks.find_one({"id": second["id"]}, {"_id": 0}))
-    check("hold2: and is marked expired", sec_doc["hold_status"] == "expired", str(sec_doc["hold_status"]))
-    check("hold2: the mission is back on the normal clock",
-          server._task_availability(sec_doc, c.get("/api/config").json()["day_segments"], None, False, 10, True) == "closed",
-          "still frozen")
-
-    # A fresh request within the window still survives
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    o2, s2t = mkh2("Pembuka lagi", 1), mkh2("Kedua lagi", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{s2t['id']}/hold-request", json={"reason": "Tamu datang"})
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    check("hold2: a recent request is still waiting",
-          any(t["id"] == s2t["id"] for t in c.get("/api/hold-requests").json()))
-    r = c.get("/api/activity?limit=40")
-    check("hold2: expiry is logged for the parent to see",
-          any(x["action"] == "hold_expired" for x in r.json()), str([x["action"] for x in r.json()][:8]))
-
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== HOLD TIDAK BOLEH MEMBLOKIR ANTREAN ===============
-    # Reported: after asking to hold one mission, EVERY later mission refused to
-    # start with "finish the previous one first" — a granted pause had turned
-    # into a lock on the rest of the evening.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Blok", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "auto_approve_tasks": False})
-    BS = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mkb = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                  "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                  "segment_id": BS, "order": o}).json()
-    b_open, b_held, b_after = mkb("Pembuka", 1), mkb("Cuci Piring", 2), mkb("Sholat Isya", 3)
-    _aio_tg.run(server.db.tasks.update_one({"id": b_open["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{b_held['id']}/hold-request", json={"reason": "Diajak keluar"})
-    # Even while merely PENDING it must not wall off the rest of the day
-    r = c.post(f"/api/tasks/{b_after['id']}/start")
-    check("holdq: a pending hold doesn't block the missions behind it", r.status_code == 200, r.text[:170])
-    c.post(f"/api/tasks/{b_after['id']}/complete")
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{b_held['id']}/hold-approve")
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    # ...and the held mission itself is still doable whenever they get back
-    r = c.post(f"/api/tasks/{b_held['id']}/start")
-    check("holdq: the held mission can be picked up out of order", r.status_code == 200, r.text[:170])
-    check("holdq: and is marked used",
-          _aio_tg.run(server.db.tasks.find_one({"id": b_held["id"]}, {"_id": 0}))["hold_status"] == "used")
-
-    # A mission with no hold still obeys the queue as normal
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    q1, q2 = mkb("Antre satu", 1), mkb("Antre dua", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{q2['id']}/start")
-    check("holdq: ordinary missions still queue normally", r.status_code == 409, str(r.status_code))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== MISI YANG SUDAH DIMULAI HARUS SELALU BISA DISELESAIKAN ===============
-    # Reported: after a hold, the child was stuck — "Selesai" refused because
-    # the queue had moved on and the duration had run out while they were away.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Stuck", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "auto_approve_tasks": False})
-    KS = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mks = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                  "duration_minutes": 5, "target_children": [adskhan["id"]],
-                                                  "segment_id": KS, "order": o}).json()
-    s_open, s_held, s_next = mks("Pembuka", 1), mks("Cuci Piring", 2), mks("Sholat Isya", 3)
-    _aio_tg.run(server.db.tasks.update_one({"id": s_open["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-
-    # Hold it, start it, then let the duration lapse while the child is away
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{s_held['id']}/hold-request", json={"reason": "Diajak keluar"})
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post(f"/api/tasks/{s_held['id']}/hold-approve")
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{s_held['id']}/start")
-    _aio_tg.run(server.db.tasks.update_one({"id": s_held["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=1)).isoformat()}}))
-    r = c.post(f"/api/tasks/{s_held['id']}/complete")
-    check("stuck: a held mission can still be finished after the duration lapsed",
-          r.status_code == 200, r.text[:180])
-
-    # The same must hold for a mission whose lateness was owned via Terlambat
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"late_reasons": [
-        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True}]})
-    _sr = c.get("/api/config").json()["late_reasons"][0]["id"]
-    late_t = mks("Telat lalu selesai", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{late_t['id']}/start")
-    _aio_tg.run(server.db.tasks.update_one({"id": late_t["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=1)).isoformat()}}))
-    c.post(f"/api/tasks/{late_t['id']}/late-reason", json={"reason_id": _sr})
-    r = c.post(f"/api/tasks/{late_t['id']}/complete")
-    check("stuck: an acknowledged-late mission can be finished too", r.status_code == 200, r.text[:180])
-
-    # A started mission is finishable even when the queue has moved past it
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    m1, m2 = mks("Mulai duluan", 1), mks("Yang lain", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{m1['id']}/start")
-    _aio_tg.run(server.db.tasks.update_one({"id": m1["id"]}, {"$set": {"order": 99}}))
-    r = c.post(f"/api/tasks/{m1['id']}/complete")
-    check("stuck: a mission under way is finishable regardless of queue order",
-          r.status_code == 200, r.text[:180])
-
-    # But an untouched mission still can't jump the queue
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    n1, n2 = mks("Antre dulu", 1), mks("Belum giliran", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{n2['id']}/complete")
-    check("stuck: an untouched mission still respects the queue", r.status_code == 409, str(r.status_code))
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== ANTREAN TIDAK BOLEH MACET DI MISI YANG TIDAK TERSEDIA ===============
-    # Reported: with a mission held (or its section not yet open), nothing at
-    # all could be started — the turn sat on a task that wasn't available, so
-    # the whole queue stalled behind it.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _nl6 = server._now_local(); _nm6 = _nl6.hour * 60 + _nl6.minute
-    _f6 = lambda m: f"{max(0, min(m, 23*60+59)) // 60:02d}:{max(0, min(m, 23*60+59)) % 60:02d}"
-    c.post("/api/config", json={
-        "day_segments": [
-            {"label": "Sekarang", "start_time": "00:00", "end_time": _f6(min(_nm6 + 60, 23 * 60 + 58))},
-            {"label": "Nanti", "start_time": _f6(min(_nm6 + 61, 23 * 60 + 59)), "end_time": "23:59"}],
-        "min_gap_seconds": 0, "auto_approve_tasks": False})
-    NOWS, LATERS = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mkn = lambda t, seg, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                       "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                       "segment_id": seg, "order": o}).json()
-
-    # A held mission must not become the blocking turn. Holds don't apply to a
-    # section's opening mission, so put a finished one in front of it.
-    opener_q = mkn("Pembuka", NOWS, 1)
-    _aio_tg.run(server.db.tasks.update_one({"id": opener_q["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-    held = mkn("Ditahan dulu", NOWS, 2)
-    follow = mkn("Berikutnya", NOWS, 3)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{held['id']}/hold-request", json={"reason": "Diajak keluar"})
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r_ha = c.post(f"/api/tasks/{held['id']}/hold-approve")
-    check("queue: the hold was actually granted", r_ha.status_code == 200, r_ha.text[:170])
-    nxt = _aio_tg.run(server.get_next_actionable_task(adskhan["id"], today_local))
-    check("queue: a held mission never holds the turn",
-          nxt and nxt["id"] == follow["id"], str(nxt and nxt["title"]))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{follow['id']}/start")
-    check("queue: the next mission starts normally", r.status_code == 200, r.text[:170])
-
-    # A mission whose section hasn't opened must not block an available one
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    future_first = mkn("Sesi nanti", LATERS, 1)
-    available = mkn("Sesi sekarang", NOWS, 2)
-    nxt2 = _aio_tg.run(server.get_next_actionable_task(adskhan["id"], today_local))
-    check("queue: a not-yet-open section doesn't stall the day",
-          nxt2 and nxt2["id"] == available["id"], str(nxt2 and nxt2["title"]))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{available['id']}/start")
-    check("queue: the available mission is startable", r.status_code == 200, r.text[:170])
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== TIDAK BOLEH ADA MISI TANPA JALAN KELUAR ===============
-    # Reported: a mission showed only "Menunggu giliran" — no Mulai, no
-    # Terlambat, nothing to press. Whatever closes a mission, Terlambat must
-    # stay reachable so the child is never cornered.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Buntu", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
-        "late_reasons": [
-            {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
-            {"label": "Keasyikan main", "gives_penalty_card": True, "award_points": False}]})
-    DS2 = c.get("/api/config").json()["day_segments"][0]["id"]
-    _dr = c.get("/api/config").json()["late_reasons"]
-    DOK, DBAD = _dr[0]["id"], _dr[1]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mkd2 = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                   "segment_id": DS2, "order": o}).json()
-    d_prev, d_stuck = mkd2("Selesai duluan", 1), mkd2("Berpakaian lengkap", 2)
-
-    # Finish the first, then let the child idle well past the limit
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{d_prev['id']}/start")
-    c.post(f"/api/tasks/{d_prev['id']}/complete")
-    _aio_tg.run(server.db.tasks.update_one({"id": d_prev["id"]}, {"$set": {
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=90)).isoformat()}}))
-
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    row = {t["id"]: t for t in r.json()["tasks"]}[d_stuck["id"]]
-    check("noway: idling past the limit closes the mission", row["availability"] == "closed", str(row["availability"]))
-
-    # It can't be started — that's intended — but it MUST be reportable
-    r = c.post(f"/api/tasks/{d_stuck['id']}/start")
-    check("noway: it cannot simply be started", r.status_code == 409, str(r.status_code))
-    r = c.post(f"/api/tasks/{d_stuck['id']}/late-reason", json={"reason_id": DBAD})
-    check("noway: Terlambat is always accepted as the way out", r.status_code == 200, r.text[:200])
-
-    # ...and after owning it, the mission runs through to the end
-    r = c.post(f"/api/tasks/{d_stuck['id']}/start")
-    check("noway: startable again once owned", r.status_code == 200, r.text[:170])
-    r = c.post(f"/api/tasks/{d_stuck['id']}/complete")
-    check("noway: and completable", r.status_code == 200, r.text[:170])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{d_stuck['id']}/approve")
-    check("noway: and approvable — no dead end anywhere", r.status_code == 200, r.text[:170])
-
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
@@ -5331,20 +2976,19 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
 
     # 1) Every timing rule is configurable — none of them silently hardcoded
     cfg_all = c.get("/api/config").json()
-    for _k in ("min_gap_seconds", "flash_threshold_pct", "pacing_bonus_points",
-               "segment_late_grace_minutes", "max_idle_minutes", "auto_start_next",
-               "snooze_options_minutes", "duration_warning_minutes", "bonus_follows_sequence",
-               "auto_approve_tasks", "hold_auto_reject_minutes", "exam_false_claim_penalty",
+    for _k in ("segment_late_grace_minutes", "auto_approve_tasks", "exam_false_claim_penalty",
                "penalty_card_threshold", "punishment_mode", "punishment_options",
                "day_segments", "late_reasons"):
         check(f"audit: {_k} is exposed as config", _k in cfg_all, str(sorted(cfg_all.keys()))[:100])
 
-    # 2) Every rule can be switched off without breaking the app
-    r = c.post("/api/config", json={
-        "min_gap_seconds": 0, "max_idle_minutes": 0, "pacing_bonus_points": 0,
-        "duration_warning_minutes": [], "auto_start_next": False,
-        "family_combo_bonus_points": 0, "early_bonus_pct": 0})
-    check("audit: every guard can be turned off at once", r.status_code == 200, r.text[:170])
+    for _k in ("min_gap_seconds", "flash_threshold_pct", "pacing_bonus_points", "max_idle_minutes",
+               "auto_start_next", "snooze_options_minutes", "duration_warning_minutes",
+               "bonus_follows_sequence", "hold_auto_reject_minutes", "early_bonus_pct", "skip_cost_points"):
+        check(f"audit: old per-mission setting {_k} is gone", _k not in cfg_all)
+
+    # 2) A mission still runs with the optional rules off
+    r = c.post("/api/config", json={"family_combo_bonus_points": 0, "segment_late_grace_minutes": 0})
+    check("audit: optional rules can be turned off", r.status_code == 200, r.text[:170])
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
     c.post("/api/config", json={"day_segments": [{"label": "Bebas", "start_time": "00:00", "end_time": "23:59"}]})
     FS2 = c.get("/api/config").json()["day_segments"][0]["id"]
@@ -5353,9 +2997,9 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
                                    "duration_minutes": 10, "target_children": [adskhan["id"]],
                                    "segment_id": FS2, "order": 1}).json()
     c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{z['id']}/start")
+    r = start(z['id'])
     check("audit: a mission still runs with every guard off", r.status_code == 200, r.text[:170])
-    r = c.post(f"/api/tasks/{z['id']}/complete")
+    r = complete(z['id'])
     check("audit: and completes", r.status_code == 200, r.text[:170])
 
     # 3) Kids can't reach anything that belongs to a parent
@@ -5366,42 +3010,17 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         (f"/api/children/{adskhan['id']}/penalty-cards", {"penalty_cards": 0}),
         (f"/api/children/{adskhan['id']}/rebalance-buckets", {}),
         ("/api/tasks/bulk-delete", {"task_ids": [z["id"]]}),
-        ("/api/tasks/dedupe", {}),
+        ("/api/family/overdue-sections/resolve", {"child_id": adskhan["id"], "date_key": today_local,
+                                                  "segment_id": FS2, "action": "dismiss"}),
         ("/api/off-days", {"start_date": today_local}),
         ("/api/reminders/run", {}),
     ]:
         r = c.post(_path, json=_body)
         check(f"audit: kid blocked from {_path}", r.status_code == 403, f"{_path} → {r.status_code}")
 
-    # 4) No mission may ever be a dead end: whatever closes it, Terlambat works
+    # 5) The wallet always equals the balance, whatever happened to it    # 5) The wallet always equals the balance, whatever happened to it
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"max_idle_minutes": 20, "late_reasons": [
-        {"label": "Kena macet", "gives_penalty_card": False, "award_points": True},
-        {"label": "Lalai", "gives_penalty_card": True, "award_points": False}]})
-    _ar = c.get("/api/config").json()["late_reasons"]
-    _aok, _abad = _ar[0]["id"], _ar[1]["id"]
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    a_prev = c.post("/api/tasks", json={"title": "Sebelumnya", "points": 5, "date_key": today_local,
-                                        "duration_minutes": 5, "target_children": [adskhan["id"]],
-                                        "segment_id": FS2, "order": 1}).json()
-    a_stuck = c.post("/api/tasks", json={"title": "Yang tertutup", "points": 10, "date_key": today_local,
-                                         "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                         "segment_id": FS2, "order": 2}).json()
-    _aio_tg.run(server.db.tasks.update_one({"id": a_prev["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso(),
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(hours=2)).isoformat()}}))
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{a_stuck['id']}/start")
-    check("audit: idling closes it as designed", r.status_code == 409, str(r.status_code))
-    r = c.post(f"/api/tasks/{a_stuck['id']}/late-reason", json={"reason_id": _abad})
-    check("audit: Terlambat is always a way out", r.status_code == 200, r.text[:180])
-    r = c.post(f"/api/tasks/{a_stuck['id']}/start")
-    check("audit: and the mission runs again afterwards", r.status_code == 200, r.text[:170])
-    r = c.post(f"/api/tasks/{a_stuck['id']}/complete")
-    check("audit: through to completion", r.status_code == 200, r.text[:170])
-
-    # 5) The wallet always equals the balance, whatever happened to it
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"family_combo_bonus_points": 10, "segment_late_grace_minutes": 15})
     for _delta in (250, -80, 15):
         c.post(f"/api/children/{adskhan['id']}/adjust-points", json={"points": _delta, "reason": "audit"})
         _k = next(x for x in c.get("/api/children").json() if x["id"] == adskhan["id"])
@@ -5409,233 +3028,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
               _k["chiky_save"] + _k["chiky_spend"] + _k["chiky_share"] == max(0, _k["points"]),
               f'{_k["points"]} vs {_k["chiky_save"]}+{_k["chiky_spend"]}+{_k["chiky_share"]}')
 
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "min_gap_seconds": 0,
-                                "max_idle_minutes": 20, "early_bonus_pct": 10})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== TEMPLATE HARI (rombak cara set tugas) ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.day_templates.delete_many({}))
-    _aio_tg.run(server.db.template_tasks.delete_many({}))
-    _aio_tg.run(server.db.template_assignments.delete_many({}))
-    _aio_tg.run(server.db.off_days.delete_many({}))
-    c.post("/api/config", json={"day_segments": [
-        {"label": "Pagi", "start_time": "04:45", "end_time": "11:59"},
-        {"label": "Malam", "start_time": "18:00", "end_time": "21:00"}]})
-    TSEG = {x["label"]: x["id"] for x in c.get("/api/config").json()["day_segments"]}
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # Two kinds of day — names are the family's own, nothing fixed in code
-    r = c.post("/api/day-templates", json={"name": "Hari Biasa", "emoji": "🎒", "is_default": True})
-    check("tpl: a template can be created", r.status_code == 200, r.text[:180])
-    T_BIASA = r.json()["id"]
-    r = c.post("/api/day-templates", json={"name": "Tanggal Merah", "emoji": "🎉"})
-    T_LIBUR = r.json()["id"]
-    check("tpl: a second, differently-named template", r.status_code == 200 and r.json()["is_default"] is False)
-    check("tpl: only one default at a time",
-          len([t for t in c.get("/api/day-templates").json() if t["is_default"]]) == 1)
-
-    # Slots: same weekday, different template → different routines
-    mkslot = lambda tid, wd, seg, title, order, **kw: c.post("/api/template-tasks", json={
-        "template_id": tid, "weekday": wd, "segment_id": TSEG[seg], "title": title,
-        "points": 10, "duration_minutes": 10, "order": order, **kw})
-    for i, t in enumerate(["Bangun pagi", "Sholat Subuh", "Siap-siap sekolah"], 1):
-        check(f"tpl: weekday slot {i} added", mkslot(T_BIASA, 0, "Pagi", t, i).status_code == 200)
-    mkslot(T_BIASA, 0, "Malam", "Belajar", 1)
-    mkslot(T_LIBUR, 0, "Pagi", "Bangun santai", 1)
-    mkslot(T_LIBUR, 0, "Pagi", "Bantu bersih-bersih", 2)
-
-    r = c.get(f"/api/template-tasks?template_id={T_BIASA}")
-    check("tpl: slots listed for a template", len(r.json()) == 4, str(len(r.json())))
-    check("tpl: sorted by section then order",
-          [x["title"] for x in r.json()][:3] == ["Bangun pagi", "Sholat Subuh", "Siap-siap sekolah"],
-          str([x["title"] for x in r.json()]))
-    check("tpl: the other template is untouched",
-          len(c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()) == 2)
-    check("tpl: task_count surfaced on the list",
-          next(t for t in c.get("/api/day-templates").json() if t["id"] == T_BIASA)["task_count"] == 4)
-
-    # Paste onto a real Monday
-    _next_mon = _off_base
-    while _next_mon.weekday() != 0:
-        _next_mon += _dt_off.timedelta(days=1)
-    MON = _next_mon.strftime("%Y-%m-%d")
-    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": MON})
-    check("tpl: assigning builds the day", r.status_code == 200 and r.json()["created"] > 0, r.text[:200])
-    built = c.get(f"/api/tasks?date_key={MON}").json()
-    check("tpl: one copy per child for shared slots", len(built) == 4 * 2, str(len(built)))
-    check("tpl: slot details carried over",
-          all(t["points"] == 10 and t["duration_minutes"] == 10 for t in built))
-    check("tpl: sections carried over",
-          len([t for t in built if t["segment_id"] == TSEG["Malam"]]) == 2,
-          str([t["segment_id"] for t in built]))
-    check("tpl: tasks remember which template built them",
-          all(t.get("from_template_id") == T_BIASA for t in built))
-
-    # Swap that same Monday to the holiday routine — this is the whole point
-    r = c.post("/api/template-assignments", json={"template_id": T_LIBUR, "start_date": MON})
-    check("tpl: swapping the template rebuilds the day", r.status_code == 200, r.text[:200])
-    after = c.get(f"/api/tasks?date_key={MON}").json()
-    check("tpl: the school routine is gone", not any(t["title"] == "Sholat Subuh" for t in after),
-          str([t["title"] for t in after]))
-    check("tpl: the holiday routine is there",
-          any(t["title"] == "Bangun santai" for t in after), str([t["title"] for t in after]))
-    check("tpl: assignment recorded for the calendar",
-          c.get(f"/api/template-assignments?start_date={MON}&end_date={MON}").json()[0]["template_id"] == T_LIBUR)
-
-    # Work already done is never destroyed by re-applying
-    _kept = after[0]
-    _aio_tg.run(server.db.tasks.update_one({"id": _kept["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso()}}))
-    c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": MON})
-    kept_rows = c.get(f"/api/tasks?date_key={MON}").json()
-    check("tpl: a finished mission survives a re-apply",
-          any(t["id"] == _kept["id"] for t in kept_rows), "finished work was wiped")
-
-    # Range assignment
-    RANGE_END = (_next_mon + _dt_off.timedelta(days=2)).strftime("%Y-%m-%d")
-    r = c.post("/api/template-assignments", json={"template_id": T_LIBUR, "start_date": MON, "end_date": RANGE_END})
-    check("tpl: a range can be pasted at once", r.status_code == 200 and len(r.json()["days"]) == 3, r.text[:200])
-    check("tpl: every day in the range is recorded",
-          len(c.get(f"/api/template-assignments?start_date={MON}&end_date={RANGE_END}").json()) == 3)
-
-    # Detaching a date
-    r = c.delete(f"/api/template-assignments/{RANGE_END}")
-    check("tpl: a date can be detached", r.status_code == 200, r.text[:170])
-    check("tpl: its untouched missions are cleared",
-          len(c.get(f"/api/tasks?date_key={RANGE_END}").json()) == 0)
-
-    # Duplicating a template
-    r = c.post(f"/api/day-templates/{T_BIASA}/duplicate")
-    check("tpl: duplicating copies the slots too", r.status_code == 200 and r.json()["task_count"] == 4, r.text[:200])
-    T_COPY = r.json()["id"]
-    check("tpl: the copy is not the default", r.json()["is_default"] is False)
-
-    # Editing and removing slots
-    slot = c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()[0]
-    r = c.patch(f"/api/template-tasks/{slot['id']}", json={"points": 25, "title": "Bangun agak siang"})
-    check("tpl: a slot can be edited", r.status_code == 200 and r.json()["points"] == 25, r.text[:170])
-    check("tpl: edits persist", c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()[0]["title"] == "Bangun agak siang")
-    r = c.delete(f"/api/template-tasks/{slot['id']}")
-    check("tpl: a slot can be removed", r.status_code == 200 and
-          len(c.get(f"/api/template-tasks?template_id={T_LIBUR}").json()) == 1)
-
-    # Deleting a template cleans up after itself
-    r = c.delete(f"/api/day-templates/{T_COPY}")
-    check("tpl: a template can be deleted", r.status_code == 200)
-    check("tpl: its slots go with it", len(c.get(f"/api/template-tasks?template_id={T_COPY}").json()) == 0)
-
-    # --- negative paths ---
-    r = c.post("/api/template-assignments", json={"template_id": "ngawur", "start_date": MON})
-    check("tpl: unknown template rejected", r.status_code == 404, str(r.status_code))
-    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": "bukan-tanggal"})
-    check("tpl: bad date rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": RANGE_END, "end_date": MON})
-    check("tpl: reversed range rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/template-assignments", json={"template_id": T_BIASA, "start_date": MON,
-                                                  "end_date": (_next_mon + _dt_off.timedelta(days=90)).strftime("%Y-%m-%d")})
-    check("tpl: an absurd range is rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/template-tasks", json={"template_id": T_BIASA, "weekday": 9, "title": "x"})
-    check("tpl: invalid weekday rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/template-tasks", json={"template_id": T_BIASA, "weekday": 0,
-                                            "segment_id": "ngawur", "title": "x"})
-    check("tpl: unknown section rejected", r.status_code == 404, str(r.status_code))
-    r = c.post("/api/template-tasks", json={"template_id": "ngawur", "weekday": 0, "title": "x"})
-    check("tpl: slot on a missing template rejected", r.status_code == 404, str(r.status_code))
-    r = c.patch("/api/template-tasks/tidak-ada", json={"points": 5})
-    check("tpl: editing a missing slot → 404", r.status_code == 404, str(r.status_code))
-
-    # --- permissions ---
-    c.post("/api/auth/login", json={"member_id": syila["id"], "passcode": "123456"})
-    for _p, _b in [("/api/day-templates", {"name": "Punyaku"}),
-                   ("/api/template-tasks", {"template_id": T_BIASA, "weekday": 0, "title": "x"}),
-                   ("/api/template-assignments", {"template_id": T_BIASA, "start_date": MON})]:
-        check(f"tpl: kid blocked from {_p}", c.post(_p, json=_b).status_code == 403, _p)
-    check("tpl: kid blocked from deleting a template",
-          c.delete(f"/api/day-templates/{T_BIASA}").status_code == 403)
-    check("tpl: but a kid may READ templates (their app needs them)",
-          c.get("/api/day-templates").status_code == 200)
-
-    # --- per-child slots ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    r = c.post("/api/template-tasks", json={"template_id": T_LIBUR, "weekday": 0,
-                                            "segment_id": TSEG["Pagi"], "title": "Khusus Adskhan",
-                                            "child_id": adskhan["id"], "points": 5})
-    check("tpl: a slot can target one child", r.status_code == 200, r.text[:170])
-    c.post("/api/template-assignments", json={"template_id": T_LIBUR, "start_date": MON})
-    built2 = c.get(f"/api/tasks?date_key={MON}").json()
-    solo = [t for t in built2 if t["title"] == "Khusus Adskhan"]
-    check("tpl: a targeted slot makes exactly one mission", len(solo) == 1, str(len(solo)))
-    check("tpl: and it goes to the right child", solo[0]["child_id"] == adskhan["id"])
-
-    _aio_tg.run(server.db.day_templates.delete_many({}))
-    _aio_tg.run(server.db.template_tasks.delete_many({}))
-    _aio_tg.run(server.db.template_assignments.delete_many({}))
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== MENGANGGUR HANYA MENYANGKUT MISI YANG SEDANG GILIRAN ===============
-    # Reported: after idling, EVERY remaining mission that evening showed
-    # "Terlambat" — including ones not due for hours. A child can't act on
-    # those yet, so branding them late is both wrong and discouraging.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_many({}, {"$set": {"segment_starts": {}}}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Malam", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False})
-    IDS = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    mki2 = lambda t, o: c.post("/api/tasks", json={"title": t, "points": 10, "date_key": today_local,
-                                                   "duration_minutes": 10, "target_children": [adskhan["id"]],
-                                                   "segment_id": IDS, "order": o}).json()
-    i_done, i_turn, i_later, i_last = (mki2("Sudah selesai", 1), mki2("Giliran sekarang", 2),
-                                       mki2("Nanti", 3), mki2("Paling akhir", 4))
-    # Finish the first, then idle well past the limit
-    _aio_tg.run(server.db.tasks.update_one({"id": i_done["id"]}, {"$set": {
-        "status": "approved", "timer_started_at": server.now_iso(),
-        "completed_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=90)).isoformat()}}))
-
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    by = {t["title"]: t for t in r.json()["tasks"]}
-    check("idleturn: the mission whose turn it is IS closed by idling",
-          by["Giliran sekarang"]["availability"] == "closed", str(by["Giliran sekarang"]["availability"]))
-    check("idleturn: later missions are NOT branded late",
-          by["Nanti"]["availability"] == "open" and by["Paling akhir"]["availability"] == "open",
-          f'{by["Nanti"]["availability"]}/{by["Paling akhir"]["availability"]}')
-    check("idleturn: nor are they forced into at-fault-only reasons",
-          by["Nanti"]["at_fault_only"] is False and by["Paling akhir"]["at_fault_only"] is False)
-    check("idleturn: only the current one loses its excused reasons",
-          by["Giliran sekarang"]["at_fault_only"] is True)
-
-    # Owning the current one lets the evening carry on normally
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    c.post("/api/config", json={"late_reasons": [
-        {"label": "Lalai", "gives_penalty_card": True, "award_points": False}]})
-    _ir = c.get("/api/config").json()["late_reasons"][0]["id"]
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{i_turn['id']}/late-reason", json={"reason_id": _ir})
-    c.post(f"/api/tasks/{i_turn['id']}/start")
-    c.post(f"/api/tasks/{i_turn['id']}/complete")
-    r = c.post(f"/api/tasks/{i_later['id']}/start")
-    check("idleturn: the next mission starts normally right after", r.status_code == 200, r.text[:170])
-
-    # And a child may always begin the mission whose turn it is ahead of its
-    # projected time — the forecast is guidance, not a gate.
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    e1, e2 = mki2("Pertama", 1), mki2("Kedua", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{e1['id']}/start")
-    c.post(f"/api/tasks/{e1['id']}/complete")
-    r = c.post(f"/api/tasks/{e2['id']}/start")
-    check("idleturn: starting earlier than the projected time is allowed",
-          r.status_code == 200, r.text[:170])
-
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
     __import__("asyncio").run(server._refresh_segments_cache())
 
@@ -5687,12 +3079,12 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
           any(isinstance(cc, str) and cc.startswith("=") for rr in _flat for cc in rr if cc is not None), _txt[:200])
     check("xlsx: a per-day total row exists", "Total Senin" in _txt, _txt[:200])
 
-    # Template export
-    tplx = c.post("/api/day-templates", json={"name": "Hari Biasa", "is_default": True}).json()
-    c.post("/api/template-tasks", json={"template_id": tplx["id"], "weekday": 0,
-                                        "segment_id": XSEG["Pagi"], "title": "Dari template", "points": 15})
+    # Routine export
+    c.post("/api/routine/slots", json={"weekdays": [0], "segment_id": XSEG["Pagi"],
+                                       "title": "Dari template", "points": 15})
+    tplx = _aio_tg.run(server._routine_template(create=False))
     r = c.get(f"/api/export/weekly-xlsx?template_id={tplx['id']}")
-    check("xlsx: template export succeeds", r.status_code == 200, r.text[:170])
+    check("xlsx: routine export succeeds", r.status_code == 200, r.text[:170])
     wb2 = _lwb(_io_x.BytesIO(r.content))
     check("xlsx: template rows are present",
           "Dari template" in str([[cc for cc in rr] for rr in wb2[wb2.sheetnames[0]].iter_rows(values_only=True)]))
@@ -5711,173 +3103,6 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     _aio_tg.run(server.db.template_tasks.delete_many({}))
     _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
     c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS})
-    __import__("asyncio").run(server._refresh_segments_cache())
-
-    # =============== DURASI MINIMAL & LEMBUR ===============
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.exam_periods.delete_many({}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {
-        "points": 0, "chiky_save": 0, "chiky_spend": 0, "chiky_share": 0}}))
-    c.post("/api/config", json={
-        "day_segments": [{"label": "Sesi Belajar", "start_time": "00:00", "end_time": "23:59"}],
-        "min_gap_seconds": 0, "max_idle_minutes": 20, "auto_approve_tasks": False,
-        "early_bonus_pct": 0, "pacing_bonus_points": 0, "overtime_bonus_interval_minutes": 10})
-    MS = c.get("/api/config").json()["day_segments"][0]["id"]
-    __import__("asyncio").run(server._refresh_segments_cache())
-    check("mindur: bonus interval is configurable",
-          c.get("/api/config").json()["overtime_bonus_interval_minutes"] == 10)
-
-    RUSH = "Eit, belajarnya buru-buru ya? Yang bener belajarnya."
-    mkm = lambda t, o, **kw: c.post("/api/tasks", json={
-        "title": t, "points": 10, "date_key": today_local, "duration_minutes": 30,
-        "target_children": [adskhan["id"]], "segment_id": MS, "order": o, **kw}).json()
-
-    study = mkm("Belajar", 1, min_duration_minutes=20, rush_message=RUSH,
-                overtime_allowed=True, overtime_bonus_points=5)
-    check("mindur: the floor is stored", study.get("min_duration_minutes") == 20, str(study.get("min_duration_minutes")))
-    check("mindur: the custom message is stored", study.get("rush_message") == RUSH, str(study.get("rush_message")))
-    check("mindur: overtime settings stored",
-          study.get("overtime_allowed") is True and study.get("overtime_bonus_points") == 5, str(study))
-
-    # Finishing too early is refused, in the parent's own words
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{study['id']}/start")
-    r = c.post(f"/api/tasks/{study['id']}/complete")
-    check("mindur: finishing before the floor is refused", r.status_code == 409, str(r.status_code))
-    check("mindur: and it uses the custom wording", RUSH in r.text, r.text[:200])
-
-    # Once the floor has passed, it finishes fine
-    _aio_tg.run(server.db.tasks.update_one({"id": study["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=25)).isoformat()}}))
-    r = c.post(f"/api/tasks/{study['id']}/complete")
-    check("mindur: finishes once the floor has passed", r.status_code == 200, r.text[:200])
-
-    # A mission with no floor is unaffected
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    quick = mkm("Tanpa batas minimal", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{quick['id']}/start")
-    r = c.post(f"/api/tasks/{quick['id']}/complete")
-    check("mindur: a mission without a floor still finishes instantly", r.status_code == 200, r.text[:170])
-
-    # Default wording when the parent didn't write one
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    plain = mkm("Floor tanpa pesan", 1, min_duration_minutes=15)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{plain['id']}/start")
-    r = c.post(f"/api/tasks/{plain['id']}/complete")
-    check("mindur: falls back to sensible default wording",
-          r.status_code == 409 and "15 menit" in r.text, r.text[:200])
-
-    # --- overtime: running long is fine, and pays ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
-    long_study = mkm("Belajar lama", 1, overtime_allowed=True, overtime_bonus_points=5)
-    after_it = mkm("Mandi", 2)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{long_study['id']}/start")
-    # 30-minute mission that actually took 62 minutes → 3 full 10-minute steps
-    _aio_tg.run(server.db.tasks.update_one({"id": long_study["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=62)).isoformat()}}))
-    r = c.post(f"/api/tasks/{long_study['id']}/complete")
-    check("overtime: overrunning is allowed, not blocked", r.status_code == 200, r.text[:200])
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{long_study['id']}/approve")
-    check("overtime: extra effort earns bonus points",
-          r.json()["task"]["overtime_bonus_awarded"] == 15,
-          str(r.json()["task"].get("overtime_bonus_awarded")))
-    check("overtime: base + bonus land in the wallet",
-          next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"] == 25,
-          str(next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])["points"]))
-
-    # ...and what it pushed back is not treated as lateness
-    r = c.get(f"/api/children/{adskhan['id']}/day-progress?date_key={today_local}")
-    pushed = {t["id"]: t for t in r.json()["tasks"]}[after_it["id"]]
-    check("overtime: the mission it delayed stays open", pushed["availability"] == "open", str(pushed["availability"]))
-    check("overtime: and is not forced into at-fault reasons", pushed["at_fault_only"] is False)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    r = c.post(f"/api/tasks/{after_it['id']}/start")
-    check("overtime: the next mission starts cleanly", r.status_code == 200, r.text[:170])
-
-    # Overrunning a mission NOT marked overtime is still capped as before
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    strict = mkm("Bukan lembur", 1)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{strict['id']}/start")
-    _aio_tg.run(server.db.tasks.update_one({"id": strict["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=90)).isoformat()}}))
-    r = c.post(f"/api/tasks/{strict['id']}/complete")
-    check("overtime: an ordinary mission still can't overrun freely", r.status_code == 409, str(r.status_code))
-
-    # No bonus configured → no bonus paid, even when overtime is allowed
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    _aio_tg.run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"points": 0}}))
-    nobonus = mkm("Lembur tanpa bonus", 1, overtime_allowed=True)
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "654321"})
-    c.post(f"/api/tasks/{nobonus['id']}/start")
-    _aio_tg.run(server.db.tasks.update_one({"id": nobonus["id"]}, {"$set": {
-        "timer_started_at": (_dt_off.datetime.now(_dt_off.timezone.utc) - _dt_off.timedelta(minutes=70)).isoformat()}}))
-    c.post(f"/api/tasks/{nobonus['id']}/complete")
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    r = c.post(f"/api/tasks/{nobonus['id']}/approve")
-    check("overtime: no bonus configured means no bonus", r.json()["task"]["overtime_bonus_awarded"] == 0,
-          str(r.json()["task"].get("overtime_bonus_awarded")))
-
-    # --- editing keeps everything ---
-    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    ed = mkm("Untuk diedit", 1)
-    r = c.patch(f"/api/tasks/{ed['id']}", json={"min_duration_minutes": 25, "rush_message": RUSH,
-                                                "overtime_allowed": True, "overtime_bonus_points": 8})
-    check("mindur: edit accepts the new fields", r.status_code == 200, r.text[:180])
-    got = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
-    check("mindur: edits persist",
-          got["min_duration_minutes"] == 25 and got["rush_message"] == RUSH
-          and got["overtime_allowed"] is True and got["overtime_bonus_points"] == 8, str(got)[:200])
-    c.patch(f"/api/tasks/{ed['id']}", json={"points": 99})
-    got2 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
-    check("mindur: an unrelated edit keeps them", got2["min_duration_minutes"] == 25 and got2["rush_message"] == RUSH)
-    c.patch(f"/api/tasks/{ed['id']}", json={"min_duration_minutes": None, "rush_message": None})
-    got3 = c.get(f"/api/tasks?child_id={adskhan['id']}&date_key={today_local}").json()[0]
-    check("mindur: they can be cleared again", not got3.get("min_duration_minutes") and not got3.get("rush_message"))
-
-    # --- and they flow through templates ---
-    _aio_tg.run(server.db.day_templates.delete_many({}))
-    _aio_tg.run(server.db.template_tasks.delete_many({}))
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    tpl_m = c.post("/api/day-templates", json={"name": "Belajar Template"}).json()
-    _wd_m = _dt_off.datetime.strptime(today_local, "%Y-%m-%d").weekday()
-    r = c.post("/api/template-tasks", json={
-        "template_id": tpl_m["id"], "weekday": _wd_m, "segment_id": MS, "title": "Belajar",
-        "points": 10, "duration_minutes": 30, "min_duration_minutes": 20,
-        "rush_message": RUSH, "overtime_allowed": True, "overtime_bonus_points": 5})
-    check("mindur: a template slot accepts them", r.status_code == 200, r.text[:180])
-    c.post("/api/template-assignments", json={"template_id": tpl_m["id"], "start_date": today_local})
-    made = [t for t in c.get(f"/api/tasks?date_key={today_local}").json() if t["title"] == "Belajar"]
-    check("mindur: templates carry them into real missions",
-          made and made[0]["min_duration_minutes"] == 20 and made[0]["rush_message"] == RUSH
-          and made[0]["overtime_allowed"] is True and made[0]["overtime_bonus_points"] == 5,
-          str(made[:1])[:200])
-
-    # --- validation ---
-    r = c.post("/api/tasks", json={"title": "x", "points": 5, "date_key": today_local,
-                                   "target_children": [adskhan["id"]], "min_duration_minutes": 0})
-    check("mindur: a zero floor is rejected", r.status_code == 422, str(r.status_code))
-    r = c.post("/api/tasks", json={"title": "x", "points": 5, "date_key": today_local,
-                                   "target_children": [adskhan["id"]], "overtime_bonus_points": 99999})
-    check("mindur: an absurd bonus is rejected", r.status_code == 422, str(r.status_code))
-
-    _aio_tg.run(server.db.day_templates.delete_many({}))
-    _aio_tg.run(server.db.template_tasks.delete_many({}))
-    _aio_tg.run(server.db.template_assignments.delete_many({}))
-    _aio_tg.run(server.db.tasks.delete_many({"parent_id": "family-default"}))
-    c.post("/api/config", json={"day_segments": server.DEFAULT_DAY_SEGMENTS, "early_bonus_pct": 10})
     __import__("asyncio").run(server._refresh_segments_cache())
 
     # =============== PERFORMA: JUMLAH QUERY PER PEMBUKAAN LAYAR ANAK ===============
@@ -6323,17 +3548,19 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
         TOMORROW = (_base + _dt_off.timedelta(days=1)).strftime("%Y-%m-%d")
         both = [adskhan["id"], syila["id"]]
 
-        # --- legacy data in the old shape ---
-        c.post("/api/tasks", json={"title": "Sholat Subuh", "points": 10, "date_key": MON, "recurrence": "weekly",
-                                   "duration_minutes": 10, "target_children": both, "segment_id": RS["Pagi"], "order": 1})
-        c.post("/api/tasks", json={"title": "Sholat Subuh", "points": 10, "date_key": MON, "recurrence": "weekly",
-                                   "duration_minutes": 10, "target_children": [adskhan["id"]], "segment_id": RS["Pagi"]})
-        c.post("/api/tasks", json={"title": "Belajar", "points": 20, "date_key": TOMORROW, "recurrence": "daily",
-                                   "duration_minutes": 30, "target_children": [adskhan["id"]], "segment_id": RS["Malam"]})
-        kept = c.post("/api/tasks", json={"title": "Sudah dikerjakan", "points": 5, "date_key": MON,
-                                          "recurrence": "weekly", "target_children": [syila["id"]],
-                                          "segment_id": RS["Pagi"]}).json()
-        _aio_tg.run(server.db.tasks.update_one({"id": kept["id"]}, {"$set": {"status": "approved"}}))
+        # --- legacy data in the old shape (written directly: the API no longer makes it) ---
+        def _legacy(title, pts, dk, rec, kid, seg, dur=None, status="pending"):
+            doc = {"id": server.new_id(), "parent_id": "family-default", "child_id": kid, "title": title,
+                   "points": pts, "date_key": dk, "recurrence": rec, "duration_minutes": dur,
+                   "segment_id": seg, "status": status, "order": 1, "created_at": server.now_iso()}
+            _aio_tg.run(server.db.tasks.insert_one(dict(doc)))
+            return doc
+        for kid in both:
+            _legacy("Sholat Subuh", 10, MON, "weekly", kid, RS["Pagi"], 10)
+        _legacy("Sholat Subuh", 10, MON, "weekly", adskhan["id"], RS["Pagi"], 10)
+        _legacy("Belajar", 20, TOMORROW, "daily", adskhan["id"], RS["Malam"], 30)
+        kept = _legacy("Sudah dikerjakan", 5, MON, "weekly", syila["id"], RS["Pagi"], status="approved")
+        server._ROUTINE_MIGRATED["done"] = False
 
         r = c.get("/api/routine")
         check("routine: loads for a parent", r.status_code == 200, r.text[:200])

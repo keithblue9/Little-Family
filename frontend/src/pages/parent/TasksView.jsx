@@ -4,12 +4,12 @@ import api, { formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { todayKey, humanDateKey, shiftDateKey, nextDateForWeekday } from "@/lib/dates";
-import { btnPrimary, fmtClock, fmtDuration } from "@/pages/parent/shared";
+import { btnPrimary, fmtClock } from "@/pages/parent/shared";
 
 const MonthHeatmap = lazy(() => import("@/components/MonthHeatmap"));
 const EncourageModal = lazy(() => import("@/components/EncourageModal"));
 
-export function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTemplates, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild, onEnsureDate, taskWindow }) {
+export function TasksView({ kids, tasks, selectedChildId, onAddTask, onEditTask, onDuplicate, onRefresh, onApplyConsequence, onAddChild, onEnsureDate, taskWindow }) {
   // Drag-and-drop reordering of the active list. We keep a local copy while
   // dragging so the row follows the cursor instantly, then persist the whole
   // visible slice in one call. If the save fails we reload from the server
@@ -278,9 +278,6 @@ export function TasksView({ kids, tasks, selectedChildId, onAddTask, onOpenTempl
           📅 {showCalendar ? "Sembunyikan Kalender" : "Lihat Kalender"}
         </button>
         <div className="flex gap-2 flex-wrap">
-          <button onClick={onOpenTemplates} className="press-btn inline-flex items-center gap-1.5 bg-white border-2 border-indigo-200 text-indigo-600 hover:bg-indigo-50 font-semibold px-4 py-2 rounded-xl text-sm">
-            📋 Dari Template
-          </button>
           <button onClick={onAddTask} data-testid={TEST_IDS.parent.addTaskBtn} className={btnPrimary}>
             <Plus className="w-4 h-4" strokeWidth={2.5} /> Tugas baru
           </button>
@@ -570,27 +567,14 @@ function TaskRow({ task, childName, children, dim = false, currentDateFilter = n
               📅 {humanDateKey(task.date_key)}
             </Chip>
           )}
-          {task.due_time && <Chip tone="indigo" title="Batas waktu">🕒 {task.due_time}</Chip>}
-          {task.duration_minutes && <Chip title="Durasi">⏱️ {task.duration_minutes}m</Chip>}
-          {task.recurrence !== "none" && <Chip title={task.recurrence === "daily" ? "Berulang harian" : "Berulang mingguan"}>{task.recurrence === "daily" ? "🔁 harian" : "🔁 mingguan"}</Chip>}
+          {task.duration_minutes && <Chip title="Perkiraan durasi (info saja)">⏱️ {task.duration_minutes}m</Chip>}
           {task.status === "skipped" && <Chip tone="amber">dilewati</Chip>}
-          {task.early_bonus_awarded > 0 && <Chip tone="green" title="Bonus selesai lebih cepat">⚡ +{task.early_bonus_awarded} cepat</Chip>}
         </div>
-        {/* Start/finish timestamps — lets a parent sanity-check whether the kid
-            actually spent time on a task vs. instantly tapping through. */}
-        {(task.timer_started_at || task.completed_at) && (
+        {/* When the child ticked it — the section's finish time is the only
+            deadline, so this is the one timestamp worth showing. */}
+        {task.checked_at && (
           <div className="flex items-center gap-2 flex-wrap mt-1 text-[11px] text-slate-400">
-            {task.timer_started_at && (
-              <span title="Waktu anak menekan Mulai">▶️ Mulai {fmtClock(task.timer_started_at)}</span>
-            )}
-            {task.completed_at && (
-              <span title="Waktu anak menekan Selesai">✅ Selesai {fmtClock(task.completed_at)}</span>
-            )}
-            {task.timer_started_at && task.completed_at && (
-              <span className="text-slate-500 font-semibold" title="Lama pengerjaan">
-                ⏳ {fmtDuration(task.timer_started_at, task.completed_at)}
-              </span>
-            )}
+            <span title="Waktu anak mencentang">✔️ Dicentang {fmtClock(task.checked_at)}</span>
           </div>
         )}
       </div>

@@ -22,7 +22,6 @@ const SettingsView = lazy(() => import("@/pages/parent/SettingsView").then((m) =
 const ChildFormModal = lazy(() => import("@/pages/parent/ChildFormModal").then((m) => ({ default: m.ChildFormModal })));
 const TaskFormModal = lazy(() => import("@/pages/parent/TaskFormModal").then((m) => ({ default: m.TaskFormModal })));
 const RewardFormModal = lazy(() => import("@/pages/parent/RewardFormModal").then((m) => ({ default: m.RewardFormModal })));
-const TemplateModal = lazy(() => import("@/pages/parent/TemplateModal").then((m) => ({ default: m.TemplateModal })));
 const ConsequenceFormModal = lazy(() => import("@/pages/parent/ConsequenceModals").then((m) => ({ default: m.ConsequenceFormModal })));
 const ApplyConsequenceModal = lazy(() => import("@/pages/parent/ConsequenceModals").then((m) => ({ default: m.ApplyConsequenceModal })));
 const MoneyApprovals = lazy(() => import("@/components/MoneyApprovals"));
@@ -35,7 +34,6 @@ const CommandPalette = lazy(() => import("@/components/CommandPalette"));
 const HonestyInsightCard = lazy(() => import("@/components/HonestyInsightCard"));
 const ActivityLogCard = lazy(() => import("@/components/ActivityLogCard"));
 const RoutineManager = lazy(() => import("@/components/RoutineManager"));
-const HoldRequestsReview = lazy(() => import("@/components/HoldRequestsReview"));
 
 // Start downloading a tab's code the moment a finger or cursor reaches it.
 const VIEW_PREFETCH = {
@@ -106,7 +104,6 @@ export default function ParentApp() {
   const [childModal, setChildModal] = useState(false);
   const [taskModal, setTaskModal] = useState(false);
   const [editingTask, setEditingTask] = useState(null);
-  const [templateModal, setTemplateModal] = useState(false);
   const [rewardModal, setRewardModal] = useState(false);
   const [editingReward, setEditingReward] = useState(null);
   const [consModal, setConsModal] = useState(false);
@@ -342,7 +339,6 @@ export default function ParentApp() {
           )}
           {view === "tasks" && (
             <div className="space-y-4">
-              <HoldRequestsReview onChanged={load} />
               {/* The weekly routine is the schedule now; per-date missions are
                   generated from it. The old per-date list stays reachable for
                   one-off corrections, folded away so it doesn't compete. */}
@@ -357,7 +353,6 @@ export default function ParentApp() {
                     tasks={filteredTasks}
                     selectedChildId={selectedChildId}
                     onAddTask={() => { setEditingTask(null); setTaskModal(true); }}
-                    onOpenTemplates={() => setTemplateModal(true)}
                     onEditTask={(t) => { setEditingTask(t); setTaskModal(true); }}
                     onDuplicate={(t) => {
                       // Pre-fill form with task values but as a NEW task (not edit)
@@ -474,7 +469,6 @@ export default function ParentApp() {
         onSaved={load}
         editTask={editingTask}
       />
-      <TemplateModal open={templateModal} onClose={() => setTemplateModal(false)} kids={children} onSaved={load} />
       <RewardFormModal open={rewardModal} onClose={() => { setRewardModal(false); setEditingReward(null); }} onSaved={load} editReward={editingReward} />
       <ConsequenceFormModal open={consModal} onClose={() => { setConsModal(false); setEditingCons(null); }} onSaved={load} editConsequence={editingCons} />
       <ApplyConsequenceModal

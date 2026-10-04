@@ -150,10 +150,6 @@ export default function ConfigMenu() {
             <span className="text-xs text-slate-500">Rupiah per poin</span>
             <input type="number" min="1" value={config.rupiah_per_point} onChange={(e) => change("rupiah_per_point", parseInt(e.target.value) || 1)} className={inputCls} />
           </div>
-          <div>
-            <span className="text-xs text-slate-500">Biaya lewati misi (poin)</span>
-            <input type="number" min="0" value={config.skip_cost_points} onChange={(e) => change("skip_cost_points", parseInt(e.target.value) || 0)} className={inputCls} />
-          </div>
         </div>
       </div>
 

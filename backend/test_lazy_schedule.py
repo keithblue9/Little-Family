@@ -1185,6 +1185,70 @@ with TestClient(server.app, base_url="https://testserver") as c:
     run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"pet_force_dead": False}}))
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # ---------------- Timed activities (Mulai → Selesai) ----------------
+    reset_schedule()
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/config", json={"auto_approve_tasks": True})
+    TA = server.ANYTIME_SEGMENT_ID
+    tb = {"child_id": adskhan["id"], "date_key": TODAY, "segment_id": TA}
+    t_sar = c.post("/api/tasks", json={"title": "Sarapan", "points": 10, "date_key": TODAY, "duration_minutes": 15,
+                                       "timed": True, "target_children": [adskhan["id"]]}).json()
+    t_plain = c.post("/api/tasks", json={"title": "Cuci tangan", "points": 5, "date_key": TODAY,
+                                         "target_children": [adskhan["id"]]}).json()
+    check("timer: the mission remembers it is timed", t_sar.get("timed") is True and not t_plain.get("timed"))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    r = c.post(f"/api/tasks/{t_sar['id']}/timer/start")
+    check("timer: not before the section starts", r.status_code == 409, r.text[:120])
+    c.post("/api/segment-sessions/start", json=tb)
+    check("timer: a plain activity has no timer", c.post(f"/api/tasks/{t_plain['id']}/timer/start").status_code == 400)
+    check("timer: can't stop what never started", c.post(f"/api/tasks/{t_sar['id']}/timer/stop").status_code == 409)
+    r = c.post(f"/api/tasks/{t_sar['id']}/check", json={"checked": True})
+    check("timer: a plain tick is refused", r.status_code == 422 and "TIMER_REQUIRED" in r.text, r.text[:120])
+    c.post("/api/segment-sessions/check-all", json={**tb, "checked": True})
+    check("timer: 'centang semua' skips it", run(server.db.tasks.find_one({"id": t_sar["id"]})).get("checked") is not True)
+    c.post(f"/api/tasks/{t_plain['id']}/check", json={"checked": True})
+    r = c.post("/api/segment-sessions/finish", json=tb)
+    check("timer: the section can't finish with the timer untouched", r.status_code == 422 and "Sarapan" in r.text, r.text[:150])
+    r = c.post(f"/api/tasks/{t_sar['id']}/timer/start")
+    check("timer: Mulai stores the start", r.status_code == 200 and r.json()["timer_started_at"], r.text[:120])
+    r2 = c.post(f"/api/tasks/{t_sar['id']}/timer/start")
+    check("timer: Mulai twice keeps the first start", r2.json()["timer_started_at"] == r.json()["timer_started_at"] and r2.json().get("already"))
+    r = c.post("/api/segment-sessions/finish", json=tb)
+    check("timer: a running timer blocks finishing the section", r.status_code == 422, r.text[:150])
+    # pretend 12 minutes went by
+    ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)).isoformat()
+    run(server.db.tasks.update_one({"id": t_sar["id"]}, {"$set": {"timer_started_at": ago}}))
+    r = c.post(f"/api/tasks/{t_sar['id']}/timer/stop")
+    check("timer: Selesai stops the clock and ticks the activity",
+          r.status_code == 200 and 710 <= r.json()["timer_seconds"] <= 740 and r.json()["checked"] is True, r.text[:150])
+    check("timer: stopping twice changes nothing", c.post(f"/api/tasks/{t_sar['id']}/timer/stop").json().get("already") is True)
+    check("timer: can't restart a finished timer", c.post(f"/api/tasks/{t_sar['id']}/timer/start").status_code == 409)
+    sd = c.get(f"/api/children/{adskhan['id']}/segments-day").json()
+    act = next(a for sg in sd["segments"] for a in sg["activities"] if a["id"] == t_sar["id"])
+    check("timer: the checklist carries it", act["timed"] and act["timer_seconds"] and act["checked"], str(act)[:200])
+    r = c.post("/api/segment-sessions/finish", json=tb)
+    check("timer: the section finishes once it is done", r.status_code == 200 and r.json()["awarded"] == 2, r.text[:200])
+    # unticking starts it over
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    c.post("/api/segment-sessions/reopen", json=tb)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    c.post(f"/api/tasks/{t_sar['id']}/check", json={"checked": False})
+    again = run(server.db.tasks.find_one({"id": t_sar["id"]}))
+    check("timer: unticking clears the timer", again.get("timer_seconds") is None and again.get("timer_started_at") is None)
+    c.post("/api/auth/login", json={"member_id": other["id"], "passcode": "123456"})
+    check("timer: a sibling can't run it", c.post(f"/api/tasks/{t_sar['id']}/timer/start").status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    # from the routine
+    reset_schedule()
+    segs_t = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    add_routine(c, "Makan malam", 10, segs_t[0], weekdays=list(range(7)), child_id=adskhan["id"])
+    sl = [x for x in c.get("/api/routine").json()["slots"] if x["title"] == "Makan malam"]
+    for x in sl:
+        c.patch(f"/api/routine/slots/{x['id']}", json={"timed": True})
+    c.post("/api/routine/apply-today")
+    built = [t for t in c.get(f"/api/tasks?date_key={TODAY}").json() if t["title"] == "Makan malam"]
+    check("timer: the routine hands it to each day's mission", built and all(t.get("timed") for t in built), str(built)[:150])
+
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})
     check("gzip: large JSON is compressed",

@@ -617,6 +617,7 @@ const proofIcons = (s) => [
   s.summary_required && ((s.summary_questions || []).length ? "❓" : "📝"),
   (s.photo_required || s.before_photo_required) && "📷",
   s.reading && "📖",
+  s.timed && "⏱",
   (s.steps || []).length > 0 && "☑️",
 ].filter(Boolean).join("");
 
@@ -644,6 +645,8 @@ function ProofEditor({ slot: s, onPatch }) {
         <button className={chip(s.photo_required)} onClick={() => onPatch(s, { photo_required: !s.photo_required })}>📷 Foto sesudah</button>
         <button className={chip(s.before_photo_required)} onClick={() => onPatch(s, { before_photo_required: !s.before_photo_required })}>📷 Foto sebelum</button>
         <button className={chip(s.reading)} onClick={() => onPatch(s, { reading: !s.reading })}>📖 Halaman buku</button>
+        <button className={chip(s.timed)} onClick={() => onPatch(s, { timed: !s.timed })}
+          title="Anak menekan Mulai lalu Selesai; waktunya dicatat">⏱ Pakai timer</button>
         <button className={chip((s.steps || []).length > 0)}
           onClick={() => onPatch(s, { steps: (s.steps || []).length ? [] : ["Langkah 1", "Langkah 2"] })}>☑️ Checklist kecil</button>
       </div>

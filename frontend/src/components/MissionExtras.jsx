@@ -1,8 +1,8 @@
-import { useState } from "react";
-import { Check } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Check, Play, Square } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
-import { haptic } from "@/lib/offlineQueue";
+import { haptic, sendOrQueue } from "@/lib/offlineQueue";
 
 /**
  * Small pieces a mission can carry besides its own tick:
@@ -148,5 +148,88 @@ export function AdmitButton({ activity, onDone, big = false }) {
         </button>
       </div>
     </div>
+  );
+}
+
+
+// One interval shared by every running timer on screen, alive only while at
+// least one is running — a stopwatch costs nothing when nobody is timing.
+const tickSubs = new Set();
+let tickId = null;
+function useTick(active) {
+  const [, set] = useState(0);
+  useEffect(() => {
+    if (!active) return undefined;
+    const fn = () => set((n) => n + 1);
+    tickSubs.add(fn);
+    if (!tickId) tickId = setInterval(() => { if (!document.hidden) tickSubs.forEach((f) => f()); }, 1000);
+    return () => {
+      tickSubs.delete(fn);
+      if (!tickSubs.size && tickId) { clearInterval(tickId); tickId = null; }
+    };
+  }, [active]);
+}
+
+export const fmtClock = (secs) => {
+  const s = Math.max(0, Math.round(secs));
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+};
+export const fmtTook = (secs) => (secs < 90 ? `${Math.max(1, Math.round(secs))} dtk` : `${Math.round(secs / 60)} mnt`);
+
+/**
+ * Mulai → Selesai for an activity the parent chose to time. The clock is just
+ * the stored start time, so it survives closing the app; Selesai also ticks
+ * the activity. Updates show at once and are queued if there's no signal.
+ */
+export function TimerControl({ activity, canEdit, onChange, big = false }) {
+  const [busy, setBusy] = useState(false);
+  const running = !!activity.timer_started_at && !activity.timer_ended_at;
+  useTick(running);
+  const done = !!activity.timer_ended_at;
+  const elapsed = running ? (Date.now() - new Date(activity.timer_started_at).getTime()) / 1000 : 0;
+  const target = (activity.duration_minutes || 0) * 60;
+
+  const go = async (kind) => {
+    if (busy) return;
+    setBusy(true);
+    const nowIso = new Date().toISOString();
+    haptic(kind === "start" ? 10 : [20, 30, 20]);
+    const prev = { timer_started_at: activity.timer_started_at, timer_ended_at: activity.timer_ended_at,
+                   timer_seconds: activity.timer_seconds, checked: activity.checked };
+    onChange?.(kind === "start"
+      ? { timer_started_at: nowIso }
+      : { timer_ended_at: nowIso, timer_seconds: Math.max(1, Math.round(elapsed)), checked: true });
+    try {
+      await sendOrQueue(`/tasks/${activity.id}/timer/${kind === "start" ? "start" : "stop"}`, {}, `timer:${kind}:${activity.id}`);
+    } catch (e) {
+      onChange?.(prev);
+      toast.error(formatApiError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const size = big ? "px-5 py-3 text-lg" : "px-2.5 py-1.5 text-xs";
+  if (done) {
+    return <span className={`shrink-0 font-bold text-emerald-600 ${big ? "text-lg" : "text-[11px]"}`}>⏱ {fmtTook(activity.timer_seconds || 0)}</span>;
+  }
+  if (!canEdit) return null;
+  if (running) {
+    const over = target && elapsed > target;
+    return (
+      <div className="shrink-0 flex items-center gap-1.5">
+        <span className={`font-mono font-bold tabular-nums ${over ? "text-amber-600" : "text-indigo-600"} ${big ? "text-2xl" : "text-xs"}`}>{fmtClock(elapsed)}</span>
+        <button type="button" onClick={() => go("stop")} disabled={busy}
+          className={`press-btn inline-flex items-center gap-1 rounded-xl bg-emerald-500 text-white font-fun font-bold ${size}`}>
+          <Square className="w-3 h-3 fill-current" /> Selesai
+        </button>
+      </div>
+    );
+  }
+  return (
+    <button type="button" onClick={() => go("start")} disabled={busy}
+      className={`press-btn shrink-0 inline-flex items-center gap-1 rounded-xl bg-indigo-600 text-white font-fun font-bold ${size}`}>
+      <Play className="w-3 h-3 fill-current" /> Mulai{target ? ` · ${activity.duration_minutes} mnt` : ""}
+    </button>
   );
 }

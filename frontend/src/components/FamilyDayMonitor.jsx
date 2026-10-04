@@ -277,6 +277,14 @@ function TaskRow({ task, bonus, onChanged, strikes }) {
             <span className="text-sky-600">· 📖 {task.reading_book} hal. {task.reading_from_page ? `${task.reading_from_page}→` : ""}{task.reading_page}</span>
           )}
           {(task.steps || []).length > 0 && <span>· ☑️ {stepsDone}/{task.steps.length}</span>}
+          {task.timed && task.timer_seconds != null && (
+            <span className={task.duration_minutes && task.timer_seconds > task.duration_minutes * 60 * 1.25 ? "text-amber-600 font-semibold" : "text-indigo-600"}
+                  title="Lama yang dicatat timer">
+              · ⏱ {task.timer_seconds < 90 ? `${task.timer_seconds} dtk` : `${Math.round(task.timer_seconds / 60)} mnt`}
+              {task.duration_minutes ? ` (target ${task.duration_minutes})` : ""}
+            </span>
+          )}
+          {task.timed && task.timer_started_at && !task.timer_ended_at && <span className="text-indigo-600">· ⏱ sedang berjalan</span>}
         </div>
       </div>
       {hasPhoto && (

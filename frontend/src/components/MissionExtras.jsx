@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, Play, Square } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
@@ -170,28 +170,105 @@ function useTick(active) {
   }, [active]);
 }
 
+// Keep the screen on while a timer runs, so the child's phone doesn't lock
+// mid-activity. (If it locks anyway, nothing is lost: the clock is the stored
+// start time, so the elapsed time is right the moment the screen comes back.)
+let wakeLock = null;
+let wakeUsers = 0;
+async function acquireWake() {
+  try {
+    if (!("wakeLock" in navigator) || wakeLock || document.hidden) return;
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch { /* not allowed or unsupported — harmless */ }
+}
+function useWakeLock(active) {
+  useEffect(() => {
+    if (!active) return undefined;
+    wakeUsers += 1;
+    acquireWake();
+    const onVisible = () => { if (!document.hidden && wakeUsers > 0) acquireWake(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      wakeUsers -= 1;
+      if (wakeUsers <= 0 && wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; wakeUsers = 0; }
+    };
+  }, [active]);
+}
+
 export const fmtClock = (secs) => {
   const s = Math.max(0, Math.round(secs));
   return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 };
 export const fmtTook = (secs) => (secs < 90 ? `${Math.max(1, Math.round(secs))} dtk` : `${Math.round(secs / 60)} mnt`);
 
+// A milestone (minimum reached / target reached) is announced once per run.
+const announced = new Set();
+function announce(key, text, mood, title) {
+  if (announced.has(key)) return;
+  announced.add(key);
+  // The pet says it in a pop-up (with its voice); with no pet screen to show it, a toast.
+  const detail = { text, mood, sound: true, handled: false };
+  window.dispatchEvent(new CustomEvent("app:pet-say", { detail }));
+  if (!detail.handled) toast(text, { duration: 6000 });
+  haptic([30, 60, 30]);
+  // App in the background or phone locked: a system notification, if allowed.
+  if (document.hidden && typeof Notification !== "undefined" && Notification.permission === "granted") {
+    const opts = { body: text, tag: key, icon: "/icons/icon-192.png", renotify: true };
+    navigator.serviceWorker?.getRegistration?.().then((reg) => (reg ? reg.showNotification(title, opts) : new Notification(title, opts)))
+      .catch(() => { try { new Notification(title, opts); } catch { /* ignore */ } });
+  }
+}
+
 /**
  * Mulai → Selesai for an activity the parent chose to time. The clock is just
- * the stored start time, so it survives closing the app; Selesai also ticks
- * the activity. Updates show at once and are queued if there's no signal.
+ * the stored start time, so it survives closing the app or locking the phone;
+ * Selesai also ticks the activity. If the parent set a minimum, Selesai stays
+ * off until that much time has passed. Updates show at once and are queued if
+ * there's no signal.
  */
 export function TimerControl({ activity, canEdit, onChange, big = false }) {
   const [busy, setBusy] = useState(false);
+  const holdUntil = useRef(0);   // set when the server says "not yet"
   const running = !!activity.timer_started_at && !activity.timer_ended_at;
   useTick(running);
+  useWakeLock(running);
   const done = !!activity.timer_ended_at;
-  const elapsed = running ? (Date.now() - new Date(activity.timer_started_at).getTime()) / 1000 : 0;
+  const startMs = running ? new Date(activity.timer_started_at).getTime() : 0;
+  const elapsed = running ? (Date.now() - startMs) / 1000 : 0;
   const target = (activity.duration_minutes || 0) * 60;
+  const min = (activity.timer_min_minutes || 0) * 60;
+  const wait = running ? Math.max(0, min - elapsed, (holdUntil.current - Date.now()) / 1000) : 0;
+
+  // Milestones: right on time while the app is open, and — if the phone slept
+  // through them — as soon as it wakes.
+  useEffect(() => {
+    if (!running) return undefined;
+    const base = `${activity.id}:${activity.timer_started_at}`;
+    const check = () => {
+      const el = (Date.now() - startMs) / 1000;
+      if (min && el >= min) {
+        announce(`${base}:min`, `Sudah ${activity.timer_min_minutes} menit — kamu boleh tekan Selesai kalau “${activity.title}” sudah beres 🎉`, "happy", "Timer: boleh Selesai");
+      }
+      if (target && el >= target) {
+        announce(`${base}:target`, `Waktu ${activity.duration_minutes} menit untuk “${activity.title}” sudah habis ⏰`, "wake", "Timer: waktu habis");
+      }
+    };
+    check();
+    const timers = [min, target].filter((x) => x && Date.now() - startMs < x * 1000)
+      .map((x) => setTimeout(check, x * 1000 - (Date.now() - startMs) + 80));
+    const onVisible = () => { if (!document.hidden) check(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { timers.forEach(clearTimeout); document.removeEventListener("visibilitychange", onVisible); };
+  }, [running, startMs, min, target, activity.id, activity.timer_started_at, activity.title, activity.timer_min_minutes, activity.duration_minutes]);
 
   const go = async (kind) => {
     if (busy) return;
     setBusy(true);
+    if (kind === "start" && typeof Notification !== "undefined" && Notification.permission === "default") {
+      try { Notification.requestPermission(); } catch { /* ignore */ }   // so a locked phone can still be told
+    }
     const nowIso = new Date().toISOString();
     haptic(kind === "start" ? 10 : [20, 30, 20]);
     const prev = { timer_started_at: activity.timer_started_at, timer_ended_at: activity.timer_ended_at,
@@ -203,7 +280,13 @@ export function TimerControl({ activity, canEdit, onChange, big = false }) {
       await sendOrQueue(`/tasks/${activity.id}/timer/${kind === "start" ? "start" : "stop"}`, {}, `timer:${kind}:${activity.id}`);
     } catch (e) {
       onChange?.(prev);
-      toast.error(formatApiError(e));
+      const m = /TIMER_TOO_SHORT:(\d+)/.exec(e?.response?.data?.detail || "");
+      if (m) {
+        holdUntil.current = Date.now() + Number(m[1]) * 1000;
+        toast(`Belum cukup lama — tunggu ${fmtClock(Number(m[1]))} lagi ⏳`);
+      } else {
+        toast.error(formatApiError(e));
+      }
     } finally {
       setBusy(false);
     }
@@ -216,12 +299,15 @@ export function TimerControl({ activity, canEdit, onChange, big = false }) {
   if (!canEdit) return null;
   if (running) {
     const over = target && elapsed > target;
+    const locked = wait > 0;
     return (
       <div className="shrink-0 flex items-center gap-1.5">
         <span className={`font-mono font-bold tabular-nums ${over ? "text-amber-600" : "text-indigo-600"} ${big ? "text-2xl" : "text-xs"}`}>{fmtClock(elapsed)}</span>
-        <button type="button" onClick={() => go("stop")} disabled={busy}
-          className={`press-btn inline-flex items-center gap-1 rounded-xl bg-emerald-500 text-white font-fun font-bold ${size}`}>
-          <Square className="w-3 h-3 fill-current" /> Selesai
+        <button type="button" onClick={() => go("stop")} disabled={busy || locked}
+          title={locked ? `Selesai bisa ditekan setelah minimal ${activity.timer_min_minutes || ""} menit` : undefined}
+          className={`press-btn inline-flex items-center gap-1 rounded-xl font-fun font-bold ${size} ${
+            locked ? "bg-slate-200 text-slate-500" : "bg-emerald-500 text-white"}`}>
+          <Square className="w-3 h-3 fill-current" /> {locked ? `Selesai · ${fmtClock(wait)}` : "Selesai"}
         </button>
       </div>
     );

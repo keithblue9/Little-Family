@@ -998,7 +998,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     check("pet: fresh pick has feed reset to 0", r.json().get("feed_balance") == 0 and r.json().get("feed_lifetime") == 0)
     r = c.patch("/api/me/profile", json={"pet_type": "dragon"})
     check("pet: cannot switch while alive", r.status_code == 400, r.text[:150])
-    r = c.patch("/api/me/profile", json={"pet_type": "elephant"})
+    r = c.patch("/api/me/profile", json={"pet_type": "unicorn"})
     check("pet: invalid animal rejected", r.status_code == 422, str(r.status_code))
     # Still 'chicken' after the rejected switch attempts
     ads_pet_check = next(k for k in c.get("/api/children").json() if k["id"] == adskhan["id"])

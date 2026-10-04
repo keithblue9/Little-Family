@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
@@ -29,35 +29,7 @@ function moodFor(child) {
   return { label: "Kangen Banget", face: "🥺", ring: "ring-slate-400", glow: "shadow-slate-200" };
 }
 
-/** Did this child feed their pet today (family local time, GMT+7)? */
-function fedToday(kid) {
-  if (!kid?.pet_last_fed_at) return false;
-  try {
-    const fed = new Date(kid.pet_last_fed_at);
-    const fedLocal = new Date(fed.getTime() + 7 * 3600 * 1000);
-    const nowLocal = new Date(Date.now() + 7 * 3600 * 1000);
-    return fedLocal.toISOString().slice(0, 10) === nowLocal.toISOString().slice(0, 10);
-  } catch {
-    return false;
-  }
-}
-
-export default function VirtualPetMascot({ child, onChanged, levelTitles, petStageNames, petFeedThresholds, feedCostPerMeal }) {
-  // Sibling pets — when BOTH kids have cared for their pet today, the pets
-  // come out to play together. A shared moment that rewards the family being
-  // in sync, rather than one more thing to compete over.
-  const [siblings, setSiblings] = useState([]);
-  useEffect(() => {
-    let cancelled = false;
-    api.get("/children")
-      .then(({ data }) => {
-        if (cancelled) return;
-        setSiblings(data.filter((k) => k.id !== child?.id && k.pet_type));
-      })
-      .catch(() => { if (!cancelled) setSiblings([]); });
-    return () => { cancelled = true; };
-  }, [child?.id, child?.pet_last_fed_at]);
-  const playmates = fedToday(child) ? siblings.filter(fedToday) : [];
+export default function VirtualPetMascot({ child, onChanged, levelTitles, petStageNames, petFeedThresholds, feedCostPerMeal, serverMood, phase, pathIcon, pathLabel }) {
   const [picking, setPicking] = useState(false);
   const [saving, setSaving] = useState(false);
   const [feeding, setFeeding] = useState(false);
@@ -233,13 +205,34 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
   }
 
   const appearance = petAppearanceByFeed(child.pet_type, child.pet_feed_count || 0, petFeedThresholds, petStageNames);
-  const mood = moodFor(child);
+  const MOOD_RING = {
+    ecstatic: ["ring-green-300", "shadow-green-200"], happy: ["ring-lime-300", "shadow-lime-200"],
+    calm: ["ring-blue-200", "shadow-blue-100"], sad: ["ring-slate-300", "shadow-slate-100"],
+    hungry: ["ring-amber-200", "shadow-amber-100"], thirsty: ["ring-sky-200", "shadow-sky-100"], bored: ["ring-amber-200", "shadow-amber-100"],
+  };
+  const mood = serverMood
+    ? { label: serverMood.label, face: serverMood.face, line: serverMood.line,
+        ring: (MOOD_RING[serverMood.key] || MOOD_RING.calm)[0], glow: (MOOD_RING[serverMood.key] || MOOD_RING.calm)[1] }
+    : moodFor(child);
+  const night = phase?.key === "night";
   // The pet is drawn as a real SVG creature (PetSprite) that physically grows
   // each stage. Size scales up baby→adult so growth is unmistakable.
   const SPRITE_SIZE_BY_STAGE = [58, 54, 66, 76];
 
+  const PHASE_BG = {
+    morning: "linear-gradient(155deg, #fff3c4 0%, #cfe8c9 60%, #a9d6a1 100%)",
+    noon: "linear-gradient(155deg, #d6f0ff 0%, #cfe8c9 55%, #8fc987 100%)",
+    evening: "linear-gradient(155deg, #ffd9b0 0%, #e8c9a0 55%, #b9a07c 100%)",
+    night: "linear-gradient(155deg, #2a3466 0%, #3b4a8a 60%, #55649e 100%)",
+  };
   return shell(
     <div className="relative">
+      {phase && (
+        <div className={`flex items-center gap-1.5 text-[11px] font-bold mb-2 ${night ? "text-indigo-100" : "text-slate-600"}`}>
+          <span>{phase.emoji}</span><span>{phase.label}</span>
+          {mood.line && <span className={`font-normal ${night ? "text-indigo-100" : "text-slate-700"}`}>· {night ? phase.line : mood.line}</span>}
+        </div>
+      )}
       <div className="flex items-center gap-4">
         <button onClick={handleTap} className="relative shrink-0" title="Sentuh aku!">
           <motion.div
@@ -249,7 +242,11 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
             className={`relative w-24 h-24 rounded-full bg-white/40 flex items-center justify-center ring-4 ${mood.ring} shadow-lg ${mood.glow}`}
           >
             <PetSprite petType={child.pet_type} stageIndex={appearance.stageIndex} size={SPRITE_SIZE_BY_STAGE[appearance.stageIndex]} />
-            <span className="absolute -bottom-1 -right-1 text-xl">{mood.face}</span>
+            <span className="absolute -bottom-1 -right-1 text-xl">{night ? "😴" : mood.face}</span>
+            {night && (
+              <motion.span animate={{ y: [0, -10], opacity: [1, 0] }} transition={{ duration: 2, repeat: Infinity }}
+                           className="absolute -top-2 right-0 text-sm font-bold text-indigo-100">Zzz</motion.span>
+            )}
             {equipped.map((key, i) => {
               const acc = ACCESSORY_CATALOG.find((a) => a.key === key);
               if (!acc) return null;
@@ -291,7 +288,8 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="font-fun font-bold text-slate-800 bg-white/50 rounded-full px-2 py-0.5 text-sm">{appearance.stageName} {appearance.petName}-mu</span>
+            <span className="font-fun font-bold text-slate-800 bg-white/50 rounded-full px-2 py-0.5 text-sm">{appearance.stageName} {appearance.petName}-mu{pathIcon ? ` ${pathIcon}` : ""}</span>
+            {pathLabel && <span className="text-[10px] font-bold text-violet-700 bg-white/50 rounded-full px-2 py-0.5">{pathLabel}</span>}
           </div>
           <div className="flex items-center gap-1 mt-1" title={`Tahap: ${appearance.stageName} (${appearance.stageIndex + 1}/4)`}>
             {[0, 1, 2, 3].map((i) => (
@@ -348,51 +346,7 @@ export default function VirtualPetMascot({ child, onChanged, levelTitles, petSta
         </div>
       </div>
 
-      {/* 🎪 Playdate — both siblings cared for their pets today, so the pets
-          come out to play together. Purely celebratory, no mechanics attached. */}
-      {playmates.length > 0 && (
-        <motion.div
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="mt-3 bg-white/50 rounded-2xl px-3 py-2.5 border-2 border-white/60"
-        >
-          <div className="text-xs font-fun font-bold text-slate-700 mb-1.5 flex items-center gap-1">
-            🎪 Peliharaan lagi main bareng!
-          </div>
-          <div className="flex items-end justify-center gap-1">
-            <motion.div
-              animate={{ y: [0, -5, 0], rotate: [0, -6, 0] }}
-              transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut" }}
-            >
-              <PetSprite petType={child.pet_type} stageIndex={appearance.stageIndex} size={44} />
-            </motion.div>
-            <motion.span
-              animate={{ scale: [1, 1.25, 1], opacity: [0.7, 1, 0.7] }}
-              transition={{ duration: 1.6, repeat: Infinity }}
-              className="text-base pb-3"
-            >
-              💞
-            </motion.span>
-            {playmates.slice(0, 2).map((mate, i) => (
-              <motion.div
-                key={mate.id}
-                animate={{ y: [0, -5, 0], rotate: [0, 6, 0] }}
-                transition={{ duration: 1.6, repeat: Infinity, ease: "easeInOut", delay: 0.35 + i * 0.2 }}
-                title={`Peliharaan ${mate.name}`}
-              >
-                <PetSprite
-                  petType={mate.pet_type}
-                  stageIndex={petAppearanceByFeed(mate.pet_type, mate.pet_feed_count || 0, petFeedThresholds, petStageNames).stageIndex}
-                  size={44}
-                />
-              </motion.div>
-            ))}
-          </div>
-          <div className="text-[10px] text-slate-500 text-center mt-1">
-            Kalian berdua sudah merawat peliharaan hari ini 💛
-          </div>
-        </motion.div>
-      )}
-    </div>
+    </div>,
+    phase ? { screenBg: PHASE_BG[phase.key] } : {}
   );
 }

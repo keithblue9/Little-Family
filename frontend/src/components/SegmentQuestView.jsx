@@ -121,7 +121,10 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       if (r.spot_check) {
         toast(`📸 Cek kejutan! Kirim foto "${r.spot_check.title}" ya.`, { duration: 6000 });
       }
+      if (r.pet_gift) toast(`🎁 Peliharaanmu ${r.pet_gift.text}`, { duration: 5000 });
+      else if (r.pet_ticket) toast("🎟️ Dapat 1 tiket main untuk peliharaanmu!", { duration: 4000 });
       window.dispatchEvent(new Event("app:honesty-refresh"));
+      window.dispatchEvent(new Event("app:pet-refresh"));
       await load();
     } catch (e) {
       if (isNetworkError(e)) { queueOffline("finish", payload); haptic([20, 40, 20]); onCelebrate?.(); }
@@ -381,6 +384,11 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                         ⏱ {a.duration_minutes} mnt
                       </span>
                     ) : null}
+                    {a.pet_care && a.pet_care !== "food" && (
+                      <span className="text-[11px] shrink-0" title={a.pet_care === "water" ? "Memberi air untuk peliharaanmu" : "Memberi mainan untuk peliharaanmu"}>
+                        {a.pet_care === "water" ? "💧" : "🎾"}
+                      </span>
+                    )}
                     <span className="text-[11px] font-bold text-indigo-600 shrink-0">+{a.points}</span>
                   </button>
                   {a.summary_required && summaryFor === a.id && running && (

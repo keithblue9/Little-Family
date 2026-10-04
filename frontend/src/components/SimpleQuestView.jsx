@@ -167,7 +167,9 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
       const { data: r } = await api.post("/segment-sessions/finish", payload);
       done();
       if (r?.spot_check) speak(`Cek kejutan! Kirim foto ${r.spot_check.title} ya.`);
+      if (r?.pet_gift) toast(`🎁 Peliharaanmu ${r.pet_gift.text}`, { duration: 5000 });
       window.dispatchEvent(new Event("app:honesty-refresh"));
+      window.dispatchEvent(new Event("app:pet-refresh"));
       await load();
     } catch (e) {
       if (isNetworkError(e)) { done(); queueOffline("finish", payload); }

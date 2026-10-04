@@ -498,6 +498,55 @@ with TestClient(server.app, base_url="https://testserver") as c:
         "from_child_id": adskhan["id"], "to_child_ids": [sib["id"]]}).status_code == 403)
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
+    # ---------------- Copy picked activities / a whole section ----------------
+    reset_schedule()
+    sib = next(k for k in kids if k["id"] != adskhan["id"])
+    segs_all = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    add_routine(c, "Bangun pagi", 10, segs_all[0], weekdays=[0], child_id=adskhan["id"])
+    add_routine(c, "Sholat Subuh", 10, segs_all[0], weekdays=[0], child_id=adskhan["id"])
+    add_routine(c, "Sarapan", 5, segs_all[0], weekdays=[0])                       # shared by every child
+    add_routine(c, "Les piano", 15, segs_all[1], weekdays=[0], child_id=adskhan["id"])
+    pc = [x for x in c.get("/api/routine").json()["slots"] if x["title"] == "Sholat Subuh"][0]
+    c.patch(f"/api/routine/slots/{pc['id']}", json={"steps": ["Wudhu", "Sholat"], "reading": False})
+
+    def slots(**f):
+        rows = c.get("/api/routine").json()["slots"]
+        return sorted((x["weekday"], x["title"]) for x in rows
+                      if all(x.get(k) == v for k, v in f.items()))
+
+    morning = [x["id"] for x in c.get("/api/routine").json()["slots"] if x["segment_id"] == segs_all[0] and x["weekday"] == 0]
+    r = c.post("/api/routine/copy-items", json={"slot_ids": morning, "to_weekdays": [2, 4]})
+    check("copy-items: a section goes to other days", r.status_code == 200 and r.json()["copied"] == 6, r.text[:200])
+    check("copy-items: kept on the same child / shared",
+          slots(child_id=adskhan["id"], weekday=2) == [(2, "Bangun pagi"), (2, "Sholat Subuh")]
+          and slots(child_id=None, weekday=4) == [(4, "Sarapan")], str(slots(weekday=2)))
+    copy_pc = [x for x in c.get("/api/routine").json()["slots"] if x["title"] == "Sholat Subuh" and x["weekday"] == 2][0]
+    check("copy-items: proof options travel with it", copy_pc["steps"] == ["Wudhu", "Sholat"], str(copy_pc.get("steps")))
+    r = c.post("/api/routine/copy-items", json={"slot_ids": morning, "to_weekdays": [2, 4]})
+    check("copy-items: running it again adds nothing", r.json()["copied"] == 0 and r.json()["skipped"] == 6, r.text[:200])
+    # a few picked activities to the other child (shared ones are not duplicated)
+    r = c.post("/api/routine/copy-items", json={"slot_ids": morning, "to_child_ids": [sib["id"]]})
+    check("copy-items: to the other child, shared skipped", r.status_code == 200 and r.json()["copied"] == 2
+          and r.json()["shared_skipped"] == 1, r.text[:200])
+    check("copy-items: sibling got them on the same day",
+          slots(child_id=sib["id"]) == [(0, "Bangun pagi"), (0, "Sholat Subuh")], str(slots(child_id=sib["id"])))
+    # both at once: other child AND other days
+    one = [x["id"] for x in c.get("/api/routine").json()["slots"] if x["title"] == "Les piano"]
+    r = c.post("/api/routine/copy-items", json={"slot_ids": one, "to_weekdays": [1, 3], "to_child_ids": [sib["id"]]})
+    check("copy-items: other child + other days", r.status_code == 200 and r.json()["copied"] == 2
+          and slots(child_id=sib["id"], title="Les piano") == [(1, "Les piano"), (3, "Les piano")], r.text[:200])
+    # replace swaps the target's section for the copy
+    add_routine(c, "Main bola", 5, segs_all[0], weekdays=[5], child_id=adskhan["id"])
+    r = c.post("/api/routine/copy-items", json={"slot_ids": morning, "to_weekdays": [5], "mode": "replace"})
+    check("copy-items: replace clears the target section first",
+          r.status_code == 200 and r.json()["removed"] == 1 and "Main bola" not in [t for _, t in slots(weekday=5)],
+          r.text[:200])
+    # guards
+    check("copy-items: same place is refused", c.post("/api/routine/copy-items", json={"slot_ids": morning, "to_weekdays": [0]}).status_code == 422)
+    check("copy-items: no destination is refused", c.post("/api/routine/copy-items", json={"slot_ids": morning}).status_code == 422)
+    check("copy-items: unknown child is refused", c.post("/api/routine/copy-items", json={"slot_ids": morning, "to_child_ids": ["nope"]}).status_code == 404)
+    check("copy-items: unknown activity is refused", c.post("/api/routine/copy-items", json={"slot_ids": ["nope"], "to_weekdays": [3]}).status_code == 404)
+
     # ---------------- Written summary missions ----------------
     reset_schedule()
     sm = add_routine(c, "Belajar IPA", 15, first_seg, weekdays=list(range(7)), child_id=adskhan["id"])
@@ -987,6 +1036,154 @@ with TestClient(server.app, base_url="https://testserver") as c:
     check("finish: finishing after the personal end is late", tm["late_finish"], str(tm))
     c.put(f"/api/children/{adskhan['id']}/segment-starts", json={"starts": {}, "ends": {}})
     check("finish: cleared", not c.get(f"/api/children/{adskhan['id']}/segment-starts").json()["segment_ends"])
+
+    # ---------------- Virtual pet: care, mood, gifts, games, home, journal, messages ----------------
+    reset_schedule()
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    syila_k = next(k for k in kids if k["id"] != adskhan["id"])
+    for kk in (adskhan, syila_k):
+        run(server.db.children.update_one({"id": kk["id"]}, {"$set": {
+            "pet_type": "cat", "pet_feed_count": 0, "pet_chosen_at": server.now_iso(), "pet_last_fed_at": server.now_iso(),
+            "pet_last_watered_at": server.now_iso(), "pet_last_played_at": server.now_iso(),
+            "feed_balance": 0, "water_balance": 0, "play_balance": 0, "play_tickets": 0, "pet_coins": 0,
+            "pet_force_dead": False, "pet_path": None, "pet_games": None, "pet_home": None}}))
+    c.post("/api/config", json={"auto_approve_tasks": True})
+    P = server.ANYTIME_SEGMENT_ID
+    pb = {"child_id": adskhan["id"], "date_key": TODAY, "segment_id": P}
+
+    def kid_pet(cid=None):
+        return c.get(f"/api/children/{cid or adskhan['id']}/pet").json()
+
+    def mk(title, care=None, pts=10):
+        body = {"title": title, "points": pts, "date_key": TODAY, "target_children": [adskhan["id"]]}
+        if care:
+            body["pet_care"] = care
+        return c.post("/api/tasks", json=body).json()
+
+    t_food, t_water, t_play = mk("Makan sehat"), mk("Sholat", "water"), mk("Belajar", "play")
+    check("pet: the mission remembers its reward kind", t_water.get("pet_care") == "water" and t_play.get("pet_care") == "play")
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    c.post("/api/segment-sessions/start", json=pb)
+    for t in (t_food, t_water, t_play):
+        c.post(f"/api/tasks/{t['id']}/check", json={"checked": True})
+    # make the surprise gift certain so it can be asserted
+    import random as _rnd
+    _real = _rnd.random
+    _rnd.random = lambda: 0.0
+    r = c.post("/api/segment-sessions/finish", json=pb)
+    _rnd.random = _real
+    check("pet: finishing a section pays pakan, air and mainan separately",
+          r.status_code == 200 and kid_pet()["feed_balance"] >= 10 and kid_pet()["water_balance"] == 10
+          and kid_pet()["play_balance"] == 10, str({k: kid_pet()[k] for k in ("feed_balance", "water_balance", "play_balance")}))
+    check("pet: a finished section earns a play ticket and may bring a gift",
+          r.json().get("pet_ticket") == 1 and (r.json().get("pet_gift") or {}).get("kind") in ("coins", "feed", "ticket"),
+          str((r.json().get("pet_ticket"), r.json().get("pet_gift"))))
+    st = kid_pet()
+    check("pet: state carries mood, phase, needs and stage",
+          st["has_pet"] and st["mood"]["key"] in ("happy", "ecstatic") and st["phase"]["key"] in ("morning", "noon", "evening", "night")
+          and st["stage_index"] == 0 and st["stage_name"], str(st["mood"]))
+    r = c.post(f"/api/children/{adskhan['id']}/pet-care", json={"kind": "water"})
+    check("pet: giving water spends air", r.status_code == 200 and kid_pet()["water_balance"] == 7, r.text[:150])
+    r = c.post(f"/api/children/{adskhan['id']}/pet-care", json={"kind": "play"})
+    check("pet: playing spends mainan and earns a koin", r.status_code == 200 and kid_pet()["play_balance"] == 7, r.text[:150])
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"water_balance": 1}}))
+    check("pet: not enough air is refused kindly",
+          c.post(f"/api/children/{adskhan['id']}/pet-care", json={"kind": "water"}).status_code == 400)
+    # undoing an approval takes the right reward back
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    before_play = kid_pet()["play_balance"]
+    r = c.post(f"/api/tasks/{t_play['id']}/undo-approval")
+    check("pet: undoing a 'play' mission takes back mainan, not pakan",
+          r.status_code == 200 and kid_pet()["play_balance"] == before_play - 10, r.text[:200])
+    # feeding: stage-up goes in the journal
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"feed_balance": 50, "pet_feed_count": 2}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    r = c.post(f"/api/children/{adskhan['id']}/feed-pet")
+    check("pet: the feed that hatches the egg is flagged", r.status_code == 200 and r.json()["stage_up"] is True, r.text[:150])
+    jr = c.get(f"/api/children/{adskhan['id']}/pet-journal").json()
+    check("pet: the journal remembers it", any(j["kind"] == "stage" for j in jr), str([j["kind"] for j in jr]))
+
+    # mini-games
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"play_tickets": 2, "pet_coins": 0, "pet_games": None}}))
+    r = c.post(f"/api/children/{adskhan['id']}/pet-game", json={"game": "catch", "score": 100})
+    check("pet-game: a ticket buys a round, score sets the koin", r.status_code == 200 and r.json()["coins"] == 8
+          and r.json()["tickets"] == 1, r.text[:150])
+    r = c.post(f"/api/children/{adskhan['id']}/pet-game", json={"game": "guess", "score": 0})
+    check("pet-game: a zero score pays nothing", r.status_code == 200 and r.json()["coins"] == 0, r.text[:150])
+    check("pet-game: no ticket, no game", c.post(f"/api/children/{adskhan['id']}/pet-game",
+          json={"game": "memory", "score": 50}).status_code == 400)
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"play_tickets": 5}}))
+    c.post(f"/api/children/{adskhan['id']}/pet-game", json={"game": "memory", "score": 50})
+    r = c.post(f"/api/children/{adskhan['id']}/pet-game", json={"game": "memory", "score": 50})
+    check("pet-game: a daily limit keeps it a treat", r.status_code == 409, r.text[:150])
+    check("pet-game: the score is bounded", c.post(f"/api/children/{adskhan['id']}/pet-game",
+          json={"game": "catch", "score": 500}).status_code == 422)
+
+    # home
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"pet_coins": 30, "pet_home": None}}))
+    r = c.post(f"/api/children/{adskhan['id']}/pet-home/buy", json={"item": "bed"})
+    check("pet-home: buying spends koin", r.status_code == 200 and kid_pet()["coins"] == 15, r.text[:150])
+    check("pet-home: can't buy twice", c.post(f"/api/children/{adskhan['id']}/pet-home/buy", json={"item": "bed"}).status_code == 409)
+    check("pet-home: too expensive is refused", c.post(f"/api/children/{adskhan['id']}/pet-home/buy", json={"item": "piano"}).status_code == 400)
+    check("pet-home: unknown item is refused", c.post(f"/api/children/{adskhan['id']}/pet-home/buy", json={"item": "ufo"}).status_code == 404)
+    r = c.post(f"/api/children/{adskhan['id']}/pet-home/set", json={"items": ["bed"]})
+    check("pet-home: place what you own", r.status_code == 200 and kid_pet()["home"]["items"] == ["bed"], r.text[:150])
+    check("pet-home: can't place what you don't own", c.post(f"/api/children/{adskhan['id']}/pet-home/set",
+          json={"items": ["piano"]}).status_code == 400)
+    check("pet-home: a wall isn't a floor", c.post(f"/api/children/{adskhan['id']}/pet-home/set",
+          json={"floor": "wall_sky"}).status_code == 400)
+
+    # path (needs the teen stage)
+    check("pet-path: not before the teen stage", c.post(f"/api/children/{adskhan['id']}/pet-path",
+          json={"path": "brave"}).status_code == 400)
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"pet_feed_count": 9}}))
+    check("pet-path: offered at the teen stage", kid_pet()["path_available"] is True)
+    r = c.post(f"/api/children/{adskhan['id']}/pet-path", json={"path": "smart"})
+    check("pet-path: chosen once", r.status_code == 200 and kid_pet()["path_label"] == "Pintar"
+          and c.post(f"/api/children/{adskhan['id']}/pet-path", json={"path": "brave"}).status_code == 409, r.text[:150])
+
+    # playdate between siblings
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    run(server.db.pet_playdates.delete_many({}))
+    check("playdate: not until a sibling also finished a section", kid_pet()["playdate"] is None
+          or kid_pet()["playdate"]["claimed"] is False)
+    run(server.db.segment_sessions.insert_one({"parent_id": server.FAMILY_ID, "child_id": syila_k["id"], "date_key": TODAY,
+                                               "segment_id": P, "started_at": server.now_iso(), "completed_at": server.now_iso()}))
+    pd = kid_pet()["playdate"]
+    check("playdate: both finished → the pets can play", pd and pd["mate_id"] == syila_k["id"] and not pd["claimed"], str(pd))
+    c0 = kid_pet()["coins"]
+    r = c.post(f"/api/children/{adskhan['id']}/pet-playdate")
+    check("playdate: claiming pays both", r.status_code == 200 and kid_pet()["coins"] == c0 + 3
+          and kid_pet(syila_k["id"])["coins"] >= 3, r.text[:150])
+    check("playdate: once a day", c.post(f"/api/children/{syila_k['id']}/pet-playdate").status_code == 409)
+
+    # a parent's message, spoken by the pet
+    r = c.post("/api/pet-messages", json={"text": "Abi bangga sama kamu hari ini!", "child_id": adskhan["id"]})
+    check("pet-message: a parent leaves a note", r.status_code == 200, r.text[:150])
+    mid = r.json()["id"]
+    check("pet-message: the right child sees it", (kid_pet()["message"] or {}).get("id") == mid
+          and kid_pet(syila_k["id"])["message"] is None)
+    check("pet-message: too long is refused", c.post("/api/pet-messages", json={"text": "x" * 141}).status_code == 422)
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    check("pet-message: a child can't write them", c.post("/api/pet-messages", json={"text": "hai"}).status_code == 403)
+    check("pet-message: reading it clears it", c.post(f"/api/pet-messages/{mid}/read").status_code == 200
+          and kid_pet()["message"] is None)
+    check("pet-message: reading lands in the journal",
+          any(j["kind"] == "message" for j in c.get(f"/api/children/{adskhan['id']}/pet-journal").json()))
+    check("pet: a sibling can't poke another child's pet", c.post(f"/api/children/{syila_k['id']}/pet-care",
+          json={"kind": "play"}).status_code in (403, 404))
+    # mood follows a correction
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+    run(server.db.corrections.insert_one({"child_id": adskhan["id"], "undone": False, "date_key": TODAY}))
+    check("pet: a recent correction makes the pet gently sad", kid_pet()["mood"]["key"] == "sad", str(kid_pet()["mood"]))
+    run(server.db.corrections.delete_many({"child_id": adskhan["id"]}))
+    # a pet that left can't be cared for
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"pet_force_dead": True}}))
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    check("pet: a pet that left can't be played with", c.post(f"/api/children/{adskhan['id']}/pet-care",
+          json={"kind": "play"}).status_code == 400)
+    run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"pet_force_dead": False}}))
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})

@@ -7,7 +7,7 @@ import { todayKey } from "@/lib/dates";
 import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
 import SummaryBox from "@/components/SummaryBox";
-import { StepsList, ReadingForm } from "@/components/MissionExtras";
+import { StepsList, ReadingForm, TimerControl } from "@/components/MissionExtras";
 import { withLiveClock } from "@/lib/segmentClock";
 
 function speak(text) {
@@ -227,6 +227,18 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
             {(nextAct.steps || []).length > 0 ? (
               <div className="w-full text-left">
                 <StepsList big activity={nextAct} canEdit onChange={(patch) => {
+                  setData((d) => {
+                    const nd = d && { ...d, segments: d.segments.map((sg) => sg.id !== current.id ? sg : {
+                      ...sg, activities: sg.activities.map((x) => x.id === nextAct.id ? { ...x, ...patch } : x),
+                    }) };
+                    if (nd) cacheSet(cacheKey, nd);
+                    return nd;
+                  });
+                }} />
+              </div>
+            ) : nextAct.timed ? (
+              <div className="w-full flex justify-center">
+                <TimerControl big activity={nextAct} canEdit onChange={(patch) => {
                   setData((d) => {
                     const nd = d && { ...d, segments: d.segments.map((sg) => sg.id !== current.id ? sg : {
                       ...sg, activities: sg.activities.map((x) => x.id === nextAct.id ? { ...x, ...patch } : x),

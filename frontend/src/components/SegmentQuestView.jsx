@@ -8,7 +8,7 @@ import { todayKey, shiftDateKey, humanDateKey } from "@/lib/dates";
 import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
 import SummaryBox from "@/components/SummaryBox";
-import { StepsList, ReadingForm, AdmitButton } from "@/components/MissionExtras";
+import { StepsList, ReadingForm, AdmitButton, TimerControl } from "@/components/MissionExtras";
 import { withLiveClock } from "@/lib/segmentClock";
 import { fileToDownscaledDataUrl } from "@/lib/imageUpload";
 
@@ -184,6 +184,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
     // A summary mission is ticked by writing the summary, not by tapping.
     if (!act.checked && act.summary_required) { setSummaryFor(act.id); return; }
     if (!act.checked && act.reading) { setReadingFor(act.id); return; }
+    if (!act.checked && act.timed) { toast("Tekan Mulai di sebelah kanan, lalu Selesai kalau sudah ⏱"); return; }
     if (!act.checked && (act.steps || []).length) { toast("Centang daftar kecilnya satu per satu ya ☑️"); return; }
     const next = !act.checked;
     patchActivity(seg.id, act.id, next);
@@ -200,6 +201,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
       const detail = e?.response?.data?.detail;
       if (detail === "SUMMARY_REQUIRED") { setSummaryFor(act.id); return; }
       if (detail === "READING_REQUIRED") { setReadingFor(act.id); return; }
+      if (detail === "TIMER_REQUIRED") { toast("Tekan Mulai, lalu Selesai ya ⏱"); return; }
       await onFail(e, seg, "check");
     }
   };
@@ -357,9 +359,10 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                 const canTick = running;
                 return (
                   <div key={a.id} className="space-y-1.5">
+                  <div className="flex items-center gap-1.5">
                   <button type="button" disabled={!canTick}
                     onClick={() => canTick && toggle(seg, a)}
-                    className={`w-full flex items-center gap-3 rounded-2xl border-2 px-3 py-2.5 text-left transition-colors ${
+                    className={`flex-1 min-w-0 flex items-center gap-3 rounded-2xl border-2 px-3 py-2.5 text-left transition-colors ${
                       a.checked ? "border-emerald-200 bg-emerald-50/60" : "border-slate-100 bg-white"
                     } ${canTick ? "press-btn hover:border-indigo-200" : "opacity-70 cursor-default"}`}>
                     <span className={`w-6 h-6 rounded-lg border-2 flex items-center justify-center shrink-0 ${
@@ -379,7 +382,7 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                         </span>
                       )}
                     </span>
-                    {a.duration_minutes ? (
+                    {a.duration_minutes && !a.timed ? (
                       <span className="text-[11px] text-slate-500 shrink-0" title="Perkiraan lama mengerjakan">
                         ⏱ {a.duration_minutes} mnt
                       </span>
@@ -391,6 +394,11 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                     )}
                     <span className="text-[11px] font-bold text-indigo-600 shrink-0">+{a.points}</span>
                   </button>
+                  {a.timed && (
+                    <TimerControl activity={a} canEdit={running && a.status !== "approved"}
+                      onChange={(patch) => patchAct(seg.id, a.id, patch)} />
+                  )}
+                  </div>
                   {a.summary_required && summaryFor === a.id && running && (
                     <SummaryBox activity={a} onCancel={() => setSummaryFor(null)}
                       onSaved={(txt) => {

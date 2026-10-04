@@ -563,6 +563,7 @@ _PROOF_FIELDS = _SUMMARY_FIELDS + (
     "reading_book",            # optional fixed book title
     "steps",                   # a small checklist inside the mission
     "pet_care",                # food (default) / water / play — which pet need its reward feeds
+    "timed",                   # a stopwatch: the child taps Mulai, then Selesai
 )
 MAX_STEPS = 10
 MAX_QUESTIONS = 3
@@ -598,6 +599,7 @@ class TaskInput(BaseModel):
     reading: bool = False
     reading_book: Optional[str] = Field(default=None, max_length=120)
     pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
+    timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     coop: bool = False  # true = a single shared task worked on together by target_children,
                          # not one copy per kid; points split evenly among participants on approval
@@ -643,6 +645,7 @@ class TaskUpdate(BaseModel):
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
     pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
+    timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     together_bonus_enabled: Optional[bool] = None
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
@@ -2137,6 +2140,7 @@ async def _build_task_doc(
         "reading": payload.reading,
         "reading_book": (payload.reading_book or "").strip() or None,
         "pet_care": payload.pet_care or None,
+        "timed": bool(payload.timed),
         "steps": _clean_list(payload.steps),
         "completion_photo_url": None,
         "is_coop": False,
@@ -3044,6 +3048,7 @@ class RoutineSlotInput(BaseModel):
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
     pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
+    timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
@@ -3063,6 +3068,7 @@ class RoutineSlotUpdate(BaseModel):
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
     pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
+    timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
@@ -3425,6 +3431,7 @@ async def add_routine_slot(payload: RoutineSlotInput, user: dict = Depends(requi
                "reading": bool(payload.reading),
                "reading_book": (payload.reading_book or "").strip() or None,
         "pet_care": payload.pet_care or None,
+        "timed": bool(payload.timed),
                "steps": _clean_list(payload.steps),
                "order": await _next_order(tpl["id"], wd, payload.segment_id), "created_at": now_iso()}
         await db.template_tasks.insert_one(doc)
@@ -3998,6 +4005,8 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                     (a.get("reading_book") or "").strip().lower()) if a.get("reading") else None,
                 "steps": a.get("steps") or [], "steps_done": a.get("steps_done") or [],
                 "pet_care": a.get("pet_care") or "food",
+                "timed": bool(a.get("timed")), "timer_started_at": a.get("timer_started_at"),
+                "timer_ended_at": a.get("timer_ended_at"), "timer_seconds": a.get("timer_seconds"),
                 # Photos as cacheable media URLs, never inline base64.
                 "before_photo_url": _media_ref("task", a["id"], "before_photo_url", a.get("before_photo_url")),
                 "completion_photo_url": _media_ref("task", a["id"], "completion_photo_url", a.get("completion_photo_url")),
@@ -4105,9 +4114,12 @@ async def check_activity(task_id: str, payload: ActivityCheckInput, user: dict =
         raise HTTPException(status_code=422, detail="READING_REQUIRED")
     if payload.checked and task.get("steps") and not _steps_complete(task):
         raise HTTPException(status_code=422, detail="STEPS_REQUIRED")
-    await db.tasks.update_one({"id": task_id}, {"$set": {
-        "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
-    }})
+    if payload.checked and task.get("timed") and not task.get("timer_ended_at"):
+        raise HTTPException(status_code=422, detail="TIMER_REQUIRED")  # ticked by Mulai → Selesai
+    upd = {"checked": payload.checked, "checked_at": now_iso() if payload.checked else None}
+    if not payload.checked and task.get("timed"):
+        upd.update(_TIMER_CLEAR)   # unticking starts that activity over
+    await db.tasks.update_one({"id": task_id}, {"$set": upd})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
@@ -4122,11 +4134,14 @@ async def check_all_activities(payload: SegmentCheckAllInput, user: dict = Depen
            if t.get("status") in ("pending", "rejected")
            and not (payload.checked and t.get("summary_required") and not t.get("summary_text"))
            and not (payload.checked and t.get("reading") and not t.get("reading_page"))
-           and not (payload.checked and t.get("steps") and not _steps_complete(t))]
+           and not (payload.checked and t.get("steps") and not _steps_complete(t))
+           and not (payload.checked and t.get("timed") and not t.get("timer_ended_at"))]
     if ids:
         await db.tasks.update_many({"id": {"$in": ids}}, {"$set": {
             "checked": payload.checked, "checked_at": now_iso() if payload.checked else None,
         }})
+        if not payload.checked:
+            await db.tasks.update_many({"id": {"$in": ids}, "timed": True}, {"$set": _TIMER_CLEAR})
     return {"success": True, "updated": len(ids)}
 
 
@@ -4274,6 +4289,45 @@ async def tick_task_step(task_id: str, payload: StepInput, user: dict = Depends(
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
+_TIMER_CLEAR = {"timer_started_at": None, "timer_ended_at": None, "timer_seconds": None}
+TIMER_MAX_SECONDS = 6 * 3600
+
+
+@api.post("/tasks/{task_id}/timer/start")
+async def start_task_timer(task_id: str, user: dict = Depends(get_current_user)):
+    """'Mulai' on a timed activity. The clock is the stored start time, so it
+    survives closing the app and costs nothing to keep running."""
+    task, _ = await _running_task_for(task_id, user)
+    if not task.get("timed"):
+        raise HTTPException(status_code=400, detail="Aktivitas ini tidak memakai timer")
+    if task.get("timer_ended_at"):
+        raise HTTPException(status_code=409, detail="Timer aktivitas ini sudah selesai")
+    if task.get("timer_started_at"):
+        return {"id": task_id, "timer_started_at": task["timer_started_at"], "already": True}
+    at = now_iso()
+    await db.tasks.update_one({"id": task_id}, {"$set": {"timer_started_at": at, "timer_ended_at": None, "timer_seconds": None}})
+    return {"id": task_id, "timer_started_at": at}
+
+
+@api.post("/tasks/{task_id}/timer/stop")
+async def stop_task_timer(task_id: str, user: dict = Depends(get_current_user)):
+    """'Selesai' on a timed activity: stops the clock and ticks the activity."""
+    task, _ = await _running_task_for(task_id, user)
+    if not task.get("timed"):
+        raise HTTPException(status_code=400, detail="Aktivitas ini tidak memakai timer")
+    if not task.get("timer_started_at"):
+        raise HTTPException(status_code=409, detail="Tekan Mulai dulu ya")
+    if task.get("timer_ended_at"):
+        return {"id": task_id, "timer_seconds": task.get("timer_seconds"), "already": True}
+    started = _hours_since(task["timer_started_at"])
+    secs = min(TIMER_MAX_SECONDS, max(1, round((started or 0) * 3600)))
+    at = now_iso()
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "timer_ended_at": at, "timer_seconds": secs, "checked": True, "checked_at": at}})
+    return {"id": task_id, "timer_started_at": task["timer_started_at"], "timer_ended_at": at,
+            "timer_seconds": secs, "checked": True}
+
+
 class ReadingInput(BaseModel):
     page: int = Field(ge=1, le=5000)
     book: Optional[str] = Field(default=None, max_length=120)
@@ -4331,7 +4385,8 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
     acts = await _segment_tasks(payload.child_id, dk, payload.segment_id)
     missing_proof = [a for a in acts if not a.get("is_bonus") and a.get("status") in ("pending", "rejected")
                      and ((a.get("reading") and not a.get("reading_page"))
-                          or (a.get("steps") and not _steps_complete(a)))]
+                          or (a.get("steps") and not _steps_complete(a))
+                          or (a.get("timed") and not a.get("timer_ended_at")))]
     if missing_proof:
         raise HTTPException(
             status_code=422,
@@ -7183,6 +7238,7 @@ async def correct_task(task_id: str, payload: CorrectionInput = CorrectionInput(
     await db.tasks.update_one({"id": task_id}, {"$set": {
         "status": "pending", "checked": False, "checked_at": None, "completed_at": None, "approved_at": None,
         "late_no_points": True, "correction_id": cid, "correction_redo": True, "redo_claimed_at": None,
+        **(_TIMER_CLEAR if task.get("timed") else {}),
     }})
     await db.reflections.insert_one({
         "id": new_id(), "parent_id": FAMILY_ID, "child_id": child_id, "correction_id": cid,
@@ -7302,7 +7358,7 @@ async def admit_not_done(task_id: str, user: dict = Depends(get_current_user)):
     sess = await _get_session(child_id, task.get("date_key"), seg_id)
     running = bool(sess and sess.get("started_at") and not sess.get("completed_at"))
     upd = {"checked": False, "checked_at": None, "honest_admit": True, "honest_admit_at": now_iso(),
-           "completed_at": None, "approved_at": None}
+           "completed_at": None, "approved_at": None, **(_TIMER_CLEAR if task.get("timed") else {})}
     upd["status"] = "pending" if running else "missed"
     if not running:
         upd["_undo_miss_penalty"] = 0

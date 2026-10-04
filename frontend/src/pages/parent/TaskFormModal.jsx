@@ -19,6 +19,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
   const [isBonus, setIsBonus] = useState(false);
   const [photoRequired, setPhotoRequired] = useState(false);
   const [summaryRequired, setSummaryRequired] = useState(false);
+  const [timed, setTimed] = useState(false);
   const [summaryPrompt, setSummaryPrompt] = useState("");
   const [summaryMinWords, setSummaryMinWords] = useState(15);
   const [isCoop, setIsCoop] = useState(false);
@@ -56,6 +57,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
       setSummaryRequired(!!editTask.summary_required);
+      setTimed(!!editTask.timed);
       setSummaryPrompt(editTask.summary_prompt || "");
       setSummaryMinWords(editTask.summary_min_words || 15);
       setIsCoop(!!editTask.is_coop);
@@ -75,6 +77,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
       setIsBonus(!!editTask.is_bonus);
       setPhotoRequired(!!editTask.photo_required);
       setSummaryRequired(!!editTask.summary_required);
+      setTimed(!!editTask.timed);
       setSummaryPrompt(editTask.summary_prompt || "");
       setSummaryMinWords(editTask.summary_min_words || 15);
       setIsCoop(false);
@@ -122,6 +125,7 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
         segment_id: segmentId || null,
         is_bonus: isCoop ? true : isBonus,
         photo_required: photoRequired,
+        timed,
         summary_required: summaryRequired,
         summary_prompt: summaryRequired ? (summaryPrompt.trim() || null) : null,
         summary_min_words: summaryRequired ? Math.min(300, Math.max(3, Number(summaryMinWords) || 15)) : null,
@@ -354,6 +358,17 @@ export function TaskFormModal({ open, onClose, kids, defaultChildId, onSaved, ed
           <div className="flex-1 text-left">
             <div className="font-semibold text-slate-800 text-sm">📷 Butuh Foto Bukti</div>
             <div className="text-xs text-slate-500">Anak harus lampirkan foto sebelum bisa menandai selesai.</div>
+          </div>
+        </button>
+
+        <button type="button" onClick={() => setTimed(!timed)}
+          className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border-2 transition-colors ${timed ? "border-indigo-400 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"}`}>
+          <div className={`w-5 h-5 rounded-md border-2 flex items-center justify-center ${timed ? "bg-indigo-500 border-indigo-500" : "border-slate-300"}`}>
+            {timed && <span className="text-white text-xs">✓</span>}
+          </div>
+          <div className="flex-1 text-left">
+            <div className="font-semibold text-slate-800 text-sm">⏱ Pakai timer</div>
+            <div className="text-xs text-slate-500">Anak menekan Mulai lalu Selesai; lamanya dicatat. Cocok untuk sarapan atau belajar.</div>
           </div>
         </button>
 

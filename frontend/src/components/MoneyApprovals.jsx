@@ -9,23 +9,10 @@ const fmtRp = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
 export default function MoneyApprovals() {
   const [items, setItems] = useState([]);
   const [rate, setRate] = useState("");
-  const [skipCost, setSkipCost] = useState("");
-  const [earlyBonus, setEarlyBonus] = useState("");
   const [penaltyThreshold, setPenaltyThreshold] = useState("3");
-  const [minGap, setMinGap] = useState("60");
-  const [flashPct, setFlashPct] = useState("15");
-  const [pacingBonus, setPacingBonus] = useState("2");
-  const [notifyStart, setNotifyStart] = useState(true);
   const [graceMin, setGraceMin] = useState("15");
-  const [autoNext, setAutoNext] = useState(true);
-  const [bonusQueue, setBonusQueue] = useState(true);
   const [autoApprove, setAutoApprove] = useState(true);
-  const [maxIdle, setMaxIdle] = useState("20");
-  const [otInterval, setOtInterval] = useState("10");
-  const [holdExpiry, setHoldExpiry] = useState("5");
   const [examPenalty, setExamPenalty] = useState("100");
-  const [snoozeOpts, setSnoozeOpts] = useState("5, 10, 15, 20");
-  const [warnMins, setWarnMins] = useState("3, 2, 1");
   const [comboBonus, setComboBonus] = useState("");
   const [savingCfg, setSavingCfg] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -38,23 +25,10 @@ export default function MoneyApprovals() {
       ]);
       setItems(red.data);
       setRate(String(cfg.data.rupiah_per_point ?? 100));
-      setSkipCost(String(cfg.data.skip_cost_points ?? 20));
-      setEarlyBonus(String(cfg.data.early_bonus_pct ?? 10));
       setPenaltyThreshold(String(cfg.data.penalty_card_threshold ?? 3));
-      setMinGap(String(cfg.data.min_gap_seconds ?? 60));
-      setFlashPct(String(cfg.data.flash_threshold_pct ?? 15));
-      setPacingBonus(String(cfg.data.pacing_bonus_points ?? 2));
-      setNotifyStart(cfg.data.notify_parent_on_start !== false);
       setGraceMin(String(cfg.data.segment_late_grace_minutes ?? 15));
-      setAutoNext(cfg.data.auto_start_next !== false);
-      setBonusQueue(cfg.data.bonus_follows_sequence !== false);
       setAutoApprove(cfg.data.auto_approve_tasks !== false);
-      setMaxIdle(String(cfg.data.max_idle_minutes ?? 20));
-      setOtInterval(String(cfg.data.overtime_bonus_interval_minutes ?? 10));
-      setHoldExpiry(String(cfg.data.hold_auto_reject_minutes ?? 5));
       setExamPenalty(String(cfg.data.exam_false_claim_penalty ?? 100));
-      setSnoozeOpts((cfg.data.snooze_options_minutes || [5, 10, 15, 20]).join(", "));
-      setWarnMins((cfg.data.duration_warning_minutes ?? [3, 2, 1]).join(", "));
       setComboBonus(String(cfg.data.family_combo_bonus_points ?? 10));
     } catch (e) {
       toast.error(formatApiError(e));
@@ -67,51 +41,21 @@ export default function MoneyApprovals() {
 
   const saveConfig = async () => {
     const r = parseInt(rate || "0", 10);
-    const s = parseInt(skipCost || "0", 10);
-    const eb = parseInt(earlyBonus || "0", 10);
     const pct = parseInt(penaltyThreshold || "3", 10);
-    const mg = parseInt(minGap || "0", 10);
-    const fp = parseInt(flashPct || "0", 10);
-    const pbp = parseInt(pacingBonus || "0", 10);
     const gm = parseInt(graceMin || "0", 10);
-    const mi = parseInt(maxIdle || "0", 10);
-    const oti = parseInt(otInterval || "10", 10);
-    const he = parseInt(holdExpiry || "5", 10);
     const ep = parseInt(examPenalty || "0", 10);
-    const wrn = [...new Set(warnMins.split(",").map((x) => parseInt(x.trim(), 10)).filter((x) => x > 0))].sort((a, b) => b - a);
-    const snz = [...new Set(snoozeOpts.split(",").map((x) => parseInt(x.trim(), 10)).filter((x) => x > 0))].sort((a, b) => a - b);
     const cb = parseInt(comboBonus || "0", 10);
     if (r < 1) { toast.error("Kurs minimal Rp 1 per poin"); return; }
-    if (eb < 0 || eb > 100) { toast.error("Bonus cepat harus 0–100%"); return; }
     if (pct < 1 || pct > 50) { toast.error("Batas Kartu Hukuman harus 1–50"); return; }
-    if (mg < 0 || mg > 1800) { toast.error("Jeda antar misi harus 0–1800 detik"); return; }
-    if (fp < 0 || fp > 100) { toast.error("Ambang kilat harus 0–100%"); return; }
-    if (pbp < 0 || pbp > 100) { toast.error("Bonus ritme harus 0–100 poin"); return; }
     if (gm < 0 || gm > 15) { toast.error("Toleransi telat maksimal 15 menit"); return; }
-    if (mi < 0 || mi > 240) { toast.error("Batas menganggur harus 0–240 menit"); return; }
-    if (oti < 1 || oti > 240) { toast.error("Kelipatan bonus lembur harus 1–240 menit"); return; }
-    if (he < 1 || he > 120) { toast.error("Batas tunggu izin tunda harus 1–120 menit"); return; }
     if (ep < 0 || ep > 10000) { toast.error("Potongan klaim ujian palsu harus 0–10000"); return; }
-    if (wrn.length > 6 || (wrn.length > 0 && wrn[0] > 120)) {
-      toast.error("Pengingat waktu maksimal 6 titik, masing-masing 1–120 menit"); return;
-    }
-    if (snz.length === 0 || snz.length > 6 || snz[snz.length - 1] > 240) {
-      toast.error("Pilihan tunda harus 1–6 angka, masing-masing 1–240 menit"); return;
-    }
     if (cb < 0 || cb > 1000) { toast.error("Bonus kompak harus 0–1000 poin"); return; }
     setSavingCfg(true);
     try {
       await api.post("/config", {
-        rupiah_per_point: r, skip_cost_points: s,
-        early_bonus_pct: eb, penalty_card_threshold: pct,
-        min_gap_seconds: mg, flash_threshold_pct: fp,
-        pacing_bonus_points: pbp, notify_parent_on_start: notifyStart,
-        segment_late_grace_minutes: gm, auto_start_next: autoNext,
-        snooze_options_minutes: snz, duration_warning_minutes: wrn,
-        bonus_follows_sequence: bonusQueue, auto_approve_tasks: autoApprove,
-        max_idle_minutes: mi, hold_auto_reject_minutes: he, exam_false_claim_penalty: ep,
-        overtime_bonus_interval_minutes: oti,
-        family_combo_bonus_points: cb,
+        rupiah_per_point: r, penalty_card_threshold: pct,
+        segment_late_grace_minutes: gm, auto_approve_tasks: autoApprove,
+        exam_false_claim_penalty: ep, family_combo_bonus_points: cb,
       });
       toast.success("Pengaturan tersimpan");
       load();
@@ -151,7 +95,7 @@ export default function MoneyApprovals() {
           <Settings2 className="w-5 h-5 text-indigo-500" /> Pengaturan Poin & Uang
         </h3>
         <p className="text-sm text-slate-500 mb-4">
-          Atur nilai tukar poin ke rupiah, biaya melewati misi, bonus selesai cepat, dan batas Kartu Hukuman.
+          Atur nilai tukar poin ke rupiah, toleransi telat, poin otomatis, dan batas Kartu Hukuman.
         </p>
         <div className="grid sm:grid-cols-2 gap-4 max-w-lg">
           <div>
@@ -165,50 +109,6 @@ export default function MoneyApprovals() {
               />
             </div>
           </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Biaya lewati misi (poin)</label>
-            <input
-              type="text" inputMode="numeric" value={skipCost}
-              onChange={(e) => setSkipCost(e.target.value.replace(/\D/g, "").slice(0, 6))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-          </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Bonus selesai lebih cepat (%)</label>
-            <input
-              type="text" inputMode="numeric" value={earlyBonus}
-              onChange={(e) => setEarlyBonus(e.target.value.replace(/\D/g, "").slice(0, 3))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Ekstra poin jika misi selesai sebelum jam-nya. 0 = mati.</p>
-          </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Jeda antar misi (detik)</label>
-            <input
-              type="text" inputMode="numeric" value={minGap}
-              onChange={(e) => setMinGap(e.target.value.replace(/\D/g, "").slice(0, 4))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Cegah misi "dirapel" sekaligus. 0 = mati. Misi bonus tidak terkena.</p>
-          </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Ambang "kilat" (%)</label>
-            <input
-              type="text" inputMode="numeric" value={flashPct}
-              onChange={(e) => setFlashPct(e.target.value.replace(/\D/g, "").slice(0, 3))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Selesai di bawah % durasi ini → anak diminta konfirmasi, dan ditandai untukmu.</p>
-          </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Bonus ritme sehat (poin)</label>
-            <input
-              type="text" inputMode="numeric" value={pacingBonus}
-              onChange={(e) => setPacingBonus(e.target.value.replace(/\D/g, "").slice(0, 3))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Diberikan saat jeda wajar & durasi masuk akal. 0 = mati.</p>
-          </div>
           <div>
             <label className="block text-sm font-semibold text-slate-700 mb-1">Toleransi telat mulai (menit)</label>
             <input
@@ -218,34 +118,7 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Batas terlambat saat menekan Mulai di tiap bagian hari (maksimal 15). Lewat dari ini, anak diminta memilih alasan. Jam selesai bagian tidak ikut bergeser.</p>
           </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Batas menganggur (menit)</label>
-            <input
-              type="text" inputMode="numeric" value={maxIdle}
-              onChange={(e) => setMaxIdle(e.target.value.replace(/\D/g, "").slice(0, 3))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Dihitung dari jam server, jadi tetap berjalan walau app ditutup. Lewat batas ini, misi berikutnya harus lewat tombol Terlambat — dan hanya alasan "salah sendiri" yang bisa dipilih. 0 = mati.</p>
-          </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Kelipatan bonus lembur (menit)</label>
-            <input
-              type="text" inputMode="numeric" value={otInterval}
-              onChange={(e) => setOtInterval(e.target.value.replace(/\D/g, "").slice(0, 3))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Untuk misi yang boleh lewat durasi: bonus diberikan tiap kelebihan waktu sebanyak ini.</p>
-          </div>
-          <div className="hidden">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Batas tunggu izin tunda (menit)</label>
-            <input
-              type="text" inputMode="numeric" value={holdExpiry}
-              onChange={(e) => setHoldExpiry(e.target.value.replace(/\D/g, "").slice(0, 3))}
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Kalau kamu tidak sempat menjawab dalam waktu ini, permintaan tunda batal sendiri dan misinya kembali normal.</p>
-          </div>
-          <div className="hidden">
+          <div>
             <label className="block text-sm font-semibold text-slate-700 mb-1">Potongan klaim ujian palsu</label>
             <input
               type="text" inputMode="numeric" value={examPenalty}
@@ -254,53 +127,12 @@ export default function MoneyApprovals() {
             />
             <p className="text-[11px] text-slate-400 mt-1">Poin yang dikurangi saat kamu menolak Hari Ujian yang tidak benar.</p>
           </div>
-          <div className="hidden sm:col-span-2">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Pengingat waktu hampir habis (menit)</label>
-            <input
-              type="text" value={warnMins}
-              onChange={(e) => setWarnMins(e.target.value)}
-              placeholder="3, 2, 1"
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Saat misi sedang berjalan, anak diberi bunyi alarm + pesan pada sisa waktu ini. Kosongkan untuk mematikan.</p>
-          </div>
-          <div className="hidden sm:col-span-2">
-            <label className="block text-sm font-semibold text-slate-700 mb-1">Pilihan tunda (menit)</label>
-            <input
-              type="text" value={snoozeOpts}
-              onChange={(e) => setSnoozeOpts(e.target.value)}
-              placeholder="5, 10, 15, 20"
-              className="w-full px-4 py-2.5 rounded-xl border border-slate-200 focus:border-indigo-500 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">Tombol yang muncul saat anak menunda misi berikutnya. Pisahkan dengan koma, maks. 6 pilihan.</p>
-          </div>
           <div className="sm:col-span-2">
             <label className="flex items-center gap-2 cursor-pointer select-none">
               <input type="checkbox" checked={autoApprove} onChange={(e) => setAutoApprove(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
-              <span className="text-sm font-semibold text-slate-700">Poin otomatis diberikan saat anak menandai selesai</span>
+              <span className="text-sm font-semibold text-slate-700">Poin otomatis diberikan saat anak menyelesaikan satu bagian</span>
             </label>
             <p className="text-[11px] text-slate-400 mt-1">Kamu tidak perlu menyetujui satu per satu — cukup review di Monitor Harian, dan batalkan persetujuan kalau ada yang janggal. Misi yang butuh foto tetap menunggu pengecekanmu.</p>
-          </div>
-          <div className="hidden sm:col-span-2">
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input type="checkbox" checked={bonusQueue} onChange={(e) => setBonusQueue(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
-              <span className="text-sm font-semibold text-slate-700">Misi bonus ikut antrean urutan</span>
-            </label>
-            <p className="text-[11px] text-slate-400 mt-1">Kalau dimatikan, misi bonus bisa dikerjakan kapan saja tanpa menunggu giliran.</p>
-          </div>
-          <div className="hidden sm:col-span-2">
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input type="checkbox" checked={autoNext} onChange={(e) => setAutoNext(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
-              <span className="text-sm font-semibold text-slate-700">Tawarkan misi berikutnya otomatis setelah selesai</span>
-            </label>
-            <p className="text-[11px] text-slate-400 mt-1">Muncul popup penyemangat + hitung mundur (memakai "Jeda antar misi" di atas), lalu mulai sendiri. Hanya dalam bagian yang sama, tidak untuk misi bersama atau bonus.</p>
-          </div>
-          <div className="hidden sm:col-span-2">
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input type="checkbox" checked={notifyStart} onChange={(e) => setNotifyStart(e.target.checked)} className="w-4 h-4 accent-indigo-600" />
-              <span className="text-sm font-semibold text-slate-700">Beri tahu saya saat anak menekan Mulai</span>
-            </label>
-            <p className="text-[11px] text-slate-400 mt-1">Berguna untuk sesekali mengecek, tapi bisa cukup sering — matikan kalau terasa ramai.</p>
           </div>
           <div>
             <label className="block text-sm font-semibold text-slate-700 mb-1">Batas Kartu Hukuman</label>

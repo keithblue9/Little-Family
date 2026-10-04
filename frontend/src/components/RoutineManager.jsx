@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronUp, ChevronDown, Trash2, Plus, Copy, RefreshCw, CalendarOff, Repeat, Sparkles, X } from "lucide-react";
+import { ChevronUp, ChevronDown, Trash2, Plus, Copy, RefreshCw, CalendarOff, Repeat, Sparkles, X, Users } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { todayKey, humanDateKey } from "@/lib/dates";
@@ -21,6 +21,7 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
   const [weekday, setWeekday] = useState(todayWeekday());
   const [copyOpen, setCopyOpen] = useState(false);
   const [copyTo, setCopyTo] = useState([]);
+  const [kidCopyOpen, setKidCopyOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -59,6 +60,22 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
     await api.post("/routine/copy-day", { from_weekday: weekday, to_weekdays: copyTo, replace: true });
     setCopyOpen(false); setCopyTo([]);
   }, `Jadwal ${DAYS[weekday]} disalin`);
+  // Copy the picked child's own activities to siblings (whole week or just
+  // this day), so a parent never types the same list twice.
+  const copyToKids = (opts) => run(async () => {
+    const { data: r } = await api.post("/routine/copy-child", { from_child_id: childId, ...opts });
+    toast.success(r.copied
+      ? `${r.copied} aktivitas disalin${r.skipped ? ` · ${r.skipped} sudah ada` : ""}`
+      : "Semua aktivitas itu sudah ada di sana");
+    setKidCopyOpen(false);
+  });
+  const copySlot = (slot, toIds) => run(async () => {
+    const { data: r } = await api.post("/routine/copy-child", {
+      from_child_id: slot.child_id, to_child_ids: toIds, slot_ids: [slot.id] });
+    toast.success(r.copied ? `"${slot.title}" disalin` : `"${slot.title}" sudah ada di sana`);
+  });
+  const childName = (id) => kids.find((k) => k.id === id)?.name || "";
+
   const applyToday = () => {
     if (!window.confirm("Terapkan rutinitas terbaru ke hari ini juga?\n\nBagian yang sudah dimulai anak tidak akan diubah.")) return;
     run(() => api.post("/routine/apply-today"), "Hari ini sudah memakai rutinitas terbaru");
@@ -77,7 +94,13 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button onClick={() => setCopyOpen((v) => !v)} disabled={busy}
+            {childId && kids.length > 1 && (
+              <button onClick={() => { setKidCopyOpen((v) => !v); setCopyOpen(false); }} disabled={busy}
+                className="press-btn inline-flex items-center gap-1.5 border-2 border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold px-3 py-2 rounded-xl text-sm">
+                <Users className="w-4 h-4" /> Salin ke anak lain…
+              </button>
+            )}
+            <button onClick={() => { setCopyOpen((v) => !v); setKidCopyOpen(false); }} disabled={busy}
               className="press-btn inline-flex items-center gap-1.5 border-2 border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold px-3 py-2 rounded-xl text-sm">
               <Copy className="w-4 h-4" /> Salin {DAYS[weekday]} ke…
             </button>
@@ -90,6 +113,16 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
         <p className="text-[11px] text-slate-400 mb-4">
           Perubahan berlaku mulai besok. Tekan <b>Terapkan ke hari ini</b> kalau ingin langsung dipakai hari ini.
         </p>
+
+        {kidCopyOpen && childId && (
+          <CopyToKidsPanel
+            fromName={childName(childId)} weekdayLabel={DAYS[weekday]} busy={busy}
+            others={kids.filter((k) => k.id !== childId)}
+            onCancel={() => setKidCopyOpen(false)}
+            onCopy={({ to, scope, mode }) => copyToKids({
+              to_child_ids: to, mode, ...(scope === "day" ? { weekdays: [weekday] } : {}) })}
+          />
+        )}
 
         {copyOpen && (
           <div className="border-2 border-slate-100 rounded-2xl p-3 mb-4 bg-slate-50">
@@ -132,7 +165,7 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
               slots={daySlots.filter((s) => (s.segment_id || ANYTIME) === sg.id)}
               onAdd={(body) => run(() => api.post("/routine/slots", {
                 weekdays: [weekday], segment_id: sg.id === ANYTIME ? null : sg.id, ...body }))}
-              onPatch={patch} onMove={move} onRemove={remove} />
+              onPatch={patch} onMove={move} onRemove={remove} onCopySlot={copySlot} />
           ))}
         </div>
       </div>
@@ -142,7 +175,50 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
   );
 }
 
-function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMove, onRemove }) {
+function CopyToKidsPanel({ fromName, weekdayLabel, others, busy, onCopy, onCancel }) {
+  const [to, setTo] = useState(others.map((k) => k.id));
+  const [scope, setScope] = useState("week");
+  const [mode, setMode] = useState("add");
+  const pill = (on) => `press-btn px-3 py-1.5 rounded-xl text-xs font-semibold border-2 ${
+    on ? "border-emerald-500 bg-emerald-500 text-white" : "border-slate-200 bg-white text-slate-600"}`;
+  return (
+    <div className="border-2 border-emerald-100 rounded-2xl p-3 mb-4 bg-emerald-50/50 space-y-3">
+      <div className="text-sm font-semibold text-slate-700">
+        Salin aktivitas khusus <b>{fromName}</b> ke:
+        <span className="font-normal text-slate-500"> (aktivitas "Semua anak" sudah otomatis dimiliki semua)</span>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {others.map((k) => (
+          <button key={k.id} onClick={() => setTo((v) => v.includes(k.id) ? v.filter((x) => x !== k.id) : [...v, k.id])}
+            className={pill(to.includes(k.id))}>{k.avatar_emoji || "🙂"} {k.name}</button>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-1.5 items-center">
+        <span className="text-xs text-slate-500 mr-1">Yang disalin:</span>
+        <button onClick={() => setScope("week")} className={pill(scope === "week")}>Seminggu penuh</button>
+        <button onClick={() => setScope("day")} className={pill(scope === "day")}>Hanya {weekdayLabel}</button>
+      </div>
+      <div className="flex flex-wrap gap-1.5 items-center">
+        <span className="text-xs text-slate-500 mr-1">Caranya:</span>
+        <button onClick={() => setMode("add")} className={pill(mode === "add")}>Tambahkan</button>
+        <button onClick={() => setMode("replace")} className={pill(mode === "replace")}>Ganti yang lama</button>
+      </div>
+      <p className="text-[11px] text-slate-500">
+        {mode === "add"
+          ? "Aktivitas yang sudah ada (judul sama di bagian yang sama) dilewati, jadi tidak dobel."
+          : "Aktivitas khusus anak tujuan di hari & bagian yang sama diganti dengan salinan ini."}
+      </p>
+      <div className="flex gap-2">
+        <button onClick={() => onCopy({ to, scope, mode })} disabled={busy || to.length === 0}
+          className="press-btn bg-emerald-600 text-white font-semibold px-4 py-2 rounded-xl text-sm disabled:opacity-50">Salin</button>
+        <button onClick={onCancel}
+          className="press-btn border-2 border-slate-200 text-slate-600 font-semibold px-4 py-2 rounded-xl text-sm">Batal</button>
+      </div>
+    </div>
+  );
+}
+
+function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMove, onRemove, onCopySlot }) {
   const [title, setTitle] = useState("");
   const [dur, setDur] = useState("");
   const [pts, setPts] = useState("10");
@@ -197,12 +273,43 @@ function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMo
               <option value="">Semua anak</option>
               {kids.map((k) => <option key={k.id} value={k.id}>{k.name}</option>)}
             </select>
+            <button onClick={() => onPatch(s, { summary_required: !s.summary_required })}
+              className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border ${s.summary_required ? "bg-indigo-100 border-indigo-300 text-indigo-700" : "border-slate-200 text-slate-400 bg-white"}`}
+              title="Anak harus menulis ringkasan sebelum bisa mencentang">📝</button>
             <button onClick={() => onPatch(s, { is_bonus: !s.is_bonus })}
               className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border ${s.is_bonus ? "bg-amber-100 border-amber-300 text-amber-700" : "border-slate-200 text-slate-400 bg-white"}`}
               title="Bonus = tidak wajib dicentang">Bonus</button>
+            {s.child_id && kids.length > 1 && (
+              <select value="" disabled={busy} aria-label="Salin ke anak lain" title="Salin ke anak lain"
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (!v) return;
+                  onCopySlot(s, v === "*" ? kids.filter((k) => k.id !== s.child_id).map((k) => k.id) : [v]);
+                }}
+                className="w-9 px-1 py-1.5 rounded-lg border border-slate-200 text-xs bg-white text-slate-500 cursor-pointer">
+                <option value="">⧉</option>
+                {kids.filter((k) => k.id !== s.child_id).map((k) => <option key={k.id} value={k.id}>Salin ke {k.name}</option>)}
+                {kids.length > 2 && <option value="*">Salin ke semua anak lain</option>}
+              </select>
+            )}
             <button onClick={() => onRemove(s)} disabled={busy} className="p-1.5 rounded-lg text-red-500 hover:bg-red-50" aria-label="Hapus">
               <Trash2 className="w-4 h-4" />
             </button>
+            {s.summary_required && (
+              <div className="basis-full flex flex-wrap items-center gap-1.5 pl-6">
+                <span className="text-[11px] text-indigo-700 font-semibold">📝 Pertanyaan:</span>
+                <input defaultValue={s.summary_prompt || ""} key={`q${s.id}${s.summary_prompt}`}
+                  placeholder="Apa yang sudah kamu pelajari?"
+                  onBlur={(e) => { const v = e.target.value.trim(); if (v !== (s.summary_prompt || "")) onPatch(s, { summary_prompt: v || null }); }}
+                  className="flex-1 min-w-[10rem] px-2 py-1 rounded-lg border border-indigo-100 text-xs bg-white" />
+                <label className="flex items-center gap-1 text-[11px] text-slate-500">min
+                  <input defaultValue={s.summary_min_words || 15} key={`w${s.id}${s.summary_min_words}`} inputMode="numeric"
+                    onBlur={(e) => { const n = Math.min(300, Math.max(3, parseInt(e.target.value.replace(/\D/g, "") || "15", 10)));
+                      if (n !== (s.summary_min_words || 15)) onPatch(s, { summary_min_words: n }); }}
+                    className="w-12 px-1 py-1 rounded-lg border border-indigo-100 text-xs text-center bg-white" />kata
+                </label>
+              </div>
+            )}
           </div>
         ))}
       </div>

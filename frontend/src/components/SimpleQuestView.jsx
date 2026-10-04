@@ -6,6 +6,7 @@ import { cacheGet, cacheSet } from "@/lib/localCache";
 import { todayKey } from "@/lib/dates";
 import { sendOrQueue, isNetworkError, enqueueSegmentAction, pendingCount, haptic } from "@/lib/offlineQueue";
 import PageSkeleton from "@/components/PageSkeleton";
+import SummaryBox from "@/components/SummaryBox";
 import { withLiveClock } from "@/lib/segmentClock";
 
 function speak(text) {
@@ -80,7 +81,9 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
     : current.status === "ready"
       ? `Waktunya ${current.label}! Tekan tombol mulai.`
       : nextAct
-        ? nextAct.title
+        ? (nextAct.summary_required
+          ? `${nextAct.title}. Lalu ceritakan apa yang sudah kamu pelajari.`
+          : nextAct.title)
         : `Semua sudah! Tekan selesai.`;
   useEffect(() => {
     if (prompt && prompt !== lastSpoken.current) {
@@ -211,10 +214,26 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
                     className="press-btn w-16 h-16 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center">
               <Volume2 className="w-8 h-8" />
             </button>
-            <button onClick={tick}
-                    className="press-btn w-full max-w-xs py-6 rounded-3xl bg-emerald-500 text-white font-fun font-bold text-3xl flex items-center justify-center gap-3">
-              <Check className="w-10 h-10" strokeWidth={3} /> Sudah!
-            </button>
+            {nextAct.summary_required ? (
+              <div className="w-full text-left">
+                <SummaryBox big activity={nextAct} onSaved={(txt) => {
+                  haptic();
+                  setData((d) => {
+                    const nd = d && { ...d, segments: d.segments.map((sg) => sg.id !== current.id ? sg : {
+                      ...sg, activities: sg.activities.map((x) => x.id === nextAct.id
+                        ? { ...x, checked: true, summary_text: txt } : x),
+                    }) };
+                    if (nd) cacheSet(cacheKey, nd);
+                    return nd;
+                  });
+                }} />
+              </div>
+            ) : (
+              <button onClick={tick}
+                      className="press-btn w-full max-w-xs py-6 rounded-3xl bg-emerald-500 text-white font-fun font-bold text-3xl flex items-center justify-center gap-3">
+                <Check className="w-10 h-10" strokeWidth={3} /> Sudah!
+              </button>
+            )}
           </>
         ) : allTicked ? (
           <>

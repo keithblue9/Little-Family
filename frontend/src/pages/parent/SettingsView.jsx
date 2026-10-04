@@ -19,7 +19,6 @@ const LevelConfigEditor = lazy(() => import("@/components/LevelConfigEditor"));
 const PetConfigEditor = lazy(() => import("@/components/PetConfigEditor"));
 const PetResetRequestsReview = lazy(() => import("@/components/PetResetRequestsReview"));
 const MaintenanceModeCard = lazy(() => import("@/components/MaintenanceModeCard"));
-const CompactScheduleCard = lazy(() => import("@/components/CompactScheduleCard"));
 const LateReasonsConfig = lazy(() => import("@/components/LateReasonsConfig"));
 const PunishmentConfig = lazy(() => import("@/components/PunishmentConfig"));
 const DaySegmentsConfig = lazy(() => import("@/components/DaySegmentsConfig"));
@@ -307,10 +306,6 @@ export function SettingsView({ kids, onAdd, onRefresh }) {
 
 
 
-
-      <div className="bg-white rounded-2xl border border-slate-200 p-6">
-        <CompactScheduleCard onChanged={onRefresh} />
-      </div>
 
       <div className="bg-white rounded-2xl border-2 border-red-100 p-6">
         <MaintenanceModeCard />

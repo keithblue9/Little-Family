@@ -8,6 +8,7 @@ import { todayKey, shiftDateKey, humanDateKey, isFutureDate } from "@/lib/dates"
 import BeforeAfter from "@/components/BeforeAfter";
 import MonthHeatmap from "@/components/MonthHeatmap";
 import GrowthTrail from "@/components/GrowthTrail";
+import OverdueSectionsCard from "@/components/OverdueSectionsCard";
 
 const statusLabel = {
   pending: { icon: Clock, label: "Belum", color: "text-slate-400" },
@@ -58,6 +59,8 @@ export default function FamilyDayMonitor() {
         )}
       </div>
 
+      <OverdueSectionsCard onChanged={load} />
+
       {data?.children?.[0]?.vacation_mode && (
         <div className="bg-sky-50 border-2 border-sky-200 rounded-2xl px-4 py-3 flex items-center gap-2 text-sky-700">
           <span className="text-xl">🏖️</span>
@@ -73,7 +76,7 @@ export default function FamilyDayMonitor() {
         <>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {data.children.map((entry) => (
-              <ChildDayCard key={entry.child.id} entry={entry} />
+              <ChildDayCard key={entry.child.id} entry={entry} onChanged={load} />
             ))}
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -92,7 +95,7 @@ export default function FamilyDayMonitor() {
   );
 }
 
-function ChildDayCard({ entry }) {
+function ChildDayCard({ entry, onChanged }) {
   const child = entry.child;
   const theme = QUEST_THEMES[pickQuestTheme(child)] || QUEST_THEMES.ocean;
 
@@ -159,7 +162,7 @@ function ChildDayCard({ entry }) {
         ) : (
           <>
             {required.map((t) => (
-              <TaskRow key={t.id} task={t} />
+              <TaskRow key={t.id} task={t} onChanged={onChanged} />
             ))}
             {bonus.length > 0 && (
               <div className="mt-3 pt-3 border-t border-slate-100">
@@ -167,7 +170,7 @@ function ChildDayCard({ entry }) {
                   <Sparkles className="w-3 h-3" /> Bonus
                 </div>
                 {bonus.map((t) => (
-                  <TaskRow key={t.id} task={t} bonus />
+                  <TaskRow key={t.id} task={t} bonus onChanged={onChanged} />
                 ))}
               </div>
             )}
@@ -184,30 +187,10 @@ function fmtClock(iso) {
     return new Date(iso).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
   } catch { return ""; }
 }
-function fmtElapsed(startIso, endIso) {
-  try {
-    const ms = new Date(endIso).getTime() - new Date(startIso).getTime();
-    if (ms < 0) return "";
-    const mins = Math.floor(ms / 60000);
-    const secs = Math.floor((ms % 60000) / 1000);
-    if (mins < 1) return `${secs} dtk`;
-    if (mins < 60) return `${mins} mnt`;
-    return `${Math.floor(mins / 60)} jam ${mins % 60} mnt`;
-  } catch { return ""; }
-}
-
-function fmtMins(mins) {
-  if (mins < 60) return `${mins} mnt`;
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return m ? `${h} jam ${m} mnt` : `${h} jam`;
-}
-
-function TaskRow({ task, bonus }) {
+function TaskRow({ task, bonus, onChanged }) {
   const s = statusLabel[task.status] || statusLabel.pending;
   const Icon = s.icon;
   const isDone = task.status === "approved" || task.status === "completed" || task.status === "skipped";
-  const hasTimes = task.timer_started_at || task.completed_at;
   const hasPhoto = task.before_photo_url || task.completion_photo_url;
   const [showPhoto, setShowPhoto] = useState(false);
 
@@ -232,33 +215,9 @@ function TaskRow({ task, bonus }) {
         <div className="text-xs text-slate-500 flex items-center gap-2 flex-wrap">
           <span>{s.label}</span>
           {task.is_coop && <span className="text-teal-600 font-bold">🤝 Bersama</span>}
-          {task.due_time && <span>· sblm {task.due_time}</span>}
-          {task.duration_minutes && <span>· {task.duration_minutes}m</span>}
-          {task.early_bonus_awarded > 0 && <span className="text-green-600 font-bold">· ⚡ +{task.early_bonus_awarded}</span>}
+          {task.duration_minutes && <span>· ±{task.duration_minutes}m</span>}
+          {task.checked_at && <span title="Waktu anak mencentang">· ✔️ {fmtClock(task.checked_at)}</span>}
         </div>
-        {/* Start / finish / actual duration — for spotting instant-tap-through
-            vs. genuinely doing the task. Only shown once there's timing data. */}
-        {hasTimes && (
-          <div className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap mt-0.5">
-            {task.timer_started_at && <span title="Jam mulai">▶️ {fmtClock(task.timer_started_at)}</span>}
-            {task.completed_at && <span title="Jam selesai">✅ {fmtClock(task.completed_at)}</span>}
-            {/* Idle time before this mission began. Long gaps are where a
-                routine quietly leaks an hour without any single task looking
-                wrong, so it's worth stating plainly rather than leaving the
-                parent to subtract timestamps by hand. */}
-            {task.gap_from_prev_seconds > 120 && (
-              <span
-                className={task.gap_from_prev_seconds >= 1800 ? "text-amber-600 font-semibold" : "text-slate-400"}
-                title="Jeda sejak misi sebelumnya selesai"
-              >
-                ⏸️ jeda {fmtMins(Math.round(task.gap_from_prev_seconds / 60))}
-              </span>
-            )}
-            {task.timer_started_at && task.completed_at && (
-              <span className="text-slate-500 font-semibold" title="Lama pengerjaan">⏳ {fmtElapsed(task.timer_started_at, task.completed_at)}</span>
-            )}
-          </div>
-        )}
       </div>
       {hasPhoto && (
         <button onClick={() => setShowPhoto((v) => !v)} title="Lihat foto misi"
@@ -274,6 +233,58 @@ function TaskRow({ task, bonus }) {
     {showPhoto && hasPhoto && (
       <BeforeAfter before={task.before_photo_url} after={task.completion_photo_url} alt={task.title} />
     )}
+    {task.summary_required && (task.summary_text || task.summary_previous) && (
+      <SummaryReview task={task} onChanged={onChanged} />
+    )}
+    </div>
+  );
+}
+
+
+/** What the child wrote for a summary mission, with a quick 👍 / rewrite. */
+function SummaryReview({ task, onChanged }) {
+  const [busy, setBusy] = useState(false);
+  const review = async (verdict) => {
+    let note = "";
+    if (verdict === "redo") {
+      const v = window.prompt("Pesan untuk anak (opsional), mis. \"Ceritakan contohnya ya\":", "");
+      if (v === null) return;
+      note = v;
+    }
+    setBusy(true);
+    try {
+      const { data } = await api.post(`/tasks/${task.id}/summary-review`, { verdict, note });
+      toast.success(verdict === "good" ? "Ditandai bagus 👍"
+        : data.reopened ? "Diminta tulis ulang — centangnya dibuka lagi" : "Catatan terkirim ke anak");
+      onChanged?.();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const text = task.summary_text || task.summary_previous;
+  const mins = task.summary_typing_seconds != null ? Math.max(1, Math.round(task.summary_typing_seconds / 60)) : null;
+  return (
+    <div className="ml-10 rounded-xl border border-indigo-100 bg-indigo-50/50 px-3 py-2 space-y-1">
+      <div className="text-[11px] text-indigo-700 font-semibold flex items-center gap-2 flex-wrap">
+        <span>📝 Ringkasan</span>
+        {task.summary_words ? <span className="text-slate-400 font-normal">{task.summary_words} kata</span> : null}
+        {mins != null && <span className="text-slate-400 font-normal">· ditulis ±{mins} mnt</span>}
+        {task.summary_pasted && <span className="text-amber-600">· ⚠️ ada yang ditempel (copy-paste)</span>}
+        {!task.summary_text && <span className="text-amber-600">· diminta tulis ulang</span>}
+        {task.summary_review === "good" && <span className="text-emerald-600">· 👍 sudah dibaca</span>}
+      </div>
+      <div className="text-sm text-slate-700 whitespace-pre-wrap break-words">{text}</div>
+      {task.summary_note && <div className="text-xs text-amber-700">💬 {task.summary_note}</div>}
+      {task.summary_text && (
+        <div className="flex gap-2 pt-1">
+          <button onClick={() => review("good")} disabled={busy}
+            className="press-btn px-2.5 py-1 rounded-lg text-xs font-semibold bg-emerald-500 text-white disabled:opacity-50">👍 Bagus</button>
+          <button onClick={() => review("redo")} disabled={busy}
+            className="press-btn px-2.5 py-1 rounded-lg text-xs font-semibold border border-amber-300 text-amber-700 bg-white disabled:opacity-50">✍️ Tulis ulang</button>
+        </div>
+      )}
     </div>
   );
 }

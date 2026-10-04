@@ -34,7 +34,7 @@ export default function AppBadgeSync() {
     // Wait until the first screen has painted, and skip ticks while the app is
     // in the background — the badge only matters when someone can see it.
     const first = setTimeout(sync, 4000);
-    const interval = setInterval(() => { if (!document.hidden) sync(); }, 60000);
+    const interval = setInterval(() => { if (!document.hidden) sync(); }, 180000);
     const onVisible = () => { if (!document.hidden) sync(); };
     document.addEventListener("visibilitychange", onVisible);
     return () => {

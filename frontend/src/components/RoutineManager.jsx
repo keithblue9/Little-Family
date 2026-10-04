@@ -57,6 +57,26 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
   });
   const countFor = (wd) => visible.filter((s) => s.weekday === wd).length;
 
+  // Estimated points per child: per day, and per section within each day.
+  // Activities for every child count for each of them; bonus ones are kept
+  // apart because they aren't required. One pass over the slots.
+  const estimate = useMemo(() => {
+    const out = {};
+    for (const k of kids) out[k.id] = Array.from({ length: 7 }, () => ({ total: 0, bonus: 0, seg: {} }));
+    for (const sl of data?.slots || []) {
+      const targets = sl.child_id ? (out[sl.child_id] ? [sl.child_id] : []) : Object.keys(out);
+      const sid = sl.segment_id || ANYTIME;
+      for (const id of targets) {
+        const day = out[id][sl.weekday];
+        const cell = day.seg[sid] || (day.seg[sid] = { pts: 0, bonus: 0 });
+        const pts = Number(sl.points) || 0;
+        if (sl.is_bonus) { day.bonus += pts; cell.bonus += pts; } else { day.total += pts; cell.pts += pts; }
+      }
+    }
+    return out;
+  }, [data, kids]);
+  const shownKids = childId ? kids.filter((k) => k.id === childId) : kids;
+
   const run = async (fn, okMsg) => {
     setBusy(true);
     try { await fn(); if (okMsg) toast.success(okMsg); await load(); onChanged?.(); }
@@ -190,13 +210,19 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
                 weekday === i ? "border-indigo-500 bg-indigo-500 text-white" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"}`}>
               <div>{d.slice(0, 3)}</div>
               <div className={`text-[10px] font-semibold ${weekday === i ? "text-indigo-100" : "text-slate-400"}`}>{countFor(i)} aktivitas</div>
+              {shownKids.length === 1 && (
+                <div className={`text-[10px] font-bold ${weekday === i ? "text-white" : "text-indigo-600"}`}>≈ {estimate[shownKids[0].id]?.[i]?.total || 0} poin</div>
+              )}
             </button>
           ))}
         </div>
 
+        <PointsSummary kids={shownKids} estimate={estimate} weekday={weekday} segments={segments} />
+
         <div className="space-y-4">
           {segments.map((sg) => (
             <SegmentCard key={sg.id} segment={sg} weekday={weekday} kids={kids} busy={busy} childId={childId}
+              pointsByKid={shownKids.map((k) => ({ kid: k, ...((estimate[k.id]?.[weekday]?.seg[sg.id]) || { pts: 0, bonus: 0 }) }))}
               slots={daySlots.filter((s) => (s.segment_id || ANYTIME) === sg.id)}
               onAdd={(body) => run(() => api.post("/routine/slots", {
                 weekdays: [weekday], segment_id: sg.id === ANYTIME ? null : sg.id, ...body }))}
@@ -251,6 +277,33 @@ function CopyToKidsPanel({ fromName, weekdayLabel, others, busy, onCopy, onCance
         <button onClick={onCancel}
           className="press-btn border-2 border-slate-200 text-slate-600 font-semibold px-4 py-2 rounded-xl text-sm">Batal</button>
       </div>
+    </div>
+  );
+}
+
+/** What a day is worth for each child, with the sections that make it up. */
+function PointsSummary({ kids, estimate, weekday, segments }) {
+  if (!kids.length) return null;
+  const rows = kids.map((k) => ({ kid: k, day: estimate[k.id]?.[weekday] })).filter((r) => r.day);
+  if (rows.every((r) => !r.day.total && !r.day.bonus)) return null;
+  return (
+    <div className="mb-4 rounded-2xl border-2 border-indigo-100 bg-indigo-50/50 p-3 space-y-2">
+      <div className="text-xs font-bold text-indigo-900">⭐ Perkiraan poin {DAYS[weekday]}
+        <span className="font-normal text-indigo-700"> — dari poin tiap aktivitas, belum termasuk bonus streak</span></div>
+      {rows.map(({ kid, day }) => (
+        <div key={kid.id} className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="text-sm font-semibold text-slate-800">{kid.avatar_emoji || "🙂"} {kid.name}</span>
+          <span className="text-sm font-extrabold text-indigo-700">{day.total} poin</span>
+          {day.bonus > 0 && <span className="text-xs font-semibold text-amber-600">+{day.bonus} bonus</span>}
+          <span className="flex flex-wrap gap-1 ml-auto">
+            {segments.filter((sg) => day.seg[sg.id]?.pts || day.seg[sg.id]?.bonus).map((sg) => (
+              <span key={sg.id} className="text-[11px] text-slate-600 bg-white rounded-full px-2 py-0.5 border border-indigo-100">
+                {sg.emoji} {sg.label} {day.seg[sg.id].pts}
+              </span>
+            ))}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -312,12 +365,13 @@ function CopyItemsPanel({ weekday, kids, busy, count, onCopy, onCancel }) {
   );
 }
 
-function SegmentCard({ segment, slots, kids, busy, childId, selected, onToggle, onSelectMany, onCopySection, onAdd, onPatch, onMove, onRemove, onCopySlot }) {
+function SegmentCard({ segment, slots, kids, busy, childId, pointsByKid = [], selected, onToggle, onSelectMany, onCopySection, onAdd, onPatch, onMove, onRemove, onCopySlot }) {
   const [title, setTitle] = useState("");
   const [dur, setDur] = useState("");
   const [pts, setPts] = useState("10");
   const [who, setWho] = useState(childId || "");
   const [openProof, setOpenProof] = useState(null); // slot whose proof options are open
+  const [editing, setEditing] = useState(null);       // the one activity shown with its full editor
   useEffect(() => { setWho(childId || ""); }, [childId]); // new activities go to the picked child
   const window_ = segment.start_time ? toMin(segment.end_time) - toMin(segment.start_time) : null;
   const total = slots.reduce((n, s) => n + (s.duration_minutes || 0), 0);
@@ -332,7 +386,7 @@ function SegmentCard({ segment, slots, kids, busy, childId, selected, onToggle, 
   };
 
   return (
-    <div className="rounded-2xl border-2 border-slate-100 p-3">
+    <div className="cv-auto rounded-2xl border-2 border-slate-100 p-3">
       <div className="flex items-center gap-2 mb-2">
         <span className="text-xl">{segment.emoji || "🕒"}</span>
         <span className="font-bold text-slate-800">{segment.label}</span>
@@ -349,6 +403,15 @@ function SegmentCard({ segment, slots, kids, busy, childId, selected, onToggle, 
             </button>
           </span>
         )}
+        {pointsByKid.some((p) => p.pts || p.bonus) && (
+          <span className="flex flex-wrap items-center gap-1" title="Perkiraan poin bagian ini (tanpa bonus streak)">
+            {pointsByKid.filter((p) => p.pts || p.bonus).map((p) => (
+              <span key={p.kid.id} className="text-[11px] font-bold text-indigo-700 bg-indigo-50 rounded-full px-2 py-0.5">
+                {pointsByKid.length > 1 ? `${p.kid.name} ` : "≈ "}{p.pts} poin{p.bonus ? ` +${p.bonus} bonus` : ""}
+              </span>
+            ))}
+          </span>
+        )}
         <span className={`ml-auto text-[11px] font-semibold ${over ? "text-amber-600" : "text-slate-400"}`}>
           {total ? `${total} mnt` : ""}{window_ != null && total ? ` dari ${window_} mnt` : ""}{over ? " · melebihi waktu bagian" : ""}
         </span>
@@ -356,8 +419,23 @@ function SegmentCard({ segment, slots, kids, busy, childId, selected, onToggle, 
 
       {slots.length === 0 && <div className="text-xs text-slate-400 mb-2">Belum ada aktivitas.</div>}
       <div className="space-y-1.5">
-        {slots.map((s, i) => (
-          <div key={s.id} className={`flex flex-wrap items-center gap-1.5 rounded-xl px-2 py-1.5 ${selected.has(s.id) ? "bg-indigo-50 ring-2 ring-indigo-200" : "bg-slate-50"}`}>
+        {slots.map((s, i) => editing !== s.id ? (
+          // Collapsed: one light line. The full editor only exists for the row being edited,
+          // which keeps a long routine fast to draw and to scroll.
+          <div key={s.id} className={`flex items-center gap-2 rounded-xl px-2 py-1.5 ${selected.has(s.id) ? "bg-indigo-50 ring-2 ring-indigo-200" : "bg-slate-50"}`}>
+            <input type="checkbox" checked={selected.has(s.id)} onChange={() => onToggle(s.id)}
+              className="w-4 h-4 accent-indigo-600 shrink-0" aria-label={`Pilih ${s.title}`} />
+            <button onClick={() => setEditing(s.id)} className="flex-1 min-w-0 text-left text-sm font-semibold text-slate-800 truncate" title="Ketuk untuk mengubah">
+              {s.title}{s.is_bonus && <span className="ml-1.5 text-[10px] font-bold text-amber-600">BONUS</span>}
+            </button>
+            {s.child_id && <span className="shrink-0 text-[11px] text-slate-500">{kids.find((k) => k.id === s.child_id)?.name}</span>}
+            {proofIcons(s) && <span className="shrink-0 text-[11px]">{proofIcons(s)}</span>}
+            {s.duration_minutes ? <span className="shrink-0 text-[11px] text-slate-500">⏱{s.duration_minutes}</span> : null}
+            <span className="shrink-0 text-[11px] font-bold text-indigo-600">⭐{s.points}</span>
+            <button onClick={() => setEditing(s.id)} className="shrink-0 px-2 py-1 rounded-lg text-[11px] font-semibold border border-slate-200 text-slate-600 bg-white" aria-label={`Ubah ${s.title}`}>Ubah</button>
+          </div>
+        ) : (
+          <div key={s.id} className={`flex flex-wrap items-center gap-1.5 rounded-xl px-2 py-1.5 ring-2 ring-indigo-200 ${selected.has(s.id) ? "bg-indigo-50" : "bg-slate-50"}`}>
             <input type="checkbox" checked={selected.has(s.id)} onChange={() => onToggle(s.id)}
               className="w-4 h-4 accent-indigo-600 shrink-0" aria-label={`Pilih ${s.title}`} />
             <div className="flex flex-col">
@@ -405,6 +483,8 @@ function SegmentCard({ segment, slots, kids, busy, childId, selected, onToggle, 
             <button onClick={() => onRemove(s)} disabled={busy} className="p-1.5 rounded-lg text-red-500 hover:bg-red-50" aria-label="Hapus">
               <Trash2 className="w-4 h-4" />
             </button>
+            <button onClick={() => { setEditing(null); setOpenProof(null); }}
+              className="press-btn px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-indigo-600 text-white">Selesai</button>
             {openProof === s.id && <ProofEditor slot={s} onPatch={onPatch} />}
           </div>
         ))}
@@ -649,14 +729,6 @@ function ProofEditor({ slot: s, onPatch }) {
           title="Anak menekan Mulai lalu Selesai; waktunya dicatat">⏱ Pakai timer</button>
         <button className={chip((s.steps || []).length > 0)}
           onClick={() => onPatch(s, { steps: (s.steps || []).length ? [] : ["Langkah 1", "Langkah 2"] })}>☑️ Checklist kecil</button>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="text-[11px] text-slate-500">Hadiah misi untuk hewan:</span>
-        {[["food", "🍖 Pakan"], ["water", "💧 Air"], ["play", "🎾 Mainan"]].map(([k, l]) => (
-          <button key={k} className={chip((s.pet_care || "food") === k)}
-            onClick={() => onPatch(s, { pet_care: k })}>{l}</button>
-        ))}
       </div>
 
       {s.summary_required && !quiz && (

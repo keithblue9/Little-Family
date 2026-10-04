@@ -8,6 +8,7 @@ import { todayKey, shiftDateKey, humanDateKey, isFutureDate } from "@/lib/dates"
 import BeforeAfter from "@/components/BeforeAfter";
 import MonthHeatmap from "@/components/MonthHeatmap";
 import GrowthTrail from "@/components/GrowthTrail";
+import LazyWhenVisible from "@/components/LazyWhenVisible";
 import OverdueSectionsCard from "@/components/OverdueSectionsCard";
 import { correctTask, trustTone } from "@/lib/honesty";
 
@@ -25,6 +26,16 @@ export default function FamilyDayMonitor() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [segments, setSegments] = useState([]);
+  // One request for every child's trust strip (was one per child, per refresh).
+  const [honesty, setHonesty] = useState({});
+  const loadHonesty = useCallback(() => {
+    api.get("/family/honesty-summary", { fresh: true }).then((r) => setHonesty(r.data || {})).catch(() => {});
+  }, []);
+  useEffect(() => {
+    loadHonesty();
+    window.addEventListener("app:parent-refresh", loadHonesty);
+    return () => window.removeEventListener("app:parent-refresh", loadHonesty);
+  }, [loadHonesty]);
   useEffect(() => {
     api.get("/config").then((r) => setSegments(r.data?.day_segments || [])).catch(() => {});
   }, []);
@@ -85,17 +96,17 @@ export default function FamilyDayMonitor() {
         <>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {data.children.map((entry) => (
-              <ChildDayCard key={entry.child.id} entry={entry} onChanged={load} segments={segments} />
+              <ChildDayCard key={entry.child.id} entry={entry} onChanged={load} segments={segments} honesty={honesty[entry.child.id]} />
             ))}
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {data.children.map((entry) => (
-              <MonthHeatmap key={entry.child.id} childId={entry.child.id} childName={entry.child.name} />
+              <LazyWhenVisible key={entry.child.id} minHeight={260}><MonthHeatmap childId={entry.child.id} childName={entry.child.name} /></LazyWhenVisible>
             ))}
           </div>
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             {data.children.map((entry) => (
-              <GrowthTrail key={entry.child.id} childId={entry.child.id} childName={entry.child.name} />
+              <LazyWhenVisible key={entry.child.id} minHeight={200}><GrowthTrail childId={entry.child.id} childName={entry.child.name} /></LazyWhenVisible>
             ))}
           </div>
         </>
@@ -104,12 +115,8 @@ export default function FamilyDayMonitor() {
   );
 }
 
-function ChildDayCard({ entry, onChanged, segments = [] }) {
+function ChildDayCard({ entry, onChanged, segments = [], honesty = null }) {
   const child = entry.child;
-  const [honesty, setHonesty] = useState(null);
-  useEffect(() => {
-    api.get(`/children/${child.id}/honesty`).then((r) => setHonesty(r.data)).catch(() => {});
-  }, [child.id, entry]);
   const tone = honesty ? trustTone(honesty.trust_score) : null;
   const theme = QUEST_THEMES[pickQuestTheme(child)] || QUEST_THEMES.ocean;
 

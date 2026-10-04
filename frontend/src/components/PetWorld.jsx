@@ -80,7 +80,7 @@ export default function PetWorld({ child, state, reload, onChanged }) {
                 onClick={() => run(() => api.post(`${base}/pet-care`, { kind: "play" }), "Seru! +1 koin 🪙")} cost={cost} />
         </div>
         <div className="text-[11px] text-slate-500 mt-2 text-center">
-          Misi bisa memberi pakan, air, atau mainan — lihat tanda di tiap misi. 🎟️ {state.tickets} tiket · 🪙 {state.coins} koin
+          Tiap bagian hari memberi pakan, air, atau mainan — lihat tandanya di judul bagian. 🎟️ {state.tickets} tiket · 🪙 {state.coins} koin
         </div>
       </div>
 

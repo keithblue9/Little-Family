@@ -58,8 +58,13 @@ export default function SimpleQuestView({ child, onCelebrate, onUseFullView }) {
     };
   }, [load]);
   useEffect(() => {
-    const t = setInterval(() => { if (!document.hidden) load(); }, 60000);
-    return () => clearInterval(t);
+    // Time-driven changes (locked → ready, late) come from the device clock;
+    // this only picks up what a parent changed, so a slow poll plus a refresh
+    // whenever the app comes back to the front is plenty.
+    const onVisible = () => { if (!document.hidden) load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    const t = setInterval(() => { if (!document.hidden) load(); }, 180000);
+    return () => { clearInterval(t); document.removeEventListener("visibilitychange", onVisible); };
   }, [load]);
 
   const [clock, setClock] = useState(0);

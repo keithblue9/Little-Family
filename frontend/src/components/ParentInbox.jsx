@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { humanDateKey, todayKey } from "@/lib/dates";
 import { correctTask } from "@/lib/honesty";
+import { fetchInbox, cachedInbox } from "@/lib/inbox";
 
 const REQUEST_LABELS = {
   money: { label: "Tukar uang", view: "money" },
@@ -24,23 +25,29 @@ const plainBtn = `${btn} bg-white border border-slate-200 text-slate-600 hover:b
  * photo, confirm a fix, read a reflection, approve a mission.
  */
 export default function ParentInbox({ onNavigate, onCount }) {
-  const [data, setData] = useState(null);
+  const [data, setData] = useState(() => cachedInbox());
   const [busy, setBusy] = useState(null);
 
-  const load = useCallback(async () => {
+  // The app shell does the polling; this list just shows what it fetched.
+  const load = useCallback(async (force = true) => {
     try {
-      const { data: d } = await api.get("/parent/inbox", { fresh: true });
+      const d = await fetchInbox(force);
       setData(d);
       onCount?.(d.total || 0);
     } catch { /* the rest of the page still works */ }
   }, [onCount]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(false); }, [load]);
   useEffect(() => {
-    window.addEventListener("app:parent-refresh", load);
-    const t = setInterval(() => { if (!document.hidden) load(); }, 90000);
-    return () => { window.removeEventListener("app:parent-refresh", load); clearInterval(t); };
-  }, [load]);
+    const onData = (e) => { setData(e.detail); onCount?.(e.detail?.total || 0); };
+    const onRefresh = () => load(true);
+    window.addEventListener("app:inbox-updated", onData);
+    window.addEventListener("app:parent-refresh", onRefresh);
+    return () => {
+      window.removeEventListener("app:inbox-updated", onData);
+      window.removeEventListener("app:parent-refresh", onRefresh);
+    };
+  }, [load, onCount]);
 
   const act = async (key, fn, msg) => {
     setBusy(key);

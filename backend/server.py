@@ -284,6 +284,8 @@ class DaySegment(BaseModel):
     emoji: str = Field(default="", max_length=8)
     start_time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     end_time: str = Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    # What finishing this section's missions feeds the pet: pakan (default), air, or mainan.
+    pet_care: Optional[Literal["food", "water", "play"]] = None
 
 
 class SegmentStartOverrideInput(BaseModel):
@@ -562,7 +564,6 @@ _PROOF_FIELDS = _SUMMARY_FIELDS + (
     "reading",                 # a reading mission: the child notes the page they reached
     "reading_book",            # optional fixed book title
     "steps",                   # a small checklist inside the mission
-    "pet_care",                # food (default) / water / play — which pet need its reward feeds
     "timed",                   # a stopwatch: the child taps Mulai, then Selesai
 )
 MAX_STEPS = 10
@@ -598,7 +599,6 @@ class TaskInput(BaseModel):
     before_photo_required: bool = False
     reading: bool = False
     reading_book: Optional[str] = Field(default=None, max_length=120)
-    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     coop: bool = False  # true = a single shared task worked on together by target_children,
@@ -644,7 +644,6 @@ class TaskUpdate(BaseModel):
     before_photo_required: Optional[bool] = None
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
-    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     together_bonus_enabled: Optional[bool] = None
@@ -2050,7 +2049,7 @@ async def list_tasks(
         "_undo_prev_streak": 0, "_undo_prev_last_completion": 0, "_undo_points_awarded": 0,
         "_undo_chiky_save": 0, "_undo_chiky_spend": 0, "_undo_chiky_share": 0, "_undo_spawned_next_id": 0,
         "_undo_coop_snapshots": 0, "_undo_prev_best_streak": 0, "_undo_feed_earned": 0, "_undo_miss_penalty": 0,
-        "_undo_free_prev_available": 0, "_undo_free_prev_week": 0,
+        "_undo_free_prev_available": 0, "_undo_free_prev_week": 0, "_undo_care": 0,
     }
     tasks = await db.tasks.find(query, {"_id": 0, **_UNDO_FIELDS}).to_list(10000)
     tasks.sort(key=lambda t: (t.get("date_key") or "", t.get("order") or 0))
@@ -2139,7 +2138,6 @@ async def _build_task_doc(
         "before_photo_required": payload.before_photo_required,
         "reading": payload.reading,
         "reading_book": (payload.reading_book or "").strip() or None,
-        "pet_care": payload.pet_care or None,
         "timed": bool(payload.timed),
         "steps": _clean_list(payload.steps),
         "completion_photo_url": None,
@@ -3047,7 +3045,6 @@ class RoutineSlotInput(BaseModel):
     before_photo_required: Optional[bool] = None
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
-    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
@@ -3067,7 +3064,6 @@ class RoutineSlotUpdate(BaseModel):
     before_photo_required: Optional[bool] = None
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
-    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     timed: Optional[bool] = None  # a stopwatch for this activity: starts on "Mulai", stops on "Selesai"
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
@@ -3386,9 +3382,18 @@ async def _cleanup_legacy_schedule() -> Optional[dict]:
     return summary
 
 
+_SLOT_ALWAYS = ("id", "weekday", "segment_id", "child_id", "title", "points", "is_bonus", "order")
+
+
 def _slot_out(sl: dict) -> dict:
-    return {k: sl.get(k) for k in ("id", "weekday", "segment_id", "child_id", "title",
-                                   "duration_minutes", "points", "is_bonus", "order", *_PROOF_FIELDS)}
+    """A routine activity for the editor. Options that aren't set are left out
+    (a missing key reads as off), which keeps a big weekly routine small."""
+    out = {k: sl.get(k) for k in _SLOT_ALWAYS}
+    for k in ("duration_minutes", *_PROOF_FIELDS):
+        v = sl.get(k)
+        if v not in (None, False, "", []):
+            out[k] = v
+    return out
 
 
 @api.get("/routine")
@@ -3430,7 +3435,6 @@ async def add_routine_slot(payload: RoutineSlotInput, user: dict = Depends(requi
                "before_photo_required": bool(payload.before_photo_required),
                "reading": bool(payload.reading),
                "reading_book": (payload.reading_book or "").strip() or None,
-        "pet_care": payload.pet_care or None,
         "timed": bool(payload.timed),
                "steps": _clean_list(payload.steps),
                "order": await _next_order(tpl["id"], wd, payload.segment_id), "created_at": now_iso()}
@@ -3972,6 +3976,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
             "id": sid,
             "label": seg["label"] if seg else "Kapan Saja",
             "emoji": (seg or {}).get("emoji", "✨" if not seg else ""),
+            "pet_care": (seg or {}).get("pet_care") or "food",
             "start_time": _fmt_min(start_min) if seg else None,
             "end_time": _fmt_min(end_min) if seg else None,
             "status": status,
@@ -4004,7 +4009,6 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                 "reading_page": a.get("reading_page"), "reading_last": (child.get("reading_log") or {}).get(
                     (a.get("reading_book") or "").strip().lower()) if a.get("reading") else None,
                 "steps": a.get("steps") or [], "steps_done": a.get("steps_done") or [],
-                "pet_care": a.get("pet_care") or "food",
                 "timed": bool(a.get("timed")), "timer_started_at": a.get("timer_started_at"),
                 "timer_ended_at": a.get("timer_ended_at"), "timer_seconds": a.get("timer_seconds"),
                 # Photos as cacheable media URLs, never inline base64.
@@ -4452,18 +4456,25 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
     on_watch = _in_probation(child, dk)
     auto = bool(config.get("auto_approve_tasks", True)) and not on_watch
     awarded = 0
-    for a in to_award:
-        await db.tasks.update_one({"id": a["id"]}, {"$set": {
+    if to_award:   # one write for the whole section, not one per mission
+        await db.tasks.update_many({"id": {"$in": [a["id"] for a in to_award]}}, {"$set": {
             "status": "completed", "completed_at": now_iso(),
             "late_no_points": no_points, "late_ack": bool(finish_update.get("finish_late") or sess.get("start_late")),
             "via_segment": payload.segment_id,
         }})
+    touched: set = set()
+    for a in to_award:
         if auto and not a.get("photo_required"):
             try:
-                await approve_task(a["id"], TaskApproveInput(), {"id": "system", "role": "parent", "name": "Otomatis"})
+                await _approve_task(a["id"], TaskApproveInput(), defer=True)
                 awarded += 1
+                touched.update(a.get("coop_participants") or [a["child_id"]])
             except HTTPException:
                 pass  # left for a parent to approve by hand
+    if touched:   # badges and the family combo once per section, not once per mission
+        for cid in touched:
+            await award_badges(FAMILY_ID, cid)
+        await _check_family_combo(dk, config)
 
     await db.segment_sessions.update_one(
         {"parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "segment_id": payload.segment_id},
@@ -6014,6 +6025,16 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict, care
     }
 
 
+async def _task_care(task: dict) -> str:
+    """What this mission's reward feeds the pet — set once per section
+    (pakan / air / mainan); 'Kapan Saja' always gives pakan."""
+    sid = task.get("segment_id")
+    if not sid or sid == ANYTIME_SEGMENT_ID:
+        return "food"
+    sg = next((x for x in await _get_day_segments() if x.get("id") == sid), None)
+    return (sg or {}).get("pet_care") or "food"
+
+
 def _care_inc(care: str, n: int) -> dict:
     """Where an approved mission's pet reward lands: pakan (food, the default),
     air (water) or mainan (play)."""
@@ -6026,6 +6047,13 @@ def _care_inc(care: str, n: int) -> dict:
 
 @api.post("/tasks/{task_id}/approve")
 async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInput(), user: dict = Depends(require_parent)):
+    return await _approve_task(task_id, payload)
+
+
+async def _approve_task(task_id: str, payload: TaskApproveInput, defer: bool = False):
+    """Approve one mission. `defer` (used when a whole section is approved at
+    once) leaves the per-child badge check and the family-combo check to the
+    caller, so they run once per section instead of once per mission."""
     task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID})
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -6048,7 +6076,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         snapshots = []
         for i, cid in enumerate(participants):
             share = base_share + (1 if i < remainder else 0)  # remainder spread across first few
-            snap = await _apply_approval_rewards(cid, share, config, care=task.get("pet_care"))
+            snap = await _apply_approval_rewards(cid, share, config, care=await _task_care(task))
             snapshots.append(snap)
 
         await db.tasks.update_one(
@@ -6063,7 +6091,8 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         )
         new_badges = []
         for cid in participants:
-            new_badges += await award_badges(FAMILY_ID, cid)
+            if not defer:
+                new_badges += await award_badges(FAMILY_ID, cid)
             await log_activity(FAMILY_ID, cid, "task_approved", {"task_id": task_id, "points": task["points"], "coop": True})
         if payload.encouragement_message or payload.encouragement_voice_url:
             for cid in participants:
@@ -6073,7 +6102,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                     body=payload.encouragement_message or "Dengarkan pesan suara dari orang tuamu!",
                     url=f"/kid/{cid}",
                 )
-        combo = await _check_family_combo(task.get("date_key"), config)
+        combo = None if defer else await _check_family_combo(task.get("date_key"), config)
         return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges, "family_combo": combo}
 
     # --- Normal single-child path ---
@@ -6091,7 +6120,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         # bonuses of any kind.
         points = 0
         together_bonus_awarded = 0
-    snap = await _apply_approval_rewards(task["child_id"], points, config, care=task.get("pet_care"))
+    snap = await _apply_approval_rewards(task["child_id"], points, config, care=await _task_care(task))
 
     await db.tasks.update_one(
         {"id": task_id},
@@ -6114,7 +6143,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
             }
         },
     )
-    new_badges = await award_badges(FAMILY_ID, task["child_id"])
+    new_badges = [] if defer else await award_badges(FAMILY_ID, task["child_id"])
     await log_activity(FAMILY_ID, task["child_id"], "task_approved", {"task_id": task_id, "points": points})
     if payload.encouragement_message or payload.encouragement_voice_url:
         await send_push_to(
@@ -6123,6 +6152,8 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
             body=payload.encouragement_message or "Dengarkan pesan suara dari orang tuamu!",
             url=f"/kid/{task['child_id']}",
         )
+    if defer:
+        return {"task": None, "new_badges": [], "family_combo": None}
     combo = await _check_family_combo(task.get("date_key"), config)
     return {"task": await db.tasks.find_one({"id": task_id}, {"_id": 0}), "new_badges": new_badges, "family_combo": combo}
 
@@ -7407,6 +7438,20 @@ async def mark_reflection_read(reflection_id: str, user: dict = Depends(require_
     return {"success": True}
 
 
+@api.get("/family/honesty-summary")
+async def family_honesty_summary(user: dict = Depends(require_parent)):
+    """Trust score, watch period and correction count for every child in one
+    request (the Monitor shows them side by side)."""
+    config = await get_config_cached()
+    out = {}
+    for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50):
+        await _refresh_trust(k["id"])
+        k = await db.children.find_one({"id": k["id"]}, {"_id": 0}) or k
+        out[k["id"]] = {"trust_score": _trust(k), "probation_until": k.get("probation_until") if _in_probation(k) else None,
+                        "strikes": await _strike_count(k["id"], config), "honest_admits": int(k.get("honest_admits") or 0)}
+    return out
+
+
 @api.get("/children/{child_id}/honesty")
 async def child_honesty(child_id: str, user: dict = Depends(get_current_user)):
     """Everything about honesty for one child: trust score, watch period, what
@@ -8328,8 +8373,8 @@ async def parent_bootstrap(
 ):
     today = _today_key()
     base = datetime.strptime(today, "%Y-%m-%d")
-    sd = start_date or (base - timedelta(days=14)).strftime("%Y-%m-%d")
-    ed = end_date or (base + timedelta(days=14)).strftime("%Y-%m-%d")
+    sd = start_date or (base - timedelta(days=3)).strftime("%Y-%m-%d")
+    ed = end_date or (base + timedelta(days=3)).strftime("%Y-%m-%d")
     # Build today/tomorrow first so the concurrent reads below see them.
     await _ensure_days_ready()
     children, tasks, rewards, consequences, redemptions, stats = await asyncio.gather(

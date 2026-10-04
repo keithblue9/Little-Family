@@ -8,6 +8,7 @@ const WeeklyReport = lazy(() => import("@/components/WeeklyReport"));
 const FamilyChallenges = lazy(() => import("@/components/FamilyChallenges"));
 const FamilyMissionCard = lazy(() => import("@/components/FamilyMissionCard"));
 const ParentInbox = lazy(() => import("@/components/ParentInbox"));
+const PetMessagesCard = lazy(() => import("@/components/PetMessagesCard"));
 
 export function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNavigate, onInboxCount }) {
   return (
@@ -74,6 +75,8 @@ export function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, o
           )}
         </div>
       </div>
+
+      {kids.length > 0 && <Suspense fallback={null}><PetMessagesCard kids={kids} /></Suspense>}
 
       {/* The rest is good to have but rarely urgent — folded away. */}
       {kids.length > 0 && (

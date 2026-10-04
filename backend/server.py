@@ -562,6 +562,7 @@ _PROOF_FIELDS = _SUMMARY_FIELDS + (
     "reading",                 # a reading mission: the child notes the page they reached
     "reading_book",            # optional fixed book title
     "steps",                   # a small checklist inside the mission
+    "pet_care",                # food (default) / water / play — which pet need its reward feeds
 )
 MAX_STEPS = 10
 MAX_QUESTIONS = 3
@@ -596,6 +597,7 @@ class TaskInput(BaseModel):
     before_photo_required: bool = False
     reading: bool = False
     reading_book: Optional[str] = Field(default=None, max_length=120)
+    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     coop: bool = False  # true = a single shared task worked on together by target_children,
                          # not one copy per kid; points split evenly among participants on approval
@@ -640,6 +642,7 @@ class TaskUpdate(BaseModel):
     before_photo_required: Optional[bool] = None
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
+    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
     together_bonus_enabled: Optional[bool] = None
     together_bonus_points: Optional[int] = Field(default=None, ge=1, le=1000)
@@ -971,6 +974,9 @@ async def update_own_profile(payload: SelfProfileInput, user: dict = Depends(get
         updates["feed_balance"] = 0
         updates["feed_lifetime"] = 0
         updates["pet_equipped"] = []
+        updates["pet_path"] = None
+        updates["pet_last_watered_at"] = now
+        updates["pet_last_played_at"] = now
 
     if updates:
         await db.members.update_one({"id": user["id"]}, {"$set": updates})
@@ -2130,6 +2136,7 @@ async def _build_task_doc(
         "before_photo_required": payload.before_photo_required,
         "reading": payload.reading,
         "reading_book": (payload.reading_book or "").strip() or None,
+        "pet_care": payload.pet_care or None,
         "steps": _clean_list(payload.steps),
         "completion_photo_url": None,
         "is_coop": False,
@@ -2490,10 +2497,14 @@ async def feed_pet(child_id: str, user: dict = Depends(get_current_user)):
     )
     await log_activity(FAMILY_ID, child_id, "pet_fed", {"cost": feed_cost})
     updated = await db.children.find_one({"id": child_id}, {"_id": 0})
+    before, after = _pet_stage(child, config), _pet_stage(updated, config)
+    if after[0] > before[0]:
+        await _pet_log(child_id, "stage", f"Peliharaanmu naik ke tahap {after[1]} 🎉", "🌟")
     return {
         "feed_balance": updated.get("feed_balance", 0),
         "feed_lifetime": updated.get("feed_lifetime", 0),
         "pet_feed_count": updated.get("pet_feed_count", 0),
+        "stage_up": after[0] > before[0], "stage_name": after[1],
     }
 
 
@@ -3032,6 +3043,7 @@ class RoutineSlotInput(BaseModel):
     before_photo_required: Optional[bool] = None
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
+    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
@@ -3050,6 +3062,7 @@ class RoutineSlotUpdate(BaseModel):
     before_photo_required: Optional[bool] = None
     reading: Optional[bool] = None
     reading_book: Optional[str] = Field(default=None, max_length=120)
+    pet_care: Optional[Literal["food", "water", "play"]] = None  # which pet need the reward feeds
     steps: Optional[List[str]] = Field(default=None, max_length=MAX_STEPS)
 
 
@@ -3411,6 +3424,7 @@ async def add_routine_slot(payload: RoutineSlotInput, user: dict = Depends(requi
                "before_photo_required": bool(payload.before_photo_required),
                "reading": bool(payload.reading),
                "reading_book": (payload.reading_book or "").strip() or None,
+        "pet_care": payload.pet_care or None,
                "steps": _clean_list(payload.steps),
                "order": await _next_order(tpl["id"], wd, payload.segment_id), "created_at": now_iso()}
         await db.template_tasks.insert_one(doc)
@@ -3562,6 +3576,85 @@ async def copy_routine_to_child(payload: RoutineCopyChildInput, user: dict = Dep
     await log_activity(FAMILY_ID, payload.from_child_id, "routine_copied_to_child",
                        {"to": targets, "copied": copied, "skipped": skipped, "removed": removed})
     return {"success": True, "copied": copied, "skipped": skipped, "removed": removed}
+
+
+class RoutineCopyItemsInput(BaseModel):
+    slot_ids: List[str] = Field(min_length=1, max_length=500)  # what to copy (a whole section = all its ids)
+    to_weekdays: Optional[List[int]] = Field(default=None, max_length=7)   # default: the activity's own day
+    to_child_ids: Optional[List[str]] = Field(default=None, max_length=20)  # default: the activity's own child
+    # "add": same-titled activities already there are skipped;
+    # "replace": the target's activities in each copied section are replaced first.
+    mode: Literal["add", "replace"] = "add"
+
+
+@api.post("/routine/copy-items")
+async def copy_routine_items(payload: RoutineCopyItemsInput, user: dict = Depends(require_parent)):
+    """Copy picked activities (or a whole section) to other days and/or to
+    another child. Everything a mission carries — points, proof options,
+    steps, quiz — comes along. Activities shared by every child stay shared
+    when copied to another day; they are not duplicated per child."""
+    tpl = await _routine_template()
+    src = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": tpl["id"],
+                                        "id": {"$in": payload.slot_ids}}, {"_id": 0}).to_list(500)
+    if not src:
+        raise HTTPException(status_code=404, detail="Aktivitas yang dipilih tidak ditemukan")
+    days = sorted(set(payload.to_weekdays)) if payload.to_weekdays is not None else None
+    if days is not None and (not days or any(d < 0 or d > 6 for d in days)):
+        raise HTTPException(status_code=422, detail="Pilih hari tujuan yang valid")
+    kids = list(dict.fromkeys(payload.to_child_ids)) if payload.to_child_ids is not None else None
+    if kids is not None and not kids:
+        raise HTTPException(status_code=422, detail="Pilih anak tujuan")
+    for k in kids or []:
+        await get_child_or_404(FAMILY_ID, k)
+    if days is None and kids is None:
+        raise HTTPException(status_code=422, detail="Pilih hari atau anak tujuan")
+    src.sort(key=lambda x: (x["weekday"], str(x.get("segment_id")), x.get("order") or 0))
+
+    # Every (activity, day, child) it should land on, minus itself.
+    plan = []
+    shared_skipped = 0
+    for sl in src:
+        for wd in (days if days is not None else [sl["weekday"]]):
+            for cid in (kids if kids is not None else [sl.get("child_id")]):
+                if cid and kids is not None and not sl.get("child_id"):
+                    shared_skipped += 1   # already seen by every child
+                    continue
+                if wd == sl["weekday"] and cid == sl.get("child_id"):
+                    continue
+                plan.append((sl, wd, cid))
+    if not plan:
+        raise HTTPException(status_code=422, detail="Tujuannya sama dengan sumbernya — pilih hari atau anak lain")
+
+    removed = copied = skipped = 0
+    if payload.mode == "replace":
+        scopes = {(wd, sl.get("segment_id"), cid) for sl, wd, cid in plan}
+        for wd, seg, cid in scopes:
+            res = await db.template_tasks.delete_many({"parent_id": FAMILY_ID, "template_id": tpl["id"],
+                                                       "weekday": wd, "segment_id": seg, "child_id": cid,
+                                                       "id": {"$nin": payload.slot_ids}})
+            removed += res.deleted_count
+    existing = await db.template_tasks.find({"parent_id": FAMILY_ID, "template_id": tpl["id"]},
+                                            {"_id": 0, "weekday": 1, "segment_id": 1, "title": 1, "child_id": 1}).to_list(10000)
+
+    def taken(wd, seg, cid, title):
+        t = (title or "").strip().lower()
+        return any(x["weekday"] == wd and x.get("segment_id") == seg and (x.get("title") or "").strip().lower() == t
+                   and (x.get("child_id") == cid or x.get("child_id") is None) for x in existing)
+
+    for sl, wd, cid in plan:
+        seg = sl.get("segment_id")
+        if taken(wd, seg, cid, sl.get("title")):
+            skipped += 1
+            continue
+        doc = {**sl, "id": new_id(), "weekday": wd, "child_id": cid, "created_at": now_iso(),
+               "order": await _next_order(tpl["id"], wd, seg), "copied_from_slot_id": sl["id"]}
+        await db.template_tasks.insert_one(dict(doc))
+        existing.append({"weekday": wd, "segment_id": seg, "title": sl.get("title"), "child_id": cid})
+        copied += 1
+    await _invalidate_days(_today_key(), include_today=False)
+    await log_activity(FAMILY_ID, None, "routine_items_copied",
+                       {"copied": copied, "skipped": skipped, "removed": removed, "days": days, "children": kids})
+    return {"success": True, "copied": copied, "skipped": skipped, "removed": removed, "shared_skipped": shared_skipped}
 
 
 @api.post("/routine/apply-today")
@@ -3904,6 +3997,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
                 "reading_page": a.get("reading_page"), "reading_last": (child.get("reading_log") or {}).get(
                     (a.get("reading_book") or "").strip().lower()) if a.get("reading") else None,
                 "steps": a.get("steps") or [], "steps_done": a.get("steps_done") or [],
+                "pet_care": a.get("pet_care") or "food",
                 # Photos as cacheable media URLs, never inline base64.
                 "before_photo_url": _media_ref("task", a["id"], "before_photo_url", a.get("before_photo_url")),
                 "completion_photo_url": _media_ref("task", a["id"], "completion_photo_url", a.get("completion_photo_url")),
@@ -4334,9 +4428,13 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
     streak = await _bump_section_streak(child, payload.segment_id, dk,
                                         on_time=not (finish_update["finish_late"] or sess.get("start_late")))
     spot = await _maybe_spot_check(child, dk, (seg or {}).get("label", "Kapan Saja"), acts, config)
+    fresh = await db.children.find_one({"id": payload.child_id}, {"_id": 0}) or child
+    pet_ticket = await _pet_ticket(fresh, config)
+    pet_gift = await _pet_gift(fresh, config, on_time=not (finish_update["finish_late"] or sess.get("start_late")))
     return {"success": True, "completed": len(to_award), "awarded": awarded,
             "finish_late": finish_update["finish_late"], "no_points": no_points,
-            "on_watch": on_watch, "spot_check": spot, "section_streak": streak}
+            "on_watch": on_watch, "spot_check": spot, "section_streak": streak,
+            "pet_ticket": pet_ticket, "pet_gift": pet_gift}
 
 
 @api.post("/segment-sessions/reopen")
@@ -5082,6 +5180,405 @@ async def cancel_punishment(punishment_id: str, user: dict = Depends(require_par
     return await db.punishments.find_one({"id": punishment_id}, {"_id": 0})
 
 
+# ---- Virtual pet: care, mood, gifts, games, home, journal, messages ----------
+PET_CARE_COST = 3            # air / mainan units per action
+PET_TICKET_CAP = 5           # play tickets that can be saved up
+PET_GAMES_PER_DAY = 3
+PET_GAME_MAX_COINS = {"catch": 8, "memory": 6, "guess": 5}
+PET_HOME_MAX_ITEMS = 5
+PET_PATHS = {"brave": ("Pemberani", "🦁"), "smart": ("Pintar", "🦉"), "kind": ("Penyayang", "💗")}
+PET_HOME_CATALOG = {
+    # key: (name, emoji, price in koin, slot)
+    "wall_sky": ("Langit cerah", "🌤️", 0, "wall"), "wall_night": ("Malam bintang", "🌙", 20, "wall"),
+    "wall_forest": ("Hutan", "🌳", 30, "wall"), "wall_space": ("Luar angkasa", "🚀", 45, "wall"),
+    "wall_candy": ("Negeri permen", "🍭", 45, "wall"),
+    "floor_grass": ("Rumput", "🌱", 0, "floor"), "floor_wood": ("Lantai kayu", "🪵", 15, "floor"),
+    "floor_sand": ("Pasir pantai", "🏖️", 20, "floor"), "floor_snow": ("Salju", "❄️", 25, "floor"),
+    "bed": ("Kasur", "🛏️", 15, "item"), "ball": ("Bola", "⚽", 10, "item"), "plant": ("Tanaman", "🪴", 12, "item"),
+    "lamp": ("Lampu", "💡", 15, "item"), "books": ("Buku", "📚", 12, "item"), "teddy": ("Boneka", "🧸", 10, "item"),
+    "cake": ("Kue", "🎂", 20, "item"), "fish": ("Akuarium", "🐠", 25, "item"), "tent": ("Tenda", "⛺", 30, "item"),
+    "rainbow": ("Pelangi", "🌈", 40, "item"), "piano": ("Piano", "🎹", 40, "item"), "telescope": ("Teleskop", "🔭", 35, "item"),
+}
+_HOME_DEFAULT = {"wall": "wall_sky", "floor": "floor_grass", "items": [], "owned": ["wall_sky", "floor_grass"]}
+
+
+def _pet_stage(child: dict, config: dict) -> tuple:
+    th = config.get("pet_stage_feed_thresholds") or _DEFAULT_PET_FEED_THRESHOLDS
+    names = config.get("pet_stage_names") or _DEFAULT_PET_STAGE_NAMES
+    n = int(child.get("pet_feed_count") or 0)
+    idx = sum(1 for t in th if n >= t)
+    return idx, names[min(idx, len(names) - 1)]
+
+
+def _jakarta_now() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=7)
+
+
+def _pet_phase() -> dict:
+    h = _jakarta_now().hour
+    if 5 <= h < 11:
+        return {"key": "morning", "label": "Pagi", "emoji": "🌅", "line": "Selamat pagi! Aku baru bangun~"}
+    if 11 <= h < 15:
+        return {"key": "noon", "label": "Siang", "emoji": "☀️", "line": "Siang yang seru!"}
+    if 15 <= h < 19:
+        return {"key": "evening", "label": "Sore", "emoji": "🌇", "line": "Sore-sore enaknya santai."}
+    return {"key": "night", "label": "Malam", "emoji": "🌙", "line": "Zzz… aku ngantuk."}
+
+
+def _hours_since(iso: Optional[str]) -> Optional[float]:
+    if not iso:
+        return None
+    try:
+        d = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        d = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - d).total_seconds() / 3600
+    except Exception:
+        return None
+
+
+async def _pet_log(child_id: str, kind: str, text: str, emoji: str = "🐾") -> None:
+    await db.pet_journal.insert_one({"id": new_id(), "parent_id": FAMILY_ID, "child_id": child_id, "kind": kind,
+                                     "text": text, "emoji": emoji, "date_key": _today_key(), "at": now_iso()})
+
+
+async def _pet_mood(child: dict) -> dict:
+    """How the pet feels today. Always gentle — a hint about the day, never a
+    scolding: it follows what the child did (on-time sections, a recent
+    correction) and the pet's own small needs."""
+    today = _today_key()
+    since = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d")
+    corrected = await db.corrections.count_documents({"child_id": child["id"], "undone": {"$ne": True},
+                                                      "date_key": {"$gt": since}})
+    sess = await db.segment_sessions.find({"child_id": child["id"], "date_key": today,
+                                           "completed_at": {"$nin": [None, ""]}}, {"_id": 0}).to_list(50)
+    on_time = sum(1 for x in sess if not x.get("start_late") and not x.get("finish_late"))
+    chosen = child.get("pet_chosen_at")
+    h_fed = _hours_since(child.get("pet_last_fed_at") or chosen)
+    h_water = _hours_since(child.get("pet_last_watered_at") or chosen)
+    h_play = _hours_since(child.get("pet_last_played_at") or chosen)
+    if corrected:
+        m = ("sad", "🥺", "Sedikit sedih", "Aku sedih sedikit… tapi aku percaya kamu bisa lebih baik besok 💛")
+    elif h_fed is not None and h_fed >= 30:
+        m = ("hungry", "😋", "Lapar", "Perutku keroncongan… ada makanan?")
+    elif h_water is not None and h_water >= 48:
+        m = ("thirsty", "🥤", "Haus", "Aku haus, boleh minum?")
+    elif h_play is not None and h_play >= 48:
+        m = ("bored", "🥱", "Bosan", "Ayo main sama aku, aku bosan~")
+    elif on_time >= 2:
+        m = ("ecstatic", "🤩", "Sangat senang", "Kamu tepat waktu terus hari ini! Hebat!")
+    elif sess:
+        m = ("happy", "😄", "Senang", "Asyik, satu bagian selesai!")
+    else:
+        m = ("calm", "🙂", "Tenang", "Aku siap menemanimu hari ini.")
+    return {"key": m[0], "face": m[1], "label": m[2], "line": m[3]}
+
+
+async def _pet_gift(child: dict, config: dict, on_time: bool) -> Optional[dict]:
+    """After a finished section the pet sometimes comes back with a present.
+    What it brings leans with the path the child chose for it."""
+    import random as _random
+    if not child.get("pet_type") or _pet_is_dead(child, config):
+        return None
+    if _random.random() >= (0.45 if on_time else 0.2):
+        return None
+    path = child.get("pet_path")
+    weights = {"coins": 3, "feed": 3, "ticket": 2}
+    if path == "brave":
+        weights["coins"] += 3
+    elif path == "smart":
+        weights["feed"] += 3
+    elif path == "kind":
+        weights["ticket"] += 3
+    kind = _random.choices(list(weights), weights=list(weights.values()))[0]
+    if kind == "coins":
+        n = _random.randint(2, 5)
+        inc, text = {"pet_coins": n}, f"membawa {n} koin 🪙"
+    elif kind == "feed":
+        n = _random.randint(2, 4)
+        inc, text = {"feed_balance": n, "feed_lifetime": n}, f"membawa {n} pakan 🍖"
+    else:
+        n = 1
+        inc, text = {"play_tickets": 1}, "membawa 1 tiket main 🎟️"
+        if int(child.get("play_tickets") or 0) >= PET_TICKET_CAP:
+            kind, n = "coins", 3
+            inc, text = {"pet_coins": 3}, "membawa 3 koin 🪙"
+    await db.children.update_one({"id": child["id"]}, {"$inc": inc})
+    await _pet_log(child["id"], "gift", f"Peliharaanmu {text} setelah kamu menyelesaikan satu bagian", "🎁")
+    return {"kind": kind, "amount": n, "text": text}
+
+
+async def _pet_ticket(child: dict, config: dict) -> int:
+    """One play ticket per finished section (saved up to a small cap)."""
+    if not child.get("pet_type") or _pet_is_dead(child, config):
+        return 0
+    if int(child.get("play_tickets") or 0) >= PET_TICKET_CAP:
+        return 0
+    await db.children.update_one({"id": child["id"]}, {"$inc": {"play_tickets": 1}})
+    return 1
+
+
+def _pet_alive(child: dict, config: dict) -> None:
+    if not child.get("pet_type"):
+        raise HTTPException(status_code=400, detail="Kamu belum punya peliharaan — pilih dulu ya!")
+    if _pet_is_dead(child, config):
+        raise HTTPException(status_code=400, detail="Peliharaanmu sudah pergi 💔 — pilih peliharaan baru untuk mulai lagi.")
+
+
+async def _playdate_for(child: dict, config: dict) -> Optional[dict]:
+    """Two siblings who both finished a section today let their pets play
+    together — claiming it pays both a few koin."""
+    today = _today_key()
+    done = {x["child_id"] for x in await db.segment_sessions.find(
+        {"parent_id": FAMILY_ID, "date_key": today, "completed_at": {"$nin": [None, ""]}},
+        {"_id": 0, "child_id": 1}).to_list(500)}
+    if child["id"] not in done:
+        return None
+    for k in await db.children.find({"parent_id": FAMILY_ID, "id": {"$ne": child["id"]}}, {"_id": 0}).to_list(50):
+        if k["id"] in done and k.get("pet_type") and not _pet_is_dead(k, config):
+            pair = sorted([child["id"], k["id"]])
+            claimed = bool(await db.pet_playdates.find_one({"date_key": today, "pair": pair}))
+            idx, _ = _pet_stage(k, config)
+            return {"mate_id": k["id"], "mate_name": k["name"], "mate_pet": k["pet_type"], "mate_stage": idx,
+                    "claimed": claimed}
+    return None
+
+
+@api.get("/children/{child_id}/pet")
+async def pet_state(child_id: str, user: dict = Depends(get_current_user)):
+    """Everything the pet screen needs in one call."""
+    _assert_can_act(user, child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    config = await get_config_cached()
+    if not child.get("pet_type"):
+        return {"has_pet": False}
+    dead = _pet_is_dead(child, config)
+    idx, stage_name = _pet_stage(child, config)
+    today = _today_key()
+    games = child.get("pet_games") or {}
+    games_today = int(games.get("n") or 0) if games.get("date") == today else 0
+    home = {**_HOME_DEFAULT, **(child.get("pet_home") or {})}
+    msg = await db.pet_messages.find({"parent_id": FAMILY_ID, "$or": [{"child_id": child_id}, {"child_id": None}],
+                                      "read_by": {"$ne": child_id}}, {"_id": 0}).sort("created_at", -1).to_list(1)
+    journal = await db.pet_journal.find({"child_id": child_id}, {"_id": 0}).sort("at", -1).to_list(8)
+    path = child.get("pet_path")
+    h = lambda iso: _hours_since(iso or child.get("pet_chosen_at"))
+    return {
+        "has_pet": True, "dead": dead, "pet_type": child["pet_type"], "stage_index": idx, "stage_name": stage_name,
+        "feed_balance": int(child.get("feed_balance") or 0), "water_balance": int(child.get("water_balance") or 0),
+        "play_balance": int(child.get("play_balance") or 0), "care_cost": PET_CARE_COST,
+        "tickets": int(child.get("play_tickets") or 0), "coins": int(child.get("pet_coins") or 0),
+        "games_left": max(0, PET_GAMES_PER_DAY - games_today),
+        "mood": None if dead else await _pet_mood(child), "phase": _pet_phase(),
+        "path": path, "path_label": PET_PATHS[path][0] if path in PET_PATHS else None,
+        "path_icon": PET_PATHS[path][1] if path in PET_PATHS else None,
+        "path_available": idx >= 2 and not path and not dead,
+        "paths": [{"key": k, "label": v[0], "icon": v[1]} for k, v in PET_PATHS.items()],
+        "home": home,
+        "catalog": [{"key": k, "name": v[0], "emoji": v[1], "price": v[2], "slot": v[3]} for k, v in PET_HOME_CATALOG.items()],
+        "message": msg[0] if msg else None, "journal": journal,
+        "playdate": None if dead else await _playdate_for(child, config),
+        "water_hours": h(child.get("pet_last_watered_at")), "play_hours": h(child.get("pet_last_played_at")),
+    }
+
+
+class PetCareInput(BaseModel):
+    kind: Literal["water", "play"]
+
+
+@api.post("/children/{child_id}/pet-care")
+async def pet_care(child_id: str, payload: PetCareInput, user: dict = Depends(get_current_user)):
+    """Give the pet a drink or play with it — using the units its missions earned."""
+    _assert_can_act(user, child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    config = await get_config_cached()
+    _pet_alive(child, config)
+    field = f"{payload.kind}_balance"
+    if int(child.get(field) or 0) < PET_CARE_COST:
+        raise HTTPException(status_code=400, detail=f"Butuh {PET_CARE_COST} {'air' if payload.kind == 'water' else 'mainan'} — "
+                                                     "kerjakan misi yang memberinya dulu ya!")
+    stamp = "pet_last_watered_at" if payload.kind == "water" else "pet_last_played_at"
+    inc = {field: -PET_CARE_COST}
+    if payload.kind == "play":
+        inc["pet_coins"] = 1
+    await db.children.update_one({"id": child_id}, {"$inc": inc, "$set": {stamp: now_iso()}})
+    await _pet_log(child_id, payload.kind, "Kamu memberi minum peliharaanmu 💧" if payload.kind == "water"
+                   else "Kamu bermain dengan peliharaanmu 🎾 (+1 koin)", "💧" if payload.kind == "water" else "🎾")
+    return {"success": True, "bonus_coins": 1 if payload.kind == "play" else 0}
+
+
+class PetGameInput(BaseModel):
+    game: Literal["catch", "memory", "guess"]
+    score: int = Field(ge=0, le=100)   # how well it went, as a percentage
+
+
+@api.post("/children/{child_id}/pet-game")
+async def pet_game(child_id: str, payload: PetGameInput, user: dict = Depends(get_current_user)):
+    """A finished mini-game: spends one tiket main, pays a few koin by score.
+    Limited per day so it stays a treat, not an escape."""
+    _assert_can_act(user, child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    config = await get_config_cached()
+    _pet_alive(child, config)
+    today = _today_key()
+    games = child.get("pet_games") or {}
+    n = int(games.get("n") or 0) if games.get("date") == today else 0
+    if n >= PET_GAMES_PER_DAY:
+        raise HTTPException(status_code=409, detail="Main hari ini sudah cukup — lanjut besok ya 🌙")
+    if int(child.get("play_tickets") or 0) < 1:
+        raise HTTPException(status_code=400, detail="Tiket main habis — selesaikan satu bagian untuk dapat tiket 🎟️")
+    coins = round(PET_GAME_MAX_COINS[payload.game] * payload.score / 100)
+    if payload.score > 0:
+        coins = max(1, coins)
+    await db.children.update_one({"id": child_id}, {
+        "$inc": {"play_tickets": -1, "pet_coins": coins},
+        "$set": {"pet_games": {"date": today, "n": n + 1}, "pet_last_played_at": now_iso()}})
+    names = {"catch": "Tangkap", "memory": "Memori", "guess": "Tebak"}
+    if payload.score >= 80:
+        await _pet_log(child_id, "game", f"Skor tinggi di permainan {names[payload.game]}: {payload.score}! 🏆", "🏆")
+    return {"success": True, "coins": coins, "tickets": int(child.get("play_tickets") or 0) - 1,
+            "games_left": PET_GAMES_PER_DAY - n - 1}
+
+
+class PetBuyInput(BaseModel):
+    item: str
+
+
+@api.post("/children/{child_id}/pet-home/buy")
+async def pet_home_buy(child_id: str, payload: PetBuyInput, user: dict = Depends(get_current_user)):
+    _assert_can_act(user, child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    spec = PET_HOME_CATALOG.get(payload.item)
+    if not spec:
+        raise HTTPException(status_code=404, detail="Barang tidak ada")
+    home = {**_HOME_DEFAULT, **(child.get("pet_home") or {})}
+    if payload.item in home["owned"]:
+        raise HTTPException(status_code=409, detail="Sudah kamu punya")
+    if int(child.get("pet_coins") or 0) < spec[2]:
+        raise HTTPException(status_code=400, detail=f"Koinmu kurang — butuh {spec[2]} koin 🪙")
+    home["owned"] = [*home["owned"], payload.item]
+    await db.children.update_one({"id": child_id}, {"$inc": {"pet_coins": -spec[2]}, "$set": {"pet_home": home}})
+    await _pet_log(child_id, "home", f"Membeli {spec[0]} untuk rumah peliharaan {spec[1]}", "🏠")
+    return {"success": True}
+
+
+class PetHomeSetInput(BaseModel):
+    wall: Optional[str] = None
+    floor: Optional[str] = None
+    items: Optional[List[str]] = Field(default=None, max_length=PET_HOME_MAX_ITEMS)
+
+
+@api.post("/children/{child_id}/pet-home/set")
+async def pet_home_set(child_id: str, payload: PetHomeSetInput, user: dict = Depends(get_current_user)):
+    _assert_can_act(user, child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    home = {**_HOME_DEFAULT, **(child.get("pet_home") or {})}
+    owned = set(home["owned"])
+    for key, slot in ((payload.wall, "wall"), (payload.floor, "floor")):
+        if key is not None:
+            if key not in owned or PET_HOME_CATALOG.get(key, (0, 0, 0, ""))[3] != slot:
+                raise HTTPException(status_code=400, detail="Barang itu belum kamu punya")
+            home[slot] = key
+    if payload.items is not None:
+        items = list(dict.fromkeys(payload.items))
+        if any(i not in owned or PET_HOME_CATALOG.get(i, (0, 0, 0, ""))[3] != "item" for i in items):
+            raise HTTPException(status_code=400, detail="Ada barang yang belum kamu punya")
+        home["items"] = items
+    await db.children.update_one({"id": child_id}, {"$set": {"pet_home": home}})
+    return {"success": True, "home": home}
+
+
+@api.post("/children/{child_id}/pet-playdate")
+async def pet_playdate_claim(child_id: str, user: dict = Depends(get_current_user)):
+    _assert_can_act(user, child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    config = await get_config_cached()
+    _pet_alive(child, config)
+    pd = await _playdate_for(child, config)
+    if not pd:
+        raise HTTPException(status_code=400, detail="Belum ada teman main — tunggu saudaramu menyelesaikan satu bagian juga ya")
+    if pd["claimed"]:
+        raise HTTPException(status_code=409, detail="Hari ini sudah main bareng 🎪")
+    pair = sorted([child_id, pd["mate_id"]])
+    await db.pet_playdates.insert_one({"date_key": _today_key(), "pair": pair, "at": now_iso()})
+    await db.children.update_many({"id": {"$in": pair}}, {"$inc": {"pet_coins": 3}, "$set": {"pet_last_played_at": now_iso()}})
+    await _pet_log(child_id, "playdate", f"Main bareng peliharaan {pd['mate_name']} 🎪 (+3 koin)", "🎪")
+    await _pet_log(pd["mate_id"], "playdate", f"Main bareng peliharaan {child['name']} 🎪 (+3 koin)", "🎪")
+    return {"success": True, "coins": 3}
+
+
+class PetPathInput(BaseModel):
+    path: Literal["brave", "smart", "kind"]
+
+
+@api.post("/children/{child_id}/pet-path")
+async def pet_choose_path(child_id: str, payload: PetPathInput, user: dict = Depends(get_current_user)):
+    """At the teen stage the child picks what kind of pet theirs becomes."""
+    _assert_can_act(user, child_id)
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    config = await get_config_cached()
+    _pet_alive(child, config)
+    if child.get("pet_path"):
+        raise HTTPException(status_code=409, detail="Jalannya sudah dipilih")
+    if _pet_stage(child, config)[0] < 2:
+        raise HTTPException(status_code=400, detail="Tunggu sampai peliharaanmu remaja dulu ya")
+    await db.children.update_one({"id": child_id}, {"$set": {"pet_path": payload.path}})
+    label, icon = PET_PATHS[payload.path]
+    await _pet_log(child_id, "path", f"Peliharaanmu tumbuh menjadi {label} {icon}", icon)
+    return {"success": True, "path": payload.path, "label": label}
+
+
+@api.get("/children/{child_id}/pet-journal")
+async def pet_journal(child_id: str, limit: int = Query(default=40, ge=1, le=200), user: dict = Depends(get_current_user)):
+    _assert_can_act(user, child_id)
+    return await db.pet_journal.find({"child_id": child_id}, {"_id": 0}).sort("at", -1).to_list(limit)
+
+
+class PetMessageInput(BaseModel):
+    text: str = Field(min_length=1, max_length=140)
+    child_id: Optional[str] = None   # empty = every child
+
+
+@api.get("/pet-messages")
+async def list_pet_messages(user: dict = Depends(require_parent)):
+    return await db.pet_messages.find({"parent_id": FAMILY_ID}, {"_id": 0}).sort("created_at", -1).to_list(50)
+
+
+@api.post("/pet-messages")
+async def add_pet_message(payload: PetMessageInput, user: dict = Depends(require_parent)):
+    """A short note from a parent that the child's pet 'says' on their screen."""
+    if payload.child_id:
+        await get_child_or_404(FAMILY_ID, payload.child_id)
+    doc = {"id": new_id(), "parent_id": FAMILY_ID, "child_id": payload.child_id or None, "text": payload.text.strip(),
+           "from": user.get("name", ""), "created_at": now_iso(), "read_by": []}
+    await db.pet_messages.insert_one(dict(doc))
+    targets = [payload.child_id] if payload.child_id else [k["id"] for k in await db.children.find(
+        {"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50)]
+    for cid in targets:
+        await send_push_to({"role": "child", "member_id": cid}, title="Peliharaanmu punya pesan 💌",
+                           body="Buka aplikasi untuk mendengarnya.", url=f"/kid/{cid}")
+    doc.pop("_id", None)
+    return doc
+
+
+@api.delete("/pet-messages/{message_id}")
+async def delete_pet_message(message_id: str, user: dict = Depends(require_parent)):
+    await db.pet_messages.delete_one({"id": message_id, "parent_id": FAMILY_ID})
+    return {"success": True}
+
+
+@api.post("/pet-messages/{message_id}/read")
+async def read_pet_message(message_id: str, child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    cid = user["id"] if user["role"] == "child" else child_id
+    if not cid:
+        raise HTTPException(status_code=422, detail="child_id diperlukan")
+    m = await db.pet_messages.find_one({"id": message_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not m or (m.get("child_id") and m["child_id"] != cid):
+        raise HTTPException(status_code=404, detail="Pesan tidak ditemukan")
+    await db.pet_messages.update_one({"id": message_id}, {"$addToSet": {"read_by": cid}})
+    await _pet_log(cid, "message", f"Pesan dari {m.get('from') or 'orang tua'}: “{m['text']}”", "💌")
+    return {"success": True}
+
+
 @api.post("/children/{child_id}/revive-pet")
 async def revive_pet(child_id: str, user: dict = Depends(require_parent)):
     """Undo a punishment-caused pet death (a second chance is the parent's to
@@ -5392,7 +5889,7 @@ async def bulk_delete_tasks(payload: BulkDeleteInput, user: dict = Depends(requi
 
 # ---- Stage 3: compact the pre-built schedule -------------------------------
 
-async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> dict:
+async def _apply_approval_rewards(child_id: str, points: int, config: dict, care: Optional[str] = None) -> dict:
     """Applies streak/Chikybank updates for ONE child earning
     `points` from an approval. Returns a snapshot describing exactly what
     changed, so a later undo can reverse precisely this — used for both the
@@ -5437,6 +5934,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
     # configured rate (default 1:1), separate from the spendable points
     # economy (feeding never touches points).
     feed_earned = round(points * float(config.get("feed_per_point", 1)))
+    care = care if care in ("water", "play") else "food"
 
     await db.children.update_one(
         {"id": child_id},
@@ -5444,7 +5942,7 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
             "$inc": {
                 "points": points, "lifetime_points": points, "tasks_completed": 1,
                 "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
-                "feed_balance": feed_earned, "feed_lifetime": feed_earned,
+                **_care_inc(care, feed_earned),
             },
             "$set": {
                 "last_completion_date": today, "streak_days": streak,
@@ -5457,9 +5955,18 @@ async def _apply_approval_rewards(child_id: str, points: int, config: dict) -> d
         "chiky_save": p_save, "chiky_spend": p_spend, "chiky_share": p_share,
         "prev_streak": prev_streak, "prev_last_completion": prev_last_completion,
         "prev_best_streak": prev_best_streak,
-        "feed_earned": feed_earned,
+        "feed_earned": feed_earned, "care": care,
     }
 
+
+def _care_inc(care: str, n: int) -> dict:
+    """Where an approved mission's pet reward lands: pakan (food, the default),
+    air (water) or mainan (play)."""
+    if care == "water":
+        return {"water_balance": n}
+    if care == "play":
+        return {"play_balance": n}
+    return {"feed_balance": n, "feed_lifetime": n}
 
 
 @api.post("/tasks/{task_id}/approve")
@@ -5486,7 +5993,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         snapshots = []
         for i, cid in enumerate(participants):
             share = base_share + (1 if i < remainder else 0)  # remainder spread across first few
-            snap = await _apply_approval_rewards(cid, share, config)
+            snap = await _apply_approval_rewards(cid, share, config, care=task.get("pet_care"))
             snapshots.append(snap)
 
         await db.tasks.update_one(
@@ -5529,7 +6036,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
         # bonuses of any kind.
         points = 0
         together_bonus_awarded = 0
-    snap = await _apply_approval_rewards(task["child_id"], points, config)
+    snap = await _apply_approval_rewards(task["child_id"], points, config, care=task.get("pet_care"))
 
     await db.tasks.update_one(
         {"id": task_id},
@@ -5546,7 +6053,7 @@ async def approve_task(task_id: str, payload: TaskApproveInput = TaskApproveInpu
                 "_undo_chiky_spend": snap["chiky_spend"],
                 "_undo_chiky_share": snap["chiky_share"],
                 "_undo_prev_best_streak": snap["prev_best_streak"],
-                "_undo_feed_earned": snap["feed_earned"],
+                "_undo_feed_earned": snap["feed_earned"], "_undo_care": snap["care"],
                 "encouragement_message": payload.encouragement_message,
                 "encouragement_voice_url": payload.encouragement_voice_url,
             }
@@ -5624,7 +6131,7 @@ async def _reverse_task_points(task: dict, restore_streak: bool) -> int:
             upd = {"$inc": {
                 "points": -snap["points"], "lifetime_points": -snap["points"], "tasks_completed": -1,
                 "chiky_save": -snap["chiky_save"], "chiky_spend": -snap["chiky_spend"], "chiky_share": -snap["chiky_share"],
-                "feed_balance": -snap.get("feed_earned", 0), "feed_lifetime": -snap.get("feed_earned", 0),
+                **_care_inc(snap.get("care", "food"), -snap.get("feed_earned", 0)),
             }}
             if restore_streak:
                 upd["$set"] = {"streak_days": snap["prev_streak"], "last_completion_date": snap["prev_last_completion"],
@@ -5641,7 +6148,7 @@ async def _reverse_task_points(task: dict, restore_streak: bool) -> int:
         "points": -points, "lifetime_points": -points, "tasks_completed": -1,
         "chiky_save": -task.get("_undo_chiky_save", 0), "chiky_spend": -task.get("_undo_chiky_spend", 0),
         "chiky_share": -task.get("_undo_chiky_share", 0),
-        "feed_balance": -feed, "feed_lifetime": -feed,
+        **_care_inc(task.get("_undo_care", "food"), -feed),
     }}
     if restore_streak:
         upd["$set"] = {"streak_days": task.get("_undo_prev_streak", 0),
@@ -5651,7 +6158,7 @@ async def _reverse_task_points(task: dict, restore_streak: bool) -> int:
     await db.tasks.update_one({"id": task["id"]}, {"$unset": {
         "_undo_prev_streak": "", "_undo_prev_last_completion": "", "_undo_points_awarded": "",
         "_undo_chiky_save": "", "_undo_chiky_spend": "", "_undo_chiky_share": "", "_undo_spawned_next_id": "",
-        "_undo_prev_best_streak": "", "_undo_feed_earned": "",
+        "_undo_prev_best_streak": "", "_undo_feed_earned": "", "_undo_care": "",
         "encouragement_message": "", "encouragement_voice_url": ""}})
     return points
 

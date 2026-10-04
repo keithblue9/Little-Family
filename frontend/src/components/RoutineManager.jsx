@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronUp, ChevronDown, Trash2, Plus, Copy, RefreshCw, CalendarOff, Repeat, Sparkles, X, Users } from "lucide-react";
+import { ChevronUp, ChevronDown, Trash2, Plus, Copy, RefreshCw, CalendarOff, Repeat, Sparkles, X, Users, CheckSquare } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatApiError } from "@/lib/api";
 import { todayKey, humanDateKey } from "@/lib/dates";
@@ -23,6 +23,9 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
   const [copyTo, setCopyTo] = useState([]);
   const [kidCopyOpen, setKidCopyOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Activities ticked for copying, and whether the destination panel is open.
+  const [sel, setSel] = useState(() => new Set());
+  const [itemCopyOpen, setItemCopyOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -41,6 +44,17 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
     [data, childId],
   );
   const daySlots = useMemo(() => visible.filter((s) => s.weekday === weekday), [visible, weekday]);
+  // A different day or child means a different list — the old ticks no longer apply.
+  useEffect(() => { setSel(new Set()); setItemCopyOpen(false); }, [weekday, childId]);
+  const toggleSel = (id) => setSel((v) => { const n = new Set(v); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const setMany = (ids, on) => setSel((v) => { const n = new Set(v); ids.forEach((i) => (on ? n.add(i) : n.delete(i))); return n; });
+  const copyItems = (opts) => run(async () => {
+    const { data: r } = await api.post("/routine/copy-items", { slot_ids: [...sel], ...opts });
+    toast.success(r.copied
+      ? `${r.copied} aktivitas disalin${r.skipped ? ` · ${r.skipped} sudah ada` : ""}${r.removed ? ` · ${r.removed} diganti` : ""}`
+      : "Semua aktivitas itu sudah ada di sana");
+    setItemCopyOpen(false); setSel(new Set());
+  });
   const countFor = (wd) => visible.filter((s) => s.weekday === wd).length;
 
   const run = async (fn, okMsg) => {
@@ -147,6 +161,27 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
           </div>
         )}
 
+        {sel.size > 0 && (
+          <div className="sticky top-2 z-20 mb-4 rounded-2xl border-2 border-indigo-200 bg-indigo-50 p-3 shadow-sm space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <CheckSquare className="w-4 h-4 text-indigo-600" />
+              <span className="text-sm font-bold text-indigo-900">{sel.size} aktivitas dipilih</span>
+              <button onClick={() => setMany(daySlots.map((x) => x.id), true)}
+                className="press-btn text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-white border border-indigo-200 text-indigo-700">Pilih semua hari ini</button>
+              <button onClick={() => setItemCopyOpen((v) => !v)}
+                className="press-btn ml-auto inline-flex items-center gap-1.5 text-sm font-semibold px-3 py-1.5 rounded-xl bg-indigo-600 text-white">
+                <Copy className="w-4 h-4" /> Salin…
+              </button>
+              <button onClick={() => { setSel(new Set()); setItemCopyOpen(false); }}
+                className="press-btn text-xs font-semibold px-2.5 py-1.5 rounded-lg text-slate-500">Batal</button>
+            </div>
+            {itemCopyOpen && (
+              <CopyItemsPanel weekday={weekday} kids={kids} busy={busy} count={sel.size}
+                onCancel={() => setItemCopyOpen(false)} onCopy={copyItems} />
+            )}
+          </div>
+        )}
+
         {/* Weekday tabs */}
         <div className="grid grid-cols-7 gap-1.5 mb-5">
           {DAYS.map((d, i) => (
@@ -165,6 +200,8 @@ export default function RoutineManager({ kids = [], childId = null, onChanged })
               slots={daySlots.filter((s) => (s.segment_id || ANYTIME) === sg.id)}
               onAdd={(body) => run(() => api.post("/routine/slots", {
                 weekdays: [weekday], segment_id: sg.id === ANYTIME ? null : sg.id, ...body }))}
+              selected={sel} onToggle={toggleSel} onSelectMany={setMany}
+              onCopySection={(ids) => { setSel(new Set(ids)); setItemCopyOpen(true); }}
               onPatch={patch} onMove={move} onRemove={remove} onCopySlot={copySlot} />
           ))}
         </div>
@@ -218,7 +255,64 @@ function CopyToKidsPanel({ fromName, weekdayLabel, others, busy, onCopy, onCance
   );
 }
 
-function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMove, onRemove, onCopySlot }) {
+/** Where the ticked activities go: other days, another child, or both. */
+function CopyItemsPanel({ weekday, kids, busy, count, onCopy, onCancel }) {
+  const [days, setDays] = useState([]);
+  const [to, setTo] = useState([]);
+  const [mode, setMode] = useState("add");
+  const pill = (on) => `press-btn px-3 py-1.5 rounded-xl text-xs font-semibold border-2 ${
+    on ? "border-indigo-500 bg-indigo-500 text-white" : "border-slate-200 bg-white text-slate-600"}`;
+  const flip = (setter) => (v) => setter((a) => (a.includes(v) ? a.filter((x) => x !== v) : [...a, v]));
+  const ok = days.length > 0 || to.length > 0;
+  return (
+    <div className="rounded-xl bg-white border border-indigo-100 p-3 space-y-3">
+      <div>
+        <div className="text-xs font-semibold text-slate-700 mb-1.5">Salin ke hari: <span className="font-normal text-slate-400">(kosongkan kalau hanya ke anak lain)</span></div>
+        <div className="flex flex-wrap gap-1.5">
+          {DAYS.map((d, i) => (
+            <button key={d} onClick={() => flip(setDays)(i)} className={pill(days.includes(i))}>
+              {d.slice(0, 3)}{i === weekday ? " •" : ""}
+            </button>
+          ))}
+        </div>
+      </div>
+      {kids.length > 1 && (
+        <div>
+          <div className="text-xs font-semibold text-slate-700 mb-1.5">Salin ke anak: <span className="font-normal text-slate-400">(kosongkan kalau tetap untuk anak yang sama)</span></div>
+          <div className="flex flex-wrap gap-1.5">
+            {kids.map((k) => (
+              <button key={k.id} onClick={() => flip(setTo)(k.id)} className={pill(to.includes(k.id))}>{k.avatar_emoji || "🙂"} {k.name}</button>
+            ))}
+          </div>
+          <p className="text-[11px] text-slate-400 mt-1">Aktivitas "Semua anak" tidak digandakan ke anak lain — mereka sudah ikut memilikinya.</p>
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-xs text-slate-500 mr-1">Caranya:</span>
+        <button onClick={() => setMode("add")} className={pill(mode === "add")}>Tambahkan</button>
+        <button onClick={() => setMode("replace")} className={pill(mode === "replace")}>Ganti bagian tujuan</button>
+      </div>
+      <p className="text-[11px] text-slate-500">
+        {mode === "add"
+          ? "Aktivitas dengan judul sama di bagian yang sama dilewati, jadi tidak dobel."
+          : "Isi bagian tujuan (hari, bagian, dan anak yang sama) dihapus dulu, lalu diganti salinan ini."}
+      </p>
+      <div className="flex gap-2">
+        <button disabled={busy || !ok}
+          onClick={() => {
+            if (mode === "replace" && !window.confirm("Isi bagian tujuan akan diganti. Lanjutkan?")) return;
+            onCopy({ mode, ...(days.length ? { to_weekdays: days } : {}), ...(to.length ? { to_child_ids: to } : {}) });
+          }}
+          className="press-btn bg-indigo-600 text-white font-semibold px-4 py-2 rounded-xl text-sm disabled:opacity-50">
+          Salin {count} aktivitas
+        </button>
+        <button onClick={onCancel} className="press-btn border-2 border-slate-200 text-slate-600 font-semibold px-4 py-2 rounded-xl text-sm">Tutup</button>
+      </div>
+    </div>
+  );
+}
+
+function SegmentCard({ segment, slots, kids, busy, childId, selected, onToggle, onSelectMany, onCopySection, onAdd, onPatch, onMove, onRemove, onCopySlot }) {
   const [title, setTitle] = useState("");
   const [dur, setDur] = useState("");
   const [pts, setPts] = useState("10");
@@ -228,6 +322,7 @@ function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMo
   const window_ = segment.start_time ? toMin(segment.end_time) - toMin(segment.start_time) : null;
   const total = slots.reduce((n, s) => n + (s.duration_minutes || 0), 0);
   const over = window_ != null && total > window_;
+  const allSel = slots.length > 0 && slots.every((x) => selected.has(x.id));
 
   const add = () => {
     if (!title.trim()) return toast.error("Isi nama aktivitasnya dulu");
@@ -242,6 +337,18 @@ function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMo
         <span className="text-xl">{segment.emoji || "🕒"}</span>
         <span className="font-bold text-slate-800">{segment.label}</span>
         {segment.start_time && <span className="text-xs text-slate-400">{segment.start_time}–{segment.end_time}</span>}
+        {slots.length > 0 && (
+          <span className="ml-1 flex items-center gap-1">
+            <button onClick={() => onSelectMany(slots.map((x) => x.id), !allSel)}
+              className="press-btn text-[11px] font-semibold px-2 py-1 rounded-lg border border-slate-200 text-slate-600 bg-white">
+              {allSel ? "Batal pilih" : "Pilih semua"}
+            </button>
+            <button onClick={() => onCopySection(slots.map((x) => x.id))} title="Salin seluruh bagian ini ke hari atau anak lain"
+              className="press-btn inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded-lg border border-indigo-200 text-indigo-700 bg-indigo-50">
+              <Copy className="w-3 h-3" /> Salin bagian
+            </button>
+          </span>
+        )}
         <span className={`ml-auto text-[11px] font-semibold ${over ? "text-amber-600" : "text-slate-400"}`}>
           {total ? `${total} mnt` : ""}{window_ != null && total ? ` dari ${window_} mnt` : ""}{over ? " · melebihi waktu bagian" : ""}
         </span>
@@ -250,7 +357,9 @@ function SegmentCard({ segment, slots, kids, busy, childId, onAdd, onPatch, onMo
       {slots.length === 0 && <div className="text-xs text-slate-400 mb-2">Belum ada aktivitas.</div>}
       <div className="space-y-1.5">
         {slots.map((s, i) => (
-          <div key={s.id} className="flex flex-wrap items-center gap-1.5 bg-slate-50 rounded-xl px-2 py-1.5">
+          <div key={s.id} className={`flex flex-wrap items-center gap-1.5 rounded-xl px-2 py-1.5 ${selected.has(s.id) ? "bg-indigo-50 ring-2 ring-indigo-200" : "bg-slate-50"}`}>
+            <input type="checkbox" checked={selected.has(s.id)} onChange={() => onToggle(s.id)}
+              className="w-4 h-4 accent-indigo-600 shrink-0" aria-label={`Pilih ${s.title}`} />
             <div className="flex flex-col">
               <button onClick={() => onMove(s, "up")} disabled={busy || i === 0} className="text-slate-400 disabled:opacity-20" aria-label="Naik"><ChevronUp className="w-3.5 h-3.5" /></button>
               <button onClick={() => onMove(s, "down")} disabled={busy || i === slots.length - 1} className="text-slate-400 disabled:opacity-20" aria-label="Turun"><ChevronDown className="w-3.5 h-3.5" /></button>
@@ -537,6 +646,14 @@ function ProofEditor({ slot: s, onPatch }) {
         <button className={chip(s.reading)} onClick={() => onPatch(s, { reading: !s.reading })}>📖 Halaman buku</button>
         <button className={chip((s.steps || []).length > 0)}
           onClick={() => onPatch(s, { steps: (s.steps || []).length ? [] : ["Langkah 1", "Langkah 2"] })}>☑️ Checklist kecil</button>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-[11px] text-slate-500">Hadiah misi untuk hewan:</span>
+        {[["food", "🍖 Pakan"], ["water", "💧 Air"], ["play", "🎾 Mainan"]].map(([k, l]) => (
+          <button key={k} className={chip((s.pet_care || "food") === k)}
+            onClick={() => onPatch(s, { pet_care: k })}>{l}</button>
+        ))}
       </div>
 
       {s.summary_required && !quiz && (

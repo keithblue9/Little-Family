@@ -12,7 +12,7 @@ import { haptic } from "@/lib/offlineQueue";
 import { toast } from "sonner";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { useAuth } from "@/contexts/AuthContext";
-import VirtualPetMascot from "@/components/VirtualPetMascot";
+import PetSection from "@/components/PetSection";
 import SegmentQuestView from "@/components/SegmentQuestView";
 import HonestyPanel from "@/components/HonestyPanel";
 const BestDayCard = lazy(() => import("@/components/BestDayCard"));
@@ -380,7 +380,7 @@ export default function KidHome() {
           {tab === "tasks" && (
             <motion.div key="tasks" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
               <div className="mb-5">
-                <VirtualPetMascot child={child} onChanged={load} levelTitles={levelTitles} petStageNames={petStageNames} petFeedThresholds={petFeedThresholds} feedCostPerMeal={feedCostPerMeal} />
+                <PetSection child={child} onChanged={load} levelTitles={levelTitles} petStageNames={petStageNames} petFeedThresholds={petFeedThresholds} feedCostPerMeal={feedCostPerMeal} />
               </div>
               <div className="mb-5">
                 <Suspense fallback={null}><FamilyMissionCard compact /></Suspense>

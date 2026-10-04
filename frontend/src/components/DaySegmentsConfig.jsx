@@ -116,6 +116,16 @@ export default function DaySegmentsConfig({ onChanged }) {
                 className="px-2 py-1.5 rounded-xl border-2 border-slate-200 text-sm"
               />
             </div>
+            <div className="flex flex-wrap items-center gap-1.5 mt-2">
+              <span className="text-[11px] font-bold text-slate-500">Hadiah bagian ini untuk hewan:</span>
+              {[["food", "🍖 Pakan"], ["water", "💧 Air"], ["play", "🎾 Mainan"]].map(([k, l]) => (
+                <button key={k} type="button" onClick={() => update(i, { pet_care: k })}
+                  className={`press-btn px-2.5 py-1 rounded-lg text-[11px] font-bold border-2 ${
+                    (s.pet_care || "food") === k ? "border-indigo-500 bg-indigo-500 text-white" : "border-slate-200 bg-white text-slate-600"}`}>
+                  {l}
+                </button>
+              ))}
+            </div>
           </div>
         ))}
       </div>

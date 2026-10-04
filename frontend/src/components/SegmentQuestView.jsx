@@ -58,8 +58,13 @@ export default function SegmentQuestView({ child, onCelebrate }) {
   // Keep "locked → ready" and lateness honest without the child refreshing.
   useEffect(() => {
     if (dateKey !== todayKey()) return undefined;
-    const t = setInterval(() => { if (!document.hidden) load(); }, 60000);
-    return () => clearInterval(t);
+    // Time-driven changes (locked → ready, late) come from the device clock;
+    // this only picks up what a parent changed, so a slow poll plus a refresh
+    // whenever the app comes back to the front is plenty.
+    const onVisible = () => { if (!document.hidden) load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    const t = setInterval(() => { if (!document.hidden) load(); }, 180000);
+    return () => { clearInterval(t); document.removeEventListener("visibilitychange", onVisible); };
   }, [dateKey, load]);
 
   const body = (seg, extra = {}) => ({
@@ -301,8 +306,8 @@ export default function SegmentQuestView({ child, onCelebrate }) {
         const running = seg.status === "in_progress";
         const done = seg.status === "done";
         return (
-          <motion.div key={seg.id} layout
-            className={`rounded-3xl border-2 p-4 bg-white chunky-shadow ${
+          <motion.div key={seg.id}
+            className={`cv-auto rounded-3xl border-2 p-4 bg-white chunky-shadow ${
               done ? "border-emerald-200" : running ? "border-indigo-300" : "border-slate-100"}`}>
             {/* Header */}
             <div className="flex items-start gap-2 mb-3">
@@ -310,6 +315,12 @@ export default function SegmentQuestView({ child, onCelebrate }) {
               <div className="flex-1 min-w-0">
                 <div className="font-fun font-bold text-slate-900 text-lg leading-tight flex items-center gap-1.5">
                   {seg.label}
+                  {seg.pet_care && seg.pet_care !== "food" && (
+                    <span className="text-[11px] font-bold text-sky-700 bg-sky-50 rounded-full px-2 py-0.5"
+                          title={seg.pet_care === "water" ? "Bagian ini memberi air untuk peliharaanmu" : "Bagian ini memberi mainan untuk peliharaanmu"}>
+                      {seg.pet_care === "water" ? "💧 air" : "🎾 mainan"}
+                    </span>
+                  )}
                   {seg.streak > 1 && (
                     <span className="text-[11px] font-bold text-orange-600 bg-orange-50 rounded-full px-2 py-0.5"
                           title="Hari berturut-turut selesai tepat waktu">🔥 {seg.streak}</span>
@@ -387,11 +398,6 @@ export default function SegmentQuestView({ child, onCelebrate }) {
                         ⏱ {a.duration_minutes} mnt
                       </span>
                     ) : null}
-                    {a.pet_care && a.pet_care !== "food" && (
-                      <span className="text-[11px] shrink-0" title={a.pet_care === "water" ? "Memberi air untuk peliharaanmu" : "Memberi mainan untuk peliharaanmu"}>
-                        {a.pet_care === "water" ? "💧" : "🎾"}
-                      </span>
-                    )}
                     <span className="text-[11px] font-bold text-indigo-600 shrink-0">+{a.points}</span>
                   </button>
                   {a.timed && (

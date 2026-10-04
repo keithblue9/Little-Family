@@ -1,4 +1,4 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useState } from "react";
 import { Plus, CheckCircle2, Star, Users, Clock } from "lucide-react";
 import { TEST_IDS } from "@/constants/testIds/app";
 import { StatCard, btnPrimary } from "@/pages/parent/shared";
@@ -11,6 +11,7 @@ const ParentInbox = lazy(() => import("@/components/ParentInbox"));
 const PetMessagesCard = lazy(() => import("@/components/PetMessagesCard"));
 
 export function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, onNavigate, onInboxCount }) {
+  const [more, setMore] = useState(false);
   return (
     <div className="space-y-6">
       {/* What needs a parent comes first; everything else is context. */}
@@ -80,15 +81,20 @@ export function Overview({ stats, kids, tasks, pendingRedemptions, onAddChild, o
 
       {/* The rest is good to have but rarely urgent — folded away. */}
       {kids.length > 0 && (
-        <details className="bg-white rounded-2xl border border-slate-200 group">
+        <details className="bg-white rounded-2xl border border-slate-200 group" onToggle={(e) => e.currentTarget.open && setMore(true)}>
           <summary className="cursor-pointer px-5 py-3 text-sm font-semibold text-slate-600 select-none">
             🏆 Peringkat, tantangan & laporan mingguan
           </summary>
-          <div className="p-4 pt-0 space-y-6">
-            <Leaderboard />
-            <FamilyChallenges kids={kids} />
-            <WeeklyReport />
-          </div>
+          {/* Nothing here is fetched or drawn until it is opened. */}
+          {more && (
+            <div className="p-4 pt-0 space-y-6">
+              <Suspense fallback={null}>
+                <Leaderboard />
+                <FamilyChallenges kids={kids} />
+                <WeeklyReport />
+              </Suspense>
+            </div>
+          )}
         </details>
       )}
     </div>

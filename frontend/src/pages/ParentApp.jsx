@@ -1,8 +1,9 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import PageSkeleton from "@/components/PageSkeleton";
 import { useNavigate } from "react-router-dom";
 import { Home, ListChecks, Gift, ShieldAlert, Activity, Settings, LogOut, Rocket, Menu, PartyPopper, Clock, ChevronLeft, ChevronRight, Search } from "lucide-react";
 import api, { formatApiError } from "@/lib/api";
+import { fetchInbox } from "@/lib/inbox";
 import { cacheGet, cacheSet } from "@/lib/localCache";
 import { toast } from "sonner";
 import { useAuth } from "@/contexts/AuthContext";
@@ -80,12 +81,20 @@ export default function ParentApp() {
   // The "Perlu perhatian" count stays fresh on every screen, not just Beranda.
   useEffect(() => {
     let alive = true;
-    const pull = () => api.get("/parent/inbox", { fresh: true })
-      .then((r) => { if (alive) setInboxCount(r.data?.total || 0); }).catch(() => {});
-    pull();
-    const t = setInterval(() => { if (!document.hidden) pull(); }, 120000);
-    window.addEventListener("app:parent-refresh", pull);
-    return () => { alive = false; clearInterval(t); window.removeEventListener("app:parent-refresh", pull); };
+    const pull = (force) => fetchInbox(force === true)
+      .then((d) => { if (alive) setInboxCount(d?.total || 0); }).catch(() => {});
+    const onRefresh = () => pull(true);
+    pull(false);
+    // One poller for the whole shell, only while the tab is in view.
+    const t = setInterval(() => { if (!document.hidden) pull(true); }, 120000);
+    const onVisible = () => { if (!document.hidden) pull(false); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("app:parent-refresh", onRefresh);
+    return () => {
+      alive = false; clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("app:parent-refresh", onRefresh);
+    };
   }, []);
   const viewTitle = (() => {
     const key = navLabelKey[view];
@@ -127,8 +136,8 @@ export default function ParentApp() {
   // on a parent), not the family's entire history. Opening a date outside it
   // widens the window; opening a future day builds that day first.
   const [taskWindow, setTaskWindow] = useState(() => ({
-    start: shiftDateKey(todayKey(), -14),
-    end: shiftDateKey(todayKey(), 14),
+    start: shiftDateKey(todayKey(), -3),
+    end: shiftDateKey(todayKey(), 3),
   }));
   const applyBootstrap = useCallback((d) => {
     setChildren(d.children || []);
@@ -155,11 +164,13 @@ export default function ParentApp() {
       applyBootstrap(data);
       cacheSet("parent:bootstrap", data);
       queryClient.invalidateQueries({ queryKey: qk.familyMission });
-      if (selectedChildId === undefined) setSelectedChildId(null);
+      // Functional update: no dependency on the selection, so tapping a child
+      // chip never re-downloads the whole start-up payload.
+      setSelectedChildId((cur) => (cur === undefined ? null : cur));
     } catch (e) {
       toast.error(formatApiError(e));
     }
-  }, [selectedChildId, taskWindow, applyBootstrap, queryClient]);
+  }, [taskWindow, applyBootstrap, queryClient]);
 
   useEffect(() => {
     load();
@@ -181,6 +192,14 @@ export default function ParentApp() {
       load();
     }
   }, [taskWindow, load]);
+
+  // Routine edits fire in quick bursts (every field blur); reload once they settle.
+  const loadTimer = useRef(null);
+  const loadSoon = useCallback(() => {
+    clearTimeout(loadTimer.current);
+    loadTimer.current = setTimeout(() => load(), 1500);
+  }, [load]);
+  useEffect(() => () => clearTimeout(loadTimer.current), []);
 
   const doLogout = async () => {
     await logout();
@@ -360,8 +379,8 @@ export default function ParentApp() {
               {/* The weekly routine is the schedule now; per-date missions are
                   generated from it. The old per-date list stays reachable for
                   one-off corrections, folded away so it doesn't compete. */}
-              <RoutineManager kids={children} childId={selectedChildId || null} onChanged={load} />
-              <RoutineExtras onChanged={load} />
+              <RoutineManager kids={children} childId={selectedChildId || null} onChanged={loadSoon} />
+              <RoutineExtras onChanged={loadSoon} />
               <details className="bg-white rounded-2xl border border-slate-200">
                 <summary className="cursor-pointer px-5 py-3 text-sm font-semibold text-slate-600 select-none">
                   🛠️ Koreksi tugas per tanggal (lanjutan)

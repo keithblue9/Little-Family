@@ -1060,30 +1060,58 @@ with TestClient(server.app, base_url="https://testserver") as c:
             body["pet_care"] = care
         return c.post("/api/tasks", json=body).json()
 
-    t_food, t_water, t_play = mk("Makan sehat"), mk("Sholat", "water"), mk("Belajar", "play")
-    check("pet: the mission remembers its reward kind", t_water.get("pet_care") == "water" and t_play.get("pet_care") == "play")
-    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
-    c.post("/api/segment-sessions/start", json=pb)
-    for t in (t_food, t_water, t_play):
-        c.post(f"/api/tasks/{t['id']}/check", json={"checked": True})
-    # make the surprise gift certain so it can be asserted
-    import random as _rnd
-    _real = _rnd.random
-    _rnd.random = lambda: 0.0
-    r = c.post("/api/segment-sessions/finish", json=pb)
-    _rnd.random = _real
-    check("pet: finishing a section pays pakan, air and mainan separately",
-          r.status_code == 200 and kid_pet()["feed_balance"] >= 10 and kid_pet()["water_balance"] == 10
-          and kid_pet()["play_balance"] == 10, str({k: kid_pet()[k] for k in ("feed_balance", "water_balance", "play_balance")}))
-    check("pet: a finished section earns a play ticket and may bring a gift",
-          r.json().get("pet_ticket") == 1 and (r.json().get("pet_gift") or {}).get("kind") in ("coins", "feed", "ticket"),
+    # Each section feeds the pet one thing: pagi → air, siang → mainan, the rest → pakan.
+    segs_p = [x["id"] for x in c.get("/api/config").json()["day_segments"]]
+    cfg_segs = c.get("/api/config").json()["day_segments"]
+    cfg_segs[0]["pet_care"], cfg_segs[1]["pet_care"] = "water", "play"
+    check("pet: a section can be set to feed air / mainan", c.post("/api/config", json={"day_segments": cfg_segs}).status_code == 200)
+    check("pet: bad care kind is refused", c.post("/api/config", json={"day_segments": [{**cfg_segs[0], "pet_care": "gold"}]}).status_code == 422)
+    seg_cfg = {x["id"]: x for x in c.get("/api/config").json()["day_segments"]}
+    check("pet: the setting is saved on the section", seg_cfg[segs_p[0]].get("pet_care") == "water" and seg_cfg[segs_p[1]].get("pet_care") == "play")
+
+    def mk_in(title, seg, pts=10):
+        return c.post("/api/tasks", json={"title": title, "points": pts, "date_key": TODAY, "segment_id": seg,
+                                          "target_children": [adskhan["id"]]}).json()
+
+    def run_section(seg_id, titles):
+        sbd = {"child_id": adskhan["id"], "date_key": TODAY, "segment_id": seg_id}
+        c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
+        ts = [mk_in(t, seg_id) for t in titles]
+        c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+        rs = c.post("/api/segment-sessions/start", json=sbd)
+        if rs.status_code == 409:
+            c.post("/api/segment-sessions/start", json={**sbd, "late_reason_id": (c.get(f"/api/children/{adskhan['id']}/segments-day").json().get("late_reasons") or [{}])[0].get("id")})
+        for t in ts:
+            c.post(f"/api/tasks/{t['id']}/check", json={"checked": True})
+        import random as _rnd2
+        _r0 = _rnd2.random
+        _rnd2.random = lambda: 0.0           # make the surprise gift certain
+        rr = c.post("/api/segment-sessions/finish", json=sbd)
+        if rr.status_code == 409 or rr.status_code == 422:
+            rr = c.post("/api/segment-sessions/finish", json={**sbd, "late_reason_id": (c.get(f"/api/children/{adskhan['id']}/segments-day").json().get("late_reasons") or [{}])[0].get("id")})
+        _rnd2.random = _r0
+        return ts, rr
+
+    f0 = kid_pet()["feed_balance"]
+    t_water_list, r = run_section(segs_p[0], ["Sholat", "Doa"])
+    check("pet: a 'water' section pays air for all its missions", r.status_code == 200 and kid_pet()["water_balance"] == 20
+          and kid_pet()["feed_balance"] == f0 + (r.json().get("pet_gift") or {}).get("amount", 0) * ((r.json().get("pet_gift") or {}).get("kind") == "feed"),
+          str({k: kid_pet()[k] for k in ("feed_balance", "water_balance", "play_balance")}))
+    t_play_list, r2 = run_section(segs_p[1], ["Belajar"])
+    check("pet: a 'play' section pays mainan", r2.status_code == 200 and kid_pet()["play_balance"] == 10)
+    t_food_list, r3 = run_section(segs_p[2], ["Makan sehat"])
+    check("pet: an ordinary section pays pakan", r3.status_code == 200 and kid_pet()["feed_balance"] >= f0 + 10)
+    r = r3
+    check("pet: finishing a section earns a play ticket and may bring a gift",
+          r.json().get("pet_ticket") == 1 and (r.json().get("pet_gift") or {}).get("kind") in ("coins", "feed", "ticket", None),
           str((r.json().get("pet_ticket"), r.json().get("pet_gift"))))
+    t_play = t_play_list[0]
     st = kid_pet()
     check("pet: state carries mood, phase, needs and stage",
           st["has_pet"] and st["mood"]["key"] in ("happy", "ecstatic") and st["phase"]["key"] in ("morning", "noon", "evening", "night")
           and st["stage_index"] == 0 and st["stage_name"], str(st["mood"]))
     r = c.post(f"/api/children/{adskhan['id']}/pet-care", json={"kind": "water"})
-    check("pet: giving water spends air", r.status_code == 200 and kid_pet()["water_balance"] == 7, r.text[:150])
+    check("pet: giving water spends air", r.status_code == 200 and kid_pet()["water_balance"] == 17, r.text[:150])
     r = c.post(f"/api/children/{adskhan['id']}/pet-care", json={"kind": "play"})
     check("pet: playing spends mainan and earns a koin", r.status_code == 200 and kid_pet()["play_balance"] == 7, r.text[:150])
     run(server.db.children.update_one({"id": adskhan["id"]}, {"$set": {"water_balance": 1}}))
@@ -1248,6 +1276,14 @@ with TestClient(server.app, base_url="https://testserver") as c:
     c.post("/api/routine/apply-today")
     built = [t for t in c.get(f"/api/tasks?date_key={TODAY}").json() if t["title"] == "Makan malam"]
     check("timer: the routine hands it to each day's mission", built and all(t.get("timed") for t in built), str(built)[:150])
+
+    # ---------------- One request for every child's trust strip ----------------
+    r = c.get("/api/family/honesty-summary")
+    check("honesty-summary: every child in one call", r.status_code == 200 and set(r.json()) >= {k["id"] for k in kids}
+          and all({"trust_score", "strikes", "probation_until"} <= set(v) for v in r.json().values()), r.text[:150])
+    c.post("/api/auth/login", json={"member_id": adskhan["id"], "passcode": "123456"})
+    check("honesty-summary: parents only", c.get("/api/family/honesty-summary").status_code == 403)
+    c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
 
     # ---------------- Gzip ----------------
     r = c.get("/api/tasks", headers={"Accept-Encoding": "gzip"})

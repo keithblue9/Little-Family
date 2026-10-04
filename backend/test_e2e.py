@@ -927,7 +927,7 @@ with TestClient(server.app, base_url="https://testserver") as c:  # context mana
     # ================= 52. BADGE CATALOG (sticker book) =================
     c.post("/api/auth/login", json={"member_id": abi["id"], "passcode": "123456"})
     r = c.get("/api/badges/catalog")
-    check("catalog: returns fixed 7 badges", r.status_code == 200 and len(r.json()) == 7, str(len(r.json())))
+    check("catalog: returns every badge", r.status_code == 200 and len(r.json()) == len(server.BADGE_CATALOG), str(len(r.json())))
     check("catalog: each has key/name/desc/emoji", all(k in r.json()[0] for k in ("key", "name", "desc", "emoji")))
 
     # ================= 53. PERSONAL BEST STREAK =================

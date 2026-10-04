@@ -377,6 +377,16 @@ class AppConfigInput(BaseModel):
     auto_approve_tasks: Optional[bool] = None
     # Points deducted when a parent rejects a claimed exam day as untrue.
     exam_false_claim_penalty: Optional[int] = Field(default=None, ge=0, le=10000)
+    # --- Honesty --------------------------------------------------------
+    # Extra points when a child, asked about a mission, admits it wasn't done.
+    honesty_bonus_points: Optional[int] = Field(default=None, ge=0, le=100)
+    # Surprise checks: after a section, sometimes one ticked mission is
+    # picked and the child is asked for a photo of it.
+    spot_checks_enabled: Optional[bool] = None
+    # How many days a second correction puts a child under closer watch.
+    probation_days: Optional[int] = Field(default=None, ge=1, le=14)
+    # Corrections older than this no longer count toward the next level.
+    strike_window_days: Optional[int] = Field(default=None, ge=1, le=60)
     # the count resets on (0=Monday .. 6=Sunday, ISO). Was hardcoded.
     # Custom label overrides: { "label_key": "custom text" }. Empty string = hide.
     custom_labels: Optional[dict] = None
@@ -1124,6 +1134,12 @@ BADGE_CATALOG = [
     {"key": "five_hundred_points", "name": "Star Saver", "desc": "Earned 500 lifetime points", "emoji": "⭐"},
     {"key": "streak_3", "name": "3-Day Streak", "desc": "3 days in a row!", "emoji": "🔥"},
     {"key": "streak_7", "name": "Week Warrior", "desc": "7 days in a row!", "emoji": "🗓️"},
+    # Behaviour, not just points.
+    {"key": "honest_1", "name": "Berani Jujur", "desc": "Mengaku sendiri saat tugas belum dikerjakan", "emoji": "🙏"},
+    {"key": "honest_5", "name": "Jujur Sejati", "desc": "5 kali jujur mengaku", "emoji": "💎"},
+    {"key": "spot_5", "name": "Lolos Cek Kejutan", "desc": "Lolos 5 cek kejutan", "emoji": "📸"},
+    {"key": "comeback", "name": "Bangkit Lagi", "desc": "Lulus masa pengawasan tanpa koreksi baru", "emoji": "🌱"},
+    {"key": "on_time_7", "name": "Tepat Waktu", "desc": "7 kali berturut-turut menyelesaikan satu bagian tepat waktu", "emoji": "⏰"},
 ]
 
 
@@ -1147,6 +1163,11 @@ async def award_badges(parent_id: str, child_id: str):
         "five_hundred_points": lifetime >= 500,
         "streak_3": streak >= 3,
         "streak_7": streak >= 7,
+        "honest_1": int(child.get("honest_admits") or 0) >= 1,
+        "honest_5": int(child.get("honest_admits") or 0) >= 5,
+        "spot_5": int(child.get("spot_passes") or 0) >= 5,
+        "comeback": int(child.get("probations_passed") or 0) >= 1,
+        "on_time_7": int(child.get("best_section_streak") or 0) >= 7,
     }
     rules = [(b["key"], b["name"], b["desc"], condition_by_key[b["key"]]) for b in BADGE_CATALOG]
     for key, name, desc, condition in rules:
@@ -3663,6 +3684,9 @@ async def _segment_tasks(child_id: str, dk: str, seg_id: str) -> list:
     }
     query["segment_id"] = None if seg_id == ANYTIME_SEGMENT_ID else seg_id
     rows = await db.tasks.find(query, {"_id": 0}).to_list(500)
+    # A corrected mission is redone on its own ("Perlu dibetulkan"), so it
+    # never holds a section's checklist hostage.
+    rows = [t for t in rows if not t.get("correction_redo")]
     rows.sort(key=lambda t: (t.get("order") or 0, t.get("created_at") or ""))
     return rows
 
@@ -3735,6 +3759,7 @@ async def segments_day(child_id: str, date_key: Optional[str] = None, user: dict
             tasks = await db.tasks.find(_sd_q, {"_id": 0}).to_list(1000)
     else:
         _schedule_materialize()
+    tasks = [t for t in tasks if not t.get("correction_redo")]
     sessions = {
         s["segment_id"]: s for s in await db.segment_sessions.find(
             {"parent_id": FAMILY_ID, "child_id": child_id, "date_key": dk}, {"_id": 0}
@@ -4076,7 +4101,9 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
 
     # Turn ticked activities into finished missions and award them.
     to_award = [a for a in acts if a.get("status") in ("pending", "rejected") and a.get("checked")]
-    auto = bool(config.get("auto_approve_tasks", True))
+    # Under a watch period nothing is approved automatically: a parent looks first.
+    on_watch = _in_probation(child, dk)
+    auto = bool(config.get("auto_approve_tasks", True)) and not on_watch
     awarded = 0
     for a in to_award:
         await db.tasks.update_one({"id": a["id"]}, {"$set": {
@@ -4106,8 +4133,10 @@ async def finish_segment(payload: SegmentActionInput, user: dict = Depends(get_c
             body=f"{len(to_award)} tugas dicentang" + (" · terlambat" if finish_update["finish_late"] else ""),
             url="/parent",
         )
+    spot = await _maybe_spot_check(child, dk, (seg or {}).get("label", "Kapan Saja"), acts, config)
     return {"success": True, "completed": len(to_award), "awarded": awarded,
-            "finish_late": finish_update["finish_late"], "no_points": no_points}
+            "finish_late": finish_update["finish_late"], "no_points": no_points,
+            "on_watch": on_watch, "spot_check": spot}
 
 
 @api.post("/segment-sessions/reopen")
@@ -4283,6 +4312,7 @@ async def honesty_insight(days: int = 14, user: dict = Depends(require_parent)):
 # the parents are told and decide what happens. Nothing is penalised
 # automatically.
 SECTION_NUDGE_MINUTES = 15
+PARENT_NOT_STARTED_MINUTES = 10
 
 
 async def _sections_status(dk: str) -> list:
@@ -4417,11 +4447,27 @@ async def _run_reminder_sweep() -> dict:
     today = _today_key()
     now_min = now.hour * 60 + now.minute
     sent = {"section_nudges": 0, "overdue_sections": 0, "parent_nudge": False}
+    sent["spot_checks_expired"] = await _expire_spot_checks()
+    for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0, "id": 1}).to_list(50):
+        await _refresh_trust(k["id"])
 
     for r in await _sections_status(today):
         if r["finished"] or r["reviewed"]:
             continue
         lead = r["end_min"] - now_min
+        if 0 <= lead <= PARENT_NOT_STARTED_MINUTES and not r["started"] and r["left"]:
+            # e.g. 10 minutes before leaving for school and the morning list
+            # hasn't even been started — worth a parent's nudge.
+            marker = f"section-not-started:{today}:{r['child_id']}:{r['segment_id']}"
+            if not await db.reminder_log.find_one({"key": marker}):
+                await send_push_to(
+                    {"role": "parent"},
+                    title=f"{r['child_name']} belum mulai {r['label']} ⏰",
+                    body=f"Selesai jam {r['end_time']} — tinggal {lead} menit.",
+                    url="/parent",
+                )
+                await db.reminder_log.insert_one({"key": marker, "sent_at": now_iso()})
+                sent["parent_not_started"] = sent.get("parent_not_started", 0) + 1
         if 0 <= lead <= SECTION_NUDGE_MINUTES and r["left"]:
             marker = f"section-nudge:{today}:{r['child_id']}:{r['segment_id']}"
             if not await db.reminder_log.find_one({"key": marker}):
@@ -5358,6 +5404,49 @@ async def _check_family_combo(date_key: Optional[str], config: dict):
     return {"points": bonus, "child_ids": child_ids}
 
 
+async def _reverse_task_points(task: dict, restore_streak: bool) -> int:
+    """Take back exactly what approving this mission gave (points, Chikybank
+    split, pet food). A quick undo also restores the streak as it was; a later
+    correction leaves the streak alone, because other days have built on it
+    since. Returns the points taken back."""
+    if task.get("is_coop"):
+        total = 0
+        for snap in task.get("_undo_coop_snapshots") or []:
+            upd = {"$inc": {
+                "points": -snap["points"], "lifetime_points": -snap["points"], "tasks_completed": -1,
+                "chiky_save": -snap["chiky_save"], "chiky_spend": -snap["chiky_spend"], "chiky_share": -snap["chiky_share"],
+                "feed_balance": -snap.get("feed_earned", 0), "feed_lifetime": -snap.get("feed_earned", 0),
+            }}
+            if restore_streak:
+                upd["$set"] = {"streak_days": snap["prev_streak"], "last_completion_date": snap["prev_last_completion"],
+                               "best_streak_days": snap.get("prev_best_streak", 0)}
+            await db.children.update_one({"id": snap["child_id"]}, upd)
+            total += snap["points"]
+        await db.tasks.update_one({"id": task["id"]}, {"$unset": {
+            "_undo_coop_snapshots": "", "_undo_spawned_next_id": "",
+            "encouragement_message": "", "encouragement_voice_url": ""}})
+        return total
+    points = task.get("_undo_points_awarded", task.get("points", 0))
+    feed = task.get("_undo_feed_earned", 0)
+    upd = {"$inc": {
+        "points": -points, "lifetime_points": -points, "tasks_completed": -1,
+        "chiky_save": -task.get("_undo_chiky_save", 0), "chiky_spend": -task.get("_undo_chiky_spend", 0),
+        "chiky_share": -task.get("_undo_chiky_share", 0),
+        "feed_balance": -feed, "feed_lifetime": -feed,
+    }}
+    if restore_streak:
+        upd["$set"] = {"streak_days": task.get("_undo_prev_streak", 0),
+                       "last_completion_date": task.get("_undo_prev_last_completion"),
+                       "best_streak_days": task.get("_undo_prev_best_streak", 0)}
+    await db.children.update_one({"id": task["child_id"]}, upd)
+    await db.tasks.update_one({"id": task["id"]}, {"$unset": {
+        "_undo_prev_streak": "", "_undo_prev_last_completion": "", "_undo_points_awarded": "",
+        "_undo_chiky_save": "", "_undo_chiky_spend": "", "_undo_chiky_share": "", "_undo_spawned_next_id": "",
+        "_undo_prev_best_streak": "", "_undo_feed_earned": "",
+        "encouragement_message": "", "encouragement_voice_url": ""}})
+    return points
+
+
 UNDO_WINDOW_MINUTES = 30
 
 
@@ -5379,79 +5468,10 @@ async def undo_task_approval(task_id: str, user: dict = Depends(require_parent))
     if elapsed_min > UNDO_WINDOW_MINUTES:
         raise HTTPException(status_code=409, detail=f"Batas waktu membatalkan sudah lewat ({UNDO_WINDOW_MINUTES} menit)")
 
-    if task.get("is_coop"):
-        snapshots = task.get("_undo_coop_snapshots") or []
-        total_points = 0
-        for snap in snapshots:
-            await db.children.update_one(
-                {"id": snap["child_id"]},
-                {
-                    "$inc": {
-                        "points": -snap["points"], "lifetime_points": -snap["points"], "tasks_completed": -1,
-                        "chiky_save": -snap["chiky_save"], "chiky_spend": -snap["chiky_spend"], "chiky_share": -snap["chiky_share"],
-                        "feed_balance": -snap.get("feed_earned", 0), "feed_lifetime": -snap.get("feed_earned", 0),
-                    },
-                    "$set": {
-                        "streak_days": snap["prev_streak"],
-                        "last_completion_date": snap["prev_last_completion"],
-                        "best_streak_days": snap.get("prev_best_streak", 0),
-                    },
-                },
-            )
-            total_points += snap["points"]
-
-        await db.tasks.update_one(
-            {"id": task_id},
-            {
-                "$set": {"status": "completed", "approved_at": None},
-                "$unset": {"_undo_coop_snapshots": "", "_undo_spawned_next_id": "", "encouragement_message": "", "encouragement_voice_url": ""},
-            },
-        )
-        await log_activity(FAMILY_ID, task["child_id"], "task_approval_undone", {"task_id": task_id, "points_reversed": total_points, "coop": True})
-        return await db.tasks.find_one({"id": task_id}, {"_id": 0})
-
-    points = task.get("_undo_points_awarded", task.get("points", 0))
-    p_save = task.get("_undo_chiky_save", 0)
-    p_spend = task.get("_undo_chiky_spend", 0)
-    p_share = task.get("_undo_chiky_share", 0)
-    feed_earned = task.get("_undo_feed_earned", 0)
-
-    await db.children.update_one(
-        {"id": task["child_id"]},
-        {
-            "$inc": {
-                "points": -points,
-                "lifetime_points": -points,
-                "tasks_completed": -1,
-                "chiky_save": -p_save,
-                "chiky_spend": -p_spend,
-                "chiky_share": -p_share,
-                "feed_balance": -feed_earned,
-                "feed_lifetime": -feed_earned,
-            },
-            "$set": {
-                "streak_days": task.get("_undo_prev_streak", 0),
-                "last_completion_date": task.get("_undo_prev_last_completion"),
-                "best_streak_days": task.get("_undo_prev_best_streak", 0),
-            },
-        },
-    )
-
-    await db.tasks.update_one(
-        {"id": task_id},
-        {
-            "$set": {"status": "completed", "approved_at": None},
-            "$unset": {
-                "_undo_prev_streak": "", "_undo_prev_last_completion": "",
-                "_undo_points_awarded": "", "_undo_chiky_save": "", "_undo_chiky_spend": "",
-                "_undo_chiky_share": "", "_undo_spawned_next_id": "",
-                "_undo_prev_best_streak": "",
-                "_undo_feed_earned": "",
-                "encouragement_message": "", "encouragement_voice_url": "",
-            },
-        },
-    )
-    await log_activity(FAMILY_ID, task["child_id"], "task_approval_undone", {"task_id": task_id, "points_reversed": points})
+    points = await _reverse_task_points(task, restore_streak=True)
+    await db.tasks.update_one({"id": task_id}, {"$set": {"status": "completed", "approved_at": None}})
+    await log_activity(FAMILY_ID, task["child_id"], "task_approval_undone",
+                       {"task_id": task_id, "points_reversed": points, "coop": bool(task.get("is_coop"))})
     return await db.tasks.find_one({"id": task_id}, {"_id": 0})
 
 
@@ -5616,6 +5636,10 @@ async def set_app_config(payload: AppConfigInput, user: dict = Depends(require_p
             "segment_late_grace_minutes": 15,
             "auto_approve_tasks": True,
             "exam_false_claim_penalty": 100,
+            "honesty_bonus_points": 2,
+            "spot_checks_enabled": True,
+            "probation_days": 3,
+            "strike_window_days": 14,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5757,6 +5781,10 @@ async def get_app_config(user: dict = Depends(get_current_user), lite: bool = Fa
             "segment_late_grace_minutes": 15,
             "auto_approve_tasks": True,
             "exam_false_claim_penalty": 100,
+            "honesty_bonus_points": 2,
+            "spot_checks_enabled": True,
+            "probation_days": 3,
+            "strike_window_days": 14,
             "custom_labels": {},
             "vacation_mode": False,
             "vacation_note": "",
@@ -5792,6 +5820,10 @@ async def get_app_config(user: dict = Depends(get_current_user), lite: bool = Fa
         "segment_late_grace_minutes": int(config.get("segment_late_grace_minutes", 15)),
         "auto_approve_tasks": bool(config.get("auto_approve_tasks", True)),
         "exam_false_claim_penalty": int(config.get("exam_false_claim_penalty", 100)),
+        "honesty_bonus_points": int(config.get("honesty_bonus_points", 2)),
+        "spot_checks_enabled": bool(config.get("spot_checks_enabled", True)),
+        "probation_days": int(config.get("probation_days", 3)),
+        "strike_window_days": int(config.get("strike_window_days", 14)),
         "maintenance_mode": bool(config.get("maintenance_mode", False)),
         "maintenance_message": config.get("maintenance_message", ""),
         "maintenance_enabled_by_name": config.get("maintenance_enabled_by_name", ""),
@@ -6284,6 +6316,642 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
         "total_points": total_points,
     }
 
+
+
+# ---- Honesty: corrections, owning up, trust and surprise checks -------------
+# Principle: telling the truth must always cost less than lying.
+#  * Owning up (unticking a mission that wasn't really done) never costs a
+#    minus; owning up when asked about it even earns a small bonus.
+#  * A parent's correction of a ticked-but-not-done mission climbs a ladder
+#    that resets after a clean stretch: 1st → points back + an equal minus,
+#    the mission is redone for nothing (redoing it earns the minus back);
+#    2nd → also a penalty card and a few days of closer watch; 3rd → the
+#    penalty-card threshold is reached, so the family's punishment follows.
+#  * Every correction asks the child for a short reflection.
+#  * A trust score (0–100) drops with corrections and grows back with clean
+#    days, passed surprise checks and honest admissions. The higher it is, the
+#    rarer the surprise checks.
+TRUST_START = 80
+TRUST_CLEAN_DAY = 2
+CORRECTION_TRUST_DROP = {1: 20, 2: 30, 3: 40}
+SPOT_CHECK_HOURS = 3
+SPOT_CHECK_DAILY_CAP = 2
+REFLECTION_MIN_WORDS = 8
+
+
+def _trust(child: Optional[dict]) -> int:
+    v = (child or {}).get("trust_score")
+    return TRUST_START if v is None else int(v)
+
+
+async def _bump_trust(child_id: str, delta: int, why: str) -> int:
+    child = await db.children.find_one({"id": child_id}, {"_id": 0, "trust_score": 1})
+    new = max(0, min(100, _trust(child) + delta))
+    await db.children.update_one({"id": child_id}, {"$set": {"trust_score": new}})
+    await db.trust_log.insert_one({"parent_id": FAMILY_ID, "child_id": child_id, "delta": delta,
+                                   "score": new, "why": why, "date_key": _today_key(), "at": now_iso()})
+    return new
+
+
+async def _refresh_trust(child_id: str) -> None:
+    """Clean days since the last check grow trust back, and a finished watch
+    period is lifted (and counted, if it passed without a new correction)."""
+    child = await db.children.find_one({"id": child_id}, {"_id": 0})
+    if not child:
+        return
+    today = _today_key()
+    last = child.get("trust_checked_date")
+    if last and last < today:
+        days = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(last, "%Y-%m-%d")).days
+        bad = await db.corrections.count_documents({"child_id": child_id, "undone": {"$ne": True},
+                                                    "date_key": {"$gte": last, "$lt": today}})
+        if days > 0 and not bad and _trust(child) < 100:
+            await _bump_trust(child_id, min(days, 7) * TRUST_CLEAN_DAY, "hari bersih")
+    upd = {"trust_checked_date": today}
+    until = child.get("probation_until")
+    if until and until < today:
+        upd["probation_until"] = None
+        since = child.get("probation_since") or until
+        clean = not await db.corrections.count_documents({
+            "child_id": child_id, "undone": {"$ne": True}, "date_key": {"$gt": since}})
+        if clean:
+            upd["probations_passed"] = int(child.get("probations_passed") or 0) + 1
+            await _bump_trust(child_id, 10, "lulus masa pengawasan")
+            await send_push_to({"role": "child", "member_id": child_id}, title="Masa pengawasan selesai 🌟",
+                               body="Kamu berhasil! Kepercayaan Abi/Ummi bertambah.", url=f"/kid/{child_id}")
+    await db.children.update_one({"id": child_id}, {"$set": upd})
+    if upd.get("probations_passed"):
+        await award_badges(FAMILY_ID, child_id)
+
+
+def _in_probation(child: Optional[dict], dk: Optional[str] = None) -> bool:
+    until = (child or {}).get("probation_until")
+    return bool(until) and (dk or _today_key()) <= until
+
+
+async def _change_points(child_id: str, delta: int) -> None:
+    """Add or take points and re-split the Chikybank so it still adds up."""
+    if not delta:
+        return
+    inc = {"points": delta}
+    if delta > 0:
+        inc["lifetime_points"] = delta
+    await db.children.update_one({"id": child_id}, {"$inc": inc})
+    await _rebalance_child_buckets(child_id, await get_config_cached())
+
+
+async def _strike_count(child_id: str, config: dict) -> int:
+    since = (datetime.strptime(_today_key(), "%Y-%m-%d")
+             - timedelta(days=int(config.get("strike_window_days", 14)))).strftime("%Y-%m-%d")
+    return await db.corrections.count_documents({"child_id": child_id, "undone": {"$ne": True},
+                                                 "date_key": {"$gt": since}})
+
+
+def _task_owner(task: dict, user: dict) -> str:
+    owners = task.get("coop_participants") or [task.get("child_id")]
+    if user["role"] == "child":
+        if user["id"] not in owners:
+            raise HTTPException(status_code=403, detail="Bukan milikmu")
+        return user["id"]
+    return task.get("child_id")
+
+
+class CorrectionInput(BaseModel):
+    note: str = Field(default="", max_length=300)
+
+
+@api.post("/tasks/{task_id}/correct")
+async def correct_task(task_id: str, payload: CorrectionInput = CorrectionInput(), user: dict = Depends(require_parent)):
+    """'Tidak dikerjakan': the child ticked it, but it wasn't really done. Only
+    this mission is affected — everything else in the section keeps its points."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    if task.get("correction_id") and task.get("correction_redo"):
+        raise HTTPException(status_code=409, detail="Misi ini sudah dikoreksi")
+    done = task.get("checked") or task.get("status") in ("completed", "approved")
+    if not done:
+        raise HTTPException(status_code=400, detail="Misi ini belum dicentang — tidak ada yang perlu dikoreksi")
+    child_id = task["child_id"]
+    config = await get_config_cached()
+    level = min(3, await _strike_count(child_id, config) + 1)
+    reversed_pts = await _reverse_task_points(task, restore_streak=False) if task.get("status") == "approved" else 0
+    minus = int(task.get("points") or 0)
+    await _change_points(child_id, -minus)
+    card = probation = False
+    child = await db.children.find_one({"id": child_id}, {"_id": 0})
+    if level >= 2:
+        threshold = int(config.get("penalty_card_threshold", DEFAULT_PENALTY_CARD_THRESHOLD))
+        cards = int(child.get("penalty_cards", 0)) + 1
+        if level >= 3:
+            cards = max(cards, threshold)
+        await db.children.update_one({"id": child_id}, {"$set": {"penalty_cards": cards}})
+        card = True
+        if cards >= threshold:
+            await _issue_punishment({**child, "id": child_id}, config, cards)
+    if level >= 2:
+        days = int(config.get("probation_days", 3))
+        until = (datetime.strptime(_today_key(), "%Y-%m-%d") + timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        await db.children.update_one({"id": child_id}, {"$set": {
+            "probation_until": max(until, child.get("probation_until") or ""), "probation_since": _today_key()}})
+        probation = True
+    cid = new_id()
+    doc = {
+        "id": cid, "parent_id": FAMILY_ID, "child_id": child_id, "task_id": task_id, "title": task.get("title"),
+        "date_key": _today_key(), "task_date": task.get("date_key"), "level": level,
+        "minus": minus, "points_reversed": reversed_pts, "card": card, "probation": probation,
+        "note": payload.note.strip(), "by": user.get("name", ""), "at": now_iso(),
+        "redo_status": "open", "minus_refunded": False, "undone": False,
+    }
+    await db.corrections.insert_one(dict(doc))
+    await db.tasks.update_one({"id": task_id}, {"$set": {
+        "status": "pending", "checked": False, "checked_at": None, "completed_at": None, "approved_at": None,
+        "late_no_points": True, "correction_id": cid, "correction_redo": True, "redo_claimed_at": None,
+    }})
+    await db.reflections.insert_one({
+        "id": new_id(), "parent_id": FAMILY_ID, "child_id": child_id, "correction_id": cid,
+        "title": task.get("title"), "status": "pending", "text": None, "created_at": now_iso(),
+    })
+    await _bump_trust(child_id, -CORRECTION_TRUST_DROP[level], f"koreksi: {task.get('title')}")
+    await log_activity(FAMILY_ID, child_id, "task_corrected", {
+        "title": task.get("title"), "level": level, "minus": minus, "card": card, "probation": probation})
+    await send_push_to(
+        {"role": "child", "member_id": child_id}, title="Ada misi yang perlu dibetulkan 🔁",
+        body=f'"{task.get("title")}" ternyata belum dikerjakan. Kerjakan sekarang ya, lalu tulis refleksimu.',
+        url=f"/kid/{child_id}")
+    doc.pop("_id", None)
+    return doc
+
+
+@api.post("/corrections/{correction_id}/undo")
+async def undo_correction(correction_id: str, user: dict = Depends(require_parent)):
+    """A correction made by mistake: the minus, the card and the watch period
+    it caused are taken back. The mission stays open for a parent to approve."""
+    c = await db.corrections.find_one({"id": correction_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Koreksi tidak ditemukan")
+    if c.get("undone"):
+        raise HTTPException(status_code=400, detail="Koreksi ini sudah dibatalkan")
+    if not c.get("minus_refunded"):
+        await _change_points(c["child_id"], int(c.get("minus") or 0))
+    if c.get("card"):
+        await db.children.update_one({"id": c["child_id"], "penalty_cards": {"$gt": 0}}, {"$inc": {"penalty_cards": -1}})
+    if c.get("probation"):
+        await db.children.update_one({"id": c["child_id"]}, {"$set": {"probation_until": None}})
+    await db.corrections.update_one({"id": correction_id}, {"$set": {"undone": True, "undone_at": now_iso()}})
+    await db.reflections.delete_many({"correction_id": correction_id, "status": "pending"})
+    await db.tasks.update_one({"id": c["task_id"]}, {"$set": {"correction_redo": False, "late_no_points": False},
+                                                       "$unset": {"correction_id": ""}})
+    await _bump_trust(c["child_id"], CORRECTION_TRUST_DROP.get(int(c.get("level") or 1), 20), "koreksi dibatalkan")
+    await log_activity(FAMILY_ID, c["child_id"], "correction_undone", {"title": c.get("title")})
+    return {"success": True}
+
+
+@api.post("/tasks/{task_id}/redo-done")
+async def claim_redo(task_id: str, user: dict = Depends(get_current_user)):
+    """The child says the corrected mission is now really done. A parent
+    confirms it (it can't be ticked away a second time unseen)."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    child_id = _task_owner(task, user)
+    if not task.get("correction_redo") or task.get("status") not in ("pending", "rejected"):
+        raise HTTPException(status_code=400, detail="Misi ini tidak sedang perlu dibetulkan")
+    await db.tasks.update_one({"id": task_id}, {"$set": {"redo_claimed_at": now_iso()}})
+    await db.corrections.update_one({"id": task.get("correction_id")}, {"$set": {"redo_status": "claimed"}})
+    await log_activity(FAMILY_ID, child_id, "redo_claimed", {"title": task.get("title")})
+    await send_push_to({"role": "parent"}, title="Misi sudah dibetulkan? 🔁",
+                       body=f'Cek "{task.get("title")}" lalu konfirmasi di aplikasi.', url="/parent")
+    return {"success": True}
+
+
+class RedoReviewInput(BaseModel):
+    ok: bool
+    note: str = Field(default="", max_length=200)
+
+
+@api.post("/corrections/{correction_id}/confirm-redo")
+async def confirm_redo(correction_id: str, payload: RedoReviewInput, user: dict = Depends(require_parent)):
+    """Redone for real: the mission closes (still without its points), and on a
+    first correction the extra minus is given back — fixing it pays."""
+    c = await db.corrections.find_one({"id": correction_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not c or c.get("undone"):
+        raise HTTPException(status_code=404, detail="Koreksi tidak ditemukan")
+    task = await db.tasks.find_one({"id": c["task_id"]}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    if not payload.ok:
+        await db.tasks.update_one({"id": task["id"]}, {"$set": {"redo_claimed_at": None}})
+        await db.corrections.update_one({"id": correction_id}, {"$set": {"redo_status": "open"}})
+        await send_push_to({"role": "child", "member_id": c["child_id"]}, title="Belum beres 🔁",
+                           body=payload.note.strip() or f'"{task.get("title")}" belum benar-benar selesai.',
+                           url=f"/kid/{c['child_id']}")
+        return {"success": True, "closed": False}
+    await db.tasks.update_one({"id": task["id"]}, {"$set": {
+        "status": "approved", "approved_at": now_iso(), "checked": True, "checked_at": now_iso(),
+        "correction_redo": False}})
+    refund = c.get("level") == 1 and not c.get("minus_refunded")
+    if refund:
+        await _change_points(c["child_id"], int(c.get("minus") or 0))
+    await db.corrections.update_one({"id": correction_id}, {"$set": {
+        "redo_status": "done", "minus_refunded": bool(refund or c.get("minus_refunded"))}})
+    await _bump_trust(c["child_id"], 5, "membetulkan misi")
+    await log_activity(FAMILY_ID, c["child_id"], "redo_confirmed",
+                       {"title": task.get("title"), "refund": int(c.get("minus") or 0) if refund else 0})
+    await send_push_to({"role": "child", "member_id": c["child_id"]}, title="Sudah dibetulkan 👍",
+                       body=("Poin minusmu dikembalikan. " if refund else "") + "Terima kasih sudah membetulkannya!",
+                       url=f"/kid/{c['child_id']}")
+    return {"success": True, "closed": True, "refunded": int(c.get("minus") or 0) if refund else 0}
+
+
+@api.post("/tasks/{task_id}/admit")
+async def admit_not_done(task_id: str, user: dict = Depends(get_current_user)):
+    """'Ternyata belum': the child owns up. No minus, ever — the mission simply
+    doesn't count (or is reopened while its section is still running). Owning
+    up when a parent asked about it earns a small honesty bonus."""
+    task = await db.tasks.find_one({"id": task_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not task:
+        raise HTTPException(status_code=404, detail="Misi tidak ditemukan")
+    child_id = _task_owner(task, user)
+    if task.get("correction_redo"):
+        raise HTTPException(status_code=409, detail="Misi ini sudah dikoreksi")
+    if not (task.get("checked") or task.get("status") in ("completed", "approved")):
+        raise HTTPException(status_code=400, detail="Misi ini memang belum dicentang")
+    oldest = (datetime.strptime(_today_key(), "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    if (task.get("date_key") or "") < oldest:
+        raise HTTPException(status_code=409, detail="Sudah terlalu lama — bicarakan langsung dengan Abi/Ummi ya")
+    if task.get("status") == "approved":
+        await _reverse_task_points(task, restore_streak=False)
+    seg_id = task.get("segment_id") or ANYTIME_SEGMENT_ID
+    sess = await _get_session(child_id, task.get("date_key"), seg_id)
+    running = bool(sess and sess.get("started_at") and not sess.get("completed_at"))
+    upd = {"checked": False, "checked_at": None, "honest_admit": True, "honest_admit_at": now_iso(),
+           "completed_at": None, "approved_at": None}
+    upd["status"] = "pending" if running else "missed"
+    if not running:
+        upd["_undo_miss_penalty"] = 0
+    await db.tasks.update_one({"id": task_id}, {"$set": upd})
+    config = await get_config_cached()
+    check = await db.spot_checks.find_one({"task_id": task_id, "status": "pending"}, {"_id": 0})
+    bonus = 0
+    if check:
+        bonus = int(config.get("honesty_bonus_points", 2))
+        await db.spot_checks.update_one({"id": check["id"]}, {"$set": {"status": "admitted", "answered_at": now_iso()}})
+        await _change_points(child_id, bonus)
+    await db.children.update_one({"id": child_id}, {"$inc": {"honest_admits": 1}})
+    await _bump_trust(child_id, 3 if check else 2, "jujur mengaku")
+    await log_activity(FAMILY_ID, child_id, "honest_admit", {"title": task.get("title"), "bonus": bonus})
+    await send_push_to({"role": "parent"}, title="Anak jujur mengaku 🙏",
+                       body=f'"{task.get("title")}" ternyata belum dikerjakan — dia mengaku sendiri.', url="/parent")
+    badges = await award_badges(FAMILY_ID, child_id)
+    return {"success": True, "reopened": running, "bonus": bonus, "new_badges": badges}
+
+
+class ReflectionInput(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+@api.post("/reflections/{reflection_id}")
+async def write_reflection(reflection_id: str, payload: ReflectionInput, user: dict = Depends(get_current_user)):
+    r = await db.reflections.find_one({"id": reflection_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not r:
+        raise HTTPException(status_code=404, detail="Refleksi tidak ditemukan")
+    if user["role"] == "child" and user["id"] != r["child_id"]:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    words = _summary_words(payload.text)
+    if len(words) < REFLECTION_MIN_WORDS:
+        raise HTTPException(status_code=422, detail=f"Tulis sedikit lebih panjang ya: {len(words)} dari {REFLECTION_MIN_WORDS} kata")
+    await db.reflections.update_one({"id": reflection_id}, {"$set": {
+        "text": payload.text.strip(), "status": "written", "written_at": now_iso(), "read": False}})
+    await log_activity(FAMILY_ID, r["child_id"], "reflection_written", {"title": r.get("title")})
+    await send_push_to({"role": "parent"}, title="Refleksi anak masuk 📝", body=f'Tentang "{r.get("title")}"',
+                       url="/parent")
+    return {"success": True}
+
+
+@api.post("/reflections/{reflection_id}/read")
+async def mark_reflection_read(reflection_id: str, user: dict = Depends(require_parent)):
+    await db.reflections.update_one({"id": reflection_id, "parent_id": FAMILY_ID}, {"$set": {"read": True}})
+    return {"success": True}
+
+
+@api.get("/children/{child_id}/honesty")
+async def child_honesty(child_id: str, user: dict = Depends(get_current_user)):
+    """Everything about honesty for one child: trust score, watch period, what
+    needs redoing, surprise checks waiting, reflections to write."""
+    _assert_can_act(user, child_id)
+    await _refresh_trust(child_id)
+    await _expire_spot_checks()
+    child = await get_child_or_404(FAMILY_ID, child_id)
+    redo = await db.tasks.find({"parent_id": FAMILY_ID, "correction_redo": True,
+                                "$or": [{"child_id": child_id}, {"coop_participants": child_id}]},
+                               {"_id": 0, "id": 1, "title": 1, "date_key": 1, "redo_claimed_at": 1,
+                                "correction_id": 1}).to_list(50)
+    checks = await db.spot_checks.find({"child_id": child_id, "status": "pending"}, {"_id": 0}).to_list(20)
+    refl = await db.reflections.find({"child_id": child_id, "status": "pending"}, {"_id": 0}).to_list(20)
+    config = await get_config_cached()
+    return {
+        "trust_score": _trust(child),
+        "probation_until": child.get("probation_until") if _in_probation(child) else None,
+        "strikes": await _strike_count(child_id, config),
+        "honest_admits": int(child.get("honest_admits") or 0),
+        "spot_passes": int(child.get("spot_passes") or 0),
+        "redo": redo, "spot_checks": checks, "reflections": refl,
+    }
+
+
+# -- Surprise checks ("cek kejutan") ------------------------------------------
+def _spot_check_chance(child: dict, dk: str) -> float:
+    if _in_probation(child, dk):
+        return 1.0
+    t = _trust(child)
+    return 0.6 if t < 50 else 0.35 if t < 80 else 0.2 if t < 95 else 0.1
+
+
+async def _maybe_spot_check(child: dict, dk: str, seg_label: str, acts: list, config: dict) -> Optional[dict]:
+    """After a section is finished, sometimes pick one ticked mission and ask
+    for a photo of it. Higher trust → rarer; under watch → every section."""
+    import random as _random
+    if not config.get("spot_checks_enabled", True) or dk != _today_key():
+        return None
+    probation = _in_probation(child, dk)
+    if not probation and await db.spot_checks.count_documents(
+            {"child_id": child["id"], "date_key": dk}) >= SPOT_CHECK_DAILY_CAP:
+        return None
+    pool = [a for a in acts if a.get("checked") and not a.get("is_bonus")
+            and not a.get("completion_photo_url") and not a.get("summary_required")]
+    if not pool or _random.random() >= _spot_check_chance(child, dk):
+        return None
+    pick = _random.choice(pool)
+    doc = {"id": new_id(), "parent_id": FAMILY_ID, "child_id": child["id"], "task_id": pick["id"],
+           "title": pick.get("title"), "segment": seg_label, "date_key": dk, "status": "pending",
+           "created_at": now_iso(),
+           "expires_at": (datetime.now(timezone.utc) + timedelta(hours=SPOT_CHECK_HOURS)).isoformat()}
+    await db.spot_checks.insert_one(dict(doc))
+    await send_push_to({"role": "child", "member_id": child["id"]}, title="Cek kejutan! 📸",
+                       body=f'Kirim foto "{pick.get("title")}" ya.', url=f"/kid/{child['id']}")
+    doc.pop("_id", None)
+    return doc
+
+
+async def _expire_spot_checks() -> int:
+    res = await db.spot_checks.update_many(
+        {"parent_id": FAMILY_ID, "status": "pending", "expires_at": {"$lt": datetime.now(timezone.utc).isoformat()}},
+        {"$set": {"status": "expired"}})
+    return res.modified_count
+
+
+class SpotCheckAnswerInput(BaseModel):
+    photo_url: str = Field(min_length=1)
+
+    @field_validator("photo_url")
+    @classmethod
+    def _must_be_image(cls, v: str) -> str:
+        if not v.startswith("data:image/"):
+            raise ValueError("Harus berupa foto")
+        if len(v) > 2_500_000:
+            raise ValueError("Foto terlalu besar")
+        return v
+
+
+@api.post("/spot-checks/{check_id}/answer")
+async def answer_spot_check(check_id: str, payload: SpotCheckAnswerInput, user: dict = Depends(get_current_user)):
+    chk = await db.spot_checks.find_one({"id": check_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not chk:
+        raise HTTPException(status_code=404, detail="Cek tidak ditemukan")
+    if user["role"] == "child" and user["id"] != chk["child_id"]:
+        raise HTTPException(status_code=403, detail="Bukan milikmu")
+    if chk["status"] != "pending":
+        raise HTTPException(status_code=409, detail="Cek ini sudah ditutup")
+    stored = await _store_task_photo(chk["task_id"], "completion_photo_url", payload.photo_url)
+    await db.tasks.update_one({"id": chk["task_id"]}, {"$set": {
+        "completion_photo_url": stored, "completion_photo_url_at": now_iso()}})
+    await db.spot_checks.update_one({"id": check_id}, {"$set": {"status": "answered", "answered_at": now_iso()}})
+    await send_push_to({"role": "parent"}, title="Foto cek kejutan masuk 📸",
+                       body=f'"{chk.get("title")}" — cek di aplikasi.', url="/parent")
+    return {"success": True}
+
+
+class SpotCheckReviewInput(BaseModel):
+    ok: bool
+    note: str = Field(default="", max_length=300)
+
+
+@api.post("/spot-checks/{check_id}/review")
+async def review_spot_check(check_id: str, payload: SpotCheckReviewInput, user: dict = Depends(require_parent)):
+    """Photo looks right → passed: trust grows and a small surprise bonus.
+    Not right → the mission is corrected like any other."""
+    import random as _random
+    chk = await db.spot_checks.find_one({"id": check_id, "parent_id": FAMILY_ID}, {"_id": 0})
+    if not chk:
+        raise HTTPException(status_code=404, detail="Cek tidak ditemukan")
+    if chk["status"] not in ("answered", "expired"):
+        raise HTTPException(status_code=409, detail="Cek ini belum dijawab atau sudah dinilai")
+    if payload.ok:
+        surprise = _random.randint(1, 5)
+        await _change_points(chk["child_id"], surprise)
+        await db.children.update_one({"id": chk["child_id"]}, {"$inc": {"spot_passes": 1}})
+        await db.spot_checks.update_one({"id": check_id}, {"$set": {
+            "status": "passed", "reviewed_at": now_iso(), "surprise": surprise}})
+        await _bump_trust(chk["child_id"], 3, "lolos cek kejutan")
+        await send_push_to({"role": "child", "member_id": chk["child_id"]}, title="Lolos cek kejutan! 🎁",
+                           body=f"Kejutan +{surprise} poin karena kamu jujur.", url=f"/kid/{chk['child_id']}")
+        await award_badges(FAMILY_ID, chk["child_id"])
+        return {"success": True, "passed": True, "surprise": surprise}
+    corr = await correct_task(chk["task_id"], CorrectionInput(note=payload.note), user)
+    await db.spot_checks.update_one({"id": check_id}, {"$set": {
+        "status": "failed", "reviewed_at": now_iso(), "correction_id": corr["id"]}})
+    return {"success": True, "passed": False, "correction": corr}
+
+
+@api.get("/spot-checks")
+async def list_spot_checks(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    await _expire_spot_checks()
+    q: dict = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        q["child_id"] = user["id"]
+    elif child_id:
+        q["child_id"] = child_id
+    return await db.spot_checks.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+@api.get("/corrections")
+async def list_corrections(child_id: Optional[str] = None, user: dict = Depends(require_parent)):
+    q: dict = {"parent_id": FAMILY_ID}
+    if child_id:
+        q["child_id"] = child_id
+    return await db.corrections.find(q, {"_id": 0}).sort("at", -1).to_list(200)
+
+
+@api.get("/reflections")
+async def list_reflections(child_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q: dict = {"parent_id": FAMILY_ID}
+    if user["role"] == "child":
+        q["child_id"] = user["id"]
+    elif child_id:
+        q["child_id"] = child_id
+    return await db.reflections.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+
+# ---- Parent inbox: everything waiting on a parent, in one place -------------
+def _section_signals(rows: list, sess: dict) -> list:
+    """Why a finished section might deserve a look: all ticks within seconds,
+    or done in under a quarter of its estimated time."""
+    def ts(v):
+        try:
+            d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    out = []
+    ticks = sorted(t for t in (ts(r.get("checked_at")) for r in rows) if t)
+    if len(ticks) >= 3 and (ticks[-1] - ticks[0]).total_seconds() <= 20:
+        out.append("burst")
+    st, en = ts(sess.get("started_at")), ts(sess.get("completed_at"))
+    est = sum(int(r.get("duration_minutes") or 0) for r in rows) * 60
+    if st and en and est and (en - st).total_seconds() < est * 0.25:
+        out.append("rushed")
+    return out
+
+
+@api.get("/parent/inbox")
+async def parent_inbox(user: dict = Depends(require_parent)):
+    """One list of what needs a parent: decisions, things to check, and
+    children's requests. Each item says what it is and what can be done."""
+    await _expire_spot_checks()
+    today = _today_key()
+    since = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=2)).strftime("%Y-%m-%d")
+    kids = {k["id"]: k for k in await db.children.find({"parent_id": FAMILY_ID},
+                                                        {"_id": 0, "id": 1, "name": 1, "avatar_emoji": 1}).to_list(50)}
+    items: list = []
+
+    def add(kind, child_id, title, detail="", **extra):
+        k = kids.get(child_id) or {}
+        items.append({"kind": kind, "child_id": child_id, "child_name": k.get("name", ""),
+                      "avatar_emoji": k.get("avatar_emoji"), "title": title, "detail": detail, **extra})
+
+    for dk in sorted({today, since, (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")}):
+        for r in await _overdue_sections(dk):
+            add("overdue_section", r["child_id"], f"{r['emoji']} {r['label']} lewat jam",
+                f"{len(r['left'])} dari {r['total']} belum" if r["started"] else "Belum dimulai",
+                date_key=dk, segment_id=r["segment_id"], left=r["left"], end_time=r["end_time"])
+    for chk in await db.spot_checks.find({"parent_id": FAMILY_ID, "status": {"$in": ["answered", "expired"]}},
+                                         {"_id": 0}).to_list(50):
+        task = await db.tasks.find_one({"id": chk["task_id"]}, {"_id": 0, "completion_photo_url": 1})
+        add("spot_check", chk["child_id"], f"📸 Cek kejutan: {chk['title']}",
+            "Foto sudah dikirim" if chk["status"] == "answered" else "Tidak dijawab sampai batas waktu",
+            check_id=chk["id"], status=chk["status"], task_id=chk["task_id"],
+            photo=_media_ref("task", chk["task_id"], "completion_photo_url", (task or {}).get("completion_photo_url")))
+    for t in await db.tasks.find({"parent_id": FAMILY_ID, "correction_redo": True, "redo_claimed_at": {"$nin": [None, ""]}},
+                                 {"_id": 0}).to_list(50):
+        add("redo_claimed", t["child_id"], f"🔁 Sudah dibetulkan: {t['title']}", "Cek lalu konfirmasi",
+            correction_id=t.get("correction_id"), task_id=t["id"])
+    for r in await db.reflections.find({"parent_id": FAMILY_ID, "status": "written", "read": {"$ne": True}},
+                                       {"_id": 0}).to_list(50):
+        add("reflection", r["child_id"], f"📝 Refleksi: {r.get('title')}", r.get("text") or "", reflection_id=r["id"])
+    for t in await db.tasks.find({"parent_id": FAMILY_ID, "date_key": {"$gte": since},
+                                  "summary_text": {"$nin": [None, ""]}, "summary_review": None},
+                                 {"_id": 0}).to_list(50):
+        add("summary", t["child_id"], f"📝 Ringkasan: {t['title']}", t.get("summary_text") or "",
+            task_id=t["id"], pasted=bool(t.get("summary_pasted")), words=t.get("summary_words"))
+    acked = {(x["child_id"], x["date_key"], x["segment_id"]) for x in await db.section_reviews.find(
+        {"parent_id": FAMILY_ID, "date_key": {"$gte": since}}, {"_id": 0}).to_list(500)}
+    sessions = await db.segment_sessions.find({"parent_id": FAMILY_ID, "date_key": {"$gte": since},
+                                               "completed_at": {"$nin": [None, ""]}}, {"_id": 0}).to_list(500)
+    if sessions:
+        rows = await db.tasks.find({"parent_id": FAMILY_ID, "date_key": {"$gte": since}, "is_bonus": {"$ne": True}},
+                                   {"_id": 0, "id": 1, "child_id": 1, "date_key": 1, "segment_id": 1, "title": 1,
+                                    "checked_at": 1, "duration_minutes": 1, "status": 1}).to_list(5000)
+        by: dict = {}
+        for r in rows:
+            by.setdefault((r["child_id"], r["date_key"], r.get("segment_id") or ANYTIME_SEGMENT_ID), []).append(r)
+        segs = {sg["id"]: sg for sg in await _get_day_segments()}
+        for se in sessions:
+            key = (se["child_id"], se["date_key"], se["segment_id"])
+            if key in acked:
+                continue
+            sig = _section_signals(by.get(key, []), se)
+            if sig:
+                sg = segs.get(se["segment_id"]) or {"label": "Kapan Saja", "emoji": "✨"}
+                why = " · ".join({"burst": "semua dicentang dalam beberapa detik",
+                                  "rushed": "selesai jauh lebih cepat dari perkiraan"}[x] for x in sig)
+                add("suspicious", se["child_id"], f"👀 {sg.get('emoji', '')} {sg['label']} perlu dicek", why,
+                    date_key=se["date_key"], segment_id=se["segment_id"],
+                    tasks=[{"id": r["id"], "title": r["title"]} for r in by.get(key, [])])
+    waiting = await db.tasks.find({"parent_id": FAMILY_ID, "status": "completed"},
+                                  {"_id": 0, "id": 1, "child_id": 1, "title": 1, "points": 1,
+                                   "completion_photo_url": 1}).to_list(100)
+    for t in waiting:
+        add("approval", t["child_id"], f"⭐ Menunggu persetujuan: {t['title']}", f"+{t.get('points', 0)} poin",
+            task_id=t["id"], photo=_media_ref("task", t["id"], "completion_photo_url", t.get("completion_photo_url")))
+    requests = {
+        "money": await db.money_redemptions.count_documents({"parent_id": FAMILY_ID, "status": "pending"}),
+        "rewards": await db.redemptions.count_documents({"parent_id": FAMILY_ID, "status": "pending"}),
+        "charity": await db.charity_requests.count_documents({"parent_id": FAMILY_ID, "status": "pending"}),
+        "pet_reset": await db.pet_reset_requests.count_documents({"parent_id": FAMILY_ID, "status": "pending"}),
+        "reward_ideas": await db.reward_suggestions.count_documents({"parent_id": FAMILY_ID, "status": "pending"}),
+    }
+    order = {"overdue_section": 0, "spot_check": 1, "redo_claimed": 2, "suspicious": 3,
+             "approval": 4, "summary": 5, "reflection": 6}
+    items.sort(key=lambda x: order.get(x["kind"], 9))
+    return {"items": items, "requests": requests, "total": len(items) + sum(requests.values())}
+
+
+class SectionAckInput(BaseModel):
+    child_id: str
+    date_key: str
+    segment_id: str
+
+
+@api.post("/family/sections/ack")
+async def acknowledge_section(payload: SectionAckInput, user: dict = Depends(require_parent)):
+    """'Sudah kucek': a flagged section was looked at and is fine."""
+    dk = validate_date_key(payload.date_key)
+    if not dk:
+        raise HTTPException(status_code=422, detail="Tanggal tidak valid")
+    await db.section_reviews.update_one(
+        {"parent_id": FAMILY_ID, "child_id": payload.child_id, "date_key": dk, "segment_id": payload.segment_id},
+        {"$set": {"action": "ok", "reviewed_at": now_iso(), "reviewed_by": user.get("name", "")}}, upsert=True)
+    return {"success": True}
+
+
+# ---- Weekly honesty recap ----------------------------------------------------
+@api.get("/family/honesty-weekly")
+async def honesty_weekly(user: dict = Depends(require_parent)):
+    """A gentle week in review per child: trust now vs a week ago, owning up,
+    surprise checks, corrections and on-time sections."""
+    today = _today_key()
+    since = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+    out = []
+    for k in await db.children.find({"parent_id": FAMILY_ID}, {"_id": 0}).to_list(50):
+        last_week = await db.trust_log.find({"child_id": k["id"], "date_key": {"$lte": since}},
+                                            {"_id": 0, "score": 1}).sort("at", -1).to_list(1)
+        sess = await db.segment_sessions.find({"child_id": k["id"], "date_key": {"$gt": since},
+                                               "completed_at": {"$nin": [None, ""]}}, {"_id": 0}).to_list(500)
+        checks = await db.spot_checks.find({"child_id": k["id"], "date_key": {"$gt": since}}, {"_id": 0}).to_list(200)
+        admits = await db.activity.count_documents({"child_id": k["id"], "action": "honest_admit",
+                                                    "created_at": {"$gt": since}})
+        corrections = await db.corrections.count_documents({"child_id": k["id"], "undone": {"$ne": True},
+                                                            "date_key": {"$gt": since}})
+        on_time = sum(1 for x in sess if not x.get("start_late") and not x.get("finish_late"))
+        trust_now = _trust(k)
+        trust_then = last_week[0]["score"] if last_week else trust_now
+        if corrections == 0 and admits == 0 and trust_now >= trust_then:
+            note = "Minggu yang tenang — kepercayaan terjaga. Pujian kecil akan berarti."
+        elif admits and not corrections:
+            note = "Dia memilih jujur saat belum selesai. Itu layak dihargai."
+        elif corrections >= 2:
+            note = "Beberapa kali perlu dikoreksi. Ajak ngobrol santai: apa yang membuatnya buru-buru?"
+        else:
+            note = "Ada naik-turun. Fokus pada usaha yang jujur, bukan hanya hasil."
+        out.append({
+            "child_id": k["id"], "child_name": k["name"], "avatar_emoji": k.get("avatar_emoji"),
+            "trust_now": trust_now, "trust_week_ago": trust_then,
+            "sections_finished": len(sess), "sections_on_time": on_time,
+            "spot_checks": len(checks), "spot_passed": sum(1 for x in checks if x["status"] == "passed"),
+            "admits": admits, "corrections": corrections, "note": note,
+        })
+    return {"since": since, "until": today, "children": out}
 
 
 # ---- Media: images out of the JSON payloads ---------------------------------
@@ -6855,29 +7523,35 @@ async def cron_send_digest(request: Request):
         sent.append("morning")
 
     if now.hour == 20 and not await db.digest_log.find_one({"date_key": today, "type": "evening"}):
+        # "Adskhan 6/7 · Syila 7/7" — ticked missions per child, plus how many
+        # sections were finished, so a parent sees the evening at a glance.
+        status = await _sections_status(today)
         lines = []
         for k in kids:
-            required = await db.tasks.count_documents({
-                "parent_id": FAMILY_ID, "date_key": today, "is_bonus": {"$ne": True},
-                "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
-            })
-            done = await db.tasks.count_documents({
-                "parent_id": FAMILY_ID, "date_key": today, "is_bonus": {"$ne": True},
-                "status": {"$in": ["approved", "completed", "skipped"]},
-                "$or": [{"child_id": k["id"]}, {"is_coop": True, "coop_participants": k["id"]}],
-            })
-            pct = int((done / required) * 100) if required else 100
-            lines.append(f"{k['name']} {pct}%")
-        pending_approval = await db.tasks.count_documents({"parent_id": FAMILY_ID, "status": "completed"})
-        body = ", ".join(lines)
-        if pending_approval:
-            body += f" — {pending_approval} menunggu dicek"
-        await send_push_to(
-            {"role": "parent"}, title="Rangkuman hari ini 🌙",
-            body=body, url="/parent",
-        )
+            mine = [r for r in status if r["child_id"] == k["id"]]
+            total = sum(r["total"] for r in mine)
+            left = sum(len(r["left"]) for r in mine)
+            if total:
+                secs = f", {sum(1 for r in mine if r['finished'])}/{len(mine)} bagian"
+                lines.append(f"{k['name']} {total - left}/{total}{secs}")
+        inbox = await parent_inbox({"role": "parent"})
+        body = " · ".join(lines) or "Tidak ada misi hari ini"
+        if inbox["total"]:
+            body += f" — {inbox['total']} perlu perhatianmu"
+        await send_push_to({"role": "parent"}, title="Rangkuman hari ini 🌙", body=body, url="/parent")
         await db.digest_log.insert_one({"date_key": today, "type": "evening", "sent_at": now_iso()})
         sent.append("evening")
+
+    # Sunday evening: the week in honesty, gently.
+    if now.weekday() == 6 and now.hour == 19 and not await db.digest_log.find_one({"date_key": today, "type": "weekly_honesty"}):
+        recap = await honesty_weekly({"role": "parent"})
+        parts = [f"{c['child_name']}: kepercayaan {c['trust_now']}"
+                 + (f" (jujur mengaku {c['admits']}x)" if c["admits"] else "") for c in recap["children"]]
+        if parts:
+            await send_push_to({"role": "parent"}, title="Rekap kejujuran minggu ini 🤝",
+                               body=" · ".join(parts), url="/parent")
+        await db.digest_log.insert_one({"date_key": today, "type": "weekly_honesty", "sent_at": now_iso()})
+        sent.append("weekly_honesty")
 
     # Streak warning — fires an hour after the parent's evening digest, so kids
     # get one last gentle nudge before bedtime if their daily goal isn't met
